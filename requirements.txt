@@ -1,0 +1,19 @@
+
+# requirements.txt is just for "src" codes. You need to look at extractnet requirements as well.
+
+transformers==4.42.1
+accelerate==0.30.0
+sentencepiece==0.2.0
+einops==0.7.0
+torch==2.3.0+cu121
+
+# may require to manually download
+# pip install torch==2.3.0+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
+
+requests==2.32.4
+beautifulsoup4==4.13.4
+trafilatura==2.0.0
+lxml==5.4.0
+numpy==2.3.0
+playwright==1.52.0
+

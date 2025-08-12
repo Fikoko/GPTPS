@@ -1,0 +1,104 @@
+{
+  "os": "",
+  "hardware": {
+    "cpu": "",
+    "ram_gb": "",
+    "gpu": [""]
+  },
+
+  "tasks": [""],
+
+  "globals": {
+    
+    "input_workspace_path_pic": "",
+    "input_workspace_path_sound": "",
+    "input_workspace_path_text": "",
+    "input_workspace_path_video": "",
+    "input_workspace_path_other": "",
+    "output_workspace_path_pic": "",
+    "output_workspace_path_sound": "",
+    "output_workspace_path_text": "",
+    "output_workspace_path_video": "",
+    "output_workspace_path_other": "",
+    "server_service_connection_name": "",
+    "server_service_connection_key": "",
+    "llm_type": ["local_model", "cloud_model"]
+
+  },
+
+  "local_model": {
+    "model": {
+      "id": "",
+      "trust_remote_code": false,
+      "max_context_tokens": 0,
+      "max_new_tokens": 0,
+      "quantized": false
+    },
+    "quantization": {
+      "load_in_4bit": false,
+      "use_double_quant": false,
+      "compute_dtype": "",
+      "quant_type": ""
+    },
+    "chunking": {
+      "max_chunk_tokens": 0,
+      "stride_tokens": 0,
+      "chunk_overlap_fraction": 0
+    },
+    "generation": {
+      "do_sample": false,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "pad_token_id": "",
+      "eos_token_id": ""
+    },
+    "device": {
+      "auto_select": true,
+      "manual_device": ""
+    }
+  },
+
+  "cloud_model": {
+    "model": {
+      "id": "",
+      "max_context_tokens": 0,
+      "max_new_tokens": 0,
+      "endpoint_url": "",
+      "api_key": ""
+    },
+    "generation": {
+      "do_sample": false,
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "pad_token_id": "",
+      "eos_token_id": ""
+    },
+    "connection": {
+      "type": "",        
+      "retry_attempts": 3,
+      "timeout_seconds": 30
+    }
+  },
+
+  "file_handling": {
+    "default_text_encoding": "utf-8",
+    "default_image_format": ["jpeg", "png"],
+    "default_sound_format": "wav",
+    "default_video_format": "mp4"
+  },
+
+  "api_keys": {
+    "huggingface": ""
+  },
+
+  "performance": {
+    "max_parallel_jobs": 2,
+    "max_memory_gb": 12,
+    "timeout_seconds": 300
+  },
+
+  "config_metadata": {
+    "version": "1.0.0",
+    "last_updated": "2025-08-09"
+  }
+}
