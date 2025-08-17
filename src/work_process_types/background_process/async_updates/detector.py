@@ -6,10 +6,10 @@ from queue import Queue
 
 # Optional C++ detector
 try:
-    from detector_logger import CPPDetector
+    from cpp_detector import CPPDetector
 except ImportError:
     CPPDetector = None
-    print("Warning: detector_logger module not found. C++ acceleration disabled.")
+    print("Warning: cpp_detector module not found. C++ acceleration disabled.")
 
 # Load global configuration
 from work_process_types.pre_process.load_config import GLOBAL_CONFIG_PATH

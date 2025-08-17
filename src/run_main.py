@@ -1,4 +1,3 @@
-
 import asyncio
 from queue import Queue, Empty
 from threading import Thread
@@ -14,8 +13,12 @@ from work_process_types.background_process.async_updates.detector import Detecto
 # ----------------- Main Run Class -----------------
 class MainRunner:
     def __init__(self):
-        # Load global configuration
-        self.config = load_config_main(auto_fill=True, interactive=False)
+        # ----------------- Config Choice -----------------
+        choice = input("Load configuration automatically? (yes/no): ").strip().lower()
+        if choice == "yes":
+            self.config = load_config_main(auto_fill=True, interactive=False)
+        else:
+            self.config = load_config_main(auto_fill=False, interactive=True)
 
         # Initialize tracker
         self.tracker = Tracker(
@@ -102,7 +105,8 @@ class MainRunner:
             task = json.loads(msg_json)
             self.task_queue.put(task)
 
-        await self.detector.listen_messages(push_task_to_queue())
+        await self.detector.listen_messages(push_task_to_queue)
+
 
     # ----------------- Run -----------------
     def run(self):

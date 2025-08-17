@@ -1,6 +1,6 @@
+
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
-import sys
 import setuptools
 
 class get_pybind_include(object):
@@ -11,10 +11,10 @@ class get_pybind_include(object):
 
 ext_modules = [
     Extension(
-        "cpp_detector",              # module name in Python
-        ["cpp_detector.cpp"],        # source file
+        "cpp_detector",               # module name in Python
+        ["cpp_detector.cpp"],         # source file
         include_dirs=[
-            get_pybind_include(),
+            str(get_pybind_include()),  # call it explicitly to get a string
         ],
         language="c++",
         extra_compile_args=["-std=c++17"],
