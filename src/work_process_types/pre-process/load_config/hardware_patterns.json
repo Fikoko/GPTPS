@@ -1,0 +1,199 @@
+{
+  "patterns": [
+    {
+      "name": "low_end_no_gpu",
+      "conditions": {
+        "cpu": "",
+        "ram_gb": 0,
+        "gpu": []
+      },
+      "defaults": {
+        "tasks": [],
+        "file_handling": {
+          "default_text_encoding": "utf-8",
+          "default_image_format": [],
+          "default_sound_format": "",
+          "default_video_format": ""
+        },
+        "performance": {
+          "max_parallel_jobs": 1,
+          "max_memory_gb": 0,
+          "timeout_seconds": 0
+        },
+        "globals": {
+          "input_workspace_path_pic": "",
+          "input_workspace_path_sound": "",
+          "input_workspace_path_text": "",
+          "input_workspace_path_video": "",
+          "input_workspace_path_other": "",
+          "output_workspace_path_pic": "",
+          "output_workspace_path_sound": "",
+          "output_workspace_path_text": "",
+          "output_workspace_path_video": "",
+          "output_workspace_path_other": "",
+          "server_service_connection": "",
+          "server_service_mode": "",
+          "llm_type": []
+        },
+        "local_model": {},
+        "cloud_model": {}
+      }
+    },
+    {
+      "name": "low_end_with_gpu",
+      "conditions": {
+        "cpu": "",
+        "ram_gb": 0,
+        "gpu": [""]
+      },
+      "defaults": {
+        "tasks": [],
+        "file_handling": {
+          "default_text_encoding": "utf-8",
+          "default_image_format": [],
+          "default_sound_format": "",
+          "default_video_format": ""
+        },
+        "performance": {
+          "max_parallel_jobs": 1,
+          "max_memory_gb": 0,
+          "timeout_seconds": 0
+        },
+        "globals": {
+          "input_workspace_path_pic": "",
+          "input_workspace_path_sound": "",
+          "input_workspace_path_text": "",
+          "input_workspace_path_video": "",
+          "input_workspace_path_other": "",
+          "output_workspace_path_pic": "",
+          "output_workspace_path_sound": "",
+          "output_workspace_path_text": "",
+          "output_workspace_path_video": "",
+          "output_workspace_path_other": "",
+          "server_service_connection": "",
+          "server_service_mode": "",
+          "llm_type": []
+        },
+        "local_model": {},
+        "cloud_model": {}
+      }
+    },
+    {
+      "name": "mid_range_no_gpu",
+      "conditions": {
+        "cpu": "",
+        "ram_gb": 0,
+        "gpu": []
+      },
+      "defaults": {
+        "tasks": [],
+        "file_handling": {
+          "default_text_encoding": "utf-8",
+          "default_image_format": [],
+          "default_sound_format": "",
+          "default_video_format": ""
+        },
+        "performance": {
+          "max_parallel_jobs": 2,
+          "max_memory_gb": 0,
+          "timeout_seconds": 0
+        },
+        "globals": {
+          "input_workspace_path_pic": "",
+          "input_workspace_path_sound": "",
+          "input_workspace_path_text": "",
+          "input_workspace_path_video": "",
+          "input_workspace_path_other": "",
+          "output_workspace_path_pic": "",
+          "output_workspace_path_sound": "",
+          "output_workspace_path_text": "",
+          "output_workspace_path_video": "",
+          "output_workspace_path_other": "",
+          "server_service_connection": "",
+          "server_service_mode": "",
+          "llm_type": []
+        },
+        "local_model": {},
+        "cloud_model": {}
+      }
+    },
+    {
+      "name": "mid_range_with_gpu",
+      "conditions": {
+        "cpu": "",
+        "ram_gb": 0,
+        "gpu": [""]
+      },
+      "defaults": {
+        "tasks": [],
+        "file_handling": {
+          "default_text_encoding": "utf-8",
+          "default_image_format": [],
+          "default_sound_format": "",
+          "default_video_format": ""
+        },
+        "performance": {
+          "max_parallel_jobs": 2,
+          "max_memory_gb": 0,
+          "timeout_seconds": 0
+        },
+        "globals": {
+          "input_workspace_path_pic": "",
+          "input_workspace_path_sound": "",
+          "input_workspace_path_text": "",
+          "input_workspace_path_video": "",
+          "input_workspace_path_other": "",
+          "output_workspace_path_pic": "",
+          "output_workspace_path_sound": "",
+          "output_workspace_path_text": "",
+          "output_workspace_path_video": "",
+          "output_workspace_path_other": "",
+          "server_service_connection": "",
+          "server_service_mode": "",
+          "llm_type": []
+        },
+        "local_model": {},
+        "cloud_model": {}
+      }
+    },
+    {
+      "name": "high_end_with_gpu",
+      "conditions": {
+        "cpu": "",
+        "ram_gb": 0,
+        "gpu": [""]
+      },
+      "defaults": {
+        "tasks": [],
+        "file_handling": {
+          "default_text_encoding": "utf-8",
+          "default_image_format": [],
+          "default_sound_format": "",
+          "default_video_format": ""
+        },
+        "performance": {
+          "max_parallel_jobs": 4,
+          "max_memory_gb": 0,
+          "timeout_seconds": 0
+        },
+        "globals": {
+          "input_workspace_path_pic": "",
+          "input_workspace_path_sound": "",
+          "input_workspace_path_text": "",
+          "input_workspace_path_video": "",
+          "input_workspace_path_other": "",
+          "output_workspace_path_pic": "",
+          "output_workspace_path_sound": "",
+          "output_workspace_path_text": "",
+          "output_workspace_path_video": "",
+          "output_workspace_path_other": "",
+          "server_service_connection": "",
+          "server_service_mode": "",
+          "llm_type": []
+        },
+        "local_model": {},
+        "cloud_model": {}
+      }
+    }
+  ]
+}
