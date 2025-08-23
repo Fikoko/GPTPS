@@ -1,6 +1,6 @@
 [submodule "src/work_process_types/main_process/ML/extractnet"]
 	path = src/work_process_types/main_process/ML/extractnet
-	url = https://github.com/Demostatics/demostatics-worker_env.git
+	url = https://github.com/currentslab/extractnet.git
 [submodule "src/work_process_types/main_process/ML/ache"]
 	path = src/work_process_types/main_process/ML/ache
 	url = https://github.com/ViDA-NYU/ache.git
