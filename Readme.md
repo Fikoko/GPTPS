@@ -43,9 +43,22 @@ This project implements a **worker-based task processing system** that listens f
 ### 1. Install dependencies
 ```bash
 pip install -r requirements.txt
+```
+### 2. Install submodules
+```bash
+git clone --recurse-submodules https://github.com/you/General_User_Env.git
+```
 
 
+## ACHE system requirements (not Python packages)
 
+java>=1.8
 
+maven>=3.5
 
+git
+
+docker   # optional so you don’t have to worry about Java/Maven locally
+
+python>=3.8   # optional, for integration
 

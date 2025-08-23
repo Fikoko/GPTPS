@@ -1,5 +1,0 @@
-
-recursive-include dragnet *.pyx *.py *.cc
-
-dragnet/pickled_models/*/*
-
