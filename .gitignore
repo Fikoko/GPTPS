@@ -1,29 +1,15 @@
-
-
-# Ignore virtual environment
-venv/
-.venv/
+# =====================
+# Python
+# =====================
 
 # Byte-compiled / cache files
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# Environment files
-.env
-.env.*
-
-# VS Code settings (optional, if you're using it)
-.vscode/
-
-# macOS system files
-.DS_Store
-
-# PyCharm settings (optional)
-.idea/
+# Virtual environments
+venv/
+.venv/
 
 # Distribution / packaging
 build/
@@ -31,6 +17,44 @@ dist/
 *.egg-info/
 .eggs/
 
-__pycache__/
-*.pyc
+# C++ extension build artifacts
+lib.*-cpython-*
+temp.*-cpython-*
 
+# PyInstaller
+*.manifest
+*.spec
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# =====================
+# Environment files
+# =====================
+.env
+.env.*
+
+# =====================
+# IDE / Editor
+# =====================
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# macOS system files
+.DS_Store
+
+# =====================
+# Logs
+# =====================
+*.log
+logs/
+
+# =====================
+# Misc
+# =====================
+*.swp
+*.swo
+*.bak
