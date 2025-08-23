@@ -40,14 +40,19 @@ This project implements a **worker-based task processing system** that listens f
 
 ## Getting Started
 
-### 1. Install dependencies
+### 1. Install dependencies (Python dependencies)
 ```bash
 pip install -r requirements.txt
 ```
 ### 2. Install submodules
 ```bash
-git clone --recurse-submodules https://github.com/you/General_User_Env.git
+git clone --recurse-submodules https://github.com/Demostatics/demostatics-worker_env.git
 ```
+If you already cloned the repo before submodules were added use "git submodule update --init --recursive"
+
+Note: The folders `ML/extractnet` and `ML/ache` are submodules. They track external repositories. Updating them can be done via:
+
+"git submodule update --remote --merge"
 
 
 ## ACHE system requirements (not Python packages)
