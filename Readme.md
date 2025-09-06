@@ -56,6 +56,12 @@ python build_all.py
 git clone --recurse-submodules https://github.com/Demostatics/demostatics-worker_env.git
 ```
 
+## 4. Start Program
+```bash
+cd src
+python run_main.py
+```
+
 If you already cloned the repo before submodules were added use "git submodule update --init --recursive"
 
 Note: The folders `ML/extractnet` and `ML/ache` are submodules. They track external repositories. Updating them can be done via:

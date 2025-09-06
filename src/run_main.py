@@ -1,11 +1,13 @@
 import asyncio
-from queue import Queue, Empty
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
-import psutil
+from queue import Queue, Empty
 from threading import Thread
 from datetime import datetime
 import uuid
+import time
+import heapq
+import psutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from work_process_types.pre_process.load_config.load_config import main as load_config_main
 from work_process_types.background_process.tracker.tracker import Tracker
@@ -26,15 +28,17 @@ class MainRunner:
         self.tracker = Tracker(
             analytics_path=Path("analytics.json"),
             session_path=Path("session_config.json"),
-            max_records=self.max_records
+            max_records=self.max_records,
+            task_types=self.config.get("performance", {}).get("task_types", [])
         )
+        print("[Runner] Tracker initialized (analytics.json + session_config.json ready)")
 
         # ----------------- Detector -----------------
         self.detector = Detector()
 
         # ----------------- Queues -----------------
         self.seq_queue = Queue()
-        self.par_queue = Queue()
+        self.par_heap = []  # heap: (priority_value, queued_at, task)
 
         # ----------------- Task Management -----------------
         self._canceled_tasks = set()
@@ -43,11 +47,14 @@ class MainRunner:
         # ----------------- Flags -----------------
         self._stop = False
         self._shutdown_in_progress = False
-        self.poll_interval = 0.1
+        self.poll_interval = 0.05  # faster polling
 
-        # ----------------- Multiprocessing Pool -----------------
-        self.pool = Pool(processes=cpu_count())
+        # ----------------- Executor -----------------
+        self.executor = ProcessPoolExecutor(max_workers=psutil.cpu_count())
         self.max_wait_seconds = max_wait_seconds
+
+        # ----------------- Priority Mapping -----------------
+        self.priority_order = {"high": 0, "normal": 1, "low": 2}
 
     # ----------------- Task Execution -----------------
     def process_task(self, task):
@@ -58,24 +65,33 @@ class MainRunner:
             print(f"[{task_name}] Task canceled before start")
             return
 
-        # Respect task-specific memory limit
         mem_limit_gb = task.get("max_memory_gb", 0)
-        if mem_limit_gb > 0 and psutil.virtual_memory().available / (1024 ** 3) < mem_limit_gb:
-            print(f"[{task_name}] Not enough memory ({mem_limit_gb} GB required). Skipping task.")
-            return
+        while mem_limit_gb > 0 and psutil.virtual_memory().available / (1024 ** 3) < mem_limit_gb:
+            print(f"[{task_name}] Waiting for memory: {mem_limit_gb:.2f} GB required")
+            time.sleep(0.1)
+            if self._stop or task_id in self._canceled_tasks:
+                print(f"[{task_name}] Task canceled during wait")
+                return
 
+        timeout = task.get("timeout_seconds", 0)
+        start_time = time.time()
         self.tracker.start_task(task_name)
 
-        try:
-            # Actual task processing goes here
-            print(f"[{task_name}] Task started...")
-            # If an error occurs, you can raise an exception here
-        except Exception as e:
-            print(f"[{task_name}] Error during task: {e}")
-        finally:
-            self.tracker.end_task(task_name)
-            self._task_map.pop(task_id, None)
-            print(f"[{task_name}] Task ended.")
+        print(f"[{task_name}] Processing payload: {task.get('payload')}")
+        while True:
+            if task_id in self._canceled_tasks:
+                print(f"[{task_name}] Task canceled mid-processing")
+                self.tracker.end_task(task_name)
+                return
+            if timeout > 0 and (time.time() - start_time) > timeout:
+                print(f"[{task_name}] Task timed out after {timeout} seconds")
+                self.tracker.end_task(task_name)
+                return
+            # Mark task done immediately (no chunk simulation)
+            break
+
+        self.tracker.end_task(task_name)
+        self._task_map.pop(task_id, None)
 
     # ----------------- Worker Loop -----------------
     def worker_loop(self):
@@ -89,62 +105,36 @@ class MainRunner:
 
             # Parallel tasks
             batch = []
-            available_cpus = cpu_count()
-            max_batch_size = max(1, available_cpus)
-            temp_queue = []
+            temp_heap = []
+            now = datetime.now()
 
-            while len(batch) < max_batch_size:
-                try:
-                    task = self.par_queue.get_nowait()
-                    task_id = task.get("task_id")
-                    if task_id in self._canceled_tasks:
-                        continue
-                    mem_required = task.get("max_memory_gb", 0)
-                    if mem_required > 0 and mem_required > psutil.virtual_memory().available / (1024 ** 3):
-                        temp_queue.append(task)
-                        continue
-                    batch.append(task)
-                except Empty:
-                    break
-
-            for task in temp_queue:
-                self.par_queue.put(task)
-
-            if batch:
-                self._apply_aging_priority()
-                for _ in self.pool.imap(self.process_task, batch):
-                    pass
-
-            psutil.sleep(self.poll_interval)
-
-    # ----------------- Aging + Priority Sorting -----------------
-    def _apply_aging_priority(self):
-        now = datetime.now()
-        temp = []
-        aged_tasks = []
-
-        while not self.par_queue.empty():
-            try:
-                task = self.par_queue.get_nowait()
-                if task.get("task_id") in self._canceled_tasks:
+            while self.par_heap and len(batch) < psutil.cpu_count():
+                priority_value, queued_at, task = heapq.heappop(self.par_heap)
+                task_id = task.get("task_id")
+                if task_id in self._canceled_tasks:
                     continue
-                queued_at = task.get("queued_at", now)
-                if isinstance(queued_at, str):
-                    queued_at = datetime.fromisoformat(queued_at)
+
+                # Aging check
                 if (now - queued_at).total_seconds() > self.max_wait_seconds:
-                    aged_tasks.append(task)
-                else:
-                    temp.append(task)
-            except Empty:
-                break
+                    priority_value = -1  # promote to highest priority
 
-        combined = aged_tasks + temp
-        # Sort: high-priority first, then normal, then low
-        priority_order = {"high": 0, "normal": 1, "low": 2}
-        combined.sort(key=lambda t: priority_order.get(t.get("priority", "normal"), 1))
+                mem_required = task.get("max_memory_gb", 0)
+                if mem_required > 0 and mem_required > psutil.virtual_memory().available / (1024 ** 3):
+                    temp_heap.append((priority_value, queued_at, task))
+                    continue
 
-        for task in combined:
-            self.par_queue.put(task)
+                batch.append(task)
+
+            # push back deferred tasks
+            for item in temp_heap:
+                heapq.heappush(self.par_heap, item)
+
+            # Submit tasks in parallel
+            futures = [self.executor.submit(self.process_task, t) for t in batch]
+            for f in as_completed(futures):
+                f.result()  # wait for completion
+
+            time.sleep(self.poll_interval)
 
     # ----------------- Detector Listener -----------------
     async def listen_detector(self):
@@ -152,22 +142,20 @@ class MainRunner:
             import json
             msg = json.loads(msg_json)
 
-            # Cancellation
             if msg.get("action") == "cancel" and "task_id" in msg:
                 self.cancel_task(msg["task_id"])
                 return
 
-            # Priority update
             if msg.get("action") == "update_priority" and "task_id" in msg and "priority" in msg:
                 self.update_task_priority(msg["task_id"], msg["priority"])
                 return
 
             if "priority" not in msg:
                 msg["priority"] = "normal"
-            msg["queued_at"] = datetime.now().isoformat()
+            queued_at = datetime.now()
+            msg["queued_at"] = queued_at
             msg["task_id"] = msg.get("task_id", str(uuid.uuid4()))
 
-            # Fill in missing performance params from global config defaults
             perf_defaults = self.config.get("performance", {})
             msg.setdefault("max_parallel_jobs", perf_defaults.get("max_parallel_jobs", 1))
             msg.setdefault("max_memory_gb", perf_defaults.get("max_memory_gb", 0))
@@ -178,46 +166,40 @@ class MainRunner:
             if msg.get("max_parallel_jobs", 1) == 1:
                 self.seq_queue.put(msg)
             else:
-                self.par_queue.put(msg)
+                heapq.heappush(self.par_heap, (self.priority_order.get(msg["priority"], 1), queued_at, msg))
 
         await self.detector.listen_messages(push_task_to_queue)
 
-    # ----------------- Cancel Task -----------------
+    # ----------------- Cancel/Update -----------------
     def cancel_task(self, task_id: str):
         print(f"[Runner] Cancelling task {task_id}")
         self._canceled_tasks.add(task_id)
         self._task_map.pop(task_id, None)
 
-    # ----------------- Update Task Priority -----------------
     def update_task_priority(self, task_id: str, new_priority: str):
         print(f"[Runner] Updating priority of task {task_id} to {new_priority}")
         task = self._task_map.get(task_id)
         if task:
             task["priority"] = new_priority
 
-    # ----------------- Graceful Shutdown -----------------
+    # ----------------- Shutdown -----------------
     def shutdown(self):
         if self._shutdown_in_progress:
             return
         self._shutdown_in_progress = True
         print("[Runner] Graceful shutdown initiated...")
 
-        # Stop accepting new tasks
         self._stop = True
 
-        # Cancel queued tasks
         while not self.seq_queue.empty():
             task = self.seq_queue.get_nowait()
             self.cancel_task(task.get("task_id"))
 
-        while not self.par_queue.empty():
-            task = self.par_queue.get_nowait()
+        while self.par_heap:
+            _, _, task = heapq.heappop(self.par_heap)
             self.cancel_task(task.get("task_id"))
 
-        # Close multiprocessing pool
-        self.pool.close()
-        print("[Runner] Waiting for running tasks to complete...")
-        self.pool.join()
+        self.executor.shutdown(wait=True)
         print("[Runner] All tasks completed, shutdown finished.")
 
     # ----------------- Run -----------------
