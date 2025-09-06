@@ -24,13 +24,13 @@
     "llm_type": []
   },
   "file_handling": {
-    "default_text_encoding": "utf-8",
+    "default_text_encoding": "",
     "default_image_format": [],
     "default_sound_format": "",
     "default_video_format": ""
   },
   "performance": {
-    "max_parallel_jobs": 1,
+    "max_parallel_jobs": 0,
     "max_memory_gb": 0,
     "timeout_seconds": 0
   },

@@ -18,7 +18,7 @@ except ImportError:
     config_helper = None
     print("Warning: config_helper module not found. C++ acceleration disabled.")
 
-# Import server service connector
+# Server service connector
 try:
     from work_process_types.pre_process.server_service import server_service_connector
 except ImportError:
@@ -28,6 +28,8 @@ except ImportError:
 GLOBAL_CONFIG_PATH = Path(__file__).parent / "global_config.json"
 HARDWARE_PATTERNS_PATH = Path(__file__).parent / "hardware_patterns.json"
 RESOURCE_DIR = Path(__file__).parent.parent / "resource"
+ANALYTICS_PATH = Path("analytics.json")
+SESSION_PATH = Path("session_config.json")
 
 # ---------------- Hardware Detection ----------------
 def detect_hardware():
@@ -47,7 +49,6 @@ def load_hardware_patterns():
 def apply_hardware_pattern(hardware_info, patterns):
     if config_helper:
         return config_helper.match_hardware_pattern(hardware_info, patterns)
-    # fallback Python matching
     for pattern in patterns.get("patterns", []):
         cond = pattern.get("conditions", {})
         match_cpu = not cond.get("cpu") or cond["cpu"].lower() in hardware_info["cpu"].lower()
@@ -57,50 +58,97 @@ def apply_hardware_pattern(hardware_info, patterns):
             return pattern.get("defaults", {})
     return {}
 
-# ---------------- User Prompt for Globals ----------------
-def prompt_user_for_globals(defaults):
-    print("\nManual configuration mode: fill values (press Enter to skip, defaults will be applied automatically)\n")
+# ---------------- User Prompt ----------------
+def prompt_user_for_globals(defaults, performance_defaults=None):
+    print("\nManual configuration mode: fill values (press Enter to skip, defaults applied)\n")
     globals_conf = {}
 
+    # Workspace paths
     workspace_keys = [
-        "input_workspace_path_pic", "input_workspace_path_sound", "input_workspace_path_text",
-        "input_workspace_path_video", "input_workspace_path_other",
-        "output_workspace_path_pic", "output_workspace_path_sound", "output_workspace_path_text",
-        "output_workspace_path_video", "output_workspace_path_other"
+        "input_workspace_path_pic","input_workspace_path_sound","input_workspace_path_text",
+        "input_workspace_path_video","input_workspace_path_other",
+        "output_workspace_path_pic","output_workspace_path_sound","output_workspace_path_text",
+        "output_workspace_path_video","output_workspace_path_other"
     ]
     for key in workspace_keys:
         default_path = defaults.get(key, str(RESOURCE_DIR / key.split("_")[-1]))
         val = input(f"{key} [{default_path}]: ").strip()
         globals_conf[key] = val or default_path
 
+    # Service connection
     service_keys = ["server_service_connection", "server_service_mode"]
     for key in service_keys:
         val = input(f"{key} [{defaults.get(key, '')}]: ").strip()
         globals_conf[key] = val or defaults.get(key, "")
 
-    # Worker and group IDs (manual input)
     globals_conf["worker_id"] = input("worker_id []: ").strip() or ""
     globals_conf["group_id"] = input("group_id []: ").strip() or ""
 
-    # LLM selection
+    # LLM
     llm_choice = input("LLM types (comma separated: local_model, cloud_model) [{}]: ".format(
         ",".join(defaults.get("llm_type", []))
     )).strip()
     globals_conf["llm_type"] = [x.strip() for x in llm_choice.split(",") if x.strip()] or defaults.get("llm_type", [])
 
-    # API keys for cloud models if selected
-    globals_conf["api_keys"] = {}
-    if "cloud_model" in globals_conf["llm_type"]:
-        cloud_key = ""
-        while not cloud_key:
-            cloud_key = input("Enter API key for cloud model (required): ").strip()
-        globals_conf["api_keys"]["cloud_model"] = cloud_key
-
-    # Manual tasks entry
+    # Tasks
     task_input = input("Enter task names (comma separated) [{}]: ".format(
         ",".join(defaults.get("tasks", []))
     )).strip()
     globals_conf["tasks"] = [t.strip() for t in task_input.split(",") if t.strip()] or defaults.get("tasks", [])
+
+    # Performance parameters
+    perf = performance_defaults or {}
+    # max_records
+    default_max_records = perf.get("max_records", 5)
+    while True:
+        val = input(f"Max records to store in analytics [{default_max_records}]: ").strip()
+        if not val:
+            globals_conf["max_records"] = default_max_records
+            break
+        if val.isdigit() and int(val) > 0:
+            globals_conf["max_records"] = int(val)
+            break
+        print("Please enter a positive integer.")
+
+    # max_parallel_jobs
+    default_parallel = perf.get("max_parallel_jobs", 1)
+    while True:
+        val = input(f"Max parallel jobs [{default_parallel}]: ").strip()
+        if not val:
+            globals_conf["max_parallel_jobs"] = default_parallel
+            break
+        if val.isdigit() and int(val) >= 0:
+            globals_conf["max_parallel_jobs"] = int(val)
+            break
+        print("Please enter a non-negative integer.")
+
+    # max_memory_gb
+    default_mem = perf.get("max_memory_gb", 0)
+    while True:
+        val = input(f"Max memory per task in GB [{default_mem}]: ").strip()
+        if not val:
+            globals_conf["max_memory_gb"] = default_mem
+            break
+        try:
+            mem_val = float(val)
+            if mem_val >= 0:
+                globals_conf["max_memory_gb"] = mem_val
+                break
+        except:
+            pass
+        print("Please enter a non-negative number.")
+
+    # timeout_seconds
+    default_timeout = perf.get("timeout_seconds", 0)
+    while True:
+        val = input(f"Timeout per task in seconds [{default_timeout}]: ").strip()
+        if not val:
+            globals_conf["timeout_seconds"] = default_timeout
+            break
+        if val.isdigit() and int(val) >= 0:
+            globals_conf["timeout_seconds"] = int(val)
+            break
+        print("Please enter a non-negative integer.")
 
     return globals_conf
 
@@ -117,6 +165,18 @@ def create_resource_subdirs(paths=None):
     else:
         for p in paths:
             Path(p).mkdir(parents=True, exist_ok=True)
+
+# ---------------- Analytics / Session ----------------
+def init_analytics(tasks: list, max_records: int = 5, analytics_path=ANALYTICS_PATH):
+    analytics_data = {task: [{"start_time": "", "end_time": "", "duration_seconds": ""} 
+                             for _ in range(max_records)] for task in tasks}
+    with open(analytics_path, "w", encoding="utf-8") as f:
+        json.dump(analytics_data, f, indent=2)
+
+def init_session_config(tasks: list, session_path=SESSION_PATH):
+    session_data = {"session_start": datetime.now().isoformat(), "tasks": {task: [] for task in tasks}}
+    with open(session_path, "w", encoding="utf-8") as f:
+        json.dump(session_data, f, indent=2)
 
 # ---------------- Main ----------------
 def main(auto_fill=True, interactive=True):
@@ -138,10 +198,8 @@ def main(auto_fill=True, interactive=True):
         "api_keys": {}
     }
 
-    # Auto-fill globals with hardware defaults
     if auto_fill:
         config["globals"] = defaults.get("globals", {}).copy()
-        # Ensure all workspace keys exist
         workspace_keys = [
             "input_workspace_path_pic","input_workspace_path_sound","input_workspace_path_text",
             "input_workspace_path_video","input_workspace_path_other",
@@ -151,22 +209,31 @@ def main(auto_fill=True, interactive=True):
         for k in workspace_keys:
             if k not in config["globals"]:
                 config["globals"][k] = str(RESOURCE_DIR / k.split("_")[-1])
-        # Always initialize IDs
         config["globals"]["worker_id"] = ""
         config["globals"]["group_id"] = ""
 
-    # Manual override / user prompt
+    performance_defaults = defaults.get("performance", {})
     if interactive:
-        user_conf = prompt_user_for_globals(config["globals"])
+        user_conf = prompt_user_for_globals(config["globals"], performance_defaults)
         config["globals"].update(user_conf)
         config["tasks"] = user_conf.get("tasks", config["tasks"])
+        # set all performance parameters from manual input
+        config["performance"]["max_records"] = user_conf.get("max_records", performance_defaults.get("max_records", 5))
+        config["performance"]["max_parallel_jobs"] = user_conf.get("max_parallel_jobs", performance_defaults.get("max_parallel_jobs", 1))
+        config["performance"]["max_memory_gb"] = user_conf.get("max_memory_gb", performance_defaults.get("max_memory_gb", 0))
+        config["performance"]["timeout_seconds"] = user_conf.get("timeout_seconds", performance_defaults.get("timeout_seconds", 0))
+    else:
+        config["performance"] = performance_defaults
 
-    # Save global config
+    max_records = config["performance"]["max_records"]
+    tasks = config["tasks"]
+    init_analytics(tasks, max_records)
+    init_session_config(tasks)
+
     with open(GLOBAL_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     print(f"\nGlobal configuration saved at {GLOBAL_CONFIG_PATH}")
 
-    # ---------------- Server Service Connection ----------------
     service_name = config["globals"].get("server_service_connection")
     service_mode = config["globals"].get("server_service_mode")
     if server_service_connector and service_name and service_mode:

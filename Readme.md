@@ -38,16 +38,24 @@ This project implements a **worker-based task processing system** that listens f
 
 ---
 
-## Getting Started
+## Getting Started (in demostatics-worker_env)
 
 ### 1. Install dependencies (Python dependencies)
 ```bash
 pip install -r requirements.txt
 ```
-### 2. Install submodules
+
+### 2. Install builds/extensions
+```bash
+cd src
+python build_all.py
+```
+
+## 3. Install submodules
 ```bash
 git clone --recurse-submodules https://github.com/Demostatics/demostatics-worker_env.git
 ```
+
 If you already cloned the repo before submodules were added use "git submodule update --init --recursive"
 
 Note: The folders `ML/extractnet` and `ML/ache` are submodules. They track external repositories. Updating them can be done via:
@@ -66,4 +74,6 @@ git
 docker   # optional so you don’t have to worry about Java/Maven locally
 
 python>=3.8   # optional, for integration
+
+
 

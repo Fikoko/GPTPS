@@ -1,29 +1,30 @@
 import json
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Callable, Optional, Dict
 from fast_logger import AnalyticsLoggerCPP  # C++ logger
 
-# ----------------- Analytics Logger -----------------
 class AnalyticsLogger:
-    def __init__(self, analytics_file: Path = Path("analytics.json"), max_records: int = 5):
+    def __init__(self, analytics_file: Path = Path("analytics.json"), max_records: int = 5, task_types: Optional[list] = None):
         self.analytics_file = Path(analytics_file)
         self.max_records = max_records
+        self.task_types = task_types or []  # List of allowed task types
         self._logger = AnalyticsLoggerCPP(str(analytics_file), max_records)
 
-        # Ensure analytics.json exists
         if not self.analytics_file.exists():
             with open(self.analytics_file, "w", encoding="utf-8") as f:
                 json.dump({}, f, indent=2)
 
     def log(self, task_name: str, start_time: datetime, end_time: datetime):
+        if self.task_types and task_name not in self.task_types:
+            return  # Ignore tasks not in allowed types
+
         duration = (end_time - start_time).total_seconds()
         self._logger.log(task_name, start_time.isoformat(), end_time.isoformat(), duration)
 
-        # Also update JSON copy
+        # Update JSON copy
         with open(self.analytics_file, "r+", encoding="utf-8") as f:
             data = json.load(f)
             if task_name not in data:
@@ -39,16 +40,17 @@ class AnalyticsLogger:
             f.truncate()
 
 
-# ----------------- Tracker -----------------
 class Tracker:
     def __init__(self,
                  analytics_path: Path = Path("analytics.json"),
                  session_path: Path = Path("session_config.json"),
                  max_records: int = 5,
-                 worker_poll_interval: float = 0.5):
-        self.logger = AnalyticsLogger(analytics_path, max_records)
+                 worker_poll_interval: float = 0.5,
+                 task_types: Optional[list] = None):
+        self.logger = AnalyticsLogger(analytics_path, max_records, task_types)
         self.session_file = Path(session_path)
         self.max_records = max_records
+        self.task_types = task_types or []
 
         # Session file initialization
         if not self.session_file.exists():
@@ -78,12 +80,18 @@ class Tracker:
 
     # ----------------- Task Methods -----------------
     def start_task(self, task_name: str):
+        if self.task_types and task_name not in self.task_types:
+            return  # Ignore tasks not in allowed types
+
         start_time = datetime.now()
         with self._lock:
             self._active[task_name] = start_time
         self._broadcast("task_started", task_name, start_time)
 
     def end_task(self, task_name: str):
+        if self.task_types and task_name not in self.task_types:
+            return
+
         end_time = datetime.now()
         with self._lock:
             start_time = self._active.pop(task_name, None)
@@ -91,10 +99,9 @@ class Tracker:
             print(f"[Tracker] end_task called but no start recorded for '{task_name}'")
             start_time = end_time
 
-        # Log to analytics
         self.logger.log(task_name, start_time, end_time)
 
-        # Log to session_config.json
+        # Update session_config.json
         with open(self.session_file, "r+", encoding="utf-8") as f:
             data = json.load(f)
             tasks = data.setdefault("tasks", {})
@@ -106,15 +113,7 @@ class Tracker:
                 "end_time": end_time.isoformat(),
                 "duration_seconds": (end_time - start_time).total_seconds()
             })
-
-            # ------------------- CLEANUP -------------------
-            # Keep only the last `max_records` tasks per task
             tasks[task_name] = tasks[task_name][-self.max_records:]
-            # Optionally, remove tasks older than certain time
-            # from datetime import timedelta
-            # cutoff = datetime.now() - timedelta(hours=24)
-            # tasks[task_name] = [t for t in tasks[task_name] if datetime.fromisoformat(t["end_time"]) > cutoff]
-            # ------------------------------------------------
 
             f.seek(0)
             json.dump(data, f, indent=2)

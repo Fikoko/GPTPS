@@ -42,7 +42,6 @@ babel==2.17.0               # Internationalization / date formatting
 coloredlogs==15.0.1         # Color-coded logging
 dateparser==1.1.0           # Parses dates from natural language strings
 filelock==3.19.1            # Locks files to prevent concurrent writes
-flatbuffers==25.2.10        # Efficient data serialization
 fsspec==2025.7.0            # Abstract filesystem specification (local + remote)
 ftfy==4.4.3                 # Fixes text encoding issues (e.g., bad Unicode)
 humanfriendly==10.0          # Converts file sizes, durations, and numbers into human-readable format

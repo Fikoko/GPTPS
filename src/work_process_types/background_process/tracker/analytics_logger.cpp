@@ -1,9 +1,8 @@
-
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <fstream>
 #include <mutex>
-#include <nlohmann/json.hpp> // for JSON handling
+#include <nlohmann/json.hpp>
 
 namespace py = pybind11;
 using json = nlohmann::json;
@@ -27,9 +26,11 @@ public:
         std::lock_guard<std::mutex> guard(mtx);
         
         json data;
-        {
-            std::ifstream f(file_path);
-            if (f.good()) f >> data;
+        std::ifstream f(file_path);
+        if (f.good()) f >> data;
+
+        if (!data.contains(task_name)) {
+            data[task_name] = json::array();
         }
 
         json rec = {
@@ -38,19 +39,14 @@ public:
             {"duration_seconds", duration}
         };
 
-        if (!data.contains(task_name)) {
-            data[task_name] = json::array();
-        }
         data[task_name].insert(data[task_name].begin(), rec);
 
         if (data[task_name].size() > max_records) {
             data[task_name].erase(data[task_name].begin() + max_records, data[task_name].end());
         }
 
-        {
-            std::ofstream f(file_path);
-            f << data.dump(2);
-        }
+        std::ofstream out(file_path);
+        out << data.dump(2);
     }
 
 private:
