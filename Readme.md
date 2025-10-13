@@ -64,22 +64,9 @@ python run_main.py
 
 If you already cloned the repo before submodules were added use "git submodule update --init --recursive"
 
-Note: The folders `ML/extractnet` and `ML/ache` are submodules. They track external repositories. Updating them can be done via:
+Note: There are folders which are submodules. They track external repositories. Updating them can be done via:
 
 "git submodule update --remote --merge"
-
-
-## ACHE system requirements (not Python packages)
-
-java>=1.8
-
-maven>=3.5
-
-git
-
-docker   # optional so you don’t have to worry about Java/Maven locally
-
-python>=3.8   # optional, for integration
 
 
 
