@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package detector;
+
+// Generic task message
+message Task {
+  string task_name = 1;
+  string worker_id = 2;
+  string group_id = 3;
+  string received_at = 4; // ISO timestamp
+
+  // Payload as a map of string keys to string values
+  map<string, string> payload = 5;
+
+  // Optional performance parameters
+  int32 max_parallel_jobs = 6;
+  float max_memory_gb = 7;
+  int32 timeout_seconds = 8;
+}

@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "GenericTask",
+  "fields": [
+    {"name": "task_name", "type": "string"},
+    {"name": "worker_id", "type": ["null", "string"], "default": null},
+    {"name": "group_id", "type": ["null", "string"], "default": null},
+    {"name": "payload", "type": ["null", "string"], "default": null}, 
+    {"name": "received_at", "type": ["null", "string"], "default": null},
+    {"name": "max_parallel_jobs", "type": "int"},
+    {"name": "max_memory_gb", "type": "float"},
+    {"name": "timeout_seconds", "type": "int"}
+  ]
+}

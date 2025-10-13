@@ -1,7 +1,7 @@
-
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 import setuptools
+import os
 
 class get_pybind_include(object):
     """Helper class to determine the pybind11 include path"""
@@ -11,13 +11,14 @@ class get_pybind_include(object):
 
 ext_modules = [
     Extension(
-        "cpp_detector",               # module name in Python
-        ["cpp_detector.cpp"],         # source file
+        "cpp_detector",
+        ["cpp_detector.cpp"],
         include_dirs=[
-            str(get_pybind_include()),  # call it explicitly to get a string
+            str(get_pybind_include()),  # pybind11
+            os.path.join("third_party", "tomlplusplus", "include"),  # toml++
         ],
         language="c++",
-        extra_compile_args=["-std=c++17"],
+        extra_compile_args=["-std=c++17", "-O3", "-Wall"],
     ),
 ]
 

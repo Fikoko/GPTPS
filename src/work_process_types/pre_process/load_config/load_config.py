@@ -4,6 +4,8 @@ import psutil
 from pathlib import Path
 from datetime import datetime
 import asyncio
+import os
+import tempfile
 
 # Optional GPU detection
 try:
@@ -30,6 +32,18 @@ HARDWARE_PATTERNS_PATH = Path(__file__).parent / "hardware_patterns.json"
 RESOURCE_DIR = Path(__file__).parent.parent / "resource"
 ANALYTICS_PATH = Path("analytics.json")
 SESSION_PATH = Path("session_config.json")
+
+# ---------------- Safe JSON save ----------------
+def safe_save_json(path: Path, data: dict):
+    """Write JSON safely using an atomic replace."""
+    temp_fd, temp_path = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        os.replace(temp_path, path)  # atomic replace
+    except Exception:
+        os.remove(temp_path)
+        raise
 
 # ---------------- Hardware Detection ----------------
 def detect_hardware():
@@ -170,13 +184,11 @@ def create_resource_subdirs(paths=None):
 def init_analytics(tasks: list, max_records: int = 5, analytics_path=ANALYTICS_PATH):
     analytics_data = {task: [{"start_time": "", "end_time": "", "duration_seconds": ""} 
                              for _ in range(max_records)] for task in tasks}
-    with open(analytics_path, "w", encoding="utf-8") as f:
-        json.dump(analytics_data, f, indent=2)
+    safe_save_json(analytics_path, analytics_data)
 
 def init_session_config(tasks: list, session_path=SESSION_PATH):
     session_data = {"session_start": datetime.now().isoformat(), "tasks": {task: [] for task in tasks}}
-    with open(session_path, "w", encoding="utf-8") as f:
-        json.dump(session_data, f, indent=2)
+    safe_save_json(session_path, session_data)
 
 # ---------------- Main ----------------
 def main(auto_fill=True, interactive=True):
@@ -230,23 +242,17 @@ def main(auto_fill=True, interactive=True):
     init_analytics(tasks, max_records)
     init_session_config(tasks)
 
-    with open(GLOBAL_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    safe_save_json(GLOBAL_CONFIG_PATH, config)
     print(f"\nGlobal configuration saved at {GLOBAL_CONFIG_PATH}")
 
+    # Server service configuration is saved for runtime use
     service_name = config["globals"].get("server_service_connection")
     service_mode = config["globals"].get("server_service_mode")
-    if server_service_connector and service_name and service_mode:
-        try:
-            connector = server_service_connector.ServerServiceConnector(service_name, service_mode)
-            asyncio.run(connector.connect())
-            print("[Server Service] Connector executed successfully.")
-        except Exception as e:
-            print(f"[Server Service] Error executing connector: {e}")
+    if service_name and service_mode:
+        print(f"[Server Service] Configuration saved: {service_name} in {service_mode} mode")
+        print("[Server Service] Connection will be established at runtime")
     else:
-        print("[Server Service] Skipped connection (service_name or mode not specified)")
-
-    return config
+        print("[Server Service] No service configured - will run in test mode")
 
 # ---------------- Entry Point ----------------
 if __name__ == "__main__":
