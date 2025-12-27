@@ -53,7 +53,7 @@ python build_all.py
 
 ## 3. Install submodules
 ```bash
-git clone --recurse-submodules https://github.com/Demostatics/demostatics-worker_env.git
+git clone --recurse-submodules https://github.com/Fikoko/App_Pc_Work_Env
 ```
 
 ## 4. Start Program
