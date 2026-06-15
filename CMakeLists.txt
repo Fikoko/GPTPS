@@ -92,6 +92,14 @@ if(UNIX)
     target_link_libraries(test_oop PRIVATE gptps)
     add_test(NAME oop COMMAND test_oop)
     set_tests_properties(oop PROPERTIES TIMEOUT 30)
+
+    add_executable(test_result tests/test_result.c) # exercises the OOP executor too
+    target_include_directories(test_result
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_result PRIVATE gptps)
+    add_test(NAME result COMMAND test_result)
+    set_tests_properties(result PROPERTIES TIMEOUT 30)
 endif()
 
 # --- example (headline usage; doubles as a smoke test) ---------------------

@@ -233,6 +233,10 @@ typedef struct {
     /* memory: DECLARED cost for in-process tasks (RSS is not measurable in a
      * shared address space); MEASURED RSS for out-of-process tasks. */
     uint64_t         mem_bytes;
+    /* task result bytes, present on GPTPS_EV_FINISHED (NULL/0 otherwise).
+     * Valid only for the duration of the callback - copy it if you need it. */
+    const void      *result;
+    size_t           result_len;
 } gptps_event;
 
 typedef void (*gptps_event_cb)(const gptps_event *ev, void *user_data);

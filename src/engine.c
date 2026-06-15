@@ -86,6 +86,8 @@ typedef struct {
     gptps_status     status;
     uint32_t         attempt;
     uint64_t         mem;
+    const void      *result;
+    size_t           result_len;
 } gptps_pending_ev;
 
 struct gptps {
@@ -177,6 +179,7 @@ static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_
     ev.kind = p->kind; ev.handle = p->handle; ev.task_name = p->name;
     ev.ts_ms = gptps_hal_monotonic_ms(); ev.status = p->status;
     ev.attempt = p->attempt; ev.mem_bytes = p->mem;
+    ev.result = p->result; ev.result_len = p->result_len;
     cb(&ev, ud);
 }
 
@@ -186,6 +189,7 @@ static void emit(gptps *e, gptps_event_kind kind, gptps_handle h,
 {
     gptps_pending_ev p;
     p.kind = kind; p.handle = h; p.name = name; p.status = st; p.attempt = attempt; p.mem = mem;
+    p.result = NULL; p.result_len = 0;
     emit_now(e, e->ev_cb, e->ev_ud, &p);
 }
 
@@ -277,32 +281,39 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
 {
     gptps_pending_ev p;
     gptps_status st;
+    struct gptps_ctx ctx;          /* used only on the in-process path */
+    void *oop_res = NULL;
+    size_t oop_len = 0;
+    bool inproc = (it->def->exec != GPTPS_EXEC_OOP);
 
     p.handle = it->handle; p.name = it->def->name; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
+    p.result = NULL; p.result_len = 0;
     p.kind = GPTPS_EV_STARTED; p.status = GPTPS_OK; emit_now(e, cb, ud, &p);
 
-    if (it->def->exec == GPTPS_EXEC_OOP) {
-        /* enforced path: run in a forked child, OS-capped, hard-killed on timeout */
-        void *res = NULL; size_t rlen = 0;
-        st = gptps_oop_execute(it->def, it->payload, it->payload_len,
-                               it->cost.mem_bytes, it->policy.timeout_seconds, &res, &rlen);
-        free(res); /* M1: result-to-caller delivery is a later increment */
-    } else {
+    if (inproc) {
         /* in-process path: cooperative cancel via the deadline flag */
-        struct gptps_ctx ctx;
-        bool timed;
         memset(&ctx, 0, sizeof ctx);
         ctx.engine = e; ctx.handle = it->handle; ctx.task_name = it->def->name;
         ctx.payload = it->payload; ctx.payload_len = it->payload_len;
         ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
         st = it->def->run(&ctx, it->def->user_data);
-        timed = gptps_flag_get(it->cancel);
-        if (timed) st = GPTPS_E_TIMEOUT;
-        ctx_clear_result(&ctx);
+        if (gptps_flag_get(it->cancel)) st = GPTPS_E_TIMEOUT;
+    } else {
+        /* enforced path: run in a forked child, OS-capped, hard-killed on timeout */
+        st = gptps_oop_execute(it->def, it->payload, it->payload_len,
+                               it->cost.mem_bytes, it->policy.timeout_seconds, &oop_res, &oop_len);
     }
 
+    /* deliver the result on the FINISHED event (valid for the callback's duration) */
     p.kind = (st == GPTPS_OK) ? GPTPS_EV_FINISHED : GPTPS_EV_FAILED; p.status = st;
+    if (st == GPTPS_OK) {
+        if (inproc) { if (ctx.result_set) { p.result = ctx.result; p.result_len = ctx.result_len; } }
+        else        { p.result = oop_res; p.result_len = oop_len; }
+    }
     emit_now(e, cb, ud, &p);
+
+    if (inproc) ctx_clear_result(&ctx);
+    else        free(oop_res);
     return st;
 }
 
@@ -391,7 +402,8 @@ static void *dispatcher_main(void *arg)
                 if (npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_RETRIED; pend[npend].handle = it->handle;
                     pend[npend].name = it->def->name; pend[npend].status = it->outcome;
-                    pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes; ++npend;
+                    pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
                 fifo_push(&e->delayed, it);
             } else {
@@ -418,7 +430,8 @@ static void *dispatcher_main(void *arg)
                         if (npend < GPTPS_PENDING_CAP) {
                             pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                             pend[npend].name = it->def->name; pend[npend].status = it->outcome;
-                            pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes; ++npend;
+                            pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                         }
                         fifo_push(&e->dead_letter, it);
                         e->dead_letter_count += 1;
