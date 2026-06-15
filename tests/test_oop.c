@@ -27,6 +27,7 @@ static void on_ev(const gptps_event *ev, void *ud)
 
 static gptps_status t_ok(gptps_ctx *ctx, void *ud)   { (void)ud; return gptps_result_set(ctx, "ok", 2); }
 static gptps_status t_hang(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; for (;;) { } return GPTPS_OK; /*unreachable*/ }
+#if defined(__linux__) /* RLIMIT_AS-enforced memory cap is Linux-only for now */
 static gptps_status t_bigmem(gptps_ctx *ctx, void *ud)
 {
     void *p;
@@ -37,6 +38,7 @@ static gptps_status t_bigmem(gptps_ctx *ctx, void *ud)
     free(p);
     return GPTPS_OK;
 }
+#endif
 
 static void def_init(gptps_task_def *d, const char *name, gptps_run_fn run,
                      uint32_t timeout_s, uint64_t mem_bytes)
@@ -78,7 +80,9 @@ int main(void)
     CHECK(get(&c_failed) >= 1);
     CHECK(get(&c_finished) == 0);
 
-    /* C) task exceeding its OS memory cap fails */
+    /* C) task exceeding its OS memory cap fails - only where the cap is
+     *    enforced (RLIMIT_AS, Linux). macOS/cgroups enforcement is deferred. */
+#if defined(__linux__)
     reset();
     CHECK(gptps_open(NULL, &e) == GPTPS_OK);
     gptps_set_event_cb(e, on_ev, NULL);
@@ -88,6 +92,7 @@ int main(void)
     gptps_shutdown(e);
     CHECK(get(&c_failed) >= 1);
     CHECK(get(&c_finished) == 0);
+#endif
 
     if (fails) { printf("%d oop check(s) FAILED\n", fails); return 1; }
     printf("all oop checks passed\n");
