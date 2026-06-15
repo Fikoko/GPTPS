@@ -19,8 +19,14 @@ target_include_directories(gptps
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-# POSIX feature macros for clock_gettime / sysconf / sysinfo under -std=c99.
-if(UNIX)
+# Per-platform feature macros so strict -std=c99 still exposes the OS APIs the
+# HAL needs (threads, clock, sysconf, RAM detection).
+#  - Apple: _DARWIN_C_SOURCE exposes BSD types (u_int) + sysctl + _SC_* . Do NOT
+#    set strict _POSIX_C_SOURCE there: it hides exactly those.
+#  - other UNIX (Linux/glibc): _GNU_SOURCE + _POSIX_C_SOURCE.
+if(APPLE)
+    target_compile_definitions(gptps PRIVATE _DARWIN_C_SOURCE)
+elseif(UNIX)
     target_compile_definitions(gptps PRIVATE _GNU_SOURCE _POSIX_C_SOURCE=200809L)
 endif()
 if(NOT MSVC)
