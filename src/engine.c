@@ -244,6 +244,29 @@ gptps_status gptps_result_set_nocopy(gptps_ctx *ctx, void *bytes, size_t len, vo
     return GPTPS_OK;
 }
 
+/* Build a ctx, run the task in THIS process, return a malloc'd copy of the
+ * result (caller frees). Used directly by the in-process path's logic and by
+ * the OOP child (see exec_oop_posix.c). */
+gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, size_t plen,
+                               void **out_result, size_t *out_len)
+{
+    struct gptps_ctx ctx;
+    gptps_status st;
+
+    *out_result = NULL; *out_len = 0;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.payload = payload; ctx.payload_len = plen;
+    ctx.cancel = NULL; /* OOP enforcement is hard-kill, not the cooperative flag */
+
+    st = def->run(&ctx, def->user_data);
+    if (ctx.result_set && ctx.result_len) {
+        void *copy = malloc(ctx.result_len);
+        if (copy) { memcpy(copy, ctx.result, ctx.result_len); *out_result = copy; *out_len = ctx.result_len; }
+    }
+    ctx_clear_result(&ctx);
+    return st;
+}
+
 /* ------------------------------------------------------------------------- */
 /* worker                                                                    */
 /* ------------------------------------------------------------------------- */
@@ -252,26 +275,34 @@ gptps_status gptps_result_set_nocopy(gptps_ctx *ctx, void *bytes, size_t len, vo
  * gptps_set_event_cb cannot pair a new callback with a stale user_data. */
 static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *ud)
 {
-    struct gptps_ctx ctx;
     gptps_pending_ev p;
     gptps_status st;
-    bool timed;
-
-    memset(&ctx, 0, sizeof ctx);
-    ctx.engine = e; ctx.handle = it->handle; ctx.task_name = it->def->name;
-    ctx.payload = it->payload; ctx.payload_len = it->payload_len;
-    ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
 
     p.handle = it->handle; p.name = it->def->name; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
     p.kind = GPTPS_EV_STARTED; p.status = GPTPS_OK; emit_now(e, cb, ud, &p);
 
-    st = it->def->run(&ctx, it->def->user_data);
-    timed = gptps_flag_get(it->cancel);
-    if (timed) st = GPTPS_E_TIMEOUT;
+    if (it->def->exec == GPTPS_EXEC_OOP) {
+        /* enforced path: run in a forked child, OS-capped, hard-killed on timeout */
+        void *res = NULL; size_t rlen = 0;
+        st = gptps_oop_execute(it->def, it->payload, it->payload_len,
+                               it->cost.mem_bytes, it->policy.timeout_seconds, &res, &rlen);
+        free(res); /* M1: result-to-caller delivery is a later increment */
+    } else {
+        /* in-process path: cooperative cancel via the deadline flag */
+        struct gptps_ctx ctx;
+        bool timed;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.engine = e; ctx.handle = it->handle; ctx.task_name = it->def->name;
+        ctx.payload = it->payload; ctx.payload_len = it->payload_len;
+        ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
+        st = it->def->run(&ctx, it->def->user_data);
+        timed = gptps_flag_get(it->cancel);
+        if (timed) st = GPTPS_E_TIMEOUT;
+        ctx_clear_result(&ctx);
+    }
 
     p.kind = (st == GPTPS_OK) ? GPTPS_EV_FINISHED : GPTPS_EV_FAILED; p.status = st;
     emit_now(e, cb, ud, &p);
-    ctx_clear_result(&ctx);
     return st;
 }
 
@@ -291,7 +322,9 @@ static void *worker_main(void *arg)
 
         it = fifo_pop(&e->ready);
         cb = e->ev_cb; ud = e->ev_ud;      /* snapshot callback under the lock */
-        it->deadline_ms = it->policy.timeout_seconds
+        /* deadline flag is the in-process cooperative path; OOP enforces its own
+         * deadline in the worker (poll + hard-kill), so it gets no flag deadline */
+        it->deadline_ms = (it->policy.timeout_seconds && it->def->exec == GPTPS_EXEC_INPROC)
             ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
         gptps_flag_set(it->cancel, false);
         fifo_push(&e->running_items, it);

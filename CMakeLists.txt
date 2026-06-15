@@ -9,12 +9,12 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# --- library (grows as modules land; currently HAL + config + engine) -------
-add_library(gptps STATIC
-    src/hal_posix.c
-    src/config.c
-    src/engine.c
-)
+# --- library (grows as modules land) ---------------------------------------
+set(GPTPS_SRC src/hal_posix.c src/config.c src/engine.c)
+if(UNIX)
+    list(APPEND GPTPS_SRC src/exec_oop_posix.c) # out-of-process executor (POSIX)
+endif()
+add_library(gptps STATIC ${GPTPS_SRC})
 target_include_directories(gptps
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -77,3 +77,13 @@ target_compile_definitions(test_addon PRIVATE
 add_dependencies(test_addon addon_demo addon_bad)
 add_test(NAME addon COMMAND test_addon)
 set_tests_properties(addon PROPERTIES TIMEOUT 30)
+
+if(UNIX)
+    add_executable(test_oop tests/test_oop.c)
+    target_include_directories(test_oop
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_oop PRIVATE gptps)
+    add_test(NAME oop COMMAND test_oop)
+    set_tests_properties(oop PROPERTIES TIMEOUT 30)
+endif()
