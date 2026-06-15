@@ -201,6 +201,11 @@ GPTPS_API gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine
  *   - dlopen  : add-ons attach via the host-table ABI (see below). */
 GPTPS_API gptps_status gptps_register_task(gptps *e, const gptps_task_def *def);
 
+/* Load a dynamic add-on (shared library) via the host-table ABI below. The
+ * add-on must export gptps_addon_init; the core validates magic/version/size
+ * before use and tears the add-on down at gptps_shutdown. */
+GPTPS_API gptps_status gptps_load_addon(gptps *e, const char *path);
+
 /* Enqueue work. Rejects with GPTPS_E_BUDGET at submit time if the task's
  * declared cost can NEVER fit max_memory_bytes (it would otherwise starve). */
 GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,

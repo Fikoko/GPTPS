@@ -70,6 +70,12 @@ typedef struct gptps_reg {
     struct gptps_reg  *next;
 } gptps_reg;
 
+typedef struct gptps_loaded {
+    gptps_dl            *dl;
+    const gptps_addon   *addon;
+    struct gptps_loaded *next;
+} gptps_loaded;
+
 typedef struct { gptps_item *head, *tail; } gptps_fifo;
 
 /* pending event emitted after the lock is released */
@@ -111,6 +117,8 @@ struct gptps {
     gptps_handle   next_handle;
     gptps_event_cb ev_cb;
     void          *ev_ud;
+
+    gptps_loaded  *addons;        /* dlopen'd add-ons, torn down at shutdown */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -571,6 +579,79 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     return GPTPS_OK;
 }
 
+/* ------------------------------------------------------------------------- */
+/* add-on loader (host-table ABI)                                            */
+/* ------------------------------------------------------------------------- */
+
+/* host-table entry: lets an add-on emit an event through the engine */
+static gptps_status api_emit_event(gptps *e, const gptps_event *ev)
+{
+    gptps_event_cb cb; void *ud;
+    if (!e || !ev) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m); cb = e->ev_cb; ud = e->ev_ud; gptps_mutex_unlock(e->m);
+    if (cb) cb(ev, ud);
+    return GPTPS_OK;
+}
+
+/* The versioned function-pointer table add-ons call the core through. Add-ons
+ * NEVER link core symbols directly; everything routes through this table. */
+static const gptps_api_routines G_API = {
+    sizeof(gptps_api_routines),
+    GPTPS_ABI_VERSION_MAJOR,
+    GPTPS_ABI_VERSION_MINOR,
+    gptps_register_task,
+    api_emit_event,
+    gptps_log,
+    gptps_result_set,
+    gptps_payload
+};
+
+gptps_status gptps_load_addon(gptps *e, const char *path)
+{
+    gptps_dl *dl;
+    void *sym;
+    gptps_addon_init_fn init;
+    const gptps_addon *addon;
+    gptps_loaded *node;
+    char *err = NULL;
+    gptps_status s;
+
+    if (!e || !path) return GPTPS_E_INVAL;
+
+    dl = gptps_dl_open(path);
+    if (!dl) return GPTPS_E_IO;
+
+    sym = gptps_dl_sym(dl, "gptps_addon_init");
+    if (!sym) { gptps_dl_close(dl); return GPTPS_E_ABI; }
+    memcpy(&init, &sym, sizeof init); /* portable object-ptr -> function-ptr */
+
+    addon = init(&G_API);
+    if (!addon ||
+        addon->magic != GPTPS_ABI_MAGIC ||
+        addon->abi_version_major != GPTPS_ABI_VERSION_MAJOR ||
+        addon->struct_size < sizeof *addon) {
+        gptps_dl_close(dl);
+        return GPTPS_E_ABI;
+    }
+
+    if (addon->setup) {
+        s = addon->setup(e, &G_API, &err);
+        if (s != GPTPS_OK) { gptps_dl_close(dl); return s; }
+    }
+
+    node = (gptps_loaded *)calloc(1, sizeof *node);
+    if (!node) {
+        if (addon->teardown) addon->teardown(e);
+        gptps_dl_close(dl);
+        return GPTPS_E_NOMEM;
+    }
+    node->dl = dl; node->addon = addon;
+    gptps_mutex_lock(e->m);
+    node->next = e->addons; e->addons = node;
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
 gptps_status gptps_submit(gptps *e, const char *task_name,
                           const void *payload, size_t len, gptps_handle *out_handle)
 {
@@ -651,6 +732,19 @@ gptps_status gptps_shutdown(gptps *e)
 
     gptps_thread_join(e->dispatcher);
     for (i = 0; i < e->nworkers; ++i) gptps_thread_join(e->workers[i]);
+
+    /* tear down add-ons (threads joined => no task code runs; last calls into
+     * each .so, then unload) */
+    {
+        gptps_loaded *a = e->addons;
+        while (a) {
+            gptps_loaded *n = a->next;
+            if (a->addon->teardown) a->addon->teardown(e);
+            gptps_dl_close(a->dl);
+            free(a);
+            a = n;
+        }
+    }
 
     /* free anything left (dead-letter retained items, etc.) */
     while ((it = fifo_pop(&e->dead_letter)) != NULL) item_free(it);

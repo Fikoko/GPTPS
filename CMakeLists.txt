@@ -30,7 +30,7 @@ endif()
 # threads (HAL uses pthreads on POSIX)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-target_link_libraries(gptps PUBLIC Threads::Threads)
+target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 # --- tests (CTest) ---------------------------------------------------------
 enable_testing()
@@ -56,3 +56,24 @@ target_include_directories(test_failure
 target_link_libraries(test_failure PRIVATE gptps)
 add_test(NAME failure COMMAND test_failure)
 set_tests_properties(failure PROPERTIES TIMEOUT 30)
+
+# add-on shared libraries (compiled against the frozen header; no core link)
+add_library(addon_demo MODULE tests/addon_demo.c)
+target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_demo PROPERTIES PREFIX "")
+add_library(addon_bad MODULE tests/addon_bad.c)
+target_include_directories(addon_bad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_bad PROPERTIES PREFIX "")
+
+add_executable(test_addon tests/test_addon.c)
+target_include_directories(test_addon
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_addon PRIVATE gptps)
+target_compile_definitions(test_addon PRIVATE
+    ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
+    ADDON_BAD_PATH="$<TARGET_FILE:addon_bad>"
+)
+add_dependencies(test_addon addon_demo addon_bad)
+add_test(NAME addon COMMAND test_addon)
+set_tests_properties(addon PROPERTIES TIMEOUT 30)

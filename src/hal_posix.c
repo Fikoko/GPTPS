@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
 #endif
@@ -188,3 +189,22 @@ void gptps_thread_join(gptps_thread *t)
     pthread_join(t->t, NULL);
     free(t);
 }
+
+/* ------------------------------------------------------------------------- */
+/* dynamic loading (add-on loader)                                           */
+/* ------------------------------------------------------------------------- */
+
+struct gptps_dl { void *handle; };
+
+gptps_dl *gptps_dl_open(const char *path)
+{
+    struct gptps_dl *d;
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL); /* LOCAL: add-on can't capture core symbols */
+    if (!h) return NULL;
+    d = (struct gptps_dl *)malloc(sizeof *d);
+    if (!d) { dlclose(h); return NULL; }
+    d->handle = h;
+    return d;
+}
+void *gptps_dl_sym(gptps_dl *h, const char *symbol) { return h ? dlsym(h->handle, symbol) : NULL; }
+void  gptps_dl_close(gptps_dl *h) { if (h) { dlclose(h->handle); free(h); } }

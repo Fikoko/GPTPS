@@ -73,8 +73,14 @@ void        gptps_cond_broadcast(gptps_cond *c);
 gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg); /* NULL on failure */
 void          gptps_thread_join(gptps_thread *t);               /* joins, then frees */
 
-/* --- still pending (later increments): dynamic loading (add-on loader),
- * OS memory cap (out-of-process executor: setrlimit / cgroups / Job Objects).
+/* --- dynamic loading (add-on loader) ------------------------------------ */
+typedef struct gptps_dl gptps_dl;
+gptps_dl *gptps_dl_open(const char *path);          /* RTLD_LOCAL; NULL on failure */
+void     *gptps_dl_sym(gptps_dl *h, const char *symbol);
+void      gptps_dl_close(gptps_dl *h);
+
+/* --- still pending (later increment): OS memory cap (out-of-process
+ * executor: setrlimit / cgroups / Job Objects).
  */
 
 #ifdef __cplusplus
