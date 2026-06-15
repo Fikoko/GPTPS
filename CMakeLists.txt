@@ -87,3 +87,10 @@ if(UNIX)
     add_test(NAME oop COMMAND test_oop)
     set_tests_properties(oop PROPERTIES TIMEOUT 30)
 endif()
+
+# --- example (headline usage; doubles as a smoke test) ---------------------
+add_executable(demo examples/demo.c)
+target_include_directories(demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(demo PRIVATE gptps)
+add_test(NAME demo COMMAND demo)
+set_tests_properties(demo PROPERTIES TIMEOUT 20)
