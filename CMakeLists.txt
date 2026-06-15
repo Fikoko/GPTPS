@@ -40,6 +40,14 @@ target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 # --- tests (CTest) ---------------------------------------------------------
 enable_testing()
+add_executable(test_constraint tests/test_constraint.c)
+target_include_directories(test_constraint
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_constraint PRIVATE gptps)
+add_test(NAME constraint COMMAND test_constraint)
+set_tests_properties(constraint PROPERTIES TIMEOUT 30)
+
 add_executable(test_foundation tests/test_foundation.c)
 target_include_directories(test_foundation
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

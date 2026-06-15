@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 0u
+#define GPTPS_ABI_VERSION_MINOR 1u  /* additive: result fields, argv/PROGRAM, constraints/observers */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -90,7 +90,8 @@ typedef enum {
     GPTPS_E_CONFIG,       /* config parse / validation error */
     GPTPS_E_IO,           /* transport / child-process I/O error */
     GPTPS_E_TASK,         /* task returned a non-OK application error */
-    GPTPS_E_SHUTDOWN      /* engine is shutting down */
+    GPTPS_E_SHUTDOWN,     /* engine is shutting down */
+    GPTPS_E_DENIED        /* a constraint hook rejected admission */
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);
@@ -274,6 +275,15 @@ typedef enum {
  * honored on DEFER so the dispatcher schedules a wake at T (no busy-spin). */
 typedef enum { GPTPS_ADMIT = 0, GPTPS_DENY, GPTPS_DEFER } gptps_admit_decision;
 
+/* A constraint hook is consulted at admission time (in the dispatcher, so it
+ * MUST be fast / non-blocking). Return GPTPS_ADMIT to allow, GPTPS_DENY to
+ * reject (task is dead-lettered with GPTPS_E_DENIED), or GPTPS_DEFER and set
+ * *retry_after_ms to re-check later. */
+typedef gptps_admit_decision (*gptps_constraint_fn)(const char *task_name,
+                                                    const gptps_cost *cost,
+                                                    uint32_t *retry_after_ms,
+                                                    void *user_data);
+
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_api_routines) */
     uint32_t abi_version_major;    /* == GPTPS_ABI_VERSION_MAJOR */
@@ -285,6 +295,9 @@ typedef struct {
     /* result/result_nocopy/payload mirror the ctx accessors for OOP shims */
     gptps_status (*result_set)(gptps_ctx *ctx, const void *bytes, size_t len);
     const void  *(*payload)(const gptps_ctx *ctx, size_t *out_len);
+    /* --- v1.1 routines (append-only) --- */
+    gptps_status (*register_constraint)(gptps *e, gptps_constraint_fn fn, void *user_data);
+    gptps_status (*register_observer)(gptps *e, gptps_event_cb fn, void *user_data);
 } gptps_api_routines;
 
 typedef struct {
@@ -313,6 +326,18 @@ typedef const gptps_addon *(*gptps_addon_init_fn)(const gptps_api_routines *api)
         gptps__api = api;                                                       \
         return &a;                                                              \
     }
+
+/* ============================================================================
+ * CONSTRAINTS & OBSERVERS (extension points; also reachable by add-ons through
+ * the api-routines table above)
+ * ==========================================================================*/
+
+/* Consulted at admission for every task (in registration order). Keep it fast. */
+GPTPS_API gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn fn, void *user_data);
+
+/* Additional event sink beyond gptps_set_event_cb (many allowed). Register
+ * before submitting work. */
+GPTPS_API gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_data);
 
 #ifdef __cplusplus
 } /* extern "C" */

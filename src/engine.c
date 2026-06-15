@@ -77,6 +77,18 @@ typedef struct gptps_loaded {
     struct gptps_loaded *next;
 } gptps_loaded;
 
+typedef struct gptps_observer {
+    gptps_event_cb         fn;
+    void                  *ud;
+    struct gptps_observer *next;
+} gptps_observer;
+
+typedef struct gptps_constraint {
+    gptps_constraint_fn      fn;
+    void                    *ud;
+    struct gptps_constraint *next;
+} gptps_constraint;
+
 typedef struct { gptps_item *head, *tail; } gptps_fifo;
 
 /* pending event emitted after the lock is released */
@@ -122,6 +134,8 @@ struct gptps {
     void          *ev_ud;
 
     gptps_loaded  *addons;        /* dlopen'd add-ons, torn down at shutdown */
+    gptps_observer *observers;    /* extra event sinks (registered before submit) */
+    gptps_constraint *constraints;/* admission hooks consulted by the dispatcher */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -173,15 +187,16 @@ static void item_free(gptps_item *it)
 static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p)
 {
     gptps_event ev;
-    (void)e;
-    if (!cb) return;
+    gptps_observer *o;
+    if (!cb && !e->observers) return;
     memset(&ev, 0, sizeof ev);
     ev.struct_size = sizeof ev;
     ev.kind = p->kind; ev.handle = p->handle; ev.task_name = p->name;
     ev.ts_ms = gptps_hal_monotonic_ms(); ev.status = p->status;
     ev.attempt = p->attempt; ev.mem_bytes = p->mem;
     ev.result = p->result; ev.result_len = p->result_len;
-    cb(&ev, ud);
+    if (cb) cb(&ev, ud);
+    for (o = e->observers; o; o = o->next) o->fn(&ev, o->ud); /* extra sinks */
 }
 
 /* worker-side emit (already lock-free) */
@@ -376,6 +391,25 @@ static uint64_t min_nonzero(uint64_t a, uint64_t b)
     return a < b ? a : b;
 }
 
+/* Consult every constraint hook. Any DENY rejects; otherwise DEFER (with the
+ * largest requested retry delay) or ADMIT. Runs on the dispatcher thread, so
+ * hooks must be non-blocking. */
+static gptps_admit_decision run_constraints(gptps *e, gptps_item *it, uint32_t *retry_after)
+{
+    gptps_constraint *c;
+    gptps_admit_decision result = GPTPS_ADMIT;
+    uint32_t max_defer = 0;
+    *retry_after = 0;
+    for (c = e->constraints; c; c = c->next) {
+        uint32_t ra = 0;
+        gptps_admit_decision d = c->fn(it->def->name, &it->cost, &ra, c->ud);
+        if (d == GPTPS_DENY) return GPTPS_DENY;
+        if (d == GPTPS_DEFER) { result = GPTPS_DEFER; if (ra > max_defer) max_defer = ra; }
+    }
+    if (result == GPTPS_DEFER) *retry_after = max_defer ? max_defer : 1u;
+    return result;
+}
+
 static void *dispatcher_main(void *arg)
 {
     gptps *e = (gptps *)arg;
@@ -445,16 +479,10 @@ static void *dispatcher_main(void *arg)
             }
         }
 
-        /* 2) emit retry/dead-letter events with the lock RELEASED */
-        if (npend > 0) {
-            gptps_event_cb cb = e->ev_cb; void *ud = e->ev_ud;
-            gptps_mutex_unlock(e->m);
-            for (i = 0; i < npend; ++i) emit_now(e, cb, ud, &pend[i]);
-            gptps_mutex_lock(e->m);
-            now = gptps_hal_monotonic_ms();
-        }
+        /* (pending events from step 1 + admission below are emitted together,
+         * after the admit step, with the lock released — see step 5) */
 
-        /* 3) move backoff-ready delayed items back to intake (single scan) */
+        /* 2) move backoff-ready delayed items back to intake (single scan) */
         {
             gptps_item *cur = e->delayed.head, *prev = NULL;
             while (cur) {
@@ -472,7 +500,7 @@ static void *dispatcher_main(void *arg)
             }
         }
 
-        /* 4) enforce deadlines on running tasks (cooperative cancel) */
+        /* 3) enforce deadlines on running tasks (cooperative cancel) */
         for (it = e->running_items.head; it; it = it->next) {
             if (it->deadline_ms) {
                 if (now >= it->deadline_ms) gptps_flag_set(it->cancel, true);
@@ -480,15 +508,52 @@ static void *dispatcher_main(void *arg)
             }
         }
 
-        /* 5) admit while the head fits (strict FIFO) */
-        while (e->intake.head &&
-               e->running < e->limits.max_concurrent_tasks &&
-               e->reserved_mem + e->intake.head->cost.mem_bytes <= e->limits.max_memory_bytes) {
-            it = fifo_pop(&e->intake);
-            e->reserved_mem += it->cost.mem_bytes;
+        /* 4) admit the FIFO head if budget fits and constraints allow */
+        while (e->intake.head && e->running < e->limits.max_concurrent_tasks) {
+            gptps_item *h = e->intake.head;
+            uint32_t retry_after = 0;
+            gptps_admit_decision dec;
+
+            if (e->reserved_mem + h->cost.mem_bytes > e->limits.max_memory_bytes)
+                break;                                   /* budget full for the head */
+
+            dec = run_constraints(e, h, &retry_after);
+            if (dec == GPTPS_DEFER) {
+                fifo_pop(&e->intake);
+                h->not_before_ms = now + retry_after;    /* re-check after the delay */
+                fifo_push(&e->delayed, h);
+                next_wake = min_nonzero(next_wake, h->not_before_ms);
+                continue;
+            }
+            if (dec == GPTPS_DENY) {
+                fifo_pop(&e->intake);
+                if (npend < GPTPS_PENDING_CAP) {
+                    pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = h->handle;
+                    pend[npend].name = h->def->name; pend[npend].status = GPTPS_E_DENIED;
+                    pend[npend].attempt = h->attempt; pend[npend].mem = h->cost.mem_bytes;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                }
+                fifo_push(&e->dead_letter, h);           /* denied -> retained */
+                e->dead_letter_count += 1;
+                continue;
+            }
+            fifo_pop(&e->intake);
+            e->reserved_mem += h->cost.mem_bytes;
             e->running      += 1;
-            fifo_push(&e->ready, it);
+            fifo_push(&e->ready, h);
             gptps_cond_signal(e->cv_work);
+        }
+
+        /* 5) emit pending events (retry / dead-letter / denied) with lock RELEASED */
+        if (npend > 0) {
+            gptps_event_cb cb = e->ev_cb; void *ud = e->ev_ud;
+            gptps_mutex_unlock(e->m);
+            for (i = 0; i < npend; ++i) emit_now(e, cb, ud, &pend[i]);
+            gptps_mutex_lock(e->m);
+            /* the lock was released: a submit/completion cv_disp signal during
+             * the window may have been lost, so re-run the loop (re-drains done
+             * AND re-admits intake) instead of risking a lost-wakeup sleep. */
+            continue;
         }
 
         /* 6) shutdown when everything is drained */
@@ -499,12 +564,9 @@ static void *dispatcher_main(void *arg)
             break;
         }
 
-        /* re-drain anything a worker pushed during the step-2 emit window: its
-         * cv_disp signal can be lost (no waiter), so never sleep with `done`
-         * non-empty or its budget/retry would be stranded (P1 lost-wakeup). */
-        if (e->done.head) continue;
-
-        /* 7) sleep until the next deadline/backoff, or until signalled */
+        /* 7) sleep until the next deadline/backoff, or until signalled. No unlock
+         * happened this pass (npend==0), so the lock is held from step 1 through
+         * cond_wait and no signal can be lost. */
         if (next_wake == 0) {
             gptps_cond_wait(e->cv_disp, e->m);
         } else if (next_wake > now) {
@@ -537,6 +599,7 @@ const char *gptps_strerror(gptps_status s)
         case GPTPS_E_IO:        return "I/O error";
         case GPTPS_E_TASK:      return "task error";
         case GPTPS_E_SHUTDOWN:  return "engine shutting down";
+        case GPTPS_E_DENIED:    return "admission denied by a constraint";
         default:                return "unknown error";
     }
 }
@@ -693,7 +756,9 @@ static const gptps_api_routines G_API = {
     api_emit_event,
     gptps_log,
     gptps_result_set,
-    gptps_payload
+    gptps_payload,
+    gptps_register_constraint,
+    gptps_register_observer
 };
 
 gptps_status gptps_load_addon(gptps *e, const char *path)
@@ -807,6 +872,32 @@ gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data)
     return GPTPS_OK;
 }
 
+gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_data)
+{
+    gptps_observer *o;
+    if (!e || !fn) return GPTPS_E_INVAL;
+    o = (gptps_observer *)calloc(1, sizeof *o);
+    if (!o) return GPTPS_E_NOMEM;
+    o->fn = fn; o->ud = user_data;
+    gptps_mutex_lock(e->m);
+    o->next = e->observers; e->observers = o;
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn fn, void *user_data)
+{
+    gptps_constraint *c;
+    if (!e || !fn) return GPTPS_E_INVAL;
+    c = (gptps_constraint *)calloc(1, sizeof *c);
+    if (!c) return GPTPS_E_NOMEM;
+    c->fn = fn; c->ud = user_data;
+    gptps_mutex_lock(e->m);
+    c->next = e->constraints; e->constraints = c;
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
 gptps_status gptps_shutdown(gptps *e)
 {
     unsigned i;
@@ -847,6 +938,8 @@ gptps_status gptps_shutdown(gptps *e)
         if (r->argv_copy) { char **a = r->argv_copy; while (*a) free(*a++); free(r->argv_copy); }
         free(r->name); free(r); r = n;
     }
+    { gptps_observer  *o = e->observers;  while (o) { gptps_observer  *n = o->next; free(o); o = n; } }
+    { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; free(c); c = n; } }
 
     free(e->workers);
     gptps_cond_destroy(e->cv_work);
