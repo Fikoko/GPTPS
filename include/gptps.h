@@ -105,7 +105,8 @@ typedef enum {
 /* --- executor kind (modular seam; enforcement is an executor property) ---- */
 typedef enum {
     GPTPS_EXEC_INPROC = 0, /* fast, advisory self-throttling; cooperative cancel only */
-    GPTPS_EXEC_OOP         /* child process, OS memory-capped; hard-kill enforced */
+    GPTPS_EXEC_OOP,        /* forked child runs the in-process run fn; OS-capped, hard-kill */
+    GPTPS_EXEC_PROGRAM     /* fork+exec an external program (argv); payload->stdin, stdout->result */
 } gptps_exec_kind;
 
 /* --- declared cost: a FIXED VECTOR so adding dimensions later is additive,
@@ -169,12 +170,17 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
 typedef struct {
     size_t                struct_size;   /* = sizeof(gptps_task_def) */
     const char           *name;          /* unique task-type id (borrowed) */
-    gptps_run_fn          run;           /* required */
+    gptps_run_fn          run;           /* required, EXCEPT for GPTPS_EXEC_PROGRAM */
     gptps_cost_fn         cost;          /* optional (NULL => use default_cost) */
     void                 *user_data;     /* passed back to run/cost */
-    gptps_exec_kind       exec;          /* GPTPS_EXEC_INPROC or _OOP */
+    gptps_exec_kind       exec;          /* INPROC | OOP | PROGRAM */
     gptps_cost            default_cost;
     gptps_failure_policy  default_policy;
+    /* GPTPS_EXEC_PROGRAM only: NULL-terminated argv (argv[0] = program path).
+     * The engine feeds the payload on the program's stdin and reads its result
+     * from stdout; exit code 0 => success, non-zero => GPTPS_E_TASK. Ignored for
+     * INPROC/OOP. Copied by the engine at registration (caller need not keep it). */
+    const char *const    *argv;
 } gptps_task_def;
 
 /* ============================================================================

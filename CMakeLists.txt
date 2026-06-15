@@ -100,6 +100,14 @@ if(UNIX)
     target_link_libraries(test_result PRIVATE gptps)
     add_test(NAME result COMMAND test_result)
     set_tests_properties(result PROPERTIES TIMEOUT 30)
+
+    add_executable(test_program tests/test_program.c) # external-program executor
+    target_include_directories(test_program
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_program PRIVATE gptps)
+    add_test(NAME program COMMAND test_program)
+    set_tests_properties(program PROPERTIES TIMEOUT 30)
 endif()
 
 # --- example (headline usage; doubles as a smoke test) ---------------------

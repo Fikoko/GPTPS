@@ -67,6 +67,7 @@ typedef struct gptps_item {
 typedef struct gptps_reg {
     gptps_task_def     def;
     char              *name;
+    char             **argv_copy;  /* owned NULL-terminated copy for EXEC_PROGRAM */
     struct gptps_reg  *next;
 } gptps_reg;
 
@@ -284,7 +285,7 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     struct gptps_ctx ctx;          /* used only on the in-process path */
     void *oop_res = NULL;
     size_t oop_len = 0;
-    bool inproc = (it->def->exec != GPTPS_EXEC_OOP);
+    bool inproc = (it->def->exec == GPTPS_EXEC_INPROC);
 
     p.handle = it->handle; p.name = it->def->name; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
     p.result = NULL; p.result_len = 0;
@@ -298,10 +299,14 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
         st = it->def->run(&ctx, it->def->user_data);
         if (gptps_flag_get(it->cancel)) st = GPTPS_E_TIMEOUT;
-    } else {
-        /* enforced path: run in a forked child, OS-capped, hard-killed on timeout */
+    } else if (it->def->exec == GPTPS_EXEC_OOP) {
+        /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed */
         st = gptps_oop_execute(it->def, it->payload, it->payload_len,
                                it->cost.mem_bytes, it->policy.timeout_seconds, &oop_res, &oop_len);
+    } else {
+        /* enforced path: fork+exec an external program; payload->stdin, stdout->result */
+        st = gptps_program_execute(it->def->argv, it->payload, it->payload_len,
+                                   it->cost.mem_bytes, it->policy.timeout_seconds, &oop_res, &oop_len);
     }
 
     /* deliver the result on the FINISHED event (valid for the callback's duration) */
@@ -599,25 +604,64 @@ gptps_status gptps_open(const char *config_path, gptps **out_engine)
     return gptps_open_ex(&cfg, out_engine);
 }
 
+/* deep-copy a NULL-terminated argv; returns NULL on alloc failure or empty */
+static char **argv_dup(const char *const *argv)
+{
+    size_t n = 0, i;
+    char **out;
+    while (argv[n]) ++n;
+    out = (char **)calloc(n + 1, sizeof *out);
+    if (!out) return NULL;
+    for (i = 0; i < n; ++i) {
+        size_t L = strlen(argv[i]) + 1;
+        out[i] = (char *)malloc(L);
+        if (!out[i]) { while (i--) free(out[i]); free(out); return NULL; }
+        memcpy(out[i], argv[i], L);
+    }
+    return out;
+}
+
 gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
 {
     gptps_reg *r;
     char *name;
+    char **argv_copy = NULL;
 
-    if (!e || !def || !def->name || !def->run) return GPTPS_E_INVAL;
+    if (!e || !def || !def->name) return GPTPS_E_INVAL;
     if (def->struct_size < sizeof *def) return GPTPS_E_INVAL; /* ABI: reject undersized struct */
+    if (def->exec == GPTPS_EXEC_PROGRAM) {
+        if (!def->argv || !def->argv[0]) return GPTPS_E_INVAL; /* program needs an argv */
+    } else if (!def->run) {
+        return GPTPS_E_INVAL;                                 /* in-process kinds need a run fn */
+    }
+
+    if (def->exec == GPTPS_EXEC_PROGRAM) {
+        argv_copy = argv_dup(def->argv);
+        if (!argv_copy) return GPTPS_E_NOMEM;
+    }
 
     gptps_mutex_lock(e->m);
-    if (registry_find(e, def->name)) { gptps_mutex_unlock(e->m); return GPTPS_E_DUP; }
+    if (registry_find(e, def->name)) {
+        gptps_mutex_unlock(e->m);
+        if (argv_copy) { char **a = argv_copy; while (*a) free(*a++); free(argv_copy); }
+        return GPTPS_E_DUP;
+    }
 
     r = (gptps_reg *)calloc(1, sizeof *r);
     name = (char *)malloc(strlen(def->name) + 1);
-    if (!r || !name) { free(r); free(name); gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+    if (!r || !name) {
+        free(r); free(name);
+        if (argv_copy) { char **a = argv_copy; while (*a) free(*a++); free(argv_copy); }
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_NOMEM;
+    }
     strcpy(name, def->name);
 
     r->def = *def;
     r->name = name;
     r->def.name = name;
+    r->argv_copy = argv_copy;
+    r->def.argv = (const char *const *)argv_copy; /* point at our owned copy (NULL for non-PROGRAM) */
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
     r->next = e->registry;
     e->registry = r;
@@ -798,7 +842,11 @@ gptps_status gptps_shutdown(gptps *e)
     while ((it = fifo_pop(&e->delayed)) != NULL) item_free(it);
 
     r = e->registry;
-    while (r) { gptps_reg *n = r->next; free(r->name); free(r); r = n; }
+    while (r) {
+        gptps_reg *n = r->next;
+        if (r->argv_copy) { char **a = r->argv_copy; while (*a) free(*a++); free(r->argv_copy); }
+        free(r->name); free(r); r = n;
+    }
 
     free(e->workers);
     gptps_cond_destroy(e->cv_work);
