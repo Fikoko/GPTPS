@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Build + test on the POSIX targets the HAL supports today.
+  # Windows is intentionally absent: the HAL (hal_posix.c / exec_oop_posix.c) is
+  # POSIX-only for M1; a Win32 HAL + out-of-process executor is a later increment.
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Verify the single-file amalgamation compiles and runs (drop-in path).
+  amalgamation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate amalgamation
+        run: sh tools/amalgamate.sh amalgamation
+      - name: Compile + run single-file build
+        run: |
+          cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
+             amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o test_amalg
+          ./test_amalg
+
+  # ThreadSanitizer on the concurrent paths (ASLR disabled for TSan in CI).
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + run under ThreadSanitizer
+        run: |
+          for t in test_engine test_failure; do
+            cc -fsanitize=thread -std=c99 -D_GNU_SOURCE -g -I include -I src \
+               src/hal_posix.c src/config.c src/engine.c src/exec_oop_posix.c \
+               tests/$t.c -lpthread -ldl -o $t.tsan
+            setarch "$(uname -m)" -R ./$t.tsan
+          done

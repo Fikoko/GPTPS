@@ -16,6 +16,8 @@
 #include <dlfcn.h>
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+#  include <sys/sysctl.h>
 #endif
 
 #if !defined(__GNUC__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
@@ -105,13 +107,21 @@ gptps_status gptps_hal_detect(gptps_hwinfo *out)
         if (sysinfo(&si) == 0)
             out->ram_bytes = (uint64_t)si.totalram * (uint64_t)si.mem_unit;
     }
+#elif defined(__APPLE__)
+    {
+        int mib[2]; uint64_t mem = 0; size_t len = sizeof mem;
+        mib[0] = CTL_HW; mib[1] = HW_MEMSIZE;
+        if (sysctl(mib, 2, &mem, &len, NULL, 0) == 0) out->ram_bytes = mem;
+    }
 #endif
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
     if (out->ram_bytes == 0) {
         long pages = sysconf(_SC_PHYS_PAGES);
         long psize = sysconf(_SC_PAGESIZE);
         if (pages > 0 && psize > 0)
             out->ram_bytes = (uint64_t)pages * (uint64_t)psize;
     }
+#endif
 
     out->has_gpu = false; /* unknown without a vendor GPU add-on */
     return GPTPS_OK;

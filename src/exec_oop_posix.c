@@ -73,10 +73,14 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         gptps_status st;
         signal(SIGPIPE, SIG_IGN);
         close(p[0]);
+#if defined(RLIMIT_AS)
         if (mem_cap >= GPTPS_OOP_MEMCAP_FLOOR) {
             struct rlimit rl; rl.rlim_cur = (rlim_t)mem_cap; rl.rlim_max = (rlim_t)mem_cap;
-            setrlimit(RLIMIT_AS, &rl); /* best-effort coarse cap */
+            setrlimit(RLIMIT_AS, &rl); /* best-effort coarse cap (RLIMIT_AS absent on macOS) */
         }
+#else
+        (void)mem_cap;
+#endif
         st = gptps_run_capture(def, payload, plen, &res, &rlen);
         st32 = (int32_t)st; len64 = (uint64_t)rlen;
         write_all(p[1], &st32, sizeof st32);
