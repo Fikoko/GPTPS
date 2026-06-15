@@ -9,10 +9,11 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# --- library (grows as modules land; currently HAL + config) ---------------
+# --- library (grows as modules land; currently HAL + config + engine) -------
 add_library(gptps STATIC
     src/hal_posix.c
     src/config.c
+    src/engine.c
 )
 target_include_directories(gptps
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -26,6 +27,11 @@ if(NOT MSVC)
     target_compile_options(gptps PRIVATE -Wall -Wextra)
 endif()
 
+# threads (HAL uses pthreads on POSIX)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(gptps PUBLIC Threads::Threads)
+
 # --- tests (CTest) ---------------------------------------------------------
 enable_testing()
 add_executable(test_foundation tests/test_foundation.c)
@@ -34,3 +40,11 @@ target_include_directories(test_foundation
 )
 target_link_libraries(test_foundation PRIVATE gptps)
 add_test(NAME foundation COMMAND test_foundation)
+
+add_executable(test_engine tests/test_engine.c)
+target_include_directories(test_engine
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_engine PRIVATE gptps)
+add_test(NAME engine COMMAND test_engine)
+set_tests_properties(engine PROPERTIES TIMEOUT 30)

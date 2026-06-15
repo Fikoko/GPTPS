@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
 #endif
@@ -113,4 +114,54 @@ gptps_status gptps_hal_detect(gptps_hwinfo *out)
 
     out->has_gpu = false; /* unknown without a vendor GPU add-on */
     return GPTPS_OK;
+}
+
+/* ------------------------------------------------------------------------- */
+/* threads / mutex / condvar (pthreads)                                      */
+/* ------------------------------------------------------------------------- */
+
+struct gptps_mutex  { pthread_mutex_t m; };
+struct gptps_cond   { pthread_cond_t  c; };
+struct gptps_thread { pthread_t t; gptps_thread_fn fn; void *arg; };
+
+static void *gptps__thread_trampoline(void *p)
+{
+    struct gptps_thread *th = (struct gptps_thread *)p;
+    return th->fn(th->arg);
+}
+
+gptps_mutex *gptps_mutex_create(void)
+{
+    struct gptps_mutex *m = (struct gptps_mutex *)malloc(sizeof *m);
+    if (m && pthread_mutex_init(&m->m, NULL) != 0) { free(m); m = NULL; }
+    return m;
+}
+void gptps_mutex_destroy(gptps_mutex *m) { if (m) { pthread_mutex_destroy(&m->m); free(m); } }
+void gptps_mutex_lock(gptps_mutex *m)    { pthread_mutex_lock(&m->m); }
+void gptps_mutex_unlock(gptps_mutex *m)  { pthread_mutex_unlock(&m->m); }
+
+gptps_cond *gptps_cond_create(void)
+{
+    struct gptps_cond *c = (struct gptps_cond *)malloc(sizeof *c);
+    if (c && pthread_cond_init(&c->c, NULL) != 0) { free(c); c = NULL; }
+    return c;
+}
+void gptps_cond_destroy(gptps_cond *c)              { if (c) { pthread_cond_destroy(&c->c); free(c); } }
+void gptps_cond_wait(gptps_cond *c, gptps_mutex *m) { pthread_cond_wait(&c->c, &m->m); }
+void gptps_cond_signal(gptps_cond *c)               { pthread_cond_signal(&c->c); }
+void gptps_cond_broadcast(gptps_cond *c)            { pthread_cond_broadcast(&c->c); }
+
+gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg)
+{
+    struct gptps_thread *th = (struct gptps_thread *)malloc(sizeof *th);
+    if (!th) return NULL;
+    th->fn = fn; th->arg = arg;
+    if (pthread_create(&th->t, NULL, gptps__thread_trampoline, th) != 0) { free(th); return NULL; }
+    return th;
+}
+void gptps_thread_join(gptps_thread *t)
+{
+    if (!t) return;
+    pthread_join(t->t, NULL);
+    free(t);
 }
