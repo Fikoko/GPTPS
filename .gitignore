@@ -1,61 +1,53 @@
 # =====================
-# Python
+# Build output
 # =====================
-
-# Byte-compiled / cache files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
-venv/
-.venv/
-
-# Distribution / packaging
 build/
+cmake-build-*/
+out/
 dist/
-*.egg-info/
-.eggs/
+amalgamation/
 
-# C++ extension build artifacts
-lib.*-cpython-*
-temp.*-cpython-*
+# In-source CMake artifacts (shouldn't happen; we build out-of-tree)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
 
-# PyInstaller
-*.manifest
-*.spec
+# Compiled objects / libraries / binaries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# =====================
-# Environment files
-# =====================
-.env
-.env.*
-
-# =====================
-# IDE / Editor
-# =====================
-# VS Code
-.vscode/
-
-# PyCharm
-.idea/
-
-# macOS system files
-.DS_Store
-
-# =====================
-# Logs
-# =====================
+# Generated runtime state
+analytics.json
+session_config.json
+deadletter.json
 *.log
 logs/
 
+# Generated protobuf (nanopb) sources land in the build tree, but guard anyway
+*.pb.c
+*.pb.h
+
 # =====================
-# Misc
+# Editors / OS
 # =====================
+.vscode/
+.idea/
+.DS_Store
 *.swp
 *.swo
 *.bak
-*.so
+compile_commands.json
+
+# =====================
+# AI tooling (gstack)
+# =====================
+# Per-developer local overrides — keep personal permission grants out of git.
+.claude/settings.local.json
