@@ -97,9 +97,9 @@ GPTPS_API const char *gptps_strerror(gptps_status s);
 
 /* --- on-failure policy --------------------------------------------------- */
 typedef enum {
-    GPTPS_ON_FAILURE_REQUEUE = 0, /* at-least-once: task bodies MUST be idempotent */
-    GPTPS_ON_FAILURE_DROP,
-    GPTPS_ON_FAILURE_DEAD_LETTER  /* retained in the in-memory dead-letter list */
+    GPTPS_ON_FAILURE_DEAD_LETTER = 0, /* DEFAULT (safe): retained in the in-memory dead-letter list */
+    GPTPS_ON_FAILURE_REQUEUE,         /* re-enqueue for another retry cycle; bodies MUST be idempotent */
+    GPTPS_ON_FAILURE_DROP             /* discard after retries are exhausted */
 } gptps_on_failure;
 
 /* --- executor kind (modular seam; enforcement is an executor property) ---- */
@@ -147,7 +147,9 @@ GPTPS_API void        gptps_log(gptps_ctx *ctx, gptps_log_level lvl, const char 
  * in-process and out-of-process paths (the OOP path marshals bytes anyway).
  *   _set        : core copies your bytes (valid only during this call) and frees its copy.
  *   _set_nocopy : you transfer ownership; the core calls free_cb after delivery (zero-copy
- *                 escape hatch for large results). Exactly one of these per run. */
+ *                 escape hatch for large results). A NULL free_cb means the buffer is
+ *                 BORROWED (caller/static-owned) and the core will NOT free it.
+ *                 Exactly one of these per run. */
 GPTPS_API gptps_status gptps_result_set(gptps_ctx *ctx, const void *bytes, size_t len);
 GPTPS_API gptps_status gptps_result_set_nocopy(gptps_ctx *ctx, void *bytes, size_t len,
                                                void (*free_cb)(void *bytes));

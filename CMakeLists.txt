@@ -48,3 +48,11 @@ target_include_directories(test_engine
 target_link_libraries(test_engine PRIVATE gptps)
 add_test(NAME engine COMMAND test_engine)
 set_tests_properties(engine PROPERTIES TIMEOUT 30)
+
+add_executable(test_failure tests/test_failure.c)
+target_include_directories(test_failure
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_failure PRIVATE gptps)
+add_test(NAME failure COMMAND test_failure)
+set_tests_properties(failure PROPERTIES TIMEOUT 30)

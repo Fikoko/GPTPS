@@ -66,6 +66,7 @@ void         gptps_mutex_unlock(gptps_mutex *m);
 gptps_cond *gptps_cond_create(void);
 void        gptps_cond_destroy(gptps_cond *c);
 void        gptps_cond_wait(gptps_cond *c, gptps_mutex *m);
+void        gptps_cond_timedwait(gptps_cond *c, gptps_mutex *m, uint64_t ms); /* wakes after ~ms or on signal */
 void        gptps_cond_signal(gptps_cond *c);
 void        gptps_cond_broadcast(gptps_cond *c);
 

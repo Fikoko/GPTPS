@@ -143,13 +143,36 @@ void gptps_mutex_unlock(gptps_mutex *m)  { pthread_mutex_unlock(&m->m); }
 gptps_cond *gptps_cond_create(void)
 {
     struct gptps_cond *c = (struct gptps_cond *)malloc(sizeof *c);
-    if (c && pthread_cond_init(&c->c, NULL) != 0) { free(c); c = NULL; }
+    pthread_condattr_t a;
+    if (!c) return NULL;
+    pthread_condattr_init(&a);
+#if defined(__linux__)
+    /* match the engine's CLOCK_MONOTONIC timing so timed waits are immune to
+     * wall-clock (CLOCK_REALTIME) steps; gptps_cond_timedwait uses MONOTONIC too. */
+    pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
+    if (pthread_cond_init(&c->c, &a) != 0) { pthread_condattr_destroy(&a); free(c); return NULL; }
+    pthread_condattr_destroy(&a);
     return c;
 }
 void gptps_cond_destroy(gptps_cond *c)              { if (c) { pthread_cond_destroy(&c->c); free(c); } }
 void gptps_cond_wait(gptps_cond *c, gptps_mutex *m) { pthread_cond_wait(&c->c, &m->m); }
 void gptps_cond_signal(gptps_cond *c)               { pthread_cond_signal(&c->c); }
 void gptps_cond_broadcast(gptps_cond *c)            { pthread_cond_broadcast(&c->c); }
+
+void gptps_cond_timedwait(gptps_cond *c, gptps_mutex *m, uint64_t ms)
+{
+    struct timespec ts;
+#if defined(__linux__)
+    clock_gettime(CLOCK_MONOTONIC, &ts); /* cond created with CLOCK_MONOTONIC */
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);  /* fallback: setclock unavailable */
+#endif
+    ts.tv_sec  += (time_t)(ms / 1000u);
+    ts.tv_nsec += (long)((ms % 1000u) * 1000000u);
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+    pthread_cond_timedwait(&c->c, &m->m, &ts);
+}
 
 gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg)
 {
