@@ -36,6 +36,20 @@ jobs:
              amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o test_amalg
           ./test_amalg
 
+  # AddressSanitizer + UBSan across the whole suite (memory errors, leaks, UB).
+  # Uses CMake (not a hand-maintained source list) so it can't drift out of sync.
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (ASan + UBSan)
+        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug
+             -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g"
+      - name: Build
+        run: cmake --build build-asan
+      - name: Test
+        run: ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build-asan --output-on-failure
+
   # ThreadSanitizer on the concurrent paths (ASLR disabled for TSan in CI).
   tsan:
     runs-on: ubuntu-latest

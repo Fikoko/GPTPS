@@ -161,6 +161,15 @@ if(UNIX)
     target_link_libraries(test_gpu_quota PRIVATE gptps)
     add_test(NAME gpu_quota COMMAND test_gpu_quota)
     set_tests_properties(gpu_quota PROPERTIES TIMEOUT 30)
+
+    # parser robustness fuzz (TOML + journal); shines under the asan CI job
+    add_executable(test_fuzz tests/test_fuzz.c addons/durable_queue.c)
+    target_include_directories(test_fuzz
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/addons
+    )
+    target_link_libraries(test_fuzz PRIVATE gptps)
+    add_test(NAME fuzz COMMAND test_fuzz)
+    set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
 endif()
 
 # --- example (headline usage; doubles as a smoke test) ---------------------
