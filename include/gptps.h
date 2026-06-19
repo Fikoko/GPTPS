@@ -186,10 +186,11 @@ typedef struct {
     gptps_exec_kind       exec;          /* INPROC | OOP | PROGRAM */
     gptps_cost            default_cost;
     gptps_failure_policy  default_policy;
-    /* GPTPS_EXEC_PROGRAM only: NULL-terminated argv (argv[0] = program path).
-     * The engine feeds the payload on the program's stdin and reads its result
-     * from stdout; exit code 0 => success, non-zero => GPTPS_E_TASK. Ignored for
-     * INPROC/OOP. Copied by the engine at registration (caller need not keep it). */
+    /* GPTPS_EXEC_PROGRAM only: NULL-terminated argv. argv[0] is the program; a
+     * bare name (e.g. "wasmtime") is resolved via PATH, an absolute/relative path
+     * is used as-is. The engine feeds the payload on the program's stdin and reads
+     * its result from stdout; exit code 0 => success, non-zero => GPTPS_E_TASK.
+     * Ignored for INPROC/OOP. Copied by the engine at registration. */
     const char *const    *argv;
 } gptps_task_def;
 

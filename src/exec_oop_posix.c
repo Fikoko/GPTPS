@@ -317,7 +317,7 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap before exec */
 #endif
         if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
-        execv(argv[0], (char *const *)argv);
+        execvp(argv[0], (char *const *)argv); /* PATH-resolves a bare name (e.g. "wasmtime") */
         _exit(127); /* exec failed */
     }
 

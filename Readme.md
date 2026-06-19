@@ -67,7 +67,8 @@ ctest --test-dir build --output-on-failure   # run the test suite
 ```
 
 More runnable examples in [`examples/`](examples/): `demo` (in-process tasks + events),
-`config_file` (tuning from a TOML file), and `external_program` (run any binary as a task).
+`config_file` (tuning from a TOML file), `external_program` (run any binary as a task), and
+`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below).
 
 ## API at a glance
 
@@ -135,6 +136,13 @@ points at a memory-delegated cgroup (e.g. a systemd `Delegate=yes` scope), else 
 `RLIMIT_AS` cap; on Windows the program executor uses a **Job Object** (memory limit +
 kill-on-close). Either way it's real, killable enforcement the in-process path can't give.
 
+**WebAssembly.** A `.wasm` module is portable, sandboxed task code — and a wasm runtime CLI
+is just a program, so you can run one through `GPTPS_EXEC_PROGRAM` with **no new code**:
+`def.argv = {"wasmtime", "run", "module.wasm", NULL}` (argv[0] is PATH-resolved). The payload
+flows to the module's stdin and its stdout comes back as the result, under the usual budget /
+timeout / retry. See [`examples/wasm_program.c`](examples/wasm_program.c). For a tighter,
+in-process binding, the [`wasm_exec`](addons/) add-on takes a pluggable runtime hook instead.
+
 ## Resource budgets, failures, add-ons
 
 - **Admission:** each task type declares a rough cost (`mem` / `gpu` / duration). The core
@@ -195,7 +203,9 @@ external-program executors (`CreateProcess` + Job Object), and the add-on loader
 `GPTPS_EXEC_OOP` is POSIX-only, since it forks an in-process function (no `fork()` on
 Windows — use `GPTPS_EXEC_PROGRAM` there for isolated, killable, memory-capped work).
 
-In progress: a bundled wasm runtime for the WASM add-on (today it's bring-your-own-runtime).
+Running WebAssembly works today two ways: via `GPTPS_EXEC_PROGRAM` + a wasm runtime CLI
+(`examples/wasm_program.c`), or the `wasm_exec` add-on with a pluggable runtime. Optional
+future work: a bundled default wasm runtime so neither a CLI nor an adapter is needed.
 
 ## Design notes
 

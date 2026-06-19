@@ -299,7 +299,8 @@ clean on the concurrent paths (ASLR disabled in CI), stress loops on timing-
 sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
-**self-skip** where the facility is absent rather than failing. CI runs six jobs:
+**self-skip** where the facility is absent rather than failing (cgroup delegation, a
+wasm runtime CLI). CI runs six jobs:
 `build-test` (Linux + macOS), `windows` (mingw-w64), `amalgamation`, `asan`, and `tsan`.
 
 ---
@@ -310,15 +311,16 @@ Some planned work is partial or unbuilt, because this project only ships code it
 can verify, and these could not be fully tested in the environment they were
 developed in:
 
-- **WASM executor — runtime is bring-your-own.** `addons/wasm_exec.c` ships the
-  GPTPS-side integration: a `.wasm` module becomes a first-class task (admission,
-  cost/priority, retries/timeout, result delivery, and OOP sandboxing), with the
-  wasm interpreter supplied via a pluggable `gptps_wasm_run_fn` hook. It is fully
-  tested with a mock runtime. What's **not** bundled is an actual interpreter
-  (wasm3/wasmtime/WAMR) — that's left pluggable to keep the core dependency-free,
-  and a bundled default would need a runtime to vendor + test against. *A `.wasm`
-  can also run with no add-on at all* via `GPTPS_EXEC_PROGRAM` + a runtime CLI
-  (`argv = ["wasmtime", "module.wasm", …]`).
+- **WASM — works today; only a *bundled default* runtime is unbuilt.** Two ready
+  paths: (1) `GPTPS_EXEC_PROGRAM` + a wasm runtime CLI — `argv = ["wasmtime",
+  "run", "module.wasm"]`, argv[0] PATH-resolved — shown in
+  `examples/wasm_program.c` (which embeds a hand-assembled, validated `.wasm` and
+  self-skips when no runtime is on PATH); (2) `addons/wasm_exec.c`, an in-process
+  binding that takes a pluggable `gptps_wasm_run_fn` hook (wasm3/wasmtime/WAMR),
+  fully tested with a mock runtime. What's **not** bundled is an actual interpreter
+  — left pluggable to keep the core dependency-free; a bundled default would need a
+  runtime to vendor + a wasm toolchain to test against (the sandbox blocks fetching
+  external code, so this is owner-gated).
 Windows is otherwise complete: the Win32 HAL (`hal_win.c`), the external-program
 executor (`exec_win.c`, `CreateProcess` + Job Object), and a `windows-latest` CI
 job all ship and are green. The only platform gap is `GPTPS_EXEC_OOP`, which forks

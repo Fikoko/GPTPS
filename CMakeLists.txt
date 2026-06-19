@@ -218,4 +218,12 @@ if(UNIX)
     target_link_libraries(example_program PRIVATE gptps)
     add_test(NAME example_program COMMAND example_program)
     set_tests_properties(example_program PROPERTIES TIMEOUT 20)
+
+    # run a .wasm module via a wasm runtime CLI through EXEC_PROGRAM
+    # (self-skips, exit 0, when no `wasmtime` is on PATH)
+    add_executable(example_wasm examples/wasm_program.c)
+    target_include_directories(example_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(example_wasm PRIVATE gptps)
+    add_test(NAME example_wasm COMMAND example_wasm)
+    set_tests_properties(example_wasm PROPERTIES TIMEOUT 20)
 endif()
