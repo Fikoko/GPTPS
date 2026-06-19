@@ -66,6 +66,9 @@ ctest --test-dir build --output-on-failure   # run the test suite
 ./build/demo                                  # run the example
 ```
 
+More runnable examples in [`examples/`](examples/): `demo` (in-process tasks + events),
+`config_file` (tuning from a TOML file), and `external_program` (run any binary as a task).
+
 ## API at a glance
 
 | Call | Purpose |
@@ -167,7 +170,7 @@ gptps/
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
 ├── addons/              ← optional modules on the public API (durable_queue, gpu_quota)
-├── examples/demo.c      ← runnable example (the quick start above)
+├── examples/            ← runnable examples (demo, config_file, external_program)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/ARCHITECTURE.md ← how it works inside
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)

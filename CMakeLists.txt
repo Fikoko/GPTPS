@@ -172,9 +172,24 @@ if(UNIX)
     set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
 endif()
 
-# --- example (headline usage; doubles as a smoke test) ---------------------
+# --- examples (runnable usage; double as smoke tests) ----------------------
 add_executable(demo examples/demo.c)
 target_include_directories(demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(demo PRIVATE gptps)
 add_test(NAME demo COMMAND demo)
 set_tests_properties(demo PROPERTIES TIMEOUT 20)
+
+add_executable(example_config examples/config_file.c)
+target_include_directories(example_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(example_config PRIVATE gptps)
+add_test(NAME example_config COMMAND example_config)
+set_tests_properties(example_config PROPERTIES TIMEOUT 20)
+
+if(UNIX)
+    # external-program executor (forks + execs /bin/cat)
+    add_executable(example_program examples/external_program.c)
+    target_include_directories(example_program PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(example_program PRIVATE gptps)
+    add_test(NAME example_program COMMAND example_program)
+    set_tests_properties(example_program PROPERTIES TIMEOUT 20)
+endif()
