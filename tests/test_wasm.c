@@ -78,19 +78,24 @@ int main(void)
     if (!w) { gptps_shutdown(e); return 1; }
 
     CHECK(gptps_wasm_register(w, "up",     "/modules/upper.wasm", 0, NULL, NULL) == GPTPS_OK);
-    CHECK(gptps_wasm_register(w, "up_oop", "/modules/upper.wasm", 1, NULL, NULL) == GPTPS_OK);
     CHECK(gptps_wasm_register(w, "bad",    "/modules/bad.wasm",   0, NULL, NULL) == GPTPS_OK);
 
     CHECK(gptps_submit(e, "up",     "hello world", 11, &h) == GPTPS_OK);
-    CHECK(gptps_submit(e, "up_oop", "abc123",       6, &h) == GPTPS_OK);
     CHECK(gptps_submit(e, "bad",    "x",            1, &h) == GPTPS_OK);
+#if !defined(_WIN32)
+    /* OOP mode forks (POSIX-only); INPROC + error paths are portable */
+    CHECK(gptps_wasm_register(w, "up_oop", "/modules/upper.wasm", 1, NULL, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(e, "up_oop", "abc123",       6, &h) == GPTPS_OK);
+#endif
 
     gptps_shutdown(e);   /* drains; joins threads => results are visible */
 
     CHECK(get(&g_up_done) == 1);
     CHECK(g_up_len == 11 && memcmp(g_up, "HELLO WORLD", 11) == 0);     /* INPROC module ran */
+#if !defined(_WIN32)
     CHECK(get(&g_oop_done) == 1);
     CHECK(g_oop_len == 6 && memcmp(g_oop, "ABC123", 6) == 0);          /* OOP (forked) module ran */
+#endif
     CHECK(get(&g_bad_failed) == 1);  /* the "bad" module path failed while "upper" succeeded:
                                         per-task module_path plumbing + error propagation proven */
 

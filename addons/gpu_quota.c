@@ -13,18 +13,20 @@
  * handle) but no cost - so we learn name->units from the constraint and look it
  * up by name on release, assuming gpu_units is fixed per task type.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "gpu_quota.h"
+#include "addon_compat.h"   /* portable mutex */
 
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 
 typedef struct { char *name; uint64_t units; } gpu_entry;
 
 struct gptps_gpu_quota {
     gptps          *e;
-    pthread_mutex_t mu;
+    apx_mutex       mu;
     uint64_t        budget;
     uint64_t        reserved;
     uint32_t        defer_ms;
@@ -67,7 +69,7 @@ static gptps_admit_decision gpu_gate(const char *name, const gptps_cost *cost,
     uint64_t need = cost ? cost->gpu_units : 0;
     gptps_admit_decision dec;
     if (need == 0) return GPTPS_ADMIT;          /* non-GPU work isn't gated */
-    pthread_mutex_lock(&q->mu);
+    apx_mutex_lock(&q->mu);
     remember(q, name, need);
     if (q->reserved + need <= q->budget) {
         q->reserved += need;
@@ -76,7 +78,7 @@ static gptps_admit_decision gpu_gate(const char *name, const gptps_cost *cost,
         *retry_after_ms = q->defer_ms;
         dec = GPTPS_DEFER;
     }
-    pthread_mutex_unlock(&q->mu);
+    apx_mutex_unlock(&q->mu);
     return dec;
 }
 
@@ -85,10 +87,10 @@ static void gpu_release(const gptps_event *ev, void *ud)
     gptps_gpu_quota *q = (gptps_gpu_quota *)ud;
     uint64_t units;
     if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_FAILED) return;
-    pthread_mutex_lock(&q->mu);
+    apx_mutex_lock(&q->mu);
     units = lookup(q, ev->task_name);
     if (units) q->reserved = (q->reserved >= units) ? q->reserved - units : 0;
-    pthread_mutex_unlock(&q->mu);
+    apx_mutex_unlock(&q->mu);
 }
 
 gptps_gpu_quota *gptps_gpu_quota_install(gptps *e, uint64_t total_units, uint32_t defer_ms)
@@ -97,11 +99,11 @@ gptps_gpu_quota *gptps_gpu_quota_install(gptps *e, uint64_t total_units, uint32_
     if (!e) return NULL;
     q = (gptps_gpu_quota *)calloc(1, sizeof *q);
     if (!q) return NULL;
-    pthread_mutex_init(&q->mu, NULL);
+    apx_mutex_init(&q->mu);
     q->e = e; q->budget = total_units; q->defer_ms = defer_ms ? defer_ms : 10u;
 
     if (gptps_register_constraint(e, gpu_gate, q) != GPTPS_OK) {
-        pthread_mutex_destroy(&q->mu); free(q);   /* nothing registered: safe to free */
+        apx_mutex_destroy(&q->mu); free(q);   /* nothing registered: safe to free */
         return NULL;
     }
     if (gptps_register_observer(e, gpu_release, q) != GPTPS_OK) {
@@ -116,9 +118,9 @@ uint64_t gptps_gpu_quota_in_use(gptps_gpu_quota *q)
 {
     uint64_t v;
     if (!q) return 0;
-    pthread_mutex_lock(&q->mu);
+    apx_mutex_lock(&q->mu);
     v = q->reserved;
-    pthread_mutex_unlock(&q->mu);
+    apx_mutex_unlock(&q->mu);
     return v;
 }
 
@@ -131,6 +133,6 @@ void gptps_gpu_quota_close(gptps_gpu_quota *q)
     /* Caller contract: engine already shut down, so no constraint/observer fires. */
     for (i = 0; i < q->n; ++i) free(q->map[i].name);
     free(q->map);
-    pthread_mutex_destroy(&q->mu);
+    apx_mutex_destroy(&q->mu);
     free(q);
 }

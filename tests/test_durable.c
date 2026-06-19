@@ -9,14 +9,19 @@
  * Phase A fully shuts down (joining all engine threads) before the fork, so the
  * fork happens from a single-threaded process.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "gptps.h"
 #include "durable_queue.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/wait.h>
+#if !defined(_WIN32)               /* the crash-recovery phase forks (POSIX only) */
+#  include <unistd.h>
+#  include <sys/wait.h>
+#  define TEST_DURABLE_FORK 1
+#endif
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -91,6 +96,7 @@ static void test_happy(void)
     remove(JOURNAL_A);
 }
 
+#if defined(TEST_DURABLE_FORK)
 static void test_recovery(void)
 {
     pid_t pid;
@@ -149,11 +155,14 @@ static void test_recovery(void)
     }
     remove(JOURNAL_B);
 }
+#endif /* TEST_DURABLE_FORK */
 
 int main(void)
 {
-    test_happy();      /* shuts down + joins threads (single-threaded before fork) */
-    test_recovery();
+    test_happy();      /* portable: dq_open/submit/observer/pending/fsync/close */
+#if defined(TEST_DURABLE_FORK)
+    test_recovery();   /* crash-recovery via fork (POSIX) */
+#endif
     if (fails) { printf("%d durable-queue check(s) FAILED\n", fails); return 1; }
     printf("all durable-queue checks passed\n");
     return 0;

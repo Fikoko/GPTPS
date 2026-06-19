@@ -10,15 +10,16 @@
  * under the at-least-once contract). Replay stops at the first torn/short/bad-
  * checksum record (a crash mid-write), so a partial tail never corrupts state.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "durable_queue.h"
+#include "addon_compat.h"   /* portable mutex + fsync */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <pthread.h>
 
 #define DQ_FILE_MAGIC 0x47445131u /* "GDQ1" */
 #define DQ_REC_MAGIC  0x44515231u /* "DQR1" */
@@ -42,7 +43,7 @@ struct gptps_dq {
     gptps          *e;
     char           *path;
     FILE           *fp;        /* append handle */
-    pthread_mutex_t mu;
+    apx_mutex       mu;
     uint64_t        next_seq;
     size_t          pending;   /* count of !done recs */
     dq_rec         *recs;
@@ -177,7 +178,7 @@ static gptps_status do_rewrite(gptps_dq *dq)
     for (i = 0; i < dq->n; ++i)
         if (!dq->recs[i].done)
             write_record(t, 'P', dq->recs[i].seq, dq->recs[i].name, dq->recs[i].payload, (uint32_t)dq->recs[i].len);
-    fflush(t); fsync(fileno(t)); fclose(t);
+    fflush(t); apx_fsync(t); fclose(t);
 
     if (dq->fp) { fclose(dq->fp); dq->fp = NULL; }
     if (rename(tmp, dq->path) != 0) { free(tmp); return GPTPS_E_IO; }
@@ -200,7 +201,7 @@ static void dq_on_event(const gptps_event *ev, void *ud)
     gptps_dq *dq = (gptps_dq *)ud;
     size_t i;
     if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DEAD_LETTERED) return;
-    pthread_mutex_lock(&dq->mu);
+    apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
         if (!dq->recs[i].done && dq->recs[i].handle == ev->handle) {
             dq->recs[i].done = 1;
@@ -210,7 +211,7 @@ static void dq_on_event(const gptps_event *ev, void *ud)
             break;
         }
     }
-    pthread_mutex_unlock(&dq->mu);
+    apx_mutex_unlock(&dq->mu);
 }
 
 /* ---- public API ---- */
@@ -220,10 +221,10 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path)
     if (!e || !journal_path) return NULL;
     dq = (gptps_dq *)calloc(1, sizeof *dq);
     if (!dq) return NULL;
-    pthread_mutex_init(&dq->mu, NULL);
+    apx_mutex_init(&dq->mu);
     dq->e = e; dq->next_seq = 1;
     dq->path = dup_str(journal_path);
-    if (!dq->path) { pthread_mutex_destroy(&dq->mu); free(dq); return NULL; }
+    if (!dq->path) { apx_mutex_destroy(&dq->mu); free(dq); return NULL; }
 
     if (replay(dq) != 0) goto fail;          /* corrupt journal header */
     /* pending count after replay */
@@ -236,7 +237,7 @@ fail:
     if (dq->fp) fclose(dq->fp);
     { size_t i; for (i = 0; i < dq->n; ++i) { free(dq->recs[i].name); free(dq->recs[i].payload); } }
     free(dq->recs); free(dq->path);
-    pthread_mutex_destroy(&dq->mu);
+    apx_mutex_destroy(&dq->mu);
     free(dq);
     return NULL;
 }
@@ -250,17 +251,17 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     uint64_t seq;
     if (!dq || !task_name) return GPTPS_E_INVAL;
 
-    pthread_mutex_lock(&dq->mu);
+    apx_mutex_lock(&dq->mu);
     seq = dq->next_seq;
     if (write_record(dq->fp, 'P', seq, task_name, payload, (uint32_t)len) != 0) {
-        pthread_mutex_unlock(&dq->mu);
+        apx_mutex_unlock(&dq->mu);
         return GPTPS_E_IO;
     }
-    fflush(dq->fp); fsync(fileno(dq->fp));   /* durable before we enqueue */
+    fflush(dq->fp); apx_fsync(dq->fp);   /* durable before we enqueue */
     dq->next_seq = seq + 1;
 
     rc = push_rec(dq);
-    if (!rc) { pthread_mutex_unlock(&dq->mu); return GPTPS_E_NOMEM; }
+    if (!rc) { apx_mutex_unlock(&dq->mu); return GPTPS_E_NOMEM; }
     rc->seq = seq; rc->done = 0; rc->handle = 0; rc->len = len;
     rc->name = dup_str(task_name);
     rc->payload = dup_mem(payload, len);
@@ -275,7 +276,7 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
         rc->done = 1; if (dq->pending) dq->pending -= 1;
         write_record(dq->fp, 'D', seq, "", NULL, 0); fflush(dq->fp);
     }
-    pthread_mutex_unlock(&dq->mu);
+    apx_mutex_unlock(&dq->mu);
     return st;
 }
 
@@ -283,7 +284,7 @@ size_t gptps_dq_recover(gptps_dq *dq)
 {
     size_t i, count = 0;
     if (!dq) return 0;
-    pthread_mutex_lock(&dq->mu);
+    apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
         gptps_handle h = 0;
         if (dq->recs[i].done || dq->recs[i].handle != 0) continue; /* completed or already live */
@@ -293,7 +294,7 @@ size_t gptps_dq_recover(gptps_dq *dq)
         }
         /* on failure leave it pending: a later run with the task registered can recover it */
     }
-    pthread_mutex_unlock(&dq->mu);
+    apx_mutex_unlock(&dq->mu);
     return count;
 }
 
@@ -301,9 +302,9 @@ size_t gptps_dq_pending(gptps_dq *dq)
 {
     size_t n;
     if (!dq) return 0;
-    pthread_mutex_lock(&dq->mu);
+    apx_mutex_lock(&dq->mu);
     n = dq->pending;
-    pthread_mutex_unlock(&dq->mu);
+    apx_mutex_unlock(&dq->mu);
     return n;
 }
 
@@ -311,9 +312,9 @@ gptps_status gptps_dq_compact(gptps_dq *dq)
 {
     gptps_status st;
     if (!dq) return GPTPS_E_INVAL;
-    pthread_mutex_lock(&dq->mu);
+    apx_mutex_lock(&dq->mu);
     st = do_rewrite(dq);
-    pthread_mutex_unlock(&dq->mu);
+    apx_mutex_unlock(&dq->mu);
     return st;
 }
 
@@ -325,6 +326,6 @@ void gptps_dq_close(gptps_dq *dq)
     if (dq->fp) fclose(dq->fp);
     for (i = 0; i < dq->n; ++i) { free(dq->recs[i].name); free(dq->recs[i].payload); }
     free(dq->recs); free(dq->path);
-    pthread_mutex_destroy(&dq->mu);
+    apx_mutex_destroy(&dq->mu);
     free(dq);
 }

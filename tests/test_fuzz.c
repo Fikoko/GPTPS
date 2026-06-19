@@ -6,7 +6,9 @@
  * run under AddressSanitizer/UBSan (the `asan` CI job); a clean exit there is
  * the pass. Deterministic (fixed-seed LCG) so failures reproduce.
  */
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "gptps.h"
 #include "gptps_internal.h"   /* internal TOML parser */
 #include "durable_queue.h"

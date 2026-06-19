@@ -177,43 +177,33 @@ if(UNIX)
     target_link_libraries(test_cgroup PRIVATE gptps)
     add_test(NAME cgroup COMMAND test_cgroup)
     set_tests_properties(cgroup PROPERTIES TIMEOUT 30)
-
-    # durable-queue add-on (built on the public API; POSIX: fork/fsync/pthreads)
-    add_executable(test_durable tests/test_durable.c addons/durable_queue.c)
-    target_include_directories(test_durable
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
-    )
-    target_link_libraries(test_durable PRIVATE gptps)
-    add_test(NAME durable COMMAND test_durable)
-    set_tests_properties(durable PROPERTIES TIMEOUT 30)
-
-    # gpu-quota add-on (constraint + observer composition; POSIX: pthreads)
-    add_executable(test_gpu_quota tests/test_gpu_quota.c addons/gpu_quota.c)
-    target_include_directories(test_gpu_quota
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
-    )
-    target_link_libraries(test_gpu_quota PRIVATE gptps)
-    add_test(NAME gpu_quota COMMAND test_gpu_quota)
-    set_tests_properties(gpu_quota PROPERTIES TIMEOUT 30)
-
-    # parser robustness fuzz (TOML + journal); shines under the asan CI job
-    add_executable(test_fuzz tests/test_fuzz.c addons/durable_queue.c)
-    target_include_directories(test_fuzz
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/addons
-    )
-    target_link_libraries(test_fuzz PRIVATE gptps)
-    add_test(NAME fuzz COMMAND test_fuzz)
-    set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
-
-    # wasm executor add-on (module-as-task; mock runtime in the test). POSIX (OOP forks)
-    add_executable(test_wasm tests/test_wasm.c addons/wasm_exec.c)
-    target_include_directories(test_wasm
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
-    )
-    target_link_libraries(test_wasm PRIVATE gptps)
-    add_test(NAME wasm COMMAND test_wasm)
-    set_tests_properties(wasm PROPERTIES TIMEOUT 30)
 endif()
+
+# Portable add-on tests (all platforms): the add-on sources are portable
+# (addon_compat shim); any fork-based PHASE inside a test is guarded for Windows.
+add_executable(test_gpu_quota tests/test_gpu_quota.c addons/gpu_quota.c)  # constraint + observer
+target_include_directories(test_gpu_quota PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_gpu_quota PRIVATE gptps)
+add_test(NAME gpu_quota COMMAND test_gpu_quota)
+set_tests_properties(gpu_quota PROPERTIES TIMEOUT 30)
+
+add_executable(test_durable tests/test_durable.c addons/durable_queue.c) # journal happy-path everywhere; recovery forks on POSIX
+target_include_directories(test_durable PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable PRIVATE gptps)
+add_test(NAME durable COMMAND test_durable)
+set_tests_properties(durable PROPERTIES TIMEOUT 30)
+
+add_executable(test_wasm tests/test_wasm.c addons/wasm_exec.c)            # module-as-task; OOP case POSIX-only
+target_include_directories(test_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_wasm PRIVATE gptps)
+add_test(NAME wasm COMMAND test_wasm)
+set_tests_properties(wasm PROPERTIES TIMEOUT 30)
+
+add_executable(test_fuzz tests/test_fuzz.c addons/durable_queue.c)        # TOML + journal parser robustness
+target_include_directories(test_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_fuzz PRIVATE gptps)
+add_test(NAME fuzz COMMAND test_fuzz)
+set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
 
 # --- cross-platform external-program executor test (POSIX + Windows) -------
 add_executable(prog_helper tests/prog_helper.c)         # tiny portable test binary
