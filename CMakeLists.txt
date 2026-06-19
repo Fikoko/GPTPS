@@ -143,6 +143,15 @@ if(UNIX)
     target_link_libraries(test_cgroup PRIVATE gptps)
     add_test(NAME cgroup COMMAND test_cgroup)
     set_tests_properties(cgroup PROPERTIES TIMEOUT 30)
+
+    # durable-queue add-on (built on the public API; POSIX: fork/fsync/pthreads)
+    add_executable(test_durable tests/test_durable.c addons/durable_queue.c)
+    target_include_directories(test_durable
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
+    )
+    target_link_libraries(test_durable PRIVATE gptps)
+    add_test(NAME durable COMMAND test_durable)
+    set_tests_properties(durable PROPERTIES TIMEOUT 30)
 endif()
 
 # --- example (headline usage; doubles as a smoke test) ---------------------

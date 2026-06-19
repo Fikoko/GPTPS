@@ -146,6 +146,8 @@ coarse `RLIMIT_AS` cap. Either way it's real, killable enforcement the in-proces
 - **Dead letter:** tasks that exhaust retries (or that a constraint denies) are retained.
   `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
+- **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
+  enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
   versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See
@@ -164,8 +166,10 @@ gptps/
 │   ├── config_toml.c    TOML-subset config-file parser
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
+├── addons/              ← optional modules on the public API (durable_queue, ...)
 ├── examples/demo.c      ← runnable example (the quick start above)
 ├── gptps.example.toml   ← annotated sample config file
+├── docs/ARCHITECTURE.md ← how it works inside
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)
 ├── tools/amalgamate.sh  ← generates the single-file gptps.c + gptps.h
 ├── CMakeLists.txt
@@ -178,10 +182,10 @@ Working today (Linux + macOS, tested + ThreadSanitizer-clean): the engine, all t
 executors, result delivery, retries/timeout/dead-letter + dead-letter drain, priority
 scheduling with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with
 RLIMIT_AS fallback), the add-on loader + ABI, constraints + observers, TOML config-file
-loading (limits + scheduler + per-task overrides + add-on auto-load), the demo, CMake +
-CI + single-file amalgamation.
+loading (limits + scheduler + per-task overrides + add-on auto-load), the crash-durable
+queue add-on, the demo, CMake + CI + single-file amalgamation.
 
-In progress: durable queue / GPU / WASM add-ons, and a Windows backend.
+In progress: GPU / WASM add-ons, and a Windows backend.
 
 ## Design notes
 
@@ -190,3 +194,6 @@ The core is deliberately small and general: a mechanism-only engine with four ad
 priority, time-of-day windows — is a **constraint add-on**, so the core stays minimal while
 the variety lives in add-ons. The novel piece is single-process *self-throttling* admission:
 "can my own process afford to start this task right now, given my own remaining budget?"
+
+For the full internals — concurrency model, dispatch loop, scheduler, executors, HAL, and the
+add-on ABI — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
