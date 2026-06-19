@@ -15,13 +15,13 @@
 
 #define CFG_PATH "gptps_example.toml"
 
-static int g_finished = 0;
+static int g_finished = 0;   /* FINISHED fires on worker threads: count atomically */
 static gptps_status noop(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_OK; }
 
 static void on_event(const gptps_event *ev, void *ud)
 {
     (void)ud;
-    if (ev->kind == GPTPS_EV_FINISHED) ++g_finished;
+    if (ev->kind == GPTPS_EV_FINISHED) __atomic_add_fetch(&g_finished, 1, __ATOMIC_SEQ_CST);
 }
 
 static void reg(gptps *e, const char *name)
@@ -78,6 +78,9 @@ int main(void)
 
     gptps_shutdown(engine);
     remove(CFG_PATH);
-    printf("processed %d tasks under config from file.\n", g_finished);
-    return (g_finished == 6) ? 0 : 1;
+    {
+        int done = __atomic_load_n(&g_finished, __ATOMIC_SEQ_CST);
+        printf("processed %d tasks under config from file.\n", done);
+        return (done == 6) ? 0 : 1;
+    }
 }

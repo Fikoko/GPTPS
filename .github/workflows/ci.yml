@@ -36,6 +36,20 @@ jobs:
              amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o test_amalg
           ./test_amalg
 
+  # Windows build + test on a real runner (Win32 HAL: src/hal_win.c). Uses the
+  # ClangCL toolset so the tests' __atomic builtins compile under MSVC's ABI.
+  # POSIX-only tests (fork/pthread executors + add-ons) are gated out in CMake.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Visual Studio + ClangCL)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -T ClangCL -A x64
+      - name: Build
+        run: cmake --build build --config Debug
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+
   # AddressSanitizer + UBSan across the whole suite (memory errors, leaks, UB).
   # Uses CMake (not a hand-maintained source list) so it can't drift out of sync.
   asan:

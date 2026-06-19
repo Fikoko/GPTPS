@@ -62,8 +62,17 @@ extern "C" {
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
+/* Default build is a STATIC library, so GPTPS_API is undecorated. Define
+ * GPTPS_BUILD_DLL when building gptps as a DLL, or GPTPS_USE_DLL when linking
+ * against one. Add-on .so/.dll always export their init symbol. */
 #if defined(_WIN32)
-#  define GPTPS_API __declspec(dllimport)
+#  if defined(GPTPS_BUILD_DLL)
+#    define GPTPS_API __declspec(dllexport)
+#  elif defined(GPTPS_USE_DLL)
+#    define GPTPS_API __declspec(dllimport)
+#  else
+#    define GPTPS_API            /* static library: no decoration */
+#  endif
 #  define GPTPS_ADDON_EXPORT __declspec(dllexport)
 #else
 #  define GPTPS_API __attribute__((visibility("default")))

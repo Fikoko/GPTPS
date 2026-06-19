@@ -10,9 +10,12 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # --- library (grows as modules land) ---------------------------------------
-set(GPTPS_SRC src/hal_posix.c src/config.c src/config_toml.c src/engine.c)
-if(UNIX)
-    list(APPEND GPTPS_SRC src/exec_oop_posix.c) # out-of-process executor (POSIX)
+# Core is portable C99; the HAL + executor backend are selected per platform.
+set(GPTPS_SRC src/config.c src/config_toml.c src/engine.c)
+if(WIN32)
+    list(APPEND GPTPS_SRC src/hal_win.c src/exec_win.c)        # Win32 HAL; exec stubs (CreateProcess TODO)
+else()
+    list(APPEND GPTPS_SRC src/hal_posix.c src/exec_oop_posix.c) # POSIX HAL + out-of-process executor
 endif()
 add_library(gptps STATIC ${GPTPS_SRC})
 target_include_directories(gptps
