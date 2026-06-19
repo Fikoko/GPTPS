@@ -123,8 +123,13 @@ Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]`
 | Kind | Runs as | Enforcement | Use for |
 |---|---|---|---|
 | `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | fast, trusted work |
-| `GPTPS_EXEC_OOP` | the same C function in a forked child | OS memory cap + hard-kill on timeout | isolation / hard limits |
-| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`) | OS cap + whole-group hard-kill | any language / any binary; payload→stdin, stdout→result |
+| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout | isolation / hard limits |
+| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`) | memory cap + whole-group hard-kill | any language / any binary; payload→stdin, stdout→result |
+
+The forked executors enforce the per-task memory cap accurately with **cgroup v2**
+(`memory.max`, exceeding it ⇒ `GPTPS_E_NOMEM`) when `GPTPS_CGROUP_PARENT` points at a
+memory-delegated cgroup (e.g. a systemd `Delegate=yes` scope); otherwise they fall back to a
+coarse `RLIMIT_AS` cap. Either way it's real, killable enforcement the in-process path can't give.
 
 ## Resource budgets, failures, add-ons
 
@@ -170,13 +175,13 @@ gptps/
 ## Status
 
 Working today (Linux + macOS, tested + ThreadSanitizer-clean): the engine, all three
-executors, result delivery, retries/timeout/dead-letter, priority scheduling with
-skip-to-fit + reservation, the add-on loader + ABI, constraints + observers, TOML
-config-file loading (limits + scheduler + per-task overrides + add-on auto-load), the
-demo, CMake + CI + single-file amalgamation.
+executors, result delivery, retries/timeout/dead-letter + dead-letter drain, priority
+scheduling with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with
+RLIMIT_AS fallback), the add-on loader + ABI, constraints + observers, TOML config-file
+loading (limits + scheduler + per-task overrides + add-on auto-load), the demo, CMake +
+CI + single-file amalgamation.
 
-In progress: cgroups v2 memory enforcement, durable queue / GPU / WASM add-ons, and a
-Windows backend.
+In progress: durable queue / GPU / WASM add-ons, and a Windows backend.
 
 ## Design notes
 

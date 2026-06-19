@@ -23,8 +23,11 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
 /* Out-of-process executor (POSIX): fork, apply an OS memory cap in the child,
  * run the task there, and stream the result back. The parent hard-kills the
  * child on timeout (returns GPTPS_E_TIMEOUT) - real enforcement the in-process
- * path cannot provide. mem_cap==0 or below a floor => no AS cap; timeout_s==0
- * => no timeout (a hanging task with no timeout will block its worker). */
+ * path cannot provide. The memory cap is accurate cgroup v2 (memory.max +
+ * swap.max=0, exceeding it => GPTPS_E_NOMEM) when GPTPS_CGROUP_PARENT names a
+ * memory-delegated cgroup; otherwise a coarse RLIMIT_AS fallback. mem_cap==0 or
+ * below a floor => no cap; timeout_s==0 => no timeout (a hanging task with no
+ * timeout will block its worker). */
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s,
                                void **out_result, size_t *out_len);

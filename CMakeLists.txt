@@ -135,6 +135,14 @@ if(UNIX)
     target_link_libraries(test_program PRIVATE gptps)
     add_test(NAME program COMMAND test_program)
     set_tests_properties(program PROPERTIES TIMEOUT 30)
+
+    add_executable(test_cgroup tests/test_cgroup.c) # cgroup v2 memory enforcement (self-skips w/o delegation)
+    target_include_directories(test_cgroup
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_cgroup PRIVATE gptps)
+    add_test(NAME cgroup COMMAND test_cgroup)
+    set_tests_properties(cgroup PROPERTIES TIMEOUT 30)
 endif()
 
 # --- example (headline usage; doubles as a smoke test) ---------------------

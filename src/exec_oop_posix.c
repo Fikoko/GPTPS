@@ -29,14 +29,114 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <poll.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
-#define GPTPS_OOP_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, AS cap is meaningless */
+#define GPTPS_OOP_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, a mem cap is meaningless */
+
+/* Coarse fallback cap: bound the child's virtual address space. Approximate
+ * (caps VSZ not RSS; absent on macOS) but needs no privileges - used whenever
+ * the accurate cgroup v2 path below is unavailable. */
+static void apply_as_cap(uint64_t mem_cap)
+{
+#if defined(RLIMIT_AS)
+    if (mem_cap >= GPTPS_OOP_MEMCAP_FLOOR) {
+        struct rlimit rl; rl.rlim_cur = (rlim_t)mem_cap; rl.rlim_max = (rlim_t)mem_cap;
+        setrlimit(RLIMIT_AS, &rl); /* best-effort */
+    }
+#else
+    (void)mem_cap;
+#endif
+}
+
+/* ---- accurate memory enforcement via cgroup v2 (Linux, opt-in) -------------
+ * If GPTPS_CGROUP_PARENT names a cgroup whose subtree has the memory controller
+ * delegated (e.g. a systemd Delegate=yes scope), each forked task gets its own
+ * child cgroup with memory.max + memory.swap.max=0 - so exceeding the cap is an
+ * actual RSS-based OOM-kill, not the coarse VSZ approximation RLIMIT_AS gives.
+ * Every step is best-effort: any failure falls back to apply_as_cap(). */
+#if defined(__linux__)
+static unsigned cgroup_seq(void)
+{
+    static unsigned n = 0; /* unique suffix per concurrent task */
+    return __atomic_add_fetch(&n, 1u, __ATOMIC_SEQ_CST);
+}
+
+static int cg_write_file(const char *dir, const char *file, const char *val)
+{
+    size_t n = strlen(dir) + strlen(file) + 2;
+    char *path = (char *)malloc(n);
+    int fd; ssize_t w;
+    if (!path) return -1;
+    snprintf(path, n, "%s/%s", dir, file);
+    fd = open(path, O_WRONLY);
+    free(path);
+    if (fd < 0) return -1;
+    w = write(fd, val, strlen(val));
+    close(fd);
+    return (w < 0) ? -1 : 0;
+}
+
+/* Create a child cgroup under $GPTPS_CGROUP_PARENT with the cap applied.
+ * Returns a malloc'd path (caller frees + rmdirs) or NULL if unavailable. */
+static char *cgroup_create(uint64_t mem_cap)
+{
+    const char *parent = getenv("GPTPS_CGROUP_PARENT");
+    char val[32]; char *dir; size_t n;
+    if (!parent || !*parent) return NULL;
+    if (mem_cap < GPTPS_OOP_MEMCAP_FLOOR) return NULL;
+    n = strlen(parent) + 48;
+    dir = (char *)malloc(n);
+    if (!dir) return NULL;
+    snprintf(dir, n, "%s/gptps.%ld.%u", parent, (long)getpid(), cgroup_seq());
+    if (mkdir(dir, 0700) != 0) { free(dir); return NULL; }
+    snprintf(val, sizeof val, "%llu", (unsigned long long)mem_cap);
+    if (cg_write_file(dir, "memory.max", val) != 0) { /* controller not delegated here */
+        rmdir(dir); free(dir); return NULL;
+    }
+    cg_write_file(dir, "memory.swap.max", "0"); /* make the cap a hard ceiling, not swap */
+    return dir;
+}
+
+/* Child moves itself into the cgroup (its first act, before allocating). */
+static int cgroup_self_join(const char *dir)
+{
+    char pid[32];
+    snprintf(pid, sizeof pid, "%ld", (long)getpid());
+    return cg_write_file(dir, "cgroup.procs", pid);
+}
+
+/* Did the kernel OOM-kill anything in this cgroup? (memory.events: oom_kill N) */
+static int cgroup_oom_killed(const char *dir)
+{
+    size_t n = strlen(dir) + 16;
+    char *path = (char *)malloc(n), key[32];
+    long v; int killed = 0;
+    FILE *f;
+    if (!path) return 0;
+    snprintf(path, n, "%s/memory.events", dir);
+    f = fopen(path, "r");
+    free(path);
+    if (!f) return 0;
+    while (fscanf(f, "%31s %ld", key, &v) == 2)
+        if (strcmp(key, "oom_kill") == 0 && v > 0) killed = 1;
+    fclose(f);
+    return killed;
+}
+
+static void cgroup_destroy(char *dir)
+{
+    if (dir) { rmdir(dir); free(dir); } /* child reaped => cgroup empty => rmdir succeeds */
+}
+#endif /* __linux__ */
 
 static int write_all(int fd, const void *buf, size_t n)
 {
@@ -68,28 +168,39 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 {
     int p[2];
     pid_t pid;
+#if defined(__linux__)
+    char *cgdir = cgroup_create(mem_cap);
+#endif
 
     *out_result = NULL; *out_len = 0;
-    if (pipe(p) != 0) return GPTPS_E_IO;
+    if (pipe(p) != 0) {
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
 
     pid = fork();
-    if (pid < 0) { close(p[0]); close(p[1]); return GPTPS_E_IO; }
+    if (pid < 0) {
+        close(p[0]); close(p[1]);
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
 
     if (pid == 0) {
         /* ---- CHILD ---- */
         void *res = NULL; size_t rlen = 0;
         int32_t st32; uint64_t len64;
         gptps_status st;
+        int joined = 0;
         signal(SIGPIPE, SIG_IGN);
         close(p[0]);
-#if defined(RLIMIT_AS)
-        if (mem_cap >= GPTPS_OOP_MEMCAP_FLOOR) {
-            struct rlimit rl; rl.rlim_cur = (rlim_t)mem_cap; rl.rlim_max = (rlim_t)mem_cap;
-            setrlimit(RLIMIT_AS, &rl); /* best-effort coarse cap (RLIMIT_AS absent on macOS) */
-        }
-#else
-        (void)mem_cap;
+#if defined(__linux__)
+        if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap */
 #endif
+        if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
         st = gptps_run_capture(def, payload, plen, &res, &rlen);
         st32 = (int32_t)st; len64 = (uint64_t)rlen;
         write_all(p[1], &st32, sizeof st32);
@@ -139,9 +250,15 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         } else if (WIFSIGNALED(wstatus)) {
             free(res); res = NULL; len64 = 0;   /* crash / OOM-kill */
             eff = GPTPS_E_TASK;
+#if defined(__linux__)
+            if (cgdir && cgroup_oom_killed(cgdir)) eff = GPTPS_E_NOMEM; /* exceeded the memory cap */
+#endif
         } else {
             eff = (gptps_status)st32;
         }
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
         *out_result = res; *out_len = (size_t)len64;
         return eff;
     }
@@ -155,29 +272,51 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
 {
     int inp[2], outp[2];
     pid_t pid;
+#if defined(__linux__)
+    char *cgdir = cgroup_create(mem_cap);
+#endif
 
     *out_result = NULL; *out_len = 0;
-    if (!argv || !argv[0]) return GPTPS_E_INVAL;
-    if (pipe(inp) != 0) return GPTPS_E_IO;
-    if (pipe(outp) != 0) { close(inp[0]); close(inp[1]); return GPTPS_E_IO; }
+    if (!argv || !argv[0]) {
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_INVAL;
+    }
+    if (pipe(inp) != 0) {
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
+    if (pipe(outp) != 0) {
+        close(inp[0]); close(inp[1]);
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
 
     pid = fork();
-    if (pid < 0) { close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]); return GPTPS_E_IO; }
+    if (pid < 0) {
+        close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
 
     if (pid == 0) {
         /* ---- CHILD: wire stdin/stdout to the pipes, cap memory, exec ---- */
+        int joined = 0;
         dup2(inp[0], STDIN_FILENO);
         dup2(outp[1], STDOUT_FILENO);
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
         setpgid(0, 0); /* own process group: a timeout kill takes down the program AND its children */
-#if defined(RLIMIT_AS)
-        if (mem_cap >= GPTPS_OOP_MEMCAP_FLOOR) {
-            struct rlimit rl; rl.rlim_cur = (rlim_t)mem_cap; rl.rlim_max = (rlim_t)mem_cap;
-            setrlimit(RLIMIT_AS, &rl);
-        }
-#else
-        (void)mem_cap;
+#if defined(__linux__)
+        if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap before exec */
 #endif
+        if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
         execv(argv[0], (char *const *)argv);
         _exit(127); /* exec failed */
     }
@@ -223,6 +362,11 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
         else if (nomem)              eff = GPTPS_E_NOMEM;
         else if (WIFEXITED(wstatus)) eff = (WEXITSTATUS(wstatus) == 0) ? GPTPS_OK : GPTPS_E_TASK;
         else                         eff = GPTPS_E_TASK; /* killed by a signal */
+#if defined(__linux__)
+        if (cgdir && eff != GPTPS_OK && eff != GPTPS_E_TIMEOUT && cgroup_oom_killed(cgdir))
+            eff = GPTPS_E_NOMEM;     /* exceeded the memory cap */
+        cgroup_destroy(cgdir);
+#endif
 
         if (eff == GPTPS_OK) { *out_result = buf; *out_len = len; }
         else free(buf);
