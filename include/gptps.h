@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 1u  /* additive: result fields, argv/PROGRAM, constraints/observers */
+#define GPTPS_ABI_VERSION_MINOR 2u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -207,6 +207,14 @@ GPTPS_API gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine
  *               `cc gptps.c yourapp.c` headline path; does not cross the ABI).
  *   - dlopen  : add-ons attach via the host-table ABI (see below). */
 GPTPS_API gptps_status gptps_register_task(gptps *e, const gptps_task_def *def);
+
+/* Set a task type's scheduling priority (higher runs first; default 0, may be
+ * negative). The dispatcher admits the highest-priority pending task that fits
+ * the live budget, skipping a too-large task to backfill smaller work behind it
+ * (no head-of-line blocking) while a bounded reservation keeps the skipped task
+ * from starving. Applies to tasks submitted AFTER this call; also settable per
+ * task in the config file ([task_defaults] / [tasks.<name>] `priority`). */
+GPTPS_API gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priority);
 
 /* Load a dynamic add-on (shared library) via the host-table ABI below. The
  * add-on must export gptps_addon_init; the core validates magic/version/size

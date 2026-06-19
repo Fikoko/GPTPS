@@ -21,12 +21,22 @@ max_concurrent_tasks = 0
 max_memory_gb = 0.0
 # max_memory_bytes = 0
 
+# Scheduler tuning.
+[scheduler]
+# Starvation guard. The dispatcher admits the highest-priority task that fits the
+# live budget, backfilling smaller work past a too-large task (no head-of-line
+# blocking). A blocked top-priority task may be skipped at most this many times
+# before the dispatcher reserves for it and drains running tasks until it fits.
+# 0 => never backfill (strict priority order); omitted => 8.
+reserve_after_skips = 8
+
 # Defaults applied to EVERY registered task (before any per-task table below).
 [task_defaults]
 timeout_seconds       = 0            # 0 => no timeout
 max_retries           = 0
 retry_backoff_seconds = 0
 on_failure            = "dead_letter" # dead_letter (default) | drop | requeue
+priority              = 0            # higher => admitted first (may be negative)
 
 # Per-task overrides. The table name after `tasks.` matches the name you pass to
 # gptps_register_task / gptps_submit. These win over [task_defaults], which win
@@ -36,8 +46,10 @@ timeout_seconds = 60
 max_retries     = 1
 on_failure      = "drop"
 mem_bytes       = 268435456          # advertise this task's per-run memory cost (256 MiB)
+priority        = 10                 # run resizes ahead of lower-priority work
 
 [tasks.report]
 timeout_seconds = 300
 max_retries     = 3
 on_failure      = "requeue"          # bodies MUST be idempotent to use requeue
+priority        = -5                 # background work: yields to everything else

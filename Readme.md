@@ -72,6 +72,7 @@ ctest --test-dir build --output-on-failure   # run the test suite
 |---|---|
 | `gptps_open(path, &e)` / `gptps_open_ex(cfg, &e)` | create an engine (auto-tunes workers + memory budget) |
 | `gptps_register_task(e, &def)` | register a task type (in-process fn **or** external program) |
+| `gptps_set_task_priority(e, name, prio)` | set a task type's scheduling priority (higher runs first) |
 | `gptps_submit(e, name, payload, len, &handle)` | enqueue work |
 | `gptps_set_event_cb(e, cb, ud)` | observe lifecycle events (results arrive on `FINISHED`) |
 | `gptps_register_constraint(e, fn, ud)` | gate admission (rate limit, quota, time window) |
@@ -97,15 +98,20 @@ addons = ["./libmytasks.so"]
 max_concurrent_tasks = 8       # 0 / omitted => detected cores
 max_memory_gb        = 4.0     # or max_memory_bytes = 4294967296
 
+[scheduler]
+reserve_after_skips = 8        # starvation guard (0 => strict priority, no backfill)
+
 [task_defaults]                # applied to every task...
 max_retries = 2
 on_failure  = "dead_letter"    # dead_letter | drop | requeue
+priority    = 0                # higher => admitted first
 
 [tasks.resize]                 # ...then overridden per task name
 timeout_seconds = 60
 max_retries     = 1
 on_failure      = "drop"
 mem_bytes       = 268435456
+priority        = 10
 ```
 
 Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]` → `[tasks.<name>]`
@@ -124,6 +130,11 @@ Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]`
 - **Admission:** each task type declares a rough cost (`mem` / `gpu` / duration). The core
   starts a task only if it fits the live budget — not an all-or-nothing cap. `max_concurrent_tasks=1`
   is strictly sequential; `>1` is concurrent.
+- **Scheduling:** the dispatcher admits the **highest-priority** pending task that fits the live
+  budget. A too-large task does **not** head-of-line-block — smaller work behind it *backfills*
+  (skip-to-fit), while a bounded *reservation* keeps the skipped task from starving (it's admitted
+  once enough budget frees). Set priority via `gptps_set_task_priority()` or config; tune the
+  reservation with `[scheduler] reserve_after_skips`.
 - **Failure policy** (per task, overridable): `timeout_seconds`, `max_retries`,
   `retry_backoff_seconds`, `on_failure` = `dead_letter` (default) / `drop` / `requeue`.
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
@@ -155,12 +166,13 @@ gptps/
 ## Status
 
 Working today (Linux + macOS, tested + ThreadSanitizer-clean): the engine, all three
-executors, result delivery, retries/timeout/dead-letter, the add-on loader + ABI,
-constraints + observers, TOML config-file loading (limits + per-task overrides + add-on
-auto-load), the demo, CMake + CI + single-file amalgamation.
+executors, result delivery, retries/timeout/dead-letter, priority scheduling with
+skip-to-fit + reservation, the add-on loader + ABI, constraints + observers, TOML
+config-file loading (limits + scheduler + per-task overrides + add-on auto-load), the
+demo, CMake + CI + single-file amalgamation.
 
-In progress: richer scheduling (priority / skip-to-fit), cgroups memory enforcement,
-durable queue / GPU / WASM add-ons, and a Windows backend.
+In progress: cgroups v2 memory enforcement, durable queue / GPU / WASM add-ons, and a
+Windows backend.
 
 ## Design notes
 

@@ -10,8 +10,11 @@
  * for timing (deadline enforcement + retry backoff). Workers run tasks with the
  * lock released and post finished items to `done`; they never touch the ledger.
  *
- *   submit ─► [intake] ─► dispatcher admits (running<conc &&
- *                          reserved+cost<=max) ─► [ready] ─► worker runs
+ *   submit ─► [intake] ─► dispatcher admits the highest-PRIORITY item that fits
+ *                          (running<conc && reserved+cost<=max), skipping a
+ *                          too-large item to backfill smaller work behind it
+ *                          (bounded reservation guards against starvation)
+ *                                            ─► [ready] ─► worker runs
  *   worker  ─► [done] ─► dispatcher releases budget, then decides:
  *                          ok                -> free
  *                          fail & retries    -> [delayed] (re-admit after backoff)
@@ -56,6 +59,8 @@ typedef struct gptps_item {
     size_t                payload_len;
     gptps_cost            cost;
     gptps_failure_policy  policy;
+    int32_t               priority;  /* higher = admitted first (default 0) */
+    uint32_t              skips;     /* times a backfill admission jumped ahead while budget-blocked */
     uint32_t              attempt;   /* 1 = first try */
     uint64_t              deadline_ms;   /* 0 = no timeout */
     uint64_t              not_before_ms; /* backoff gate for delayed retries */
@@ -68,6 +73,7 @@ typedef struct gptps_reg {
     gptps_task_def     def;
     char              *name;
     char             **argv_copy;  /* owned NULL-terminated copy for EXEC_PROGRAM */
+    int32_t            priority;   /* scheduling priority for this task type (default 0) */
     struct gptps_reg  *next;
 } gptps_reg;
 
@@ -138,6 +144,7 @@ struct gptps {
     gptps_constraint *constraints;/* admission hooks consulted by the dispatcher */
 
     gptps_toml    *toml;          /* parsed config file (NULL if opened without one) */
+    uint32_t       reserve_after_skips; /* starvation guard: reserve a budget-blocked top task after this many backfill skips */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -386,6 +393,12 @@ static void *worker_main(void *arg)
  * only; the items themselves are always handled correctly). */
 #define GPTPS_PENDING_CAP 256
 
+/* Default starvation guard: a budget-blocked highest-priority task may be skipped
+ * by at most this many backfill admissions before the dispatcher reserves for it
+ * (suspends backfill and drains running tasks until it fits). Override per engine
+ * via the config file's [scheduler] reserve_after_skips. */
+#define GPTPS_RESERVE_AFTER 8u
+
 static uint64_t min_nonzero(uint64_t a, uint64_t b)
 {
     if (a == 0) return b;
@@ -510,39 +523,56 @@ static void *dispatcher_main(void *arg)
             }
         }
 
-        /* 4) admit the FIFO head if budget fits and constraints allow */
+        /* 4) admit in priority order with skip-to-fit backfill + starvation guard.
+         *    Each iteration scans intake for `top` (highest-priority item overall)
+         *    and `best` (highest-priority item that fits the live budget; ties
+         *    resolve to the older item, preserving FIFO within a priority). When
+         *    `best != top` we are about to skip the higher-priority `top` because
+         *    it does not fit yet: allowed (backfill) until `top` has been skipped
+         *    reserve_after_skips times, after which we reserve for it - admit
+         *    nothing and let running tasks drain until it fits (bounded). */
         while (e->intake.head && e->running < e->limits.max_concurrent_tasks) {
-            gptps_item *h = e->intake.head;
+            gptps_item *best = NULL, *top = NULL, *cur;
             uint32_t retry_after = 0;
             gptps_admit_decision dec;
 
-            if (e->reserved_mem + h->cost.mem_bytes > e->limits.max_memory_bytes)
-                break;                                   /* budget full for the head */
+            for (cur = e->intake.head; cur; cur = cur->next) {
+                if (!top || cur->priority > top->priority) top = cur;
+                if (e->reserved_mem + cur->cost.mem_bytes <= e->limits.max_memory_bytes &&
+                    (!best || cur->priority > best->priority))
+                    best = cur;
+            }
 
-            dec = run_constraints(e, h, &retry_after);
+            if (!best) break;                            /* nothing fits the live budget now */
+            if (best != top && top->skips >= e->reserve_after_skips)
+                break;                                   /* reserve for `top`: drain, admit nothing */
+
+            dec = run_constraints(e, best, &retry_after); /* consulted only on the chosen item */
             if (dec == GPTPS_DEFER) {
-                fifo_pop(&e->intake);
-                h->not_before_ms = now + retry_after;    /* re-check after the delay */
-                fifo_push(&e->delayed, h);
-                next_wake = min_nonzero(next_wake, h->not_before_ms);
+                fifo_remove(&e->intake, best);
+                best->not_before_ms = now + retry_after; /* re-check after the delay */
+                fifo_push(&e->delayed, best);
+                next_wake = min_nonzero(next_wake, best->not_before_ms);
                 continue;
             }
             if (dec == GPTPS_DENY) {
-                fifo_pop(&e->intake);
+                fifo_remove(&e->intake, best);
                 if (npend < GPTPS_PENDING_CAP) {
-                    pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = h->handle;
-                    pend[npend].name = h->def->name; pend[npend].status = GPTPS_E_DENIED;
-                    pend[npend].attempt = h->attempt; pend[npend].mem = h->cost.mem_bytes;
+                    pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = best->handle;
+                    pend[npend].name = best->def->name; pend[npend].status = GPTPS_E_DENIED;
+                    pend[npend].attempt = best->attempt; pend[npend].mem = best->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
-                fifo_push(&e->dead_letter, h);           /* denied -> retained */
+                fifo_push(&e->dead_letter, best);        /* denied -> retained */
                 e->dead_letter_count += 1;
                 continue;
             }
-            fifo_pop(&e->intake);
-            e->reserved_mem += h->cost.mem_bytes;
+
+            if (best != top) top->skips += 1;            /* charge the skipped higher-priority task */
+            fifo_remove(&e->intake, best);
+            e->reserved_mem += best->cost.mem_bytes;
             e->running      += 1;
-            fifo_push(&e->ready, h);
+            fifo_push(&e->ready, best);
             gptps_cond_signal(e->cv_work);
         }
 
@@ -624,6 +654,7 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     if (s != GPTPS_OK) { free(e); return s; }
 
     e->next_handle = 1;
+    e->reserve_after_skips = GPTPS_RESERVE_AFTER;
     e->m = gptps_mutex_create();
     e->cv_disp = gptps_cond_create();
     e->cv_work = gptps_cond_create();
@@ -661,7 +692,8 @@ fail:
 
 /* Apply a single config table's task overrides onto a task def. Values present
  * in the file override the def's compiled-in defaults (file wins). */
-static void apply_task_table(const gptps_toml *t, const char *section, gptps_task_def *def)
+static void apply_task_table(const gptps_toml *t, const char *section,
+                             gptps_task_def *def, int32_t *priority)
 {
     long long ll;
     const char *s;
@@ -669,6 +701,7 @@ static void apply_task_table(const gptps_toml *t, const char *section, gptps_tas
     if (gptps_toml_int(t, section, "max_retries", &ll))           def->default_policy.max_retries = (uint32_t)ll;
     if (gptps_toml_int(t, section, "retry_backoff_seconds", &ll)) def->default_policy.retry_backoff_seconds = (uint32_t)ll;
     if (gptps_toml_int(t, section, "mem_bytes", &ll))             def->default_cost.mem_bytes = (uint64_t)ll;
+    if (gptps_toml_int(t, section, "priority", &ll))              *priority = (int32_t)ll;
     s = gptps_toml_str(t, section, "on_failure");
     if (s) {
         if      (strcmp(s, "drop") == 0)        def->default_policy.on_failure = GPTPS_ON_FAILURE_DROP;
@@ -679,15 +712,16 @@ static void apply_task_table(const gptps_toml *t, const char *section, gptps_tas
 
 /* Layer file config over a task def: global [task_defaults] first, then the
  * task-specific [tasks.<name>] table (most specific wins). No-op without a file. */
-static void apply_task_config(const gptps_toml *t, const char *name, gptps_task_def *def)
+static void apply_task_config(const gptps_toml *t, const char *name,
+                              gptps_task_def *def, int32_t *priority)
 {
     char section[300];
     if (!t) return;
-    apply_task_table(t, "task_defaults", def);
+    apply_task_table(t, "task_defaults", def, priority);
     if (strlen(name) < sizeof section - 7) {
         strcpy(section, "tasks.");
         strcat(section, name);
-        apply_task_table(t, section, def);
+        apply_task_table(t, section, def, priority);
     }
 }
 
@@ -722,8 +756,12 @@ gptps_status gptps_open(const char *config_path, gptps **out_engine)
 
     if (t) {
         const char *const *addons;
+        long long ll;
         int n, k;
         (*out_engine)->toml = t;            /* retained for register-time task overrides */
+        /* [scheduler]: starvation-guard knob (0 => reserve immediately, no backfill) */
+        if (gptps_toml_int(t, "scheduler", "reserve_after_skips", &ll) && ll >= 0)
+            (*out_engine)->reserve_after_skips = (uint32_t)ll;
         /* top-level addons = ["lib1.so", ...] : auto-load (best-effort) */
         n = gptps_toml_str_array(t, "", "addons", &addons);
         for (k = 0; k < n; ++k) (void)gptps_load_addon(*out_engine, addons[k]);
@@ -790,11 +828,24 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->argv_copy = argv_copy;
     r->def.argv = (const char *const *)argv_copy; /* point at our owned copy (NULL for non-PROGRAM) */
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
-    apply_task_config(e->toml, name, &r->def); /* config file overrides compiled-in defaults */
+    r->priority = 0;
+    apply_task_config(e->toml, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
     r->next = e->registry;
     e->registry = r;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
+}
+
+gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priority)
+{
+    gptps_reg *r;
+    if (!e || !task_name) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    for (r = e->registry; r; r = r->next)
+        if (strcmp(r->name, task_name) == 0) break;
+    if (r) r->priority = (int32_t)priority;   /* applies to subsequently-submitted items */
+    gptps_mutex_unlock(e->m);
+    return r ? GPTPS_OK : GPTPS_E_NOTFOUND;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -918,6 +969,8 @@ gptps_status gptps_submit(gptps *e, const char *task_name,
     it->payload_len = len;
     it->cost = cost;
     it->policy = r->def.default_policy;
+    it->priority = r->priority;
+    it->skips = 0;
     it->attempt = 1;
 
     fifo_push(&e->intake, it);

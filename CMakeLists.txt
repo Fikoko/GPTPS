@@ -72,6 +72,14 @@ target_compile_definitions(test_toml PRIVATE ADDON_DEMO_PATH="$<TARGET_FILE:addo
 add_test(NAME toml COMMAND test_toml)
 set_tests_properties(toml PROPERTIES TIMEOUT 30)
 
+add_executable(test_scheduler tests/test_scheduler.c) # priority + skip-to-fit + reservation
+target_include_directories(test_scheduler
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_scheduler PRIVATE gptps)
+add_test(NAME scheduler COMMAND test_scheduler)
+set_tests_properties(scheduler PROPERTIES TIMEOUT 30)
+
 # add-on shared libraries (compiled against the frozen header; no core link)
 add_library(addon_demo MODULE tests/addon_demo.c)
 target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
