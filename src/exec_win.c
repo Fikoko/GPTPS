@@ -1,19 +1,25 @@
 /*
  * exec_win.c - Windows executor backend (counterpart to exec_oop_posix.c).
  *
- * The OOP executor (run an in-process task function inside an isolated, killable
- * CHILD) is built on POSIX fork() + cgroups/RLIMIT, which Windows has no direct
- * equivalent for. The external-PROGRAM executor (CreateProcess + a Job Object for
- * the memory cap and a single TerminateJobObject kill) is the natural Win32
- * mapping and is the planned next increment.
- *
- * Until then these report GPTPS_E_INVAL so the engine LINKS and EXEC_INPROC works
- * fully on Windows; EXEC_OOP / EXEC_PROGRAM tasks fail cleanly (and visibly) here.
+ *  - gptps_program_execute: the Win32 mapping of "run an external program as a
+ *    task" - CreateProcess with the payload piped to stdin and stdout captured as
+ *    the result, wrapped in a Job Object (optional memory cap + kill-on-close) and
+ *    hard-killed on the deadline. The genuinely-enforced, language-agnostic path.
+ *  - gptps_oop_execute: the OOP executor runs an in-process task FUNCTION inside an
+ *    isolated child, which is built on POSIX fork(); Windows has no equivalent, so
+ *    it reports GPTPS_E_INVAL (EXEC_OOP is POSIX-only).
  */
 #if defined(_WIN32)
 
 #include "gptps.h"
 #include "gptps_internal.h"
+
+#include <windows.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define GPTPS_WIN_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, a mem cap is meaningless */
+#define GPTPS_WIN_RESULT_CAP   (16u * 1024u * 1024u)        /* max captured stdout */
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s,
@@ -24,13 +30,158 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
     return GPTPS_E_INVAL; /* fork-based isolation is POSIX-only */
 }
 
+/* Quote argv into one CreateProcess command line (MSDN argv parsing rules). */
+static char *build_cmdline(const char *const *argv)
+{
+    size_t cap = 1, i;
+    char *out, *w;
+    for (i = 0; argv[i]; ++i) cap += 2 * strlen(argv[i]) + 3;
+    out = (char *)malloc(cap);
+    if (!out) return NULL;
+    w = out;
+    for (i = 0; argv[i]; ++i) {
+        const char *a = argv[i];
+        int quote = (*a == 0) || strpbrk(a, " \t\"") != NULL;
+        if (i) *w++ = ' ';
+        if (quote) *w++ = '"';
+        while (*a) {
+            size_t bs = 0, k;
+            while (*a == '\\') { ++bs; ++a; }
+            if (*a == 0) { for (k = 0; k < bs * 2; ++k) *w++ = '\\'; break; }      /* before closing quote */
+            else if (*a == '"') { for (k = 0; k < bs * 2 + 1; ++k) *w++ = '\\'; *w++ = '"'; ++a; }
+            else { for (k = 0; k < bs; ++k) *w++ = '\\'; *w++ = *a++; }
+        }
+        if (quote) *w++ = '"';
+    }
+    *w = 0;
+    return out;
+}
+
+typedef struct { HANDLE h; const char *data; size_t len; } writer_ctx;
+static DWORD WINAPI writer_proc(LPVOID p)
+{
+    writer_ctx *w = (writer_ctx *)p;
+    size_t off = 0; DWORD wr;
+    while (off < w->len) {
+        if (!WriteFile(w->h, w->data + off, (DWORD)(w->len - off), &wr, NULL) || wr == 0) break;
+        off += wr;
+    }
+    CloseHandle(w->h); /* EOF on the child's stdin */
+    return 0;
+}
+
+typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize; } reader_ctx;
+static DWORD WINAPI reader_proc(LPVOID p)
+{
+    reader_ctx *r = (reader_ctx *)p;
+    for (;;) {
+        DWORD got;
+        if (r->len == r->cap) {
+            size_t nc = r->cap ? r->cap * 2 : 65536;
+            char *nb;
+            if (nc > GPTPS_WIN_RESULT_CAP) nc = GPTPS_WIN_RESULT_CAP;
+            if (nc == r->cap) { r->oversize = 1; break; }
+            nb = (char *)realloc(r->buf, nc);
+            if (!nb) { r->nomem = 1; break; }
+            r->buf = nb; r->cap = nc;
+        }
+        if (!ReadFile(r->h, r->buf + r->len, (DWORD)(r->cap - r->len), &got, NULL)) break; /* pipe closed */
+        if (got == 0) break;
+        r->len += got;
+    }
+    return 0;
+}
+
 gptps_status gptps_program_execute(const char *const *argv, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s,
                                    void **out_result, size_t *out_len)
 {
-    (void)argv; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s;
+    SECURITY_ATTRIBUTES sa;
+    HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    writer_ctx wc;
+    reader_ctx rc;
+    char *cmd;
+    DWORD code = 1, tmo, waited;
+    int killed = 0, assigned = 0;
+    gptps_status eff;
+
     *out_result = NULL; *out_len = 0;
-    return GPTPS_E_INVAL; /* TODO: CreateProcess + Job Object on Windows */
+    if (!argv || !argv[0]) return GPTPS_E_INVAL;
+
+    sa.nLength = sizeof sa; sa.lpSecurityDescriptor = NULL; sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&inR, &inW, &sa, 0)) return GPTPS_E_IO;
+    if (!CreatePipe(&outR, &outW, &sa, 0)) { CloseHandle(inR); CloseHandle(inW); return GPTPS_E_IO; }
+    /* parent-side ends must NOT be inherited by the child */
+    SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+
+    job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+        memset(&jeli, 0, sizeof jeli);
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (mem_cap >= GPTPS_WIN_MEMCAP_FLOOR) {
+            jeli.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            jeli.ProcessMemoryLimit = (SIZE_T)mem_cap;
+        }
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof jeli);
+    }
+
+    cmd = build_cmdline(argv);
+    if (!cmd) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
+                if (job) CloseHandle(job); return GPTPS_E_NOMEM; }
+
+    memset(&si, 0, sizeof si); si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = inR;
+    si.hStdOutput = outW;
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    memset(&pi, 0, sizeof pi);
+
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        free(cmd);
+        CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
+        if (job) CloseHandle(job);
+        return GPTPS_E_TASK; /* program could not be started */
+    }
+    free(cmd);
+    CloseHandle(inR); CloseHandle(outW); /* child owns these; parent keeps inW + outR */
+
+    if (job && AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
+    ResumeThread(pi.hThread);
+
+    wc.h = inW; wc.data = (const char *)payload; wc.len = plen;
+    rc.h = outR; rc.buf = NULL; rc.len = rc.cap = 0; rc.nomem = rc.oversize = 0;
+    wt = CreateThread(NULL, 0, writer_proc, &wc, 0, NULL);
+    if (!wt) CloseHandle(inW);                 /* no writer => close stdin so the child sees EOF */
+    rt = CreateThread(NULL, 0, reader_proc, &rc, 0, NULL);
+
+    tmo = (timeout_s == 0) ? INFINITE : (timeout_s > 2000000u ? INFINITE : timeout_s * 1000u);
+    waited = WaitForSingleObject(pi.hProcess, tmo);
+    if (waited == WAIT_TIMEOUT) {
+        killed = 1;
+        if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE); /* fully gone => its stdout closes => reader ends */
+    if (wt) { WaitForSingleObject(wt, INFINITE); CloseHandle(wt); }
+    if (rt) { WaitForSingleObject(rt, INFINITE); CloseHandle(rt); }
+    GetExitCodeProcess(pi.hProcess, &code);
+
+    CloseHandle(outR);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    if (job) CloseHandle(job);
+
+    if      (killed)        eff = GPTPS_E_TIMEOUT;
+    else if (rc.oversize)   eff = GPTPS_E_IO;
+    else if (rc.nomem)      eff = GPTPS_E_NOMEM;
+    else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
+
+    if (eff == GPTPS_OK) { *out_result = rc.buf; *out_len = rc.len; }
+    else free(rc.buf);
+    return eff;
 }
 
 #endif /* _WIN32 */

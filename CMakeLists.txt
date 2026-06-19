@@ -188,6 +188,16 @@ if(UNIX)
     set_tests_properties(wasm PROPERTIES TIMEOUT 30)
 endif()
 
+# --- cross-platform external-program executor test (POSIX + Windows) -------
+add_executable(prog_helper tests/prog_helper.c)         # tiny portable test binary
+add_executable(test_program_helper tests/test_program_helper.c)
+target_include_directories(test_program_helper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_program_helper PRIVATE gptps)
+target_compile_definitions(test_program_helper PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_program_helper prog_helper)
+add_test(NAME program_helper COMMAND test_program_helper)
+set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
+
 # --- examples (runnable usage; double as smoke tests) ----------------------
 add_executable(demo examples/demo.c)
 target_include_directories(demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
