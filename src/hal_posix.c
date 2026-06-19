@@ -7,6 +7,17 @@
  * The cancel flag uses compiler atomic builtins (GCC/Clang, available in C99),
  * else C11 <stdatomic.h>, else a plain store with a documented weak guarantee.
  */
+
+/* Feature-test macros must precede ANY system header so strict -std=c99 still
+ * exposes the POSIX / clock / sysctl APIs the HAL uses. Defining them here lets
+ * the file (and the single-file amalgamation) build with a plain `cc -std=c99`. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE
+#endif
+
 #include "gptps_hal.h"
 
 #include <stdlib.h>
