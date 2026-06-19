@@ -283,8 +283,32 @@ appended field, never a reshape.
 ## 12. Verification discipline
 
 Every increment ships with tests and is held to: CTest green on Linux + macOS,
-ThreadSanitizer-clean on the concurrent paths (ASLR disabled in CI), stress loops
-on timing-sensitive tests, and a check that all three build paths work (CMake, the
-single-file amalgamation, and a plain `cc -std=c99`). Platform-specific tests
-(OOP memory caps, cgroup enforcement) **self-skip** where the facility is absent
-rather than failing.
+**AddressSanitizer + UBSan**-clean across the whole suite and **ThreadSanitizer**-
+clean on the concurrent paths (ASLR disabled in CI), stress loops on timing-
+sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
+check that all three build paths work (CMake, the single-file amalgamation, and a
+plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
+**self-skip** where the facility is absent rather than failing. CI runs five jobs:
+`build-test` (Linux + macOS), `amalgamation`, `asan`, and `tsan`.
+
+---
+
+## 13. Future work (intentionally not built yet)
+
+Two planned items are **not** implemented, because this project only ships code it
+can verify, and neither could be tested in the environment they were developed in:
+
+- **WASM executor add-on** — run a `.wasm` module as a task. Intended as an
+  executor/transport-seam add-on linking a small embeddable runtime (e.g. wasm3 or
+  wasmtime). Blocked on having a runtime to link + test against. *Today, a `.wasm`
+  module can already run with no new code* via `GPTPS_EXEC_PROGRAM` and a runtime
+  CLI (`argv = ["wasmtime", "module.wasm", …]`).
+- **Windows HAL** — `hal_win.c` (Win32 threads/condvars, `LoadLibrary`) and
+  `exec_oop_win.c` (Job Objects for the memory cap + kill, replacing the POSIX
+  `fork`/cgroup path), plus a `windows-latest` CI job. The HAL interface
+  (`gptps_hal.h`) is already platform-neutral and the executor seam already
+  abstracts process control, so this is additive — but it must be written and
+  tested on Windows.
+
+Both are tracked here rather than stubbed in code, so the tree stays fully tested
+and green.
