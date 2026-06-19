@@ -2,15 +2,16 @@
  * gptps_hal.h - GPTPS Hardware Abstraction Layer (INTERNAL, not a public API).
  *
  * The only platform-specific seam. The interface is pure C99; each
- * implementation (hal_posix.c, later hal_win.c) uses the best primitive its
+ * implementation (hal_posix.c, hal_win.c) uses the best primitive its
  * platform/toolchain offers. Atomics live ONLY inside the implementation so
  * the C99 core never includes an _Atomic type.
  *
  *   core (C99) ──uses──► gptps_hal_* (this header) ──impl──► hal_posix.c / hal_win.c
  *
- * Build status: hwdetect, monotonic clock, and the cancel flag are implemented
- * (T3, first slice). Threads, dynamic loading, and the OS memory cap are part
- * of this seam and land in later T3 increments.
+ * Both backends implement the full interface (hwdetect, monotonic clock, cancel
+ * flag, threads/mutex/condvar, dynamic loading). The POSIX backend also carries
+ * the fork-based out-of-process executors (exec_oop_posix.c); their Win32
+ * equivalent (CreateProcess + Job Objects) is a later increment.
  */
 #ifndef GPTPS_HAL_H
 #define GPTPS_HAL_H

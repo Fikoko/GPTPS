@@ -176,20 +176,24 @@ gptps/
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)
 ├── tools/amalgamate.sh  ← generates the single-file gptps.c + gptps.h
 ├── CMakeLists.txt
-└── .github/workflows/ci.yml   Linux + macOS build/test + ThreadSanitizer
+└── .github/workflows/ci.yml   Linux + macOS + Windows build/test, ASan/UBSan, ThreadSanitizer
 ```
 
 ## Status
 
-Working today (Linux + macOS, tested + ThreadSanitizer-clean): the engine, all three
-executors, result delivery, retries/timeout/dead-letter + dead-letter drain, priority
-scheduling with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with
-RLIMIT_AS fallback), the add-on loader + ABI, constraints + observers, TOML config-file
-loading (limits + scheduler + per-task overrides + add-on auto-load), the crash-durable
-queue, GPU-quota, and WASM-executor add-ons, the demo, CMake + CI + single-file amalgamation.
+Working today (tested + ThreadSanitizer-clean): the engine, all three executors,
+result delivery, retries/timeout/dead-letter + dead-letter drain, priority scheduling
+with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with RLIMIT_AS
+fallback), the add-on loader + ABI, constraints + observers, TOML config-file loading
+(limits + scheduler + per-task overrides + add-on auto-load), the crash-durable queue,
+GPU-quota, and WASM-executor add-ons, the demo, CMake + CI + single-file amalgamation.
 
-In progress: a bundled wasm runtime for the WASM add-on (today it's bring-your-own-runtime)
-and a Windows backend.
+Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** runs the
+engine, scheduler, config, in-process executor, and the add-on loader (Win32 HAL via
+`src/hal_win.c`); the fork-based OOP / external-program executors are POSIX-only for now.
+
+In progress: the Windows fork-equivalent executors (CreateProcess + Job Objects) and a
+bundled wasm runtime for the WASM add-on (today it's bring-your-own-runtime).
 
 ## Design notes
 

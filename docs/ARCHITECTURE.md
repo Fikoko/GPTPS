@@ -212,9 +212,14 @@ primitive its platform offers, and **all atomics are confined to the backend**
 so the core never includes an `_Atomic` type.
 
 Surface: hardware detection (CPU/RAM/GPU hint), monotonic clock, the cancel flag
-(opaque, atomic inside), mutex / condvar / thread, and dynamic loading
-(`dlopen`). `hal_posix.c` is the POSIX backend (pthreads, `clock_gettime`,
-`sysctl`/`sysinfo`, `dlopen`); a `hal_win.c` (Win32) is a future increment.
+(opaque, atomic inside), mutex / condvar / thread, and dynamic loading. Two
+backends implement it: `hal_posix.c` (pthreads, `clock_gettime`,
+`sysctl`/`sysinfo`, `dlopen`) and `hal_win.c` (`_beginthreadex`,
+`CRITICAL_SECTION` + `CONDITION_VARIABLE`, `Interlocked*`, `GetTickCount64`,
+`GetSystemInfo`/`GlobalMemoryStatusEx`, `LoadLibrary`). CMake picks the backend by
+platform; both are CI-verified (Windows via mingw-w64 on a `windows-latest`
+runner). The fork-based out-of-process executors are POSIX-only today; their Win32
+equivalent (`CreateProcess` + Job Objects) is a later increment.
 
 Feature-test macros (`_GNU_SOURCE` / `_DARWIN_C_SOURCE`) are defined **in-source**
 at the top of each backend (and at the top of the amalgamation), so a plain
@@ -289,8 +294,8 @@ clean on the concurrent paths (ASLR disabled in CI), stress loops on timing-
 sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
-**self-skip** where the facility is absent rather than failing. CI runs five jobs:
-`build-test` (Linux + macOS), `amalgamation`, `asan`, and `tsan`.
+**self-skip** where the facility is absent rather than failing. CI runs six jobs:
+`build-test` (Linux + macOS), `windows` (mingw-w64), `amalgamation`, `asan`, and `tsan`.
 
 ---
 
@@ -309,12 +314,13 @@ developed in:
   and a bundled default would need a runtime to vendor + test against. *A `.wasm`
   can also run with no add-on at all* via `GPTPS_EXEC_PROGRAM` + a runtime CLI
   (`argv = ["wasmtime", "module.wasm", …]`).
-- **Windows HAL** — `hal_win.c` (Win32 threads/condvars, `LoadLibrary`) and
-  `exec_oop_win.c` (Job Objects for the memory cap + kill, replacing the POSIX
-  `fork`/cgroup path), plus a `windows-latest` CI job. The HAL interface
-  (`gptps_hal.h`) is already platform-neutral and the executor seam already
-  abstracts process control, so this is additive — but it must be written and
-  tested on Windows.
+- **Windows executors** — the Win32 HAL (`hal_win.c`) and a `windows-latest` CI
+  job now ship and are green, so the engine/scheduler/config/in-process executor
+  and the add-on loader run on Windows. What's left is the fork-equivalent
+  executors: `exec_win.c` currently stubs `gptps_oop_execute` /
+  `gptps_program_execute` to `GPTPS_E_INVAL`; a real `CreateProcess` + Job Object
+  implementation (memory cap + single-kill) would restore the OOP/PROGRAM kinds on
+  Windows.
 
-Both are tracked here rather than stubbed in code, so the tree stays fully tested
-and green.
+These are tracked here rather than stubbed misleadingly, so the tree stays fully
+tested and green.
