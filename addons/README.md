@@ -56,6 +56,43 @@ gptps_shutdown(engine);
 gptps_gpu_quota_close(q);
 ```
 
+## wasm_exec — run WebAssembly modules as tasks (bring-your-own-runtime)
+
+`wasm_exec.c` / `wasm_exec.h`. A `.wasm` module is portable, sandboxed task code —
+"write one task, run it on any hardware." A wasm *interpreter*, though, is a heavy
+dependency, so this add-on owns the GPTPS-side integration (module-as-task:
+admission, cost/priority, retries/timeout, result delivery, and — in OOP mode —
+OS-enforced memory caps + hard-kill) and leaves the **runtime pluggable**: you
+supply one `gptps_wasm_run_fn` that drives wasm3 / wasmtime / WAMR / etc.
+
+- **Why pluggable:** keeps the core dependency-free and portable; any runtime drops
+  in. (Zero-glue alternative: `GPTPS_EXEC_PROGRAM` with a runtime CLI, e.g.
+  `argv = {"wasmtime", "module.wasm", NULL}`.)
+- **Modes:** in-process (cooperative cancel) or OOP (forked, OS-capped, hard-killed);
+  the runtime must be fork-safe for OOP.
+- **Ordering:** `gptps_wasm_close()` after `gptps_shutdown()`.
+- **Portability:** POSIX.
+
+```c
+/* you implement run_wasm3() against your runtime of choice */
+gptps_wasm *w = gptps_wasm_install(engine, run_wasm3, NULL);
+gptps_wasm_register(w, "resize", "/modules/resize.wasm", /*oop*/ 1, NULL, NULL);
+gptps_submit(engine, "resize", jpeg, jpeg_len, &h);   /* runs the module, sandboxed */
+gptps_shutdown(engine);
+gptps_wasm_close(w);
+```
+
+A minimal `gptps_wasm_run_fn` skeleton against wasm3 (illustrative):
+
+```c
+static gptps_status run_wasm3(const char *path, const void *in, size_t n,
+                              void **out, size_t *out_n, void *ud) {
+    /* m3_NewEnvironment / ParseModule(path) / LoadModule / FindFunction("run")
+       -> write `in` into wasm memory, call it, copy the result region into a
+       malloc'd buffer -> *out/*out_n. Return GPTPS_OK or an error. */
+}
+```
+
 ```c
 gptps_dq *dq = gptps_dq_open(engine, "queue.journal");
 gptps_dq_recover(dq);                              /* replay prior-run survivors */

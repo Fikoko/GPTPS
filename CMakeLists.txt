@@ -170,6 +170,15 @@ if(UNIX)
     target_link_libraries(test_fuzz PRIVATE gptps)
     add_test(NAME fuzz COMMAND test_fuzz)
     set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
+
+    # wasm executor add-on (module-as-task; mock runtime in the test). POSIX (OOP forks)
+    add_executable(test_wasm tests/test_wasm.c addons/wasm_exec.c)
+    target_include_directories(test_wasm
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
+    )
+    target_link_libraries(test_wasm PRIVATE gptps)
+    add_test(NAME wasm COMMAND test_wasm)
+    set_tests_properties(wasm PROPERTIES TIMEOUT 30)
 endif()
 
 # --- examples (runnable usage; double as smoke tests) ----------------------

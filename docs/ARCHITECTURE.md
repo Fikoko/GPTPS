@@ -242,9 +242,10 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams can simply be compiled into the host. Two ship
-in `addons/`: `durable_queue.c` (observer seam → crash-durable journal) and
-`gpu_quota.c` (constraint + observer composed → GPU-unit admission quota). See
+and the observer/constraint seams can simply be compiled into the host. Three ship
+in `addons/`: `durable_queue.c` (observer seam → crash-durable journal),
+`gpu_quota.c` (constraint + observer composed → GPU-unit admission quota), and
+`wasm_exec.c` (module-as-task with a pluggable wasm runtime). See
 [`addons/README.md`](../addons/README.md).
 
 ---
@@ -295,14 +296,19 @@ plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforceme
 
 ## 13. Future work (intentionally not built yet)
 
-Two planned items are **not** implemented, because this project only ships code it
-can verify, and neither could be tested in the environment they were developed in:
+Some planned work is partial or unbuilt, because this project only ships code it
+can verify, and these could not be fully tested in the environment they were
+developed in:
 
-- **WASM executor add-on** — run a `.wasm` module as a task. Intended as an
-  executor/transport-seam add-on linking a small embeddable runtime (e.g. wasm3 or
-  wasmtime). Blocked on having a runtime to link + test against. *Today, a `.wasm`
-  module can already run with no new code* via `GPTPS_EXEC_PROGRAM` and a runtime
-  CLI (`argv = ["wasmtime", "module.wasm", …]`).
+- **WASM executor — runtime is bring-your-own.** `addons/wasm_exec.c` ships the
+  GPTPS-side integration: a `.wasm` module becomes a first-class task (admission,
+  cost/priority, retries/timeout, result delivery, and OOP sandboxing), with the
+  wasm interpreter supplied via a pluggable `gptps_wasm_run_fn` hook. It is fully
+  tested with a mock runtime. What's **not** bundled is an actual interpreter
+  (wasm3/wasmtime/WAMR) — that's left pluggable to keep the core dependency-free,
+  and a bundled default would need a runtime to vendor + test against. *A `.wasm`
+  can also run with no add-on at all* via `GPTPS_EXEC_PROGRAM` + a runtime CLI
+  (`argv = ["wasmtime", "module.wasm", …]`).
 - **Windows HAL** — `hal_win.c` (Win32 threads/condvars, `LoadLibrary`) and
   `exec_oop_win.c` (Job Objects for the memory cap + kill, replacing the POSIX
   `fork`/cgroup path), plus a `windows-latest` CI job. The HAL interface
