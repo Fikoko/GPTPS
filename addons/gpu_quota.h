@@ -20,7 +20,7 @@
  *     gptps_shutdown(e);
  *     gptps_gpu_quota_close(q);
  *
- * POSIX only (pthreads).
+ * Portable (Linux/macOS/Windows) via the addon_compat mutex shim.
  */
 #ifndef GPTPS_GPU_QUOTA_H
 #define GPTPS_GPU_QUOTA_H

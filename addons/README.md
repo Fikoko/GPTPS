@@ -25,7 +25,7 @@ dead-lettered; `gptps_dq_recover()` re-submits anything a prior run left unfinis
   the journal and replay on recover.
 - **Ordering:** call `gptps_dq_close()` **after** `gptps_shutdown()` (the engine has
   no unregister-observer call, so the queue must outlive event delivery).
-- **Portability:** POSIX (uses `fsync` + pthreads).
+- **Portability:** Linux/macOS/Windows (via the `addon_compat` mutex + fsync shim).
 
 Build:
 
@@ -47,7 +47,7 @@ than your budget allows.
 - **Model:** `gpu_units` is treated as fixed per task type. Install as *the* GPU
   constraint.
 - **Ordering:** call `gptps_gpu_quota_close()` after `gptps_shutdown()`.
-- **Portability:** POSIX (pthreads).
+- **Portability:** Linux/macOS/Windows (via the `addon_compat` mutex shim).
 
 ```c
 gptps_gpu_quota *q = gptps_gpu_quota_install(engine, /*total*/ 8, /*defer_ms*/ 25);
@@ -68,10 +68,10 @@ supply one `gptps_wasm_run_fn` that drives wasm3 / wasmtime / WAMR / etc.
 - **Why pluggable:** keeps the core dependency-free and portable; any runtime drops
   in. (Zero-glue alternative: `GPTPS_EXEC_PROGRAM` with a runtime CLI, e.g.
   `argv = {"wasmtime", "module.wasm", NULL}`.)
-- **Modes:** in-process (cooperative cancel) or OOP (forked, OS-capped, hard-killed);
-  the runtime must be fork-safe for OOP.
+- **Modes:** in-process (cooperative cancel; all platforms) or OOP (forked,
+  OS-capped, hard-killed; POSIX only — the runtime must be fork-safe).
 - **Ordering:** `gptps_wasm_close()` after `gptps_shutdown()`.
-- **Portability:** POSIX.
+- **Portability:** Linux/macOS/Windows (the add-on itself has no platform calls).
 
 ```c
 /* you implement run_wasm3() against your runtime of choice */
@@ -96,9 +96,16 @@ static gptps_status run_wasm3(const char *path, const void *in, size_t n,
 ## tui — real-time terminal dashboard
 
 `tui.c` / `tui.h`. A live, portable terminal dashboard over a running engine,
-built on the observer seam: cumulative counts, an in-flight gauge, a per-task
-table, and a scrolling recent-events log — ANSI/VT escapes only (no ncurses;
-Windows VT enabled automatically).
+built on the observer seam — ANSI/VT escapes only (no ncurses; Windows VT enabled
+automatically). Panes/metrics:
+
+- header: uptime + **throughput** (done/s);
+- counts (queued/started/finished/failed/retried/dead) + an **in-flight gauge bar**;
+- per-task table: run / ok / fail / dead, **success rate (ok%)**, and **average
+  queue→finish latency (ms)**, plus the task's hotkey;
+- a **scrollable** recent-events log (timestamped) — `k`/`j` scroll older/newer
+  (keyboard, so it's portable everywhere; mouse reporting isn't universal, so it's
+  intentionally not used).
 
 - **Global settings** (`gptps_tui_config`): refresh rate, color, interactivity,
   which panes to show, title, output stream.

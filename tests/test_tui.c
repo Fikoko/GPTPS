@@ -76,7 +76,15 @@ int main(void)
     CHECK(strstr(frame, "RECENT")     != NULL);
     CHECK(strstr(frame, "FINISHED")   != NULL);   /* a recent finished event */
     CHECK(strstr(frame, "finished 4") != NULL);   /* cumulative count */
+    CHECK(strstr(frame, "done/s")     != NULL);   /* throughput metric */
+    CHECK(strstr(frame, "avg ms")     != NULL);   /* latency column */
+    CHECK(strstr(frame, "ok%")        != NULL);   /* success-rate column */
+    CHECK(strstr(frame, "in-flight")  != NULL);   /* gauge */
     CHECK(strstr(frame, "\x1b[") == NULL);        /* color off => no escape codes */
+
+    /* keyboard scroll (k = older, j = newer); not bound to a task => return 2 */
+    CHECK(gptps_tui_press(t, 'k') == 2);
+    CHECK(gptps_tui_press(t, 'j') == 2);
 
     /* hiding a pane (global setting) */
     {

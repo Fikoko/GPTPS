@@ -13,8 +13,9 @@
  * no-glue alternative remains GPTPS_EXEC_PROGRAM with a runtime CLI, e.g.
  * argv = {"wasmtime", "module.wasm", NULL}.)
  *
- * Built only on the public API (no core ABI change). POSIX (pthreads); OOP mode
- * also needs the fork-based executor, so the runtime must be fork-safe to use it.
+ * Built only on the public API (no core ABI change); portable (no platform calls
+ * of its own). OOP mode uses the fork-based executor (POSIX only), so the runtime
+ * must be fork-safe to use it; in-process mode runs everywhere.
  */
 #ifndef GPTPS_WASM_EXEC_H
 #define GPTPS_WASM_EXEC_H

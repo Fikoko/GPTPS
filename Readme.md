@@ -165,8 +165,10 @@ in-process binding, the [`wasm_exec`](addons/) add-on takes a pluggable runtime 
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
 - **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
-- **Live dashboard (optional):** `addons/tui.c` is a portable real-time terminal UI (counts,
-  per-task table, recent log, hotkeys to submit tasks) — global + per-task configurable.
+- **Live dashboard (optional):** `addons/tui.c` is a portable real-time terminal UI — throughput,
+  in-flight gauge, a per-task table with success-rate + average latency, a scrollable recent log
+  (`k`/`j`), and hotkeys to submit tasks. Global + per-task configurable. Keyboard-driven (no mouse,
+  since mouse reporting isn't portable to every terminal).
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
   versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See

@@ -24,7 +24,7 @@
  * gptps_dq_close MUST be called after gptps_shutdown: the engine has no
  * unregister-observer call, so the queue must outlive event delivery.
  *
- * POSIX only (uses fsync + pthreads). Build: cc ... durable_queue.c
+ * Portable (Linux/macOS/Windows) via the addon_compat shim. Build: cc ... durable_queue.c addons/addon_compat.h is header-only
  */
 #ifndef GPTPS_DURABLE_QUEUE_H
 #define GPTPS_DURABLE_QUEUE_H

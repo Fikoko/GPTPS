@@ -49,6 +49,8 @@ typedef struct {
     void    *payload;
     size_t   plen;
     unsigned started, finished, failed, retried, dead;
+    uint64_t lat_sum_ms, lat_max_ms;   /* queue->finish latency accumulators */
+    unsigned lat_n;
 } tui_task;
 
 typedef struct { uint64_t ts; int kind; char name[64]; uint64_t handle; gptps_status status; } tui_event;
@@ -63,6 +65,9 @@ struct gptps_tui {
     int              ntasks;
     tui_event       *recent;
     int              rcap, rn, rhead;
+    struct { gptps_handle h; uint64_t ts; } *lat;  /* handle->queued-ts ring for latency */
+    int              lat_cap, lat_head;
+    int              scroll;        /* recent-log scroll offset (lines back) */
     int              quit, show_tasks, show_recent;
     int              raw_active;
 #if !defined(_WIN32)
@@ -104,10 +109,30 @@ static void tui_on_event(const gptps_event *ev, void *ud)
     }
     inflight = t->s - t->fin - t->fail;          /* per-attempt: never underflows */
     if (inflight > t->peak) t->peak = inflight;
+
+    /* latency: remember queued time per handle; resolve on finish */
+    if (ev->kind == GPTPS_EV_QUEUED && t->lat_cap > 0) {
+        t->lat[t->lat_head].h = ev->handle; t->lat[t->lat_head].ts = ev->ts_ms;
+        t->lat_head = (t->lat_head + 1) % t->lat_cap;
+    }
+
     if ((tk = task_for(t, ev->task_name)) != NULL) {
         switch (ev->kind) {
             case GPTPS_EV_STARTED:       tk->started++;  break;
-            case GPTPS_EV_FINISHED:      tk->finished++; break;
+            case GPTPS_EV_FINISHED:
+                tk->finished++;
+                if (t->lat_cap > 0) {                 /* find this handle's queued ts */
+                    int j;
+                    for (j = 0; j < t->lat_cap; ++j)
+                        if (t->lat[j].h == ev->handle) {
+                            uint64_t l = (ev->ts_ms >= t->lat[j].ts) ? ev->ts_ms - t->lat[j].ts : 0;
+                            tk->lat_sum_ms += l; tk->lat_n++;
+                            if (l > tk->lat_max_ms) tk->lat_max_ms = l;
+                            t->lat[j].h = 0;          /* consume */
+                            break;
+                        }
+                }
+                break;
             case GPTPS_EV_FAILED:        tk->failed++;   break;
             case GPTPS_EV_RETRIED:       tk->retried++;  break;
             case GPTPS_EV_DEAD_LETTERED: tk->dead++;     break;
@@ -163,29 +188,45 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 
     mu_lock(&t->mu);
     up = (double)(gptps_now_ms(NULL) - t->start_ms) / 1000.0;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s%s   up %.1fs\n", B, t->cfg.title, X, up);
-    pos = appendf(buf, cap, pos, "queued %u  started %u  in-flight %u (peak %u)\n",
-                  t->q, t->s, t->s - t->fin - t->fail, t->peak);
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s%s   up %.1fs   %.1f done/s\n",
+                  B, t->cfg.title, X, up, (up > 0.05 ? (double)t->fin / up : 0.0));
+    {   /* in-flight gauge bar (ASCII; scaled to peak) */
+        unsigned inflt = t->s - t->fin - t->fail, w, j;
+        char bar[21];
+        w = (t->peak && inflt) ? (inflt * 20u / t->peak) : 0; if (w > 20u) w = 20u;
+        for (j = 0; j < 20u; ++j) bar[j] = (j < w) ? '#' : ' ';
+        bar[20] = 0;
+        pos = appendf(buf, cap, pos, "queued %u  started %u  in-flight %u [%s] peak %u\n",
+                      t->q, t->s, inflt, bar, t->peak);
+    }
     pos = appendf(buf, cap, pos, "%sfinished %u%s  %sfailed %u%s  retried %u  %sdead %u%s\n",
                   G, t->fin, X, (t->fail ? R : ""), t->fail, X, t->retr, (t->dead ? R : ""), t->dead, X);
 
     if (t->show_tasks) {
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
-        pos = appendf(buf, cap, pos, "  %-16s %5s %5s %5s %5s  key\n", "label", "run", "ok", "fail", "dead");
+        pos = appendf(buf, cap, pos, "  %-16s %5s %5s %5s %5s %5s %8s  key\n",
+                      "label", "run", "ok", "fail", "dead", "ok%", "avg ms");
         for (i = 0; i < t->ntasks; ++i) {
             tui_task *k = &t->tasks[i];
-            char key[8];
+            char key[8], pct[8], lat[12];
+            unsigned terminal = k->finished + k->dead;
             if (k->hotkey) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
-            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u  %s\n",
-                          k->label, k->started, k->finished, k->failed, k->dead, key);
+            if (terminal) snprintf(pct, sizeof pct, "%3u%%", k->finished * 100u / terminal); else strcpy(pct, "  --");
+            if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum_ms / k->lat_n); else strcpy(lat, "      --");
+            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %5s %8s  %s\n",
+                          k->label, k->started, k->finished, k->failed, k->dead, pct, lat, key);
         }
     }
 
     if (t->show_recent && t->rcap > 0) {
-        int shown = t->rn, start;
+        int shown = t->rn, start, maxoff;
         if (shown > t->cfg.max_recent) shown = t->cfg.max_recent;
-        start = (t->rhead - shown + t->rcap * 2) % t->rcap; /* oldest of the shown window */
-        pos = appendf(buf, cap, pos, "\n%sRECENT%s\n", B, X);
+        maxoff = t->rn - shown; if (maxoff < 0) maxoff = 0;
+        if (t->scroll > maxoff) t->scroll = maxoff;     /* clamp (keys can over-scroll) */
+        if (t->scroll < 0) t->scroll = 0;
+        start = (t->rhead - t->scroll - shown + t->rcap * 4) % t->rcap; /* window end = newest - scroll */
+        if (t->scroll > 0) pos = appendf(buf, cap, pos, "\n%sRECENT%s  %s(scrolled +%d)%s\n", B, X, D, t->scroll, X);
+        else               pos = appendf(buf, cap, pos, "\n%sRECENT%s\n", B, X);
         for (i = 0; i < shown; ++i) {
             tui_event *re = &t->recent[(start + i) % t->rcap];
             const char *kc = (re->kind == GPTPS_EV_FAILED || re->kind == GPTPS_EV_DEAD_LETTERED) ? R
@@ -225,6 +266,8 @@ int gptps_tui_press(gptps_tui *t, int key)
         if (t->tasks[i].hotkey == key) { name = t->tasks[i].name; pl = t->tasks[i].payload; pn = t->tasks[i].plen; break; }
     mu_unlock(&t->mu);                 /* submit OUTSIDE the lock: QUEUED fires our observer */
     if (name) { gptps_handle h; gptps_submit(t->e, name, pl, pn, &h); return 1; }
+    if (key == 'k' || key == 'K') { mu_lock(&t->mu); t->scroll += 1; mu_unlock(&t->mu); return 2; } /* scroll to older */
+    if (key == 'j' || key == 'J') { mu_lock(&t->mu); if (t->scroll > 0) t->scroll -= 1; mu_unlock(&t->mu); return 2; } /* newer */
     return 0;
 }
 
@@ -331,6 +374,9 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     t->rcap = max;
     t->recent = (tui_event *)calloc((size_t)max, sizeof(tui_event));
     if (!t->recent) { mu_destroy(&t->mu); free(t); return NULL; }
+    t->lat_cap = 1024;     /* handle->queued-ts ring for latency (approx under very deep queues) */
+    t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
+    if (!t->lat) { free(t->recent); mu_destroy(&t->mu); free(t); return NULL; }
     t->start_ms = gptps_now_ms(NULL);
     if (gptps_register_observer(e, tui_on_event, t) != GPTPS_OK) {
         free(t->recent); mu_destroy(&t->mu); free(t); return NULL;
@@ -345,6 +391,7 @@ void gptps_tui_close(gptps_tui *t)
     term_restore(t);                 /* in case run() was interrupted */
     for (i = 0; i < t->ntasks; ++i) free(t->tasks[i].payload);
     free(t->recent);
+    free(t->lat);
     mu_destroy(&t->mu);
     free(t);
 }
