@@ -186,13 +186,17 @@ Per-task `gptps_failure_policy`: `timeout_seconds`, `max_retries`,
 
 Selected per task type via `def.exec`:
 
-| Kind | Runs as | Memory cap | Kill |
-|---|---|---|---|
-| `GPTPS_EXEC_INPROC` | the C function, in-process | none (shared address space) | cooperative cancel flag |
-| `GPTPS_EXEC_OOP` | the same C function in a `fork()`ed child | cgroup v2 `memory.max`, else `RLIMIT_AS` | `SIGKILL` on timeout |
-| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | same | whole process-group `SIGKILL` |
+| Kind | Runs as | Memory cap | Kill | Platforms |
+|---|---|---|---|---|
+| `GPTPS_EXEC_INPROC` | the C function, in-process | none (shared address space) | cooperative cancel flag | all |
+| `GPTPS_EXEC_OOP` | the same C function in a `fork()`ed child | cgroup v2 `memory.max`, else `RLIMIT_AS` | `SIGKILL` on timeout | POSIX only |
+| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | cgroup/`RLIMIT_AS` (POSIX) · Job Object (Windows) | group `SIGKILL` (POSIX) · `TerminateJobObject` (Windows) | all |
 
-The forked executors apply the memory cap accurately with **cgroup v2** when
+`GPTPS_EXEC_OOP` forks an in-process function into an isolated child, so it is
+POSIX-only; on Windows use `GPTPS_EXEC_PROGRAM` (`CreateProcess` + a Job Object for
+the memory cap and a single kill) for isolated, killable, capped work.
+
+The POSIX out-of-process executors apply the memory cap accurately with **cgroup v2** when
 `GPTPS_CGROUP_PARENT` names a memory-delegated cgroup: each task gets a child
 cgroup with `memory.max` + `memory.swap.max=0`; the child moves itself in before
 allocating; exceeding the cap is a real OOM-kill surfaced as `GPTPS_E_NOMEM`.
@@ -218,8 +222,9 @@ backends implement it: `hal_posix.c` (pthreads, `clock_gettime`,
 `CRITICAL_SECTION` + `CONDITION_VARIABLE`, `Interlocked*`, `GetTickCount64`,
 `GetSystemInfo`/`GlobalMemoryStatusEx`, `LoadLibrary`). CMake picks the backend by
 platform; both are CI-verified (Windows via mingw-w64 on a `windows-latest`
-runner). The fork-based out-of-process executors are POSIX-only today; their Win32
-equivalent (`CreateProcess` + Job Objects) is a later increment.
+runner). The external-program executor exists on both POSIX (`exec_oop_posix.c`)
+and Windows (`exec_win.c`, `CreateProcess` + Job Object); the forked `EXEC_OOP`
+kind is POSIX-only (it forks an in-process function — no `fork()` on Windows).
 
 Feature-test macros (`_GNU_SOURCE` / `_DARWIN_C_SOURCE`) are defined **in-source**
 at the top of each backend (and at the top of the amalgamation), so a plain
@@ -314,13 +319,11 @@ developed in:
   and a bundled default would need a runtime to vendor + test against. *A `.wasm`
   can also run with no add-on at all* via `GPTPS_EXEC_PROGRAM` + a runtime CLI
   (`argv = ["wasmtime", "module.wasm", …]`).
-- **Windows executors** — the Win32 HAL (`hal_win.c`) and a `windows-latest` CI
-  job now ship and are green, so the engine/scheduler/config/in-process executor
-  and the add-on loader run on Windows. What's left is the fork-equivalent
-  executors: `exec_win.c` currently stubs `gptps_oop_execute` /
-  `gptps_program_execute` to `GPTPS_E_INVAL`; a real `CreateProcess` + Job Object
-  implementation (memory cap + single-kill) would restore the OOP/PROGRAM kinds on
-  Windows.
+Windows is otherwise complete: the Win32 HAL (`hal_win.c`), the external-program
+executor (`exec_win.c`, `CreateProcess` + Job Object), and a `windows-latest` CI
+job all ship and are green. The only platform gap is `GPTPS_EXEC_OOP`, which forks
+an in-process function — inherently POSIX (no `fork()` on Windows); Windows callers
+use `GPTPS_EXEC_PROGRAM` for the same isolated/killable/capped guarantees.
 
-These are tracked here rather than stubbed misleadingly, so the tree stays fully
+This is tracked here rather than stubbed misleadingly, so the tree stays fully
 tested and green.

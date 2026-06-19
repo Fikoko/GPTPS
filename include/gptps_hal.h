@@ -9,9 +9,9 @@
  *   core (C99) ──uses──► gptps_hal_* (this header) ──impl──► hal_posix.c / hal_win.c
  *
  * Both backends implement the full interface (hwdetect, monotonic clock, cancel
- * flag, threads/mutex/condvar, dynamic loading). The POSIX backend also carries
- * the fork-based out-of-process executors (exec_oop_posix.c); their Win32
- * equivalent (CreateProcess + Job Objects) is a later increment.
+ * flag, threads/mutex/condvar, dynamic loading). The external-program executor
+ * exists on both (exec_oop_posix.c / exec_win.c via CreateProcess + Job Object);
+ * the forked EXEC_OOP kind is POSIX-only (no fork() on Windows).
  */
 #ifndef GPTPS_HAL_H
 #define GPTPS_HAL_H

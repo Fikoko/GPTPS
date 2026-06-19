@@ -123,16 +123,17 @@ Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]`
 
 ## Executor kinds (per task, via `def.exec`)
 
-| Kind | Runs as | Enforcement | Use for |
+| Kind | Runs as | Enforcement | Platforms |
 |---|---|---|---|
-| `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | fast, trusted work |
-| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout | isolation / hard limits |
-| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`) | memory cap + whole-group hard-kill | any language / any binary; payload→stdin, stdout→result |
+| `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | all |
+| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout | POSIX only (needs `fork`) |
+| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout | all (POSIX `fork`+exec; Windows `CreateProcess` + Job Object) |
 
-The forked executors enforce the per-task memory cap accurately with **cgroup v2**
-(`memory.max`, exceeding it ⇒ `GPTPS_E_NOMEM`) when `GPTPS_CGROUP_PARENT` points at a
-memory-delegated cgroup (e.g. a systemd `Delegate=yes` scope); otherwise they fall back to a
-coarse `RLIMIT_AS` cap. Either way it's real, killable enforcement the in-process path can't give.
+On POSIX the out-of-process executors enforce the per-task memory cap accurately with
+**cgroup v2** (`memory.max`, exceeding it ⇒ `GPTPS_E_NOMEM`) when `GPTPS_CGROUP_PARENT`
+points at a memory-delegated cgroup (e.g. a systemd `Delegate=yes` scope), else a coarse
+`RLIMIT_AS` cap; on Windows the program executor uses a **Job Object** (memory limit +
+kill-on-close). Either way it's real, killable enforcement the in-process path can't give.
 
 ## Resource budgets, failures, add-ons
 
@@ -188,12 +189,13 @@ fallback), the add-on loader + ABI, constraints + observers, TOML config-file lo
 (limits + scheduler + per-task overrides + add-on auto-load), the crash-durable queue,
 GPU-quota, and WASM-executor add-ons, the demo, CMake + CI + single-file amalgamation.
 
-Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** runs the
-engine, scheduler, config, in-process executor, and the add-on loader (Win32 HAL via
-`src/hal_win.c`); the fork-based OOP / external-program executors are POSIX-only for now.
+Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** (Win32 HAL
+via `src/hal_win.c`) runs the engine, scheduler, config, the in-process and
+external-program executors (`CreateProcess` + Job Object), and the add-on loader; only
+`GPTPS_EXEC_OOP` is POSIX-only, since it forks an in-process function (no `fork()` on
+Windows — use `GPTPS_EXEC_PROGRAM` there for isolated, killable, memory-capped work).
 
-In progress: the Windows fork-equivalent executors (CreateProcess + Job Objects) and a
-bundled wasm runtime for the WASM add-on (today it's bring-your-own-runtime).
+In progress: a bundled wasm runtime for the WASM add-on (today it's bring-your-own-runtime).
 
 ## Design notes
 
