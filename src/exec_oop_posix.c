@@ -17,6 +17,7 @@
  */
 
 /* feature-test macros before any system header (see hal_posix.c) */
+#if !defined(_WIN32) /* POSIX backend; compiles to nothing on Windows (exec_win.c is used) */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
@@ -373,3 +374,5 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
         return eff;
     }
 }
+
+#endif /* !_WIN32 */

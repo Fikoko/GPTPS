@@ -1,9 +1,11 @@
 cmake_minimum_required(VERSION 3.13)
-project(gptps C)
+project(gptps VERSION 0.1.0 LANGUAGES C)
 
 # GPTPS - General Purpose Task Processing System.
 # Embeddable, in-process C99 task-processing library. Core is strict C99;
 # platform specifics live behind the HAL (see include/gptps_hal.h).
+
+include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -17,13 +19,14 @@ endif()
 # Core is portable C99; the HAL + executor backend are selected per platform.
 set(GPTPS_SRC src/config.c src/config_toml.c src/engine.c)
 if(WIN32)
-    list(APPEND GPTPS_SRC src/hal_win.c src/exec_win.c)        # Win32 HAL; exec stubs (CreateProcess TODO)
+    list(APPEND GPTPS_SRC src/hal_win.c src/exec_win.c)        # Win32 HAL + CreateProcess/Job-Object program executor
 else()
     list(APPEND GPTPS_SRC src/hal_posix.c src/exec_oop_posix.c) # POSIX HAL + out-of-process executor
 endif()
 add_library(gptps STATIC ${GPTPS_SRC})
 target_include_directories(gptps
-    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 # Feature-test macros are defined inside the HAL sources themselves (so the
@@ -36,6 +39,30 @@ endif()
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+# --- install / packaging (cmake --install; find_package(gptps); pkg-config) -
+include(CMakePackageConfigHelpers)
+install(TARGETS gptps EXPORT gptps-targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/gptps.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(EXPORT gptps-targets
+        FILE gptps-targets.cmake NAMESPACE gptps::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/gptps)
+configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/gptps-config.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/gptps-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/gptps)
+write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/gptps-config-version.cmake
+        VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gptps-config.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/gptps-config-version.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/gptps)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/gptps.pc.in
+               ${CMAKE_CURRENT_BINARY_DIR}/gptps.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gptps.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 # --- tests (CTest) ---------------------------------------------------------
 enable_testing()

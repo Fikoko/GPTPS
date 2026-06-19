@@ -70,6 +70,10 @@ More runnable examples in [`examples/`](examples/): `demo` (in-process tasks + e
 `config_file` (tuning from a TOML file), `external_program` (run any binary as a task), and
 `wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below).
 
+**Install / consume.** `cmake --install build --prefix <dir>` installs the header, static
+library, a CMake package config, and a pkg-config file. Downstream projects then use either
+`find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --libs gptps`.
+
 ## API at a glance
 
 | Call | Purpose |
@@ -217,3 +221,8 @@ the variety lives in add-ons. The novel piece is single-process *self-throttling
 
 For the full internals — concurrency model, dispatch loop, scheduler, executors, HAL, and the
 add-on ABI — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE). No third-party code is vendored; the TOML parser, journal, and
+all add-ons are first-party.

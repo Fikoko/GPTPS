@@ -36,9 +36,9 @@ jobs:
              amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o test_amalg
           ./test_amalg
 
-  # Windows build + test on a real runner (Win32 HAL: src/hal_win.c). Uses the
-  # ClangCL toolset so the tests' __atomic builtins compile under MSVC's ABI.
-  # POSIX-only tests (fork/pthread executors + add-ons) are gated out in CMake.
+  # Windows build + test on a real runner (Win32 HAL: src/hal_win.c) via mingw-w64
+  # gcc (native PE binaries, __atomic support, full <windows.h>). POSIX-only tests
+  # (fork/pthread executors + add-ons) are gated out in CMake.
   windows:
     runs-on: windows-latest
     defaults:
@@ -60,6 +60,11 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Single-file amalgamation build
+        run: |
+          sh tools/amalgamate.sh
+          cc -std=gnu99 -I amalgamation amalgamation/gptps.c examples/demo.c -o demo_amalg.exe
+          ./demo_amalg.exe
 
   # AddressSanitizer + UBSan across the whole suite (memory errors, leaks, UB).
   # Uses CMake (not a hand-maintained source list) so it can't drift out of sync.

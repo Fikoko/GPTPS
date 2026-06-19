@@ -11,6 +11,7 @@
 /* Feature-test macros must precede ANY system header so strict -std=c99 still
  * exposes the POSIX / clock / sysctl APIs the HAL uses. Defining them here lets
  * the file (and the single-file amalgamation) build with a plain `cc -std=c99`. */
+#if !defined(_WIN32) /* POSIX backend; compiles to nothing on Windows (hal_win.c is used) */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
@@ -229,3 +230,5 @@ gptps_dl *gptps_dl_open(const char *path)
 }
 void *gptps_dl_sym(gptps_dl *h, const char *symbol) { return h ? dlsym(h->handle, symbol) : NULL; }
 void  gptps_dl_close(gptps_dl *h) { if (h) { dlclose(h->handle); free(h); } }
+
+#endif /* !_WIN32 */
