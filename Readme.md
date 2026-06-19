@@ -166,7 +166,7 @@ gptps/
 │   ├── config_toml.c    TOML-subset config-file parser
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
-├── addons/              ← optional modules on the public API (durable_queue, ...)
+├── addons/              ← optional modules on the public API (durable_queue, gpu_quota)
 ├── examples/demo.c      ← runnable example (the quick start above)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/ARCHITECTURE.md ← how it works inside
@@ -183,9 +183,9 @@ executors, result delivery, retries/timeout/dead-letter + dead-letter drain, pri
 scheduling with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with
 RLIMIT_AS fallback), the add-on loader + ABI, constraints + observers, TOML config-file
 loading (limits + scheduler + per-task overrides + add-on auto-load), the crash-durable
-queue add-on, the demo, CMake + CI + single-file amalgamation.
+queue and GPU-quota add-ons, the demo, CMake + CI + single-file amalgamation.
 
-In progress: GPU / WASM add-ons, and a Windows backend.
+In progress: a WASM executor add-on (needs a bundled wasm runtime) and a Windows backend.
 
 ## Design notes
 

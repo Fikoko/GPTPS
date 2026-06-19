@@ -33,6 +33,29 @@ Build:
 cc -std=c99 gptps.c addons/durable_queue.c yourapp.c -lpthread -ldl
 ```
 
+## gpu_quota — GPU-unit admission quota
+
+`gpu_quota.c` / `gpu_quota.h`. Caps total in-flight GPU usage by the `gpu_units`
+each task type declares in its cost. It composes two seams: a **constraint** gates
+admission (reserve units, or `DEFER` when the budget is full) and an **observer**
+releases units when a task run ends — so the engine never starts more GPU work
+than your budget allows.
+
+- **Scope:** admission-level *oversubscription prevention*, not driver-level VRAM
+  enforcement (that needs vendor APIs / real hardware). Pair it with an OOP/cgroup
+  memory cap for hard limits.
+- **Model:** `gpu_units` is treated as fixed per task type. Install as *the* GPU
+  constraint.
+- **Ordering:** call `gptps_gpu_quota_close()` after `gptps_shutdown()`.
+- **Portability:** POSIX (pthreads).
+
+```c
+gptps_gpu_quota *q = gptps_gpu_quota_install(engine, /*total*/ 8, /*defer_ms*/ 25);
+/* tasks with def.default_cost.gpu_units = N are now budget-gated */
+gptps_shutdown(engine);
+gptps_gpu_quota_close(q);
+```
+
 ```c
 gptps_dq *dq = gptps_dq_open(engine, "queue.journal");
 gptps_dq_recover(dq);                              /* replay prior-run survivors */

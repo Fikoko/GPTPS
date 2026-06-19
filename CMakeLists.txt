@@ -152,6 +152,15 @@ if(UNIX)
     target_link_libraries(test_durable PRIVATE gptps)
     add_test(NAME durable COMMAND test_durable)
     set_tests_properties(durable PROPERTIES TIMEOUT 30)
+
+    # gpu-quota add-on (constraint + observer composition; POSIX: pthreads)
+    add_executable(test_gpu_quota tests/test_gpu_quota.c addons/gpu_quota.c)
+    target_include_directories(test_gpu_quota
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
+    )
+    target_link_libraries(test_gpu_quota PRIVATE gptps)
+    add_test(NAME gpu_quota COMMAND test_gpu_quota)
+    set_tests_properties(gpu_quota PROPERTIES TIMEOUT 30)
 endif()
 
 # --- example (headline usage; doubles as a smoke test) ---------------------

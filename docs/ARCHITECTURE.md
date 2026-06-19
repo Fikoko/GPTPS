@@ -242,8 +242,10 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams (like `addons/durable_queue.c`) can simply be
-compiled into the host. See [`addons/README.md`](../addons/README.md).
+and the observer/constraint seams can simply be compiled into the host. Two ship
+in `addons/`: `durable_queue.c` (observer seam → crash-durable journal) and
+`gpu_quota.c` (constraint + observer composed → GPU-unit admission quota). See
+[`addons/README.md`](../addons/README.md).
 
 ---
 
