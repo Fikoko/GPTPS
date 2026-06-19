@@ -8,6 +8,10 @@ project(gptps C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+if(WIN32)
+    # mingw's <windows.h> relies on GNU extensions; the core itself stays C99-portable.
+    set(CMAKE_C_EXTENSIONS ON)
+endif()
 
 # --- library (grows as modules land) ---------------------------------------
 # Core is portable C99; the HAL + executor backend are selected per platform.
