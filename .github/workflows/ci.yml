@@ -43,9 +43,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build + run under ThreadSanitizer
         run: |
-          for t in test_engine test_failure; do
+          for t in test_engine test_failure test_scheduler; do
             cc -fsanitize=thread -std=c99 -D_GNU_SOURCE -g -I include -I src \
-               src/hal_posix.c src/config.c src/engine.c src/exec_oop_posix.c \
+               src/hal_posix.c src/config.c src/config_toml.c src/engine.c src/exec_oop_posix.c \
                tests/$t.c -lpthread -ldl -o $t.tsan
             setarch "$(uname -m)" -R ./$t.tsan
           done
