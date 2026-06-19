@@ -225,6 +225,15 @@ add_dependencies(test_program_helper prog_helper)
 add_test(NAME program_helper COMMAND test_program_helper)
 set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
 
+# real-time terminal dashboard add-on (portable; headless-tested)
+add_executable(test_tui tests/test_tui.c addons/tui.c)
+target_include_directories(test_tui
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
+)
+target_link_libraries(test_tui PRIVATE gptps)
+add_test(NAME tui COMMAND test_tui)
+set_tests_properties(tui PROPERTIES TIMEOUT 30)
+
 # --- examples (runnable usage; double as smoke tests) ----------------------
 add_executable(demo examples/demo.c)
 target_include_directories(demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -237,6 +246,14 @@ target_include_directories(example_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/in
 target_link_libraries(example_config PRIVATE gptps)
 add_test(NAME example_config COMMAND example_config)
 set_tests_properties(example_config PROPERTIES TIMEOUT 20)
+
+# live terminal dashboard demo (self-skips the live loop without a TTY)
+add_executable(example_dashboard examples/dashboard.c addons/tui.c)
+target_include_directories(example_dashboard
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(example_dashboard PRIVATE gptps)
+add_test(NAME example_dashboard COMMAND example_dashboard)
+set_tests_properties(example_dashboard PROPERTIES TIMEOUT 20)
 
 if(UNIX)
     # external-program executor (forks + execs /bin/cat)

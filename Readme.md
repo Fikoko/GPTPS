@@ -68,7 +68,8 @@ ctest --test-dir build --output-on-failure   # run the test suite
 
 More runnable examples in [`examples/`](examples/): `demo` (in-process tasks + events),
 `config_file` (tuning from a TOML file), `external_program` (run any binary as a task), and
-`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below).
+`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below), and
+`dashboard` (a live terminal UI — counts, per-task table, recent log, hotkeys to add tasks).
 
 **Install / consume.** `cmake --install build --prefix <dir>` installs the header, static
 library, a CMake package config, and a pkg-config file. Downstream projects then use either
@@ -164,6 +165,8 @@ in-process binding, the [`wasm_exec`](addons/) add-on takes a pluggable runtime 
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
 - **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
+- **Live dashboard (optional):** `addons/tui.c` is a portable real-time terminal UI (counts,
+  per-task table, recent log, hotkeys to submit tasks) — global + per-task configurable.
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
   versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See
@@ -182,7 +185,7 @@ gptps/
 │   ├── config_toml.c    TOML-subset config-file parser
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
-├── addons/              ← optional modules on the public API (durable_queue, gpu_quota, wasm_exec)
+├── addons/              ← optional modules on the public API (durable_queue, gpu_quota, wasm_exec, tui)
 ├── examples/            ← runnable examples (demo, config_file, external_program)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/ARCHITECTURE.md ← how it works inside

@@ -1,0 +1,106 @@
+/*
+ * test_tui.c - terminal dashboard add-on, verified HEADLESSLY (no TTY): drive the
+ * engine + the dashboard's key handling, then assert on the rendered frame string
+ * and on independently-counted events. The live loop (gptps_tui_run) and raw
+ * terminal I/O are exercised only on a real terminal and are not unit-tested here.
+ */
+#include "gptps.h"
+#include "tui.h"
+#include <stdio.h>
+#include <string.h>
+
+static int fails = 0;
+#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
+
+static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static int c_done;   /* independent observer: counts finishes of "echo" */
+
+static void count_obs(const gptps_event *ev, void *ud)
+{ (void)ud; if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "echo") == 0) inc(&c_done); }
+
+static gptps_status task_ok(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_OK; }
+
+int main(void)
+{
+    gptps *e = NULL;
+    gptps_tui *t;
+    gptps_tui_config cfg;
+    gptps_task_def d;
+    gptps_handle h;
+    char frame[8192];
+    int i;
+
+    CHECK(gptps_open(NULL, &e) == GPTPS_OK);
+    if (!e) return 1;
+    gptps_register_observer(e, count_obs, NULL);   /* independent of the dashboard */
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg;
+    cfg.color = 0;            /* plain text so assertions match exactly */
+    cfg.interactive = 0;      /* no TTY needed */
+    cfg.title = "demo board";
+    t = gptps_tui_install(e, &cfg);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return 1; }
+
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "echo"; d.run = task_ok; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+
+    /* local/per-task config: label + hotkey 'e' submits "echo" */
+    CHECK(gptps_tui_add_task(t, "echo", "Echo", 'e', NULL, 0) == GPTPS_OK);
+
+    /* key handling (the interactivity contract) */
+    CHECK(gptps_tui_press(t, 'e') == 1);   /* bound hotkey -> submits */
+    CHECK(gptps_tui_press(t, 'e') == 1);
+    CHECK(gptps_tui_press(t, 'z') == 0);   /* unbound -> ignored */
+    /* plus a couple of direct submits */
+    CHECK(gptps_submit(e, "echo", NULL, 0, &h) == GPTPS_OK);
+    CHECK(gptps_submit(e, "echo", NULL, 0, &h) == GPTPS_OK);
+
+    /* wait until all four finish (two hotkey + two direct) */
+    { uint64_t start = gptps_now_ms(NULL);
+      while (get(&c_done) < 4 && gptps_now_ms(NULL) - start < 2000) { } }
+    CHECK(get(&c_done) == 4);
+
+    /* render a frame and assert its content reflects the live state */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strlen(frame) > 0);
+    CHECK(strstr(frame, "demo board") != NULL);   /* global title */
+    CHECK(strstr(frame, "Echo")       != NULL);   /* local label */
+    CHECK(strstr(frame, "[e]")        != NULL);   /* hotkey legend */
+    CHECK(strstr(frame, "TASKS")      != NULL);
+    CHECK(strstr(frame, "RECENT")     != NULL);
+    CHECK(strstr(frame, "FINISHED")   != NULL);   /* a recent finished event */
+    CHECK(strstr(frame, "finished 4") != NULL);   /* cumulative count */
+    CHECK(strstr(frame, "\x1b[") == NULL);        /* color off => no escape codes */
+
+    /* hiding a pane (global setting) */
+    {
+        gptps *e2 = NULL; gptps_tui *t2; gptps_tui_config c2;
+        memset(&c2, 0, sizeof c2); c2.struct_size = sizeof c2;
+        c2.color = 0; c2.interactive = 0; c2.title = "x"; c2.show_recent = -1; /* hide recent */
+        CHECK(gptps_open(NULL, &e2) == GPTPS_OK);
+        t2 = gptps_tui_install(e2, &c2);
+        if (t2) {
+            char f2[2048]; gptps_tui_render(t2, f2, sizeof f2);
+            CHECK(strstr(f2, "RECENT") == NULL);   /* hidden */
+            CHECK(strstr(f2, "TASKS")  != NULL);   /* still shown */
+            gptps_shutdown(e2);
+            gptps_tui_close(t2);
+        } else { gptps_shutdown(e2); }
+    }
+
+    /* quit key */
+    CHECK(gptps_tui_press(t, 'q') == -1);
+
+    gptps_shutdown(e);     /* close AFTER shutdown */
+    gptps_tui_close(t);
+    (void)i;
+    if (fails) { printf("%d tui check(s) FAILED\n", fails); return 1; }
+    printf("all tui checks passed\n");
+    return 0;
+}

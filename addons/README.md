@@ -93,6 +93,35 @@ static gptps_status run_wasm3(const char *path, const void *in, size_t n,
 }
 ```
 
+## tui — real-time terminal dashboard
+
+`tui.c` / `tui.h`. A live, portable terminal dashboard over a running engine,
+built on the observer seam: cumulative counts, an in-flight gauge, a per-task
+table, and a scrolling recent-events log — ANSI/VT escapes only (no ncurses;
+Windows VT enabled automatically).
+
+- **Global settings** (`gptps_tui_config`): refresh rate, color, interactivity,
+  which panes to show, title, output stream.
+- **Local settings** (`gptps_tui_add_task`): per-task label + a **hotkey that
+  submits work straight from the dashboard**.
+- **Testable split:** `gptps_tui_render()` returns the frame as a string and
+  `gptps_tui_press()` applies a key — both unit-tested headlessly; `gptps_tui_run()`
+  is the blocking live loop (and self-skips without a TTY).
+- **Ordering:** `gptps_tui_close()` after `gptps_shutdown()`. **Portable** (POSIX
+  termios + Windows console).
+
+```c
+gptps_tui_config cfg = { sizeof cfg };
+cfg.title = "image pipeline";
+gptps_tui *ui = gptps_tui_install(engine, &cfg);
+gptps_tui_add_task(ui, "resize", "Resize", 'r', NULL, 0);  /* [r] submits resize */
+gptps_tui_run(ui);          /* live dashboard until 'q' (no-op without a TTY) */
+gptps_shutdown(engine);
+gptps_tui_close(ui);
+```
+
+See [`examples/dashboard.c`](../examples/dashboard.c) for a runnable demo.
+
 ```c
 gptps_dq *dq = gptps_dq_open(engine, "queue.journal");
 gptps_dq_recover(dq);                              /* replay prior-run survivors */
