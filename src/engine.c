@@ -557,6 +557,7 @@ static void *dispatcher_main(void *arg)
             }
             if (dec == GPTPS_DENY) {
                 fifo_remove(&e->intake, best);
+                best->outcome = GPTPS_E_DENIED;          /* recorded for dead-letter drain */
                 if (npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = best->handle;
                     pend[npend].name = best->def->name; pend[npend].status = GPTPS_E_DENIED;
@@ -1014,6 +1015,51 @@ gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn fn, void *u
     c->next = e->constraints; e->constraints = c;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
+}
+
+size_t gptps_dead_letter_count(gptps *e)
+{
+    size_t n;
+    if (!e) return 0;
+    gptps_mutex_lock(e->m);
+    n = e->dead_letter_count;
+    gptps_mutex_unlock(e->m);
+    return n;
+}
+
+size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_data)
+{
+    gptps_fifo local;
+    gptps_item *it;
+    size_t n = 0;
+
+    if (!e) return 0;
+
+    /* Detach the whole list under the lock, then iterate with the lock RELEASED
+     * so the callback may re-enter the engine (e.g. re-submit) without deadlock. */
+    gptps_mutex_lock(e->m);
+    local = e->dead_letter;
+    e->dead_letter.head = e->dead_letter.tail = NULL;
+    e->dead_letter_count = 0;
+    gptps_mutex_unlock(e->m);
+
+    while ((it = fifo_pop(&local)) != NULL) {
+        if (cb) {
+            gptps_dead_letter dl;
+            memset(&dl, 0, sizeof dl);
+            dl.struct_size = sizeof dl;
+            dl.handle = it->handle;
+            dl.task_name = it->def->name;   /* registry-owned; stable until shutdown */
+            dl.status = it->outcome;
+            dl.attempts = it->attempt;
+            dl.payload = it->payload;
+            dl.payload_len = it->payload_len;
+            cb(&dl, user_data);
+        }
+        item_free(it);
+        ++n;
+    }
+    return n;
 }
 
 gptps_status gptps_shutdown(gptps *e)

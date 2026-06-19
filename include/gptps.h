@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 2u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority */
+#define GPTPS_ABI_VERSION_MINOR 3u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -256,6 +256,34 @@ typedef struct {
 
 typedef void (*gptps_event_cb)(const gptps_event *ev, void *user_data);
 GPTPS_API gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data);
+
+/* ============================================================================
+ * DEAD LETTER (retained terminal failures; inspect / reprocess)
+ *
+ * Tasks that exhaust retries under the dead_letter policy, and tasks a
+ * constraint DENYs, are retained in-memory. Pull them back out to log, audit,
+ * or re-submit them. gptps_shutdown() frees any that were never drained.
+ * ==========================================================================*/
+typedef struct {
+    size_t       struct_size;   /* = sizeof(gptps_dead_letter) */
+    gptps_handle handle;        /* the original submit handle */
+    const char  *task_name;
+    gptps_status status;        /* the terminal failure status */
+    uint32_t     attempts;      /* attempts made before giving up */
+    const void  *payload;       /* original payload (valid only for the callback) */
+    size_t       payload_len;
+} gptps_dead_letter;
+
+/* Current number of retained dead-lettered tasks (does not drain). */
+GPTPS_API size_t gptps_dead_letter_count(gptps *e);
+
+typedef void (*gptps_dead_letter_cb)(const gptps_dead_letter *dl, void *user_data);
+
+/* Drain all retained dead-lettered tasks. For each, `cb` is invoked (the payload
+ * is valid only for that call) and the item is then freed. The callback runs
+ * with the engine lock RELEASED, so it MAY re-submit (e.g. gptps_submit) to retry
+ * the work. Pass cb == NULL to simply discard them. Returns the number drained. */
+GPTPS_API size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_data);
 
 /* ============================================================================
  * HOST-TABLE ABI (for dlopen'd add-ons)

@@ -77,6 +77,7 @@ ctest --test-dir build --output-on-failure   # run the test suite
 | `gptps_set_event_cb(e, cb, ud)` | observe lifecycle events (results arrive on `FINISHED`) |
 | `gptps_register_constraint(e, fn, ud)` | gate admission (rate limit, quota, time window) |
 | `gptps_register_observer(e, cb, ud)` | extra event sink (e.g. analytics) |
+| `gptps_dead_letter_count(e)` / `gptps_dead_letter_drain(e, cb, ud)` | inspect / reprocess retained failures |
 | `gptps_load_addon(e, path)` | load a shared-library add-on over the stable ABI |
 | `gptps_shutdown(e)` | drain in-flight + queued work, then free |
 
@@ -137,6 +138,9 @@ Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]`
   reservation with `[scheduler] reserve_after_skips`.
 - **Failure policy** (per task, overridable): `timeout_seconds`, `max_retries`,
   `retry_backoff_seconds`, `on_failure` = `dead_letter` (default) / `drop` / `requeue`.
+- **Dead letter:** tasks that exhaust retries (or that a constraint denies) are retained.
+  `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
+  the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
   versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See

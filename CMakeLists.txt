@@ -80,6 +80,14 @@ target_link_libraries(test_scheduler PRIVATE gptps)
 add_test(NAME scheduler COMMAND test_scheduler)
 set_tests_properties(scheduler PROPERTIES TIMEOUT 30)
 
+add_executable(test_deadletter tests/test_deadletter.c) # dead-letter drain API
+target_include_directories(test_deadletter
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_deadletter PRIVATE gptps)
+add_test(NAME deadletter COMMAND test_deadletter)
+set_tests_properties(deadletter PROPERTIES TIMEOUT 30)
+
 # add-on shared libraries (compiled against the frozen header; no core link)
 add_library(addon_demo MODULE tests/addon_demo.c)
 target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
