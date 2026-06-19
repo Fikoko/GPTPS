@@ -29,6 +29,16 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
                                uint64_t mem_cap, uint32_t timeout_s,
                                void **out_result, size_t *out_len);
 
+/* --- minimal TOML-subset config parser (config_toml.c) --- */
+typedef struct gptps_toml gptps_toml;
+gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen); /* NULL on error */
+void        gptps_toml_free(gptps_toml *t);
+int         gptps_toml_int(const gptps_toml *t, const char *section, const char *key, long long *out);
+int         gptps_toml_double(const gptps_toml *t, const char *section, const char *key, double *out);
+int         gptps_toml_bool(const gptps_toml *t, const char *section, const char *key, int *out);
+const char *gptps_toml_str(const gptps_toml *t, const char *section, const char *key);
+int         gptps_toml_str_array(const gptps_toml *t, const char *section, const char *key, const char *const **out);
+
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the
  * result, hard-kill on the deadline. Exit 0 => OK, non-zero => GPTPS_E_TASK. */

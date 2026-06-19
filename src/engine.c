@@ -136,6 +136,8 @@ struct gptps {
     gptps_loaded  *addons;        /* dlopen'd add-ons, torn down at shutdown */
     gptps_observer *observers;    /* extra event sinks (registered before submit) */
     gptps_constraint *constraints;/* admission hooks consulted by the dispatcher */
+
+    gptps_toml    *toml;          /* parsed config file (NULL if opened without one) */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -657,14 +659,76 @@ fail:
     return s;
 }
 
+/* Apply a single config table's task overrides onto a task def. Values present
+ * in the file override the def's compiled-in defaults (file wins). */
+static void apply_task_table(const gptps_toml *t, const char *section, gptps_task_def *def)
+{
+    long long ll;
+    const char *s;
+    if (gptps_toml_int(t, section, "timeout_seconds", &ll))       def->default_policy.timeout_seconds = (uint32_t)ll;
+    if (gptps_toml_int(t, section, "max_retries", &ll))           def->default_policy.max_retries = (uint32_t)ll;
+    if (gptps_toml_int(t, section, "retry_backoff_seconds", &ll)) def->default_policy.retry_backoff_seconds = (uint32_t)ll;
+    if (gptps_toml_int(t, section, "mem_bytes", &ll))             def->default_cost.mem_bytes = (uint64_t)ll;
+    s = gptps_toml_str(t, section, "on_failure");
+    if (s) {
+        if      (strcmp(s, "drop") == 0)        def->default_policy.on_failure = GPTPS_ON_FAILURE_DROP;
+        else if (strcmp(s, "requeue") == 0)     def->default_policy.on_failure = GPTPS_ON_FAILURE_REQUEUE;
+        else if (strcmp(s, "dead_letter") == 0) def->default_policy.on_failure = GPTPS_ON_FAILURE_DEAD_LETTER;
+    }
+}
+
+/* Layer file config over a task def: global [task_defaults] first, then the
+ * task-specific [tasks.<name>] table (most specific wins). No-op without a file. */
+static void apply_task_config(const gptps_toml *t, const char *name, gptps_task_def *def)
+{
+    char section[300];
+    if (!t) return;
+    apply_task_table(t, "task_defaults", def);
+    if (strlen(name) < sizeof section - 7) {
+        strcpy(section, "tasks.");
+        strcat(section, name);
+        apply_task_table(t, section, def);
+    }
+}
+
 gptps_status gptps_open(const char *config_path, gptps **out_engine)
 {
     gptps_config cfg;
+    gptps_toml *t = NULL;
+    gptps_status s;
+
     memset(&cfg, 0, sizeof cfg);
     cfg.struct_size = sizeof cfg;
-    cfg.config_path = config_path; /* TOML parsing is a later increment; limits auto-tune */
+    cfg.config_path = config_path;
     cfg.limits.struct_size = sizeof cfg.limits;
-    return gptps_open_ex(&cfg, out_engine);
+
+    if (config_path) {
+        char err[128];
+        long long ll;
+        double gb;
+        t = gptps_toml_parse_file(config_path, err, sizeof err);
+        if (!t) return GPTPS_E_CONFIG;
+        /* [limits]: explicit file values seed the config; 0/absent => auto-tune */
+        if (gptps_toml_int(t, "limits", "max_concurrent_tasks", &ll))
+            cfg.limits.max_concurrent_tasks = (uint32_t)ll;
+        if (gptps_toml_int(t, "limits", "max_memory_bytes", &ll))
+            cfg.limits.max_memory_bytes = (uint64_t)ll;
+        else if (gptps_toml_double(t, "limits", "max_memory_gb", &gb) && gb > 0.0)
+            cfg.limits.max_memory_bytes = (uint64_t)(gb * 1073741824.0);
+    }
+
+    s = gptps_open_ex(&cfg, out_engine);
+    if (s != GPTPS_OK) { gptps_toml_free(t); return s; }
+
+    if (t) {
+        const char *const *addons;
+        int n, k;
+        (*out_engine)->toml = t;            /* retained for register-time task overrides */
+        /* top-level addons = ["lib1.so", ...] : auto-load (best-effort) */
+        n = gptps_toml_str_array(t, "", "addons", &addons);
+        for (k = 0; k < n; ++k) (void)gptps_load_addon(*out_engine, addons[k]);
+    }
+    return GPTPS_OK;
 }
 
 /* deep-copy a NULL-terminated argv; returns NULL on alloc failure or empty */
@@ -726,6 +790,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->argv_copy = argv_copy;
     r->def.argv = (const char *const *)argv_copy; /* point at our owned copy (NULL for non-PROGRAM) */
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
+    apply_task_config(e->toml, name, &r->def); /* config file overrides compiled-in defaults */
     r->next = e->registry;
     e->registry = r;
     gptps_mutex_unlock(e->m);
@@ -940,6 +1005,7 @@ gptps_status gptps_shutdown(gptps *e)
     }
     { gptps_observer  *o = e->observers;  while (o) { gptps_observer  *n = o->next; free(o); o = n; } }
     { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; free(c); c = n; } }
+    gptps_toml_free(e->toml);
 
     free(e->workers);
     gptps_cond_destroy(e->cv_work);

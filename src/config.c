@@ -2,9 +2,10 @@
  * config.c - config model + auto-tune (T6).
  *
  * Built before the pool/loader because gptps_open() depends on resolved limits.
- * TOML file parsing (tomlc99) and the [hardware_patterns.*] / per-task override
- * layers attach on top of this resolver in a later increment; this slice owns
- * the resolution rule and the auto-tune defaults.
+ * This slice owns the resolution rule and the auto-tune defaults. The config
+ * FILE is parsed by config_toml.c and applied in gptps_open(): [limits] seed the
+ * values resolved here, and [task_defaults]/[tasks.*] override per-task policy at
+ * registration. ([hardware_patterns.*] matching is a later increment.)
  */
 #include "gptps.h"
 #include "gptps_hal.h"

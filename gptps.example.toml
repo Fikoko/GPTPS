@@ -1,0 +1,43 @@
+# GPTPS sample configuration.
+#
+# Pass this file to gptps_open("gptps.example.toml", &engine). Everything here is
+# optional: omitted values fall back to hardware auto-tune (limits) and to each
+# task's compiled-in def defaults (policies). A subset of TOML is supported -
+# tables, int / float / bool / "string" scalars, single-line string arrays, and
+# `#` comments.
+
+# Shared-library add-ons to dlopen at startup, in order. Each registers its task
+# types / constraints / observers over the stable host-table ABI. Paths are passed
+# verbatim to the loader (absolute, or relative to the working directory).
+addons = []
+# e.g. addons = ["./libimage_tasks.so", "/opt/gptps/analytics.so"]
+
+[limits]
+# Worker pool size. 0 or omitted => one worker per detected CPU core.
+# 1 => strictly sequential.
+max_concurrent_tasks = 0
+# Memory admission budget. Use whichever is convenient; bytes wins if both set.
+# 0 / omitted => ~0.75 x detected RAM.
+max_memory_gb = 0.0
+# max_memory_bytes = 0
+
+# Defaults applied to EVERY registered task (before any per-task table below).
+[task_defaults]
+timeout_seconds       = 0            # 0 => no timeout
+max_retries           = 0
+retry_backoff_seconds = 0
+on_failure            = "dead_letter" # dead_letter (default) | drop | requeue
+
+# Per-task overrides. The table name after `tasks.` matches the name you pass to
+# gptps_register_task / gptps_submit. These win over [task_defaults], which win
+# over the compiled-in def.
+[tasks.resize]
+timeout_seconds = 60
+max_retries     = 1
+on_failure      = "drop"
+mem_bytes       = 268435456          # advertise this task's per-run memory cost (256 MiB)
+
+[tasks.report]
+timeout_seconds = 300
+max_retries     = 3
+on_failure      = "requeue"          # bodies MUST be idempotent to use requeue

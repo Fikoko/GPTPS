@@ -82,6 +82,35 @@ ctest --test-dir build --output-on-failure   # run the test suite
 Inside a task you get a `gptps_ctx *`: `gptps_payload()`, `gptps_is_cancelled()` (poll it
 for cooperative timeout), `gptps_result_set()` / `gptps_result_set_nocopy()`.
 
+## Configuration file (optional)
+
+`gptps_open("gptps.toml", &e)` tunes the engine from a config file — no recompile to
+re-tune for a new machine or change a task's failure policy. Pass `NULL` to skip it and
+auto-tune. A subset of TOML is supported (tables, `int`/`float`/`bool`/`"string"` and
+single-line string arrays, `#` comments):
+
+```toml
+# top level: shared-library add-ons to auto-load at open
+addons = ["./libmytasks.so"]
+
+[limits]
+max_concurrent_tasks = 8       # 0 / omitted => detected cores
+max_memory_gb        = 4.0     # or max_memory_bytes = 4294967296
+
+[task_defaults]                # applied to every task...
+max_retries = 2
+on_failure  = "dead_letter"    # dead_letter | drop | requeue
+
+[tasks.resize]                 # ...then overridden per task name
+timeout_seconds = 60
+max_retries     = 1
+on_failure      = "drop"
+mem_bytes       = 268435456
+```
+
+Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]` → `[tasks.<name>]`
+(most specific wins). Explicit `[limits]` values win over auto-tune. See `gptps.example.toml`.
+
 ## Executor kinds (per task, via `def.exec`)
 
 | Kind | Runs as | Enforcement | Use for |
@@ -112,9 +141,11 @@ gptps/
 ├── src/                 ← the library
 │   ├── engine.c         core: dispatcher, queue, admission, failure engine, loader
 │   ├── config.c         config model + hardware auto-tune
+│   ├── config_toml.c    TOML-subset config-file parser
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
 ├── examples/demo.c      ← runnable example (the quick start above)
+├── gptps.example.toml   ← annotated sample config file
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)
 ├── tools/amalgamate.sh  ← generates the single-file gptps.c + gptps.h
 ├── CMakeLists.txt
@@ -125,10 +156,10 @@ gptps/
 
 Working today (Linux + macOS, tested + ThreadSanitizer-clean): the engine, all three
 executors, result delivery, retries/timeout/dead-letter, the add-on loader + ABI,
-constraints + observers, the demo, CMake + CI + single-file amalgamation.
+constraints + observers, TOML config-file loading (limits + per-task overrides + add-on
+auto-load), the demo, CMake + CI + single-file amalgamation.
 
-In progress: TOML config-file loading (the model + auto-tune work today; file parsing is
-being added), richer scheduling (priority / skip-to-fit), cgroups memory enforcement,
+In progress: richer scheduling (priority / skip-to-fit), cgroups memory enforcement,
 durable queue / GPU / WASM add-ons, and a Windows backend.
 
 ## Design notes

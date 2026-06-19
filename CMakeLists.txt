@@ -10,7 +10,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # --- library (grows as modules land) ---------------------------------------
-set(GPTPS_SRC src/hal_posix.c src/config.c src/engine.c)
+set(GPTPS_SRC src/hal_posix.c src/config.c src/config_toml.c src/engine.c)
 if(UNIX)
     list(APPEND GPTPS_SRC src/exec_oop_posix.c) # out-of-process executor (POSIX)
 endif()
@@ -63,6 +63,15 @@ target_link_libraries(test_failure PRIVATE gptps)
 add_test(NAME failure COMMAND test_failure)
 set_tests_properties(failure PROPERTIES TIMEOUT 30)
 
+add_executable(test_toml tests/test_toml.c) # config-file parsing + overrides
+target_include_directories(test_toml
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_toml PRIVATE gptps)
+target_compile_definitions(test_toml PRIVATE ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>")
+add_test(NAME toml COMMAND test_toml)
+set_tests_properties(toml PROPERTIES TIMEOUT 30)
+
 # add-on shared libraries (compiled against the frozen header; no core link)
 add_library(addon_demo MODULE tests/addon_demo.c)
 target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -83,6 +92,8 @@ target_compile_definitions(test_addon PRIVATE
 add_dependencies(test_addon addon_demo addon_bad)
 add_test(NAME addon COMMAND test_addon)
 set_tests_properties(addon PROPERTIES TIMEOUT 30)
+
+add_dependencies(test_toml addon_demo) # test_toml writes the addon path into its config file
 
 if(UNIX)
     add_executable(test_oop tests/test_oop.c)
