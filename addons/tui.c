@@ -68,6 +68,9 @@ struct gptps_tui {
     struct { gptps_handle h; uint64_t ts; } *lat;  /* handle->queued-ts ring for latency */
     int              lat_cap, lat_head;
     int              scroll;        /* recent-log scroll offset (lines back) */
+    int              kpi;           /* effective gptps_tui_kpi (never DEFAULT) */
+    int              mode;          /* effective gptps_tui_mode */
+    int              dirty;         /* state changed since last paint (for ON_DEMAND) */
     int              quit, show_tasks, show_recent;
     int              raw_active;
 #if !defined(_WIN32)
@@ -109,9 +112,14 @@ static void tui_on_event(const gptps_event *ev, void *ud)
     }
     inflight = t->s - t->fin - t->fail;          /* per-attempt: never underflows */
     if (inflight > t->peak) t->peak = inflight;
+    t->dirty = 1;                                /* something changed (for ON_DEMAND repaint) */
 
-    /* latency: remember queued time per handle; resolve on finish */
-    if (ev->kind == GPTPS_EV_QUEUED && t->lat_cap > 0) {
+    /* MINIMAL stops here - counts only, ~no per-event cost. NORMAL+ does the
+     * per-task table + recent log; latency tracking runs only when its ring exists
+     * (FULL), and that ring is freed when the KPI level is lowered. */
+    if (t->kpi < GPTPS_TUI_KPI_NORMAL) { mu_unlock(&t->mu); return; }
+
+    if (t->lat && ev->kind == GPTPS_EV_QUEUED) {          /* remember queued time per handle */
         t->lat[t->lat_head].h = ev->handle; t->lat[t->lat_head].ts = ev->ts_ms;
         t->lat_head = (t->lat_head + 1) % t->lat_cap;
     }
@@ -121,14 +129,14 @@ static void tui_on_event(const gptps_event *ev, void *ud)
             case GPTPS_EV_STARTED:       tk->started++;  break;
             case GPTPS_EV_FINISHED:
                 tk->finished++;
-                if (t->lat_cap > 0) {                 /* find this handle's queued ts */
+                if (t->lat) {                             /* FULL: resolve this handle's latency */
                     int j;
                     for (j = 0; j < t->lat_cap; ++j)
                         if (t->lat[j].h == ev->handle) {
                             uint64_t l = (ev->ts_ms >= t->lat[j].ts) ? ev->ts_ms - t->lat[j].ts : 0;
                             tk->lat_sum_ms += l; tk->lat_n++;
                             if (l > tk->lat_max_ms) tk->lat_max_ms = l;
-                            t->lat[j].h = 0;          /* consume */
+                            t->lat[j].h = 0;              /* consume */
                             break;
                         }
                 }
@@ -148,6 +156,11 @@ static void tui_on_event(const gptps_event *ev, void *ud)
     }
     mu_unlock(&t->mu);
 }
+
+static const char *kpi_str(int k)
+{ return k == GPTPS_TUI_KPI_MINIMAL ? "minimal" : k == GPTPS_TUI_KPI_NORMAL ? "normal" : "full"; }
+static const char *mode_str(int m)
+{ return m == GPTPS_TUI_CONTINUOUS ? "realtime" : m == GPTPS_TUI_ON_DEMAND ? "on-demand" : "paused"; }
 
 static const char *kind_str(int k)
 {
@@ -201,8 +214,10 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     }
     pos = appendf(buf, cap, pos, "%sfinished %u%s  %sfailed %u%s  retried %u  %sdead %u%s\n",
                   G, t->fin, X, (t->fail ? R : ""), t->fail, X, t->retr, (t->dead ? R : ""), t->dead, X);
+    pos = appendf(buf, cap, pos, "%skpi:%s mode:%s refresh:%ums%s\n",
+                  D, kpi_str(t->kpi), mode_str(t->mode), t->cfg.refresh_ms, X);
 
-    if (t->show_tasks) {
+    if (t->show_tasks && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
         pos = appendf(buf, cap, pos, "  %-16s %5s %5s %5s %5s %5s %8s  key\n",
                       "label", "run", "ok", "fail", "dead", "ok%", "avg ms");
@@ -218,7 +233,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         }
     }
 
-    if (t->show_recent && t->rcap > 0) {
+    if (t->show_recent && t->rcap > 0 && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
         int shown = t->rn, start, maxoff;
         if (shown > t->cfg.max_recent) shown = t->cfg.max_recent;
         maxoff = t->rn - shown; if (maxoff < 0) maxoff = 0;
@@ -266,6 +281,14 @@ int gptps_tui_press(gptps_tui *t, int key)
         if (t->tasks[i].hotkey == key) { name = t->tasks[i].name; pl = t->tasks[i].payload; pn = t->tasks[i].plen; break; }
     mu_unlock(&t->mu);                 /* submit OUTSIDE the lock: QUEUED fires our observer */
     if (name) { gptps_handle h; gptps_submit(t->e, name, pl, pn, &h); return 1; }
+    if (key == 'm' || key == 'M') {                 /* cycle KPI level (configure cost live) */
+        int nk; mu_lock(&t->mu); nk = (t->kpi >= GPTPS_TUI_KPI_FULL) ? GPTPS_TUI_KPI_MINIMAL : t->kpi + 1; mu_unlock(&t->mu);
+        gptps_tui_set_kpi(t, (gptps_tui_kpi)nk); return 3;
+    }
+    if (key == 'p' || key == 'P') {                 /* toggle pause */
+        int nm; mu_lock(&t->mu); nm = (t->mode == GPTPS_TUI_PAUSED) ? GPTPS_TUI_CONTINUOUS : GPTPS_TUI_PAUSED; mu_unlock(&t->mu);
+        gptps_tui_set_mode(t, (gptps_tui_mode)nm); return 3;
+    }
     if (key == 'k' || key == 'K') { mu_lock(&t->mu); t->scroll += 1; mu_unlock(&t->mu); return 2; } /* scroll to older */
     if (key == 'j' || key == 'J') { mu_lock(&t->mu); if (t->scroll > 0) t->scroll -= 1; mu_unlock(&t->mu); return 2; } /* newer */
     return 0;
@@ -332,20 +355,30 @@ static int term_poll_key(int ms)
 void gptps_tui_run(gptps_tui *t)
 {
     char *buf; size_t cap = 16384;
+    int first = 1, kp = 0;
     if (!t || !t->cfg.interactive || !fd_is_tty(t->cfg.out)) return; /* needs a terminal */
     buf = (char *)malloc(cap);
     if (!buf) return;
     term_enable(t);
     fputs("\x1b[?25l", t->cfg.out);                 /* hide cursor */
     for (;;) {
-        int q, key;
-        mu_lock(&t->mu); q = t->quit; mu_unlock(&t->mu);
+        int q, md, key, paint;
+        uint32_t rms;
+        mu_lock(&t->mu); q = t->quit; md = t->mode; rms = t->cfg.refresh_ms; mu_unlock(&t->mu);
         if (q) break;
-        fputs("\x1b[H\x1b[2J", t->cfg.out);          /* home + clear */
-        gptps_tui_render(t, buf, cap);
-        fputs(buf, t->cfg.out); fflush(t->cfg.out);
-        key = term_poll_key((int)t->cfg.refresh_ms);
-        if (key >= 0) gptps_tui_press(t, key);
+        /* cadence: CONTINUOUS every frame; ON_DEMAND when state changed or a key
+         * was pressed; PAUSED only after a key (or the first frame) */
+        paint = first || kp || (md == GPTPS_TUI_CONTINUOUS);
+        if (!paint && md == GPTPS_TUI_ON_DEMAND) { mu_lock(&t->mu); paint = t->dirty; mu_unlock(&t->mu); }
+        if (paint) {
+            mu_lock(&t->mu); t->dirty = 0; mu_unlock(&t->mu);
+            fputs("\x1b[H\x1b[2J", t->cfg.out);      /* home + clear */
+            gptps_tui_render(t, buf, cap);
+            fputs(buf, t->cfg.out); fflush(t->cfg.out);
+        }
+        first = 0; kp = 0;
+        key = term_poll_key((int)(rms ? rms : 250));
+        if (key >= 0) { gptps_tui_press(t, key); kp = 1; }
     }
     fputs("\x1b[?25h", t->cfg.out); fflush(t->cfg.out); /* show cursor */
     term_restore(t);
@@ -374,9 +407,16 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     t->rcap = max;
     t->recent = (tui_event *)calloc((size_t)max, sizeof(tui_event));
     if (!t->recent) { mu_destroy(&t->mu); free(t); return NULL; }
-    t->lat_cap = 1024;     /* handle->queued-ts ring for latency (approx under very deep queues) */
-    t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
-    if (!t->lat) { free(t->recent); mu_destroy(&t->mu); free(t); return NULL; }
+    t->kpi = (t->cfg.kpi == GPTPS_TUI_KPI_DEFAULT) ? GPTPS_TUI_KPI_FULL : t->cfg.kpi;
+    if (t->kpi < GPTPS_TUI_KPI_MINIMAL) t->kpi = GPTPS_TUI_KPI_MINIMAL;
+    if (t->kpi > GPTPS_TUI_KPI_FULL)    t->kpi = GPTPS_TUI_KPI_FULL;
+    t->mode = t->cfg.mode;
+    if (t->mode < GPTPS_TUI_CONTINUOUS || t->mode > GPTPS_TUI_PAUSED) t->mode = GPTPS_TUI_CONTINUOUS;
+    t->lat_cap = (t->cfg.latency_window > 0) ? t->cfg.latency_window : 1024;
+    if (t->lat_cap > (1 << 20)) t->lat_cap = (1 << 20);
+    t->lat = NULL;         /* the latency ring exists only at KPI FULL (else its RAM is reclaimed) */
+    if (t->kpi == GPTPS_TUI_KPI_FULL)
+        t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
     t->start_ms = gptps_now_ms(NULL);
     if (gptps_register_observer(e, tui_on_event, t) != GPTPS_OK) {
         free(t->recent); mu_destroy(&t->mu); free(t); return NULL;
@@ -394,4 +434,54 @@ void gptps_tui_close(gptps_tui *t)
     free(t->lat);
     mu_destroy(&t->mu);
     free(t);
+}
+
+/* ---- runtime reconfiguration ---- */
+/* caller holds mu: make the latency ring match the current KPI level */
+static void lat_apply(gptps_tui *t)
+{
+    if (t->kpi == GPTPS_TUI_KPI_FULL) {
+        if (!t->lat) { t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat); t->lat_head = 0; }
+    } else if (t->lat) {
+        free(t->lat); t->lat = NULL; t->lat_head = 0;   /* reclaim the RAM */
+    }
+}
+
+gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
+{
+    if (!t) return GPTPS_E_INVAL;
+    if (level == GPTPS_TUI_KPI_DEFAULT) level = GPTPS_TUI_KPI_FULL;
+    if (level < GPTPS_TUI_KPI_MINIMAL || level > GPTPS_TUI_KPI_FULL) return GPTPS_E_INVAL;
+    mu_lock(&t->mu);
+    t->kpi = level;
+    lat_apply(t);            /* allocate at FULL, free below FULL */
+    t->dirty = 1;
+    mu_unlock(&t->mu);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode)
+{
+    if (!t) return GPTPS_E_INVAL;
+    if (mode < GPTPS_TUI_CONTINUOUS || mode > GPTPS_TUI_PAUSED) return GPTPS_E_INVAL;
+    mu_lock(&t->mu); t->mode = mode; t->dirty = 1; mu_unlock(&t->mu);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms)
+{
+    if (!t) return GPTPS_E_INVAL;
+    mu_lock(&t->mu); t->cfg.refresh_ms = refresh_ms ? refresh_ms : 250; mu_unlock(&t->mu);
+    return GPTPS_OK;
+}
+
+void gptps_tui_snapshot(gptps_tui *t)
+{
+    char *buf; size_t cap = 16384;
+    if (!t) return;
+    buf = (char *)malloc(cap);
+    if (!buf) return;
+    gptps_tui_render(t, buf, cap);     /* one frame, right now, regardless of mode */
+    fputs(buf, t->cfg.out); fputc('\n', t->cfg.out); fflush(t->cfg.out);
+    free(buf);
 }

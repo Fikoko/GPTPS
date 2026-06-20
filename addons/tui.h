@@ -37,6 +37,23 @@ extern "C" {
 
 typedef struct gptps_tui gptps_tui;
 
+/* How much the dashboard computes per event - its own CPU/RAM cost. Higher tiers
+ * do strictly more work in the observer that runs on the engine's worker threads,
+ * so dial it to what you can spare. Tunable at runtime (gptps_tui_set_kpi). */
+typedef enum {
+    GPTPS_TUI_KPI_DEFAULT = 0, /* = FULL (sensible zero-init default) */
+    GPTPS_TUI_KPI_MINIMAL,     /* cumulative counts only - cheapest, ~no per-event work */
+    GPTPS_TUI_KPI_NORMAL,      /* + per-task table + recent-events log */
+    GPTPS_TUI_KPI_FULL         /* + per-handle latency tracking (allocates a ring) */
+} gptps_tui_kpi;
+
+/* When the live loop (gptps_tui_run) repaints. Tunable at runtime. */
+typedef enum {
+    GPTPS_TUI_CONTINUOUS = 0,  /* repaint every refresh_ms (real-time) */
+    GPTPS_TUI_ON_DEMAND,       /* repaint only when state changed since last frame, or on a key */
+    GPTPS_TUI_PAUSED           /* frozen; repaint only on an explicit key / gptps_tui_snapshot */
+} gptps_tui_mode;
+
 typedef struct {
     size_t      struct_size;   /* = sizeof(gptps_tui_config) */
     uint32_t    refresh_ms;    /* redraw interval in the live loop (0 => 250) */
@@ -45,6 +62,9 @@ typedef struct {
     int         max_recent;    /* recent-event lines to keep/show (0 => 8, cap 64) */
     int         show_tasks;    /* per-task table: >=0 show (default), <0 hide */
     int         show_recent;   /* recent-events log: >=0 show (default), <0 hide */
+    int         kpi;           /* gptps_tui_kpi: how much to compute (0 => FULL) */
+    int         mode;          /* gptps_tui_mode: live-loop cadence (0 => CONTINUOUS) */
+    int         latency_window;/* handles tracked for latency at FULL (0 => 1024) */
     const char *title;         /* dashboard title (default "tasks") */
     FILE       *out;           /* output stream (NULL => stdout) */
 } gptps_tui_config;
@@ -64,9 +84,21 @@ gptps_status gptps_tui_add_task(gptps_tui *t, const char *task_name, const char 
  * length written (excluding NUL). Pure read of live state - no terminal needed. */
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
 
-/* Apply a key as if pressed: a bound hotkey submits its task (returns 1), 'q' or
- * ESC requests quit (returns -1), anything else is ignored (returns 0). */
+/* Apply a key as if pressed: a bound hotkey submits its task (returns 1); 'q'/ESC
+ * requests quit (returns -1); 'k'/'j' scroll the log (returns 2); 'm' cycles the
+ * KPI level and 'p' toggles pause (returns 3, "reconfigured"); else 0. */
 int gptps_tui_press(gptps_tui *t, int key);
+
+/* Runtime reconfiguration (thread-safe; the live loop picks changes up next frame).
+ * Lowering the KPI level frees the latency ring and stops the per-event work;
+ * raising it to FULL re-allocates it. */
+gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level);
+gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode);
+gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms);
+
+/* Render one frame to the configured output stream right now ("once" / on-demand),
+ * independent of the live loop or mode. */
+void gptps_tui_snapshot(gptps_tui *t);
 
 /* Blocking live loop: clear screen, then redraw every refresh_ms and dispatch
  * keystrokes until quit. No-op (returns immediately) when not attached to a TTY. */

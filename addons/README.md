@@ -111,11 +111,25 @@ automatically). Panes/metrics:
   which panes to show, title, output stream.
 - **Local settings** (`gptps_tui_add_task`): per-task label + a **hotkey that
   submits work straight from the dashboard**.
+- **Cost is a budgeted knob** — the dashboard runs on the engine's worker threads,
+  so its own CPU/RAM is tunable, **at runtime**:
+  - **KPI level** (`gptps_tui_set_kpi`, or `m` live): `MINIMAL` = counts only
+    (~no per-event work, no latency ring); `NORMAL` = + per-task table + recent
+    log; `FULL` = + per-handle latency (allocates a ring; **freed when you drop
+    below FULL**). `latency_window` sizes that ring.
+  - **Cadence / mode** (`gptps_tui_set_mode`, or `p` live): `CONTINUOUS` (real-time),
+    `ON_DEMAND` (repaint only when state changed or a key), `PAUSED` (frozen).
+  - `gptps_tui_set_refresh()` changes the redraw interval live.
+  - `gptps_tui_snapshot()` renders **one** frame on demand (the "once" / per-ask
+    case) — independent of the live loop, handy for logging or a signal handler.
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and
   `gptps_tui_press()` applies a key — both unit-tested headlessly; `gptps_tui_run()`
   is the blocking live loop (and self-skips without a TTY).
 - **Ordering:** `gptps_tui_close()` after `gptps_shutdown()`. **Portable** (POSIX
   termios + Windows console).
+
+Live keys: hotkeys submit their task · `k`/`j` scroll · `m` cycles KPI level ·
+`p` pauses/resumes · `q` quits.
 
 ```c
 gptps_tui_config cfg = { sizeof cfg };

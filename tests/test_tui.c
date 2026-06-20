@@ -86,6 +86,50 @@ int main(void)
     CHECK(gptps_tui_press(t, 'k') == 2);
     CHECK(gptps_tui_press(t, 'j') == 2);
 
+    /* runtime reconfiguration: dial the KPI cost down (drops panes + frees the
+     * latency ring), then back up; both visible in the next rendered frame */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_MINIMAL) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "kpi:minimal") != NULL);
+    CHECK(strstr(frame, "TASKS")       == NULL);   /* panes dropped */
+    CHECK(strstr(frame, "RECENT")      == NULL);
+    CHECK(strstr(frame, "finished 4")  != NULL);   /* counts still tracked */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "kpi:full") != NULL);
+    CHECK(strstr(frame, "TASKS")    != NULL);
+    CHECK(strstr(frame, "avg ms")   != NULL);
+
+    /* mode + refresh, reflected live in the status line */
+    CHECK(gptps_tui_set_mode(t, GPTPS_TUI_ON_DEMAND) == GPTPS_OK);
+    CHECK(gptps_tui_set_refresh(t, 500) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "mode:on-demand") != NULL);
+    CHECK(strstr(frame, "refresh:500ms")  != NULL);
+
+    /* 'm' cycles the KPI level at runtime (returns the "reconfigured" code) */
+    CHECK(gptps_tui_press(t, 'm') == 3);
+
+    /* snapshot ("once" / on demand) writes a frame to the configured stream */
+    {
+        FILE *f = fopen("tui_snap.txt", "w+");
+        if (f) {
+            gptps *es = NULL; gptps_tui_config cs; gptps_tui *ts;
+            memset(&cs, 0, sizeof cs); cs.struct_size = sizeof cs;
+            cs.color = 0; cs.interactive = 0; cs.title = "snap"; cs.out = f;
+            CHECK(gptps_open(NULL, &es) == GPTPS_OK);
+            ts = gptps_tui_install(es, &cs);
+            if (ts) {
+                char rd[2048]; long n;
+                gptps_tui_snapshot(ts); fflush(f);
+                fseek(f, 0, SEEK_SET); n = (long)fread(rd, 1, sizeof rd - 1, f); rd[n > 0 ? n : 0] = 0;
+                CHECK(strstr(rd, "snap") != NULL);
+                gptps_shutdown(es); gptps_tui_close(ts);
+            } else { gptps_shutdown(es); }
+            fclose(f); remove("tui_snap.txt");
+        }
+    }
+
     /* hiding a pane (global setting) */
     {
         gptps *e2 = NULL; gptps_tui *t2; gptps_tui_config c2;

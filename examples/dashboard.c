@@ -1,9 +1,11 @@
 /*
  * dashboard.c - a live terminal dashboard over a running GPTPS engine, using the
  * tui add-on. On a real terminal it redraws continuously and takes hotkeys:
- *   [w] submit a 'work' task   [f] submit a 'flaky' task   [q] quit
- * Run it headless (no TTY) and gptps_tui_run() simply returns - the engine still
- * drains the work submitted up front.
+ *   [w] submit 'work'  [f] submit 'flaky'  |  [k]/[j] scroll  [m] KPI level
+ *   [p] pause  [q] quit
+ * `m` cycles how much the dashboard computes (minimal/normal/full) at runtime, so
+ * its own CPU/RAM cost is tunable live. Run it headless (no TTY) and
+ * gptps_tui_run() simply returns - the engine still drains the work submitted.
  *
  *   cc dashboard.c gptps.c addons/tui.c -lpthread -ldl   (amalgamation; Win: drop -ldl)
  */
