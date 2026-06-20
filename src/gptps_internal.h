@@ -42,6 +42,16 @@ int         gptps_toml_bool(const gptps_toml *t, const char *section, const char
 const char *gptps_toml_str(const gptps_toml *t, const char *section, const char *key);
 int         gptps_toml_str_array(const gptps_toml *t, const char *section, const char *key, const char *const **out);
 
+/* --- settings registry (settings.c) --- */
+typedef struct gptps_settings gptps_settings;
+gptps_settings *gptps_settings_create(void);
+void            gptps_settings_destroy(gptps_settings *r);
+gptps_status    gptps_settings_add(gptps_settings *r, const gptps_setting_def *def);
+size_t          gptps_settings_size(gptps_settings *r);
+gptps_status    gptps_settings_get_by(gptps_settings *r, const char *key, char *buf, size_t cap);
+gptps_status    gptps_settings_set_by(gptps_settings *r, const char *key, const char *value);
+gptps_status    gptps_settings_info_at(gptps_settings *r, size_t index, gptps_setting_info *out);
+
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the
  * result, hard-kill on the deadline. Exit 0 => OK, non-zero => GPTPS_E_TASK. */

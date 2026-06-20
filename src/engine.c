@@ -74,6 +74,7 @@ typedef struct gptps_reg {
     char              *name;
     char             **argv_copy;  /* owned NULL-terminated copy for EXEC_PROGRAM */
     int32_t            priority;   /* scheduling priority for this task type (default 0) */
+    struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
     struct gptps_reg  *next;
 } gptps_reg;
 
@@ -145,6 +146,7 @@ struct gptps {
 
     gptps_toml    *toml;          /* parsed config file (NULL if opened without one) */
     uint32_t       reserve_after_skips; /* starvation guard: reserve a budget-blocked top task after this many backfill skips */
+    gptps_settings *settings;     /* unified settings registry */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -637,6 +639,79 @@ const char *gptps_strerror(gptps_status s)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* settings bindings (read/write callbacks for the registry)                 */
+/* ------------------------------------------------------------------------- */
+
+static size_t rd_u64(char *b, size_t c, uint64_t v) { return (size_t)snprintf(b, c, "%llu", (unsigned long long)v); }
+static size_t rd_u32(char *b, size_t c, uint32_t v) { return (size_t)snprintf(b, c, "%lu", (unsigned long)v); }
+static size_t rd_i32(char *b, size_t c, int32_t  v) { return (size_t)snprintf(b, c, "%ld", (long)v); }
+
+/* core settings: target = gptps* */
+static size_t       sc_rd_maxmem(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u64(b, c, e->limits.max_memory_bytes); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sc_wr_maxmem(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->limits.max_memory_bytes = (uint64_t)strtoull(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+static size_t       sc_rd_conc(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->limits.max_concurrent_tasks); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sc_wr_conc(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->limits.max_concurrent_tasks = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; } /* restart-only: pool not resized live */
+static size_t       sc_rd_resv(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->reserve_after_skips); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sc_wr_resv(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->reserve_after_skips = (uint32_t)strtoul(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+
+/* per-task settings: target = gptps_reg* (locks reg->engine->m) */
+static const char *const ONFAIL_CHOICES[] = { "dead_letter", "requeue", "drop", 0 };
+#define TASK_LOCK(r)   gptps_mutex_lock((r)->engine->m)
+#define TASK_UNLOCK(r) gptps_mutex_unlock((r)->engine->m)
+static size_t       st_rd_timeout(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u32(b, c, r->def.default_policy.timeout_seconds); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_timeout(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.default_policy.timeout_seconds = (uint32_t)strtoul(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_retries(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u32(b, c, r->def.default_policy.max_retries); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_retries(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.default_policy.max_retries = (uint32_t)strtoul(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_backoff(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u32(b, c, r->def.default_policy.retry_backoff_seconds); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_backoff(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.default_policy.retry_backoff_seconds = (uint32_t)strtoul(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_mem(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u64(b, c, r->def.default_cost.mem_bytes); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_mem(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.default_cost.mem_bytes = (uint64_t)strtoull(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_prio(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_i32(b, c, r->priority); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_prio(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->priority = (int32_t)strtol(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_onfail(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; const char *s; TASK_LOCK(r);
+    s = (r->def.default_policy.on_failure == GPTPS_ON_FAILURE_DROP) ? "drop" : (r->def.default_policy.on_failure == GPTPS_ON_FAILURE_REQUEUE) ? "requeue" : "dead_letter";
+    TASK_UNLOCK(r); return (size_t)snprintf(b, c, "%s", s); }
+static gptps_status st_wr_onfail(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; gptps_on_failure of = GPTPS_ON_FAILURE_DEAD_LETTER;
+    if (strcmp(v, "drop") == 0) of = GPTPS_ON_FAILURE_DROP; else if (strcmp(v, "requeue") == 0) of = GPTPS_ON_FAILURE_REQUEUE;
+    TASK_LOCK(r); r->def.default_policy.on_failure = of; TASK_UNLOCK(r); return GPTPS_OK; }
+
+static void reg_core_setting(gptps *e, const char *key, gptps_setting_type type, int hot,
+                             int has_range, double mn, double mx, const char *desc,
+                             size_t (*rd)(void *, char *, size_t), gptps_status (*wr)(void *, const char *))
+{
+    gptps_setting_def d;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = key; d.type = type; d.hot = hot;
+    d.has_range = has_range; d.min = mn; d.max = mx; d.desc = desc;
+    d.target = e; d.read = rd; d.write = wr;
+    gptps_settings_add(e->settings, &d);
+}
+
+static void reg_task_setting(gptps *e, gptps_reg *r, const char *leaf, gptps_setting_type type,
+                             const char *const *choices,
+                             size_t (*rd)(void *, char *, size_t), gptps_status (*wr)(void *, const char *))
+{
+    gptps_setting_def d;
+    char key[320];
+    memset(&d, 0, sizeof d);
+    snprintf(key, sizeof key, "tasks.%s.%s", r->name, leaf);
+    d.struct_size = sizeof d; d.key = key; d.type = type; d.hot = 1; d.desc = "per-task policy";
+    d.choices = choices; d.target = r; d.read = rd; d.write = wr;
+    gptps_settings_add(e->settings, &d);   /* key is copied by add() */
+}
+
+/* register the six per-task knobs for a freshly-registered task (after e->m unlocked) */
+static void register_task_settings(gptps *e, gptps_reg *r)
+{
+    reg_task_setting(e, r, "timeout_seconds",       GPTPS_SETTING_UINT, NULL,           st_rd_timeout, st_wr_timeout);
+    reg_task_setting(e, r, "max_retries",           GPTPS_SETTING_UINT, NULL,           st_rd_retries, st_wr_retries);
+    reg_task_setting(e, r, "retry_backoff_seconds", GPTPS_SETTING_UINT, NULL,           st_rd_backoff, st_wr_backoff);
+    reg_task_setting(e, r, "mem_bytes",             GPTPS_SETTING_UINT, NULL,           st_rd_mem,     st_wr_mem);
+    reg_task_setting(e, r, "priority",              GPTPS_SETTING_INT,  NULL,           st_rd_prio,    st_wr_prio);
+    reg_task_setting(e, r, "on_failure",            GPTPS_SETTING_ENUM, ONFAIL_CHOICES, st_rd_onfail,  st_wr_onfail);
+}
+
 gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
 {
     gptps *e;
@@ -659,7 +734,16 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     e->m = gptps_mutex_create();
     e->cv_disp = gptps_cond_create();
     e->cv_work = gptps_cond_create();
-    if (!e->m || !e->cv_disp || !e->cv_work) { s = GPTPS_E_NOMEM; goto fail; }
+    e->settings = gptps_settings_create();
+    if (!e->m || !e->cv_disp || !e->cv_work || !e->settings) { s = GPTPS_E_NOMEM; goto fail; }
+
+    /* core settings (read live engine state; hot ones apply immediately) */
+    reg_core_setting(e, "limits.max_memory_bytes", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+                     "admission memory budget in bytes", sc_rd_maxmem, sc_wr_maxmem);
+    reg_core_setting(e, "limits.max_concurrent_tasks", GPTPS_SETTING_UINT, 0, 1, 1, 65536,
+                     "worker pool size (restart to apply)", sc_rd_conc, sc_wr_conc);
+    reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+                     "scheduler starvation guard (backfill skips before reserving)", sc_rd_resv, sc_wr_resv);
 
     e->nworkers = e->limits.max_concurrent_tasks;
     e->workers = (gptps_thread **)calloc(e->nworkers, sizeof *e->workers);
@@ -683,6 +767,7 @@ fail_threads:
     gptps_thread_join(e->dispatcher);
     for (i = 0; i < e->nworkers; ++i) if (e->workers[i]) gptps_thread_join(e->workers[i]);
 fail:
+    if (e->settings) gptps_settings_destroy(e->settings);
     if (e->workers) free(e->workers);
     if (e->cv_work) gptps_cond_destroy(e->cv_work);
     if (e->cv_disp) gptps_cond_destroy(e->cv_disp);
@@ -830,10 +915,15 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->def.argv = (const char *const *)argv_copy; /* point at our owned copy (NULL for non-PROGRAM) */
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
     r->priority = 0;
+    r->engine = e;
     apply_task_config(e->toml, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
     r->next = e->registry;
     e->registry = r;
     gptps_mutex_unlock(e->m);
+
+    /* expose this task's knobs in the settings registry (after releasing e->m:
+     * registry add takes settings->m then e->m, preserving the lock order) */
+    register_task_settings(e, r);
     return GPTPS_OK;
 }
 
@@ -848,6 +938,18 @@ gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priori
     gptps_mutex_unlock(e->m);
     return r ? GPTPS_OK : GPTPS_E_NOTFOUND;
 }
+
+/* --- settings: public forwarders onto the registry --- */
+gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def)
+{ return e ? gptps_settings_add(e->settings, def) : GPTPS_E_INVAL; }
+size_t gptps_settings_count(gptps *e)
+{ return e ? gptps_settings_size(e->settings) : 0; }
+gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_setting_info *out)
+{ return e ? gptps_settings_info_at(e->settings, index, out) : GPTPS_E_INVAL; }
+gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap)
+{ return e ? gptps_settings_get_by(e->settings, key, buf, cap) : GPTPS_E_INVAL; }
+gptps_status gptps_settings_set(gptps *e, const char *key, const char *value)
+{ return e ? gptps_settings_set_by(e->settings, key, value) : GPTPS_E_INVAL; }
 
 /* ------------------------------------------------------------------------- */
 /* add-on loader (host-table ABI)                                            */
@@ -1104,6 +1206,7 @@ gptps_status gptps_shutdown(gptps *e)
     }
     { gptps_observer  *o = e->observers;  while (o) { gptps_observer  *n = o->next; free(o); o = n; } }
     { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; free(c); c = n; } }
+    gptps_settings_destroy(e->settings);  /* entries reference e / regs, which are freed above/after; destroy only frees the schema list */
     gptps_toml_free(e->toml);
 
     free(e->workers);

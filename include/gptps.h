@@ -296,6 +296,70 @@ typedef void (*gptps_dead_letter_cb)(const gptps_dead_letter *dl, void *user_dat
 GPTPS_API size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_data);
 
 /* ============================================================================
+ * SETTINGS - a unified, typed, introspectable + validated configuration registry.
+ *
+ * Every knob (core limits/scheduler, per-task policy, and add-on settings) is a
+ * registered entry with a dotted key (e.g. "scheduler.reserve_after_skips",
+ * "tasks.resize.timeout_seconds", "tui.refresh_ms"). The registry is SCHEMA +
+ * ACCESSOR BINDING: the live engine/add-on state stays the source of truth, so
+ * reads never go stale. set() parses + validates (range / enum / type) before
+ * applying, and applies LIVE when the setting is `hot`.
+ * ==========================================================================*/
+typedef enum {
+    GPTPS_SETTING_INT = 0,   /* signed integer        */
+    GPTPS_SETTING_UINT,      /* unsigned integer      */
+    GPTPS_SETTING_DOUBLE,
+    GPTPS_SETTING_BOOL,      /* "true" / "false"      */
+    GPTPS_SETTING_ENUM,      /* one of a fixed choice set */
+    GPTPS_SETTING_STRING
+} gptps_setting_type;
+
+#define GPTPS_SETTINGS_VALUE_MAX 256   /* cap for any rendered/parsed value string */
+
+/* Schema + accessor binding for ONE setting, supplied at registration. `key`,
+ * `desc` are copied; `choices` (enum only) is BORROWED and must outlive the engine
+ * (use a static array). `target` is opaque, passed back to read/write. */
+typedef struct {
+    size_t              struct_size;   /* = sizeof(gptps_setting_def) */
+    const char         *key;
+    gptps_setting_type  type;
+    const char         *desc;
+    int                 hot;           /* 1 = applies live; 0 = effective on restart */
+    int                 has_range;     /* 1 => min/max apply (numeric types) */
+    double              min, max;
+    const char *const  *choices;       /* NULL-terminated; NULL unless ENUM */
+    void               *target;
+    size_t            (*read)(void *target, char *buf, size_t cap);  /* render current value */
+    gptps_status      (*write)(void *target, const char *value);     /* parse + apply (takes its own lock) */
+} gptps_setting_def;
+
+/* Introspection record (struct_size first; value/defval rendered inline). */
+typedef struct {
+    size_t              struct_size;   /* = sizeof(gptps_setting_info) */
+    const char         *key;           /* borrowed; stable for engine lifetime */
+    gptps_setting_type  type;
+    const char         *desc;          /* borrowed */
+    int                 hot;
+    int                 has_range;
+    double              min, max;
+    const char *const  *choices;       /* borrowed; NULL unless ENUM */
+    char                value[GPTPS_SETTINGS_VALUE_MAX];   /* current, rendered */
+    char                defval[GPTPS_SETTINGS_VALUE_MAX];  /* default at registration */
+} gptps_setting_info;
+
+/* Register a setting into the engine's registry (GPTPS_E_DUP on a duplicate key). */
+GPTPS_API gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def);
+
+/* Introspection (index-based; indices are stable until a new task/add-on registers). */
+GPTPS_API size_t       gptps_settings_count(gptps *e);
+GPTPS_API gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_setting_info *out);
+
+/* String get/set by key. set() validates then applies; GPTPS_E_NOTFOUND for an
+ * unknown key, GPTPS_E_CONFIG for an invalid value. */
+GPTPS_API gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap);
+GPTPS_API gptps_status gptps_settings_set(gptps *e, const char *key, const char *value);
+
+/* ============================================================================
  * HOST-TABLE ABI (for dlopen'd add-ons)
  *
  * The add-on calls the core ONLY through a passed, version-stamped table of
