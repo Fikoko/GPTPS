@@ -22,6 +22,7 @@
 #include "gptps_hal.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -230,5 +231,8 @@ gptps_dl *gptps_dl_open(const char *path)
 }
 void *gptps_dl_sym(gptps_dl *h, const char *symbol) { return h ? dlsym(h->handle, symbol) : NULL; }
 void  gptps_dl_close(gptps_dl *h) { if (h) { dlclose(h->handle); free(h); } }
+
+gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
+{ return rename(tmp_path, final_path) == 0 ? GPTPS_OK : GPTPS_E_IO; }
 
 #endif /* !_WIN32 */

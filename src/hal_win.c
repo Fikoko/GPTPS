@@ -123,4 +123,7 @@ gptps_dl *gptps_dl_open(const char *path) { return (gptps_dl *)LoadLibraryA(path
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol) { return (void *)GetProcAddress((HMODULE)h, symbol); }
 void      gptps_dl_close(gptps_dl *h) { if (h) FreeLibrary((HMODULE)h); }
 
+gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
+{ return MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING) ? GPTPS_OK : GPTPS_E_IO; }
+
 #endif /* _WIN32 */

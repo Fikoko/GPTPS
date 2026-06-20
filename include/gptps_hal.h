@@ -80,6 +80,11 @@ gptps_dl *gptps_dl_open(const char *path);          /* RTLD_LOCAL; NULL on failu
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol);
 void      gptps_dl_close(gptps_dl *h);
 
+/* --- atomic file replace (settings save: temp -> final) ------------------ *
+ * Atomically replace `final_path` with `tmp_path` (rename on POSIX, MoveFileEx
+ * on Windows so it works when the target already exists). GPTPS_OK / GPTPS_E_IO. */
+gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path);
+
 /* --- still pending (later increment): OS memory cap (out-of-process
  * executor: setrlimit / cgroups / Job Objects).
  */

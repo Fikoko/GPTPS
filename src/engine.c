@@ -147,6 +147,7 @@ struct gptps {
     gptps_toml    *toml;          /* parsed config file (NULL if opened without one) */
     uint32_t       reserve_after_skips; /* starvation guard: reserve a budget-blocked top task after this many backfill skips */
     gptps_settings *settings;     /* unified settings registry */
+    char          *config_path;   /* the path opened with (NULL if none); default for save/reload */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -745,6 +746,12 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 0, 0, 0,
                      "scheduler starvation guard (backfill skips before reserving)", sc_rd_resv, sc_wr_resv);
 
+    if (cfg && cfg->config_path) {   /* remember the open path for save/reload defaults */
+        size_t L = strlen(cfg->config_path) + 1;
+        e->config_path = (char *)malloc(L);
+        if (e->config_path) memcpy(e->config_path, cfg->config_path, L);
+    }
+
     e->nworkers = e->limits.max_concurrent_tasks;
     e->workers = (gptps_thread **)calloc(e->nworkers, sizeof *e->workers);
     if (!e->workers) { s = GPTPS_E_NOMEM; goto fail; }
@@ -950,6 +957,31 @@ gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap
 { return e ? gptps_settings_get_by(e->settings, key, buf, cap) : GPTPS_E_INVAL; }
 gptps_status gptps_settings_set(gptps *e, const char *key, const char *value)
 { return e ? gptps_settings_set_by(e->settings, key, value) : GPTPS_E_INVAL; }
+
+gptps_status gptps_settings_save(gptps *e, const char *path)
+{
+    if (!e) return GPTPS_E_INVAL;
+    if (!path) path = e->config_path;
+    if (!path) return GPTPS_E_INVAL;
+    return gptps_settings_save_to(e->settings, path);
+}
+
+gptps_status gptps_settings_reload(gptps *e, const char *path)
+{
+    gptps_toml *t, *old;
+    gptps_status st;
+    if (!e) return GPTPS_E_INVAL;
+    if (!path) path = e->config_path;
+    if (!path) return GPTPS_E_INVAL;
+    t = gptps_toml_parse_file(path, NULL, 0);
+    if (!t) return GPTPS_E_CONFIG;
+    st = gptps_settings_apply_toml(e->settings, t);   /* re-apply known keys (validated) */
+    gptps_mutex_lock(e->m);                            /* swap so future task registrations see it */
+    old = e->toml; e->toml = t;
+    gptps_mutex_unlock(e->m);
+    gptps_toml_free(old);
+    return st;
+}
 
 /* ------------------------------------------------------------------------- */
 /* add-on loader (host-table ABI)                                            */
@@ -1208,6 +1240,7 @@ gptps_status gptps_shutdown(gptps *e)
     { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; free(c); c = n; } }
     gptps_settings_destroy(e->settings);  /* entries reference e / regs, which are freed above/after; destroy only frees the schema list */
     gptps_toml_free(e->toml);
+    free(e->config_path);
 
     free(e->workers);
     gptps_cond_destroy(e->cv_work);

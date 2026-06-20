@@ -359,6 +359,13 @@ GPTPS_API gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_set
 GPTPS_API gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap);
 GPTPS_API gptps_status gptps_settings_set(gptps *e, const char *key, const char *value);
 
+/* Persistence. save() regenerates a grouped TOML file atomically (comments are
+ * NOT preserved). reload() re-parses and re-applies known keys via set()+validation
+ * (best-effort: returns the first error; a parse failure applies nothing). For both,
+ * path==NULL uses the path the engine was opened with (GPTPS_E_INVAL if none). */
+GPTPS_API gptps_status gptps_settings_save(gptps *e, const char *path);
+GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
+
 /* ============================================================================
  * HOST-TABLE ABI (for dlopen'd add-ons)
  *

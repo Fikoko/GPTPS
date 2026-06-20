@@ -97,7 +97,43 @@ int main(void)
             CHECK(info.hot == 0);                    /* restart-only */
     }
 
+    /* ---- Phase 2: persistence round-trip ---- */
+    CHECK(gptps_settings_set(e, "limits.max_memory_bytes", "12345678") == GPTPS_OK);
+    CHECK(gptps_settings_save(e, "settings_rt.toml") == GPTPS_OK);
+    CHECK(gptps_settings_save(e, NULL) == GPTPS_E_INVAL);   /* engine opened without a path */
+    {
+        FILE *f = fopen("settings_rt.toml", "rb"); char rd[8192]; size_t got = 0;
+        CHECK(f != NULL);
+        if (f) { got = fread(rd, 1, sizeof rd - 1, f); rd[got] = 0; fclose(f); }
+        CHECK(strstr(rd, "[scheduler]") != NULL);
+        CHECK(strstr(rd, "reserve_after_skips = 3") != NULL);
+        CHECK(strstr(rd, "[tasks.work]") != NULL);
+        CHECK(strstr(rd, "priority = 5") != NULL);
+        CHECK(strstr(rd, "on_failure = \"drop\"") != NULL);
+        CHECK(strstr(rd, "max_memory_bytes = 12345678") != NULL);
+    }
+    { FILE *t = fopen("settings_rt.toml.tmp", "rb"); CHECK(t == NULL); if (t) fclose(t); } /* atomic: no temp left */
     gptps_shutdown(e);
+
+    /* reopen a fresh engine on the saved file => values applied; then reload reverts a live edit */
+    {
+        gptps *e2 = NULL; char b[GPTPS_SETTINGS_VALUE_MAX];
+        CHECK(gptps_open("settings_rt.toml", &e2) == GPTPS_OK);
+        if (e2) {
+            reg(e2, "work");   /* registering applies [tasks.work] from the reopened file */
+            CHECK(gptps_settings_get(e2, "scheduler.reserve_after_skips", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
+            CHECK(gptps_settings_get(e2, "limits.max_memory_bytes", b, sizeof b) == GPTPS_OK && strcmp(b, "12345678") == 0);
+            CHECK(gptps_settings_get(e2, "tasks.work.priority", b, sizeof b) == GPTPS_OK && strcmp(b, "5") == 0);
+            CHECK(gptps_settings_get(e2, "tasks.work.on_failure", b, sizeof b) == GPTPS_OK && strcmp(b, "drop") == 0);
+            CHECK(gptps_settings_set(e2, "scheduler.reserve_after_skips", "99") == GPTPS_OK);
+            CHECK(gptps_settings_reload(e2, NULL) == GPTPS_OK);   /* uses the open path */
+            CHECK(gptps_settings_get(e2, "scheduler.reserve_after_skips", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
+            CHECK(gptps_settings_save(e2, NULL) == GPTPS_OK);     /* default-path save works */
+            gptps_shutdown(e2);
+        }
+        remove("settings_rt.toml");
+    }
+
     if (fails) { printf("%d settings check(s) FAILED\n", fails); return 1; }
     printf("all settings checks passed\n");
     return 0;
