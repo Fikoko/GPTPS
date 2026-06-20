@@ -100,6 +100,17 @@ int main(void)
     CHECK(strstr(frame, "TASKS")    != NULL);
     CHECK(strstr(frame, "avg ms")   != NULL);
 
+    /* the unified settings registry drives the dashboard (tui.* settings) */
+    {
+        char b[GPTPS_SETTINGS_VALUE_MAX];
+        CHECK(gptps_settings_get(e, "tui.kpi", b, sizeof b) == GPTPS_OK && strcmp(b, "full") == 0);
+        CHECK(gptps_settings_set(e, "tui.kpi", "minimal") == GPTPS_OK);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "kpi:minimal") != NULL && strstr(frame, "TASKS") == NULL);
+        CHECK(gptps_settings_set(e, "tui.kpi", "bogus") == GPTPS_E_CONFIG);   /* enum validated */
+        CHECK(gptps_settings_set(e, "tui.kpi", "full") == GPTPS_OK);          /* restore */
+    }
+
     /* mode + refresh, reflected live in the status line */
     CHECK(gptps_tui_set_mode(t, GPTPS_TUI_ON_DEMAND) == GPTPS_OK);
     CHECK(gptps_tui_set_refresh(t, 500) == GPTPS_OK);

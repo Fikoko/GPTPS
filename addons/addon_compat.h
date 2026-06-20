@@ -10,31 +10,31 @@
 
 #include <stdio.h>
 
+/* a given add-on may use only some of these; mark them so -Wall stays quiet */
+#if defined(__GNUC__)
+#  define APX_UNUSED __attribute__((unused))
+#else
+#  define APX_UNUSED
+#endif
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <io.h>
 typedef CRITICAL_SECTION apx_mutex;
-static void apx_mutex_init(apx_mutex *m)    { InitializeCriticalSection(m); }
-static void apx_mutex_lock(apx_mutex *m)    { EnterCriticalSection(m); }
-static void apx_mutex_unlock(apx_mutex *m)  { LeaveCriticalSection(m); }
-static void apx_mutex_destroy(apx_mutex *m) { DeleteCriticalSection(m); }
-static int  apx_fsync(FILE *f)              { return _commit(_fileno(f)); }
+static APX_UNUSED void apx_mutex_init(apx_mutex *m)    { InitializeCriticalSection(m); }
+static APX_UNUSED void apx_mutex_lock(apx_mutex *m)    { EnterCriticalSection(m); }
+static APX_UNUSED void apx_mutex_unlock(apx_mutex *m)  { LeaveCriticalSection(m); }
+static APX_UNUSED void apx_mutex_destroy(apx_mutex *m) { DeleteCriticalSection(m); }
+static APX_UNUSED int  apx_fsync(FILE *f)              { return _commit(_fileno(f)); }
 #else
 #  include <pthread.h>
 #  include <unistd.h>
 typedef pthread_mutex_t apx_mutex;
-static void apx_mutex_init(apx_mutex *m)    { pthread_mutex_init(m, NULL); }
-static void apx_mutex_lock(apx_mutex *m)    { pthread_mutex_lock(m); }
-static void apx_mutex_unlock(apx_mutex *m)  { pthread_mutex_unlock(m); }
-static void apx_mutex_destroy(apx_mutex *m) { pthread_mutex_destroy(m); }
-static int  apx_fsync(FILE *f)              { return fsync(fileno(f)); }
+static APX_UNUSED void apx_mutex_init(apx_mutex *m)    { pthread_mutex_init(m, NULL); }
+static APX_UNUSED void apx_mutex_lock(apx_mutex *m)    { pthread_mutex_lock(m); }
+static APX_UNUSED void apx_mutex_unlock(apx_mutex *m)  { pthread_mutex_unlock(m); }
+static APX_UNUSED void apx_mutex_destroy(apx_mutex *m) { pthread_mutex_destroy(m); }
+static APX_UNUSED int  apx_fsync(FILE *f)              { return fsync(fileno(f)); }
 #endif
-
-/* silence -Wunused-function for whichever primitive a given add-on doesn't use */
-static void apx_compat_keep_refs(void)
-{
-    (void)apx_mutex_init; (void)apx_mutex_lock; (void)apx_mutex_unlock;
-    (void)apx_mutex_destroy; (void)apx_fsync; (void)apx_compat_keep_refs;
-}
 
 #endif /* GPTPS_ADDON_COMPAT_H */

@@ -5,6 +5,7 @@
  */
 #include "gptps.h"
 #include <stdio.h>
+#include <string.h>
 
 #ifndef ADDON_DEMO_PATH
 #define ADDON_DEMO_PATH "./addon_demo.so"
@@ -41,6 +42,13 @@ int main(void)
     CHECK(gptps_load_addon(e, ADDON_BAD_PATH) == GPTPS_E_ABI);
     /* valid add-on loads via the host-table ABI */
     CHECK(gptps_load_addon(e, ADDON_DEMO_PATH) == GPTPS_OK);
+
+    /* the add-on registered a setting through the host-table register_setting routine */
+    {
+        char b[GPTPS_SETTINGS_VALUE_MAX];
+        CHECK(gptps_settings_get(e, "demo.flag", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "demo") == 0);
+    }
 
     /* the add-on-registered task runs end-to-end */
     CHECK(gptps_submit(e, "plugintask", NULL, 0, &h) == GPTPS_OK);

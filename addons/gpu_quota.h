@@ -45,6 +45,10 @@ uint64_t gptps_gpu_quota_in_use(gptps_gpu_quota *q);
 /* Total budget the quota was installed with. */
 uint64_t gptps_gpu_quota_total(gptps_gpu_quota *q);
 
+/* Retune the total budget at runtime (also exposed as the "gpu_quota.total_units"
+ * setting in the engine's settings registry). */
+gptps_status gptps_gpu_quota_set_total(gptps_gpu_quota *q, uint64_t total_units);
+
 /* Free the quota. Call AFTER gptps_shutdown(e). */
 void gptps_gpu_quota_close(gptps_gpu_quota *q);
 

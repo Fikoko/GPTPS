@@ -385,6 +385,29 @@ void gptps_tui_run(gptps_tui *t)
     free(buf);
 }
 
+/* ---- settings registry bindings (target = the gptps_tui) ---- */
+static const char *const TUI_KPI_CHOICES[]  = { "minimal", "normal", "full", 0 };
+static const char *const TUI_MODE_CHOICES[] = { "realtime", "on-demand", "paused", 0 };
+
+static size_t ts_rd_refresh(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; unsigned ms; mu_lock(&t->mu); ms = t->cfg.refresh_ms; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%u", ms); }
+static gptps_status ts_wr_refresh(void *p, const char *v) { return gptps_tui_set_refresh((gptps_tui *)p, (uint32_t)strtoul(v, NULL, 10)); }
+static size_t ts_rd_kpi(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int k; mu_lock(&t->mu); k = t->kpi; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", kpi_str(k)); }
+static gptps_status ts_wr_kpi(void *p, const char *v) { int k = (strcmp(v, "minimal") == 0) ? GPTPS_TUI_KPI_MINIMAL : (strcmp(v, "normal") == 0) ? GPTPS_TUI_KPI_NORMAL : GPTPS_TUI_KPI_FULL; return gptps_tui_set_kpi((gptps_tui *)p, (gptps_tui_kpi)k); }
+static size_t ts_rd_mode(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int m; mu_lock(&t->mu); m = t->mode; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", mode_str(m)); }
+static gptps_status ts_wr_mode(void *p, const char *v) { int m = (strcmp(v, "realtime") == 0) ? GPTPS_TUI_CONTINUOUS : (strcmp(v, "on-demand") == 0) ? GPTPS_TUI_ON_DEMAND : GPTPS_TUI_PAUSED; return gptps_tui_set_mode((gptps_tui *)p, (gptps_tui_mode)m); }
+
+static void tui_register_settings(gptps *e, gptps_tui *t)
+{
+    gptps_setting_def d;
+    memset(&d, 0, sizeof d); d.struct_size = sizeof d; d.target = t; d.hot = 1;
+    d.key = "tui.refresh_ms"; d.type = GPTPS_SETTING_UINT; d.desc = "dashboard redraw interval (ms)"; d.choices = NULL; d.read = ts_rd_refresh; d.write = ts_wr_refresh;
+    gptps_register_setting(e, &d);
+    d.key = "tui.kpi"; d.type = GPTPS_SETTING_ENUM; d.desc = "KPI detail level"; d.choices = TUI_KPI_CHOICES; d.read = ts_rd_kpi; d.write = ts_wr_kpi;
+    gptps_register_setting(e, &d);
+    d.key = "tui.mode"; d.type = GPTPS_SETTING_ENUM; d.desc = "redraw cadence"; d.choices = TUI_MODE_CHOICES; d.read = ts_rd_mode; d.write = ts_wr_mode;
+    gptps_register_setting(e, &d);
+}
+
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
 {
     gptps_tui *t;
@@ -421,6 +444,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     if (gptps_register_observer(e, tui_on_event, t) != GPTPS_OK) {
         free(t->recent); mu_destroy(&t->mu); free(t); return NULL;
     }
+    tui_register_settings(e, t);   /* expose tui.refresh_ms / tui.kpi / tui.mode */
     return t;
 }
 

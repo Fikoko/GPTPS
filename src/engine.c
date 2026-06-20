@@ -1009,7 +1009,8 @@ static const gptps_api_routines G_API = {
     gptps_result_set,
     gptps_payload,
     gptps_register_constraint,
-    gptps_register_observer
+    gptps_register_observer,
+    gptps_register_setting
 };
 
 gptps_status gptps_load_addon(gptps *e, const char *path)

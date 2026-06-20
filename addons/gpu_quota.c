@@ -93,6 +93,17 @@ static void gpu_release(const gptps_event *ev, void *ud)
     apx_mutex_unlock(&q->mu);
 }
 
+gptps_status gptps_gpu_quota_set_total(gptps_gpu_quota *q, uint64_t total_units)
+{
+    if (!q) return GPTPS_E_INVAL;
+    apx_mutex_lock(&q->mu); q->budget = total_units; apx_mutex_unlock(&q->mu);
+    return GPTPS_OK;
+}
+
+/* settings registry bindings (target = the quota) */
+static size_t       gq_rd_total(void *p, char *b, size_t c) { gptps_gpu_quota *q = (gptps_gpu_quota *)p; uint64_t v; apx_mutex_lock(&q->mu); v = q->budget; apx_mutex_unlock(&q->mu); return (size_t)snprintf(b, c, "%llu", (unsigned long long)v); }
+static gptps_status gq_wr_total(void *p, const char *v) { return gptps_gpu_quota_set_total((gptps_gpu_quota *)p, (uint64_t)strtoull(v, NULL, 10)); }
+
 gptps_gpu_quota *gptps_gpu_quota_install(gptps *e, uint64_t total_units, uint32_t defer_ms)
 {
     gptps_gpu_quota *q;
@@ -110,6 +121,13 @@ gptps_gpu_quota *gptps_gpu_quota_install(gptps *e, uint64_t total_units, uint32_
         /* the constraint now references q; freeing it would dangle. Leak q (only
          * reachable on an allocation failure) rather than risk a use-after-free. */
         return NULL;
+    }
+    {   /* expose the budget as a runtime setting */
+        gptps_setting_def d;
+        memset(&d, 0, sizeof d); d.struct_size = sizeof d;
+        d.key = "gpu_quota.total_units"; d.type = GPTPS_SETTING_UINT; d.hot = 1;
+        d.desc = "total GPU units budget"; d.target = q; d.read = gq_rd_total; d.write = gq_wr_total;
+        gptps_register_setting(e, &d);
     }
     return q;
 }

@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 3u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain */
+#define GPTPS_ABI_VERSION_MINOR 4u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -415,6 +415,8 @@ typedef struct {
     /* --- v1.1 routines (append-only) --- */
     gptps_status (*register_constraint)(gptps *e, gptps_constraint_fn fn, void *user_data);
     gptps_status (*register_observer)(gptps *e, gptps_event_cb fn, void *user_data);
+    /* --- v1.4 routines (append-only); guard with `struct_size` before calling --- */
+    gptps_status (*register_setting)(gptps *e, const gptps_setting_def *def);
 } gptps_api_routines;
 
 typedef struct {

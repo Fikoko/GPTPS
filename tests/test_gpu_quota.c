@@ -70,6 +70,15 @@ int main(void)
     CHECK(q != NULL);
     CHECK(gptps_gpu_quota_total(q) == 4);
 
+    /* the budget is exposed + retunable through the unified settings registry */
+    {
+        char b[GPTPS_SETTINGS_VALUE_MAX];
+        CHECK(gptps_settings_get(e, "gpu_quota.total_units", b, sizeof b) == GPTPS_OK && strcmp(b, "4") == 0);
+        CHECK(gptps_settings_set(e, "gpu_quota.total_units", "9") == GPTPS_OK);
+        CHECK(gptps_gpu_quota_total(q) == 9);     /* live retune via the registry */
+        CHECK(gptps_settings_set(e, "gpu_quota.total_units", "4") == GPTPS_OK); /* back for the test below */
+    }
+
     memset(&d, 0, sizeof d);
     d.struct_size = sizeof d; d.name = "gpu"; d.run = task_gpu; d.exec = GPTPS_EXEC_INPROC;
     d.default_cost.struct_size = sizeof d.default_cost;
