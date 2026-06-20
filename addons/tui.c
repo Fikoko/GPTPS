@@ -71,6 +71,13 @@ struct gptps_tui {
     int              kpi;           /* effective gptps_tui_kpi (never DEFAULT) */
     int              mode;          /* effective gptps_tui_mode */
     int              dirty;         /* state changed since last paint (for ON_DEMAND) */
+    /* Settings pane state - touched only by the run/press/render thread (not the
+     * observer), so it needs no lock. */
+    int              pane;          /* 0 = dashboard, 1 = settings editor */
+    int              sel;           /* selected setting index */
+    int              editing, editlen;
+    char             editbuf[GPTPS_SETTINGS_VALUE_MAX];
+    char             status[160];   /* last save / validation message */
     int              quit, show_tasks, show_recent;
     int              raw_active;
 #if !defined(_WIN32)
@@ -188,6 +195,34 @@ static size_t appendf(char *buf, size_t cap, size_t pos, const char *fmt, ...)
     return pos > cap ? cap : pos;
 }
 
+/* Settings pane (no t->mu: reads only run-thread-local pane state + the registry,
+ * whose get_info takes its own locks - holding t->mu here would deadlock the tui
+ * read_fns). */
+static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
+{
+    size_t pos = 0, i, n;
+    int color = t->cfg.color;
+    const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
+    n = gptps_settings_count(t->e);
+    if (t->sel < 0) t->sel = 0;
+    if (n && (size_t)t->sel >= n) t->sel = (int)n - 1;
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s settings%s  (%lu)\n\n", B, t->cfg.title, X, (unsigned long)n);
+    for (i = 0; i < n; ++i) {
+        gptps_setting_info info;
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        if (gptps_settings_get_info(t->e, i, &info) != GPTPS_OK) continue;
+        pos = appendf(buf, cap, pos, "%s%s%-32s = %-18s %s%s\n",
+                      (i == (size_t)t->sel) ? INV : "", (i == (size_t)t->sel) ? "> " : "  ",
+                      info.key, info.value, info.hot ? "" : "(restart)", X);
+    }
+    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_\n", B, X, t->editbuf);
+    if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s j/k move  enter edit  w save  s/esc back  q quit\n", D, X);
+    if (pos >= cap) pos = cap - 1;
+    buf[pos] = 0;
+    return pos;
+}
+
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0;
@@ -195,6 +230,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     const char *B, *D, *R, *G, *X;
     double up;
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
+    if (t->pane == 1) return render_settings(t, buf, cap);
     color = t->cfg.color;
     B = color ? "\x1b[1m" : ""; D = color ? "\x1b[2m" : ""; R = color ? "\x1b[31m" : "";
     G = color ? "\x1b[32m" : ""; X = color ? "\x1b[0m" : "";
@@ -265,6 +301,47 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     return pos;
 }
 
+/* Settings-pane key handling. Returns 4 (settings interaction) or -1 (quit). */
+static int settings_press(gptps_tui *t, int key)
+{
+    gptps_setting_info info;
+    if (t->editing) {
+        if (key == 27) { t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; return 4; }   /* cancel */
+        if (key == '\r' || key == '\n') {                                                 /* commit */
+            memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+            if (gptps_settings_get_info(t->e, (size_t)t->sel, &info) == GPTPS_OK) {
+                gptps_status st = gptps_settings_set(t->e, info.key, t->editbuf);
+                if (st == GPTPS_OK) snprintf(t->status, sizeof t->status, "set %.70s = %.70s", info.key, t->editbuf);
+                else                snprintf(t->status, sizeof t->status, "rejected: %s", gptps_strerror(st));
+            }
+            t->editing = 0; t->editbuf[0] = 0; t->editlen = 0;
+            return 4;
+        }
+        if (key == 8 || key == 127) { if (t->editlen > 0) t->editbuf[--t->editlen] = 0; return 4; } /* backspace */
+        if (key >= 32 && key < 127 && t->editlen < (int)sizeof t->editbuf - 1) { t->editbuf[t->editlen++] = (char)key; t->editbuf[t->editlen] = 0; }
+        return 4;
+    }
+    switch (key) {
+        case 'q': case 'Q': mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1;
+        case 27: case 's': case 'S': case '\t': t->pane = 0; t->status[0] = 0; return 4;   /* back to dashboard */
+        case 'j': case 'J': { size_t n = gptps_settings_count(t->e); if (n && (size_t)t->sel + 1 < n) t->sel++; return 4; }
+        case 'k': case 'K': if (t->sel > 0) t->sel--; return 4;
+        case '\r': case '\n':                                                              /* start editing */
+            memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+            if (gptps_settings_get_info(t->e, (size_t)t->sel, &info) == GPTPS_OK) {
+                snprintf(t->editbuf, sizeof t->editbuf, "%s", info.value);
+                t->editlen = (int)strlen(t->editbuf); t->editing = 1;
+            }
+            return 4;
+        case 'w': case 'W': {
+            gptps_status st = gptps_settings_save(t->e, t->cfg.settings_path);
+            snprintf(t->status, sizeof t->status, st == GPTPS_OK ? "saved" : "save failed: %s", gptps_strerror(st));
+            return 4;
+        }
+        default: return 4;
+    }
+}
+
 int gptps_tui_press(gptps_tui *t, int key)
 {
     const char *name = NULL;
@@ -272,6 +349,7 @@ int gptps_tui_press(gptps_tui *t, int key)
     size_t pn = 0;
     int i;
     if (!t) return 0;
+    if (t->pane == 1) return settings_press(t, key);   /* settings editor handles its own keys */
     if (key == 'q' || key == 'Q' || key == 27) {
         mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu);
         return -1;
@@ -291,6 +369,7 @@ int gptps_tui_press(gptps_tui *t, int key)
     }
     if (key == 'k' || key == 'K') { mu_lock(&t->mu); t->scroll += 1; mu_unlock(&t->mu); return 2; } /* scroll to older */
     if (key == 'j' || key == 'J') { mu_lock(&t->mu); if (t->scroll > 0) t->scroll -= 1; mu_unlock(&t->mu); return 2; } /* newer */
+    if (key == 's' || key == 'S') { t->pane = 1; t->status[0] = 0; return 4; }   /* open the settings pane */
     return 0;
 }
 

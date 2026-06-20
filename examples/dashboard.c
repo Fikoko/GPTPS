@@ -2,10 +2,11 @@
  * dashboard.c - a live terminal dashboard over a running GPTPS engine, using the
  * tui add-on. On a real terminal it redraws continuously and takes hotkeys:
  *   [w] submit 'work'  [f] submit 'flaky'  |  [k]/[j] scroll  [m] KPI level
- *   [p] pause  [q] quit
+ *   [p] pause  [s] settings editor  [q] quit
  * `m` cycles how much the dashboard computes (minimal/normal/full) at runtime, so
- * its own CPU/RAM cost is tunable live. Run it headless (no TTY) and
- * gptps_tui_run() simply returns - the engine still drains the work submitted.
+ * its own CPU/RAM cost is tunable live; `s` opens a live editor over the unified
+ * settings registry (navigate with j/k, Enter to edit, w to save). Run it headless
+ * (no TTY) and gptps_tui_run() simply returns - the engine still drains the work.
  *
  *   cc dashboard.c gptps.c addons/tui.c -lpthread -ldl   (amalgamation; Win: drop -ldl)
  */
@@ -53,6 +54,7 @@ int main(void)
     cfg.struct_size = sizeof cfg;
     cfg.title = "GPTPS live demo";
     cfg.refresh_ms = 120;
+    cfg.settings_path = "gptps_settings.toml";   /* where the [s] pane's save writes */
     /* color + interactive default to auto (on when attached to a terminal) */
     tui = gptps_tui_install(engine, &cfg);
     if (!tui) { gptps_shutdown(engine); return 1; }

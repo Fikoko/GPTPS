@@ -40,6 +40,7 @@ int main(void)
     cfg.color = 0;            /* plain text so assertions match exactly */
     cfg.interactive = 0;      /* no TTY needed */
     cfg.title = "demo board";
+    cfg.settings_path = "tui_settings.toml";   /* where the pane's 'w' saves */
     t = gptps_tui_install(e, &cfg);
     CHECK(t != NULL);
     if (!t) { gptps_shutdown(e); return 1; }
@@ -155,6 +156,48 @@ int main(void)
             gptps_shutdown(e2);
             gptps_tui_close(t2);
         } else { gptps_shutdown(e2); }
+    }
+
+    /* ---- Settings pane: open, navigate, edit inline, save (headless) ---- */
+    {
+        int guard;
+        CHECK(gptps_tui_press(t, 's') == 4);             /* open the pane */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "settings") != NULL);
+        CHECK(strstr(frame, "scheduler.reserve_after_skips") != NULL);
+        /* navigate (j) until the scheduler knob is the selected line */
+        for (guard = 0; guard < 64; ++guard) {
+            gptps_tui_render(t, frame, sizeof frame);
+            if (strstr(frame, "> scheduler.reserve_after_skips")) break;
+            gptps_tui_press(t, 'j');
+        }
+        CHECK(strstr(frame, "> scheduler.reserve_after_skips") != NULL);
+        /* edit it to 7 */
+        CHECK(gptps_tui_press(t, '\r') == 4);            /* begin edit (loads current value) */
+        gptps_tui_press(t, 127); gptps_tui_press(t, 127); /* backspace existing */
+        gptps_tui_press(t, '7');
+        CHECK(gptps_tui_press(t, '\r') == 4);            /* commit */
+        {
+            char b[GPTPS_SETTINGS_VALUE_MAX];
+            CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", b, sizeof b) == GPTPS_OK && strcmp(b, "7") == 0);
+        }
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "set scheduler.reserve_after_skips = 7") != NULL);
+        /* an invalid edit is rejected and changes nothing */
+        gptps_tui_press(t, '\r'); gptps_tui_press(t, 127); gptps_tui_press(t, 'x');
+        CHECK(gptps_tui_press(t, '\r') == 4);
+        {
+            char b[GPTPS_SETTINGS_VALUE_MAX];
+            CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", b, sizeof b) == GPTPS_OK && strcmp(b, "7") == 0);
+        }
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "rejected") != NULL);
+        /* save to the configured path, then back to the dashboard */
+        CHECK(gptps_tui_press(t, 'w') == 4);
+        { FILE *sf = fopen("tui_settings.toml", "rb"); CHECK(sf != NULL); if (sf) fclose(sf); remove("tui_settings.toml"); }
+        CHECK(gptps_tui_press(t, 's') == 4);             /* back to dashboard */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "in-flight") != NULL);        /* dashboard again */
     }
 
     /* quit key */

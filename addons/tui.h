@@ -67,6 +67,7 @@ typedef struct {
     int         latency_window;/* handles tracked for latency at FULL (0 => 1024) */
     const char *title;         /* dashboard title (default "tasks") */
     FILE       *out;           /* output stream (NULL => stdout) */
+    const char *settings_path; /* where the Settings pane's 'w' (save) writes (NULL => engine's open path) */
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
