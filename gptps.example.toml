@@ -5,6 +5,11 @@
 # task's compiled-in def defaults (policies). A subset of TOML is supported -
 # tables, int / float / bool / "string" scalars, single-line string arrays, and
 # `#` comments.
+#
+# These same keys are the runtime SETTINGS registry: read/change them live with
+# gptps_settings_get/set, and gptps_settings_save() writes the current values back
+# here. NOTE: save REGENERATES the file (grouped [section] key = value) - hand
+# comments and ordering are not preserved.
 
 # Shared-library add-ons to dlopen at startup, in order. Each registers its task
 # types / constraints / observers over the stable host-table ABI. Paths are passed

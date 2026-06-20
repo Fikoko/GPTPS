@@ -4,6 +4,23 @@ All notable changes to GPTPS are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project aims for semantic
 versioning once it reaches 1.0.
 
+## [Unreleased]
+
+### Added — unified settings subsystem (ABI 1.4)
+- A typed settings **registry**: introspection (`gptps_settings_count` /
+  `gptps_settings_get_info`), validated string get/set (`gptps_settings_get` /
+  `gptps_settings_set`), and `gptps_register_setting` — schema + accessor binding,
+  so live engine/add-on state stays the single source of truth.
+- Dotted keys over core (`limits.*`, `scheduler.*`), per-task (`tasks.<name>.*`),
+  and add-on (`tui.*`, `gpu_quota.*`) settings; per-setting `hot` vs restart-only.
+- **Round-trip persistence:** `gptps_settings_save` / `gptps_settings_reload`, with
+  a portable atomic-replace HAL primitive (`rename` / `MoveFileEx`).
+- **Add-on extensible:** `register_setting` host-table routine (append-only;
+  `GPTPS_ABI_VERSION_MINOR` 3 → 4); the `tui` and `gpu_quota` add-ons register theirs.
+- **Live editor:** a Settings pane in the `tui` dashboard (`s`) to browse / edit /
+  save settings at runtime.
+- Validation that the raw TOML path lacked (bad enum / out-of-range / type → `E_CONFIG`).
+
 ## [0.1.0] - 2026-06-19
 
 First tagged release: a complete, embeddable C99 general-purpose task processor,

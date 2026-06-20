@@ -216,7 +216,8 @@ primitive its platform offers, and **all atomics are confined to the backend**
 so the core never includes an `_Atomic` type.
 
 Surface: hardware detection (CPU/RAM/GPU hint), monotonic clock, the cancel flag
-(opaque, atomic inside), mutex / condvar / thread, and dynamic loading. Two
+(opaque, atomic inside), mutex / condvar / thread, dynamic loading, and atomic
+file replace (`gptps_hal_atomic_replace`, for the settings save). Two
 backends implement it: `hal_posix.c` (pthreads, `clock_gettime`,
 `sysctl`/`sysinfo`, `dlopen`) and `hal_win.c` (`_beginthreadex`,
 `CRITICAL_SECTION` + `CONDITION_VARIABLE`, `Interlocked*`, `GetTickCount64`,
@@ -274,6 +275,30 @@ by `config_toml.c`, no external dependency). It maps to:
 
 `gptps_open_ex(cfg, ...)` is the explicit, file-free path.
 
+### Settings registry (`src/settings.c`)
+
+The same knobs are also a unified, typed **settings registry** for runtime
+introspection, validation, get/set, and persistence. Each entry is **schema +
+accessor binding** — `{key, type, hot, range/choices, target, read_fn, write_fn}` —
+so the live engine/add-on state stays the single source of truth (reads never
+drift). The generic registry never sees `struct gptps` or add-on layouts; it only
+calls `entry->read/write(target, …)`. Bindings live where the target is visible:
+core/per-task in `engine.c` (target = the engine or a `gptps_reg`), add-on settings
+in the add-on. Validation (range / enum / parseable) runs in the generic layer
+*before* `write_fn` — the check the raw TOML path lacked.
+
+- **Lock order is invariant:** `settings->m → e->m` (and `→` add-on mutex). Per-task
+  settings register *after* `gptps_register_task` releases `e->m`, against the
+  stable heap `gptps_reg` (append-only; freed in bulk at shutdown).
+- **Hot vs restart:** `write_fn` pushes to live state and signals the dispatcher
+  where applicable; `max_concurrent_tasks` is restart-only (pool fixed at open).
+- **Persistence:** `gptps_settings_save` regenerates a grouped TOML file written via
+  `gptps_hal_atomic_replace` (temp + rename/MoveFileEx); `gptps_settings_reload`
+  re-applies known keys through the validated `set()` path and swaps `e->toml`.
+- **Extensible:** add-ons register settings via the public `gptps_register_setting`
+  or the host-table `register_setting` routine; the `tui` Settings pane (`s`) is a
+  thin editor over the registry.
+
 ---
 
 ## 11. ABI versioning & stability
@@ -286,8 +311,9 @@ by `config_toml.c`, no external dependency). It maps to:
 
 New capabilities have so far been added without breaking the ABI: result
 delivery, the external-program executor, constraints/observers, task priority
-(`gptps_set_task_priority`), and the dead-letter drain — each a new symbol or an
-appended field, never a reshape.
+(`gptps_set_task_priority`), the dead-letter drain, and the settings registry
+(new symbols + a `register_setting` routine appended to the host table, minor
+3 → 4) — each a new symbol or an appended field, never a reshape.
 
 ---
 

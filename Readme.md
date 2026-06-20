@@ -87,6 +87,9 @@ library, a CMake package config, and a pkg-config file. Downstream projects then
 | `gptps_register_constraint(e, fn, ud)` | gate admission (rate limit, quota, time window) |
 | `gptps_register_observer(e, cb, ud)` | extra event sink (e.g. analytics) |
 | `gptps_dead_letter_count(e)` / `gptps_dead_letter_drain(e, cb, ud)` | inspect / reprocess retained failures |
+| `gptps_settings_get/set(e, key, …)` · `gptps_settings_count/get_info(e, …)` | read / change / introspect any setting at runtime |
+| `gptps_settings_save/reload(e, path)` | persist settings to / from a TOML file |
+| `gptps_register_setting(e, &def)` | add a custom setting (also a host-table routine for add-ons) |
 | `gptps_load_addon(e, path)` | load a shared-library add-on over the stable ABI |
 | `gptps_shutdown(e)` | drain in-flight + queued work, then free |
 
@@ -126,6 +129,31 @@ priority        = 10
 
 Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]` → `[tasks.<name>]`
 (most specific wins). Explicit `[limits]` values win over auto-tune. See `gptps.example.toml`.
+
+## Settings (runtime, introspectable, persistable)
+
+The same knobs are also a live, typed **settings registry** — one API over core,
+per-task, and add-on settings (dotted keys like `scheduler.reserve_after_skips`,
+`tasks.resize.timeout_seconds`, `tui.kpi`, `gpu_quota.total_units`):
+
+```c
+char v[256];
+gptps_settings_get(e, "scheduler.reserve_after_skips", v, sizeof v);  /* read current */
+gptps_settings_set(e, "tasks.resize.timeout_seconds", "60");          /* validated + applied live */
+gptps_settings_save(e, "gptps.toml");                                 /* persist (atomic) */
+size_t n = gptps_settings_count(e);                                   /* enumerate for a UI */
+```
+
+- **Typed + validated:** `set()` parses and range/enum-checks before applying (so a bad
+  `on_failure` or out-of-range value is rejected with `GPTPS_E_CONFIG`, not silently dropped).
+- **Hot vs restart:** most settings apply immediately; a few (e.g. the worker-pool size) are
+  flagged effective-on-restart. `gptps_settings_get_info` exposes type, default, range, and the
+  hot flag for building a UI.
+- **Round-trip:** `gptps_settings_save` regenerates a grouped TOML file (atomically; comments
+  not preserved); `gptps_settings_reload` re-applies it.
+- **Extensible:** add-ons register their own settings (via `gptps_register_setting` or the
+  host-table routine), so they show up in the registry, TOML, and editor uniformly.
+- **Editor:** the `tui` add-on includes a live **Settings pane** (`s`) to browse/edit/save.
 
 ## Executor kinds (per task, via `def.exec`)
 
@@ -203,8 +231,10 @@ Working today (tested + ThreadSanitizer-clean): the engine, all three executors,
 result delivery, retries/timeout/dead-letter + dead-letter drain, priority scheduling
 with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with RLIMIT_AS
 fallback), the add-on loader + ABI, constraints + observers, TOML config-file loading
-(limits + scheduler + per-task overrides + add-on auto-load), the crash-durable queue,
-GPU-quota, and WASM-executor add-ons, the demo, CMake + CI + single-file amalgamation.
+(limits + scheduler + per-task overrides + add-on auto-load), the unified settings
+registry (typed get/set + validation + round-trip persistence + add-on-extensible +
+a live TUI editor), the crash-durable queue, GPU-quota, and WASM-executor add-ons,
+the demo, CMake + CI + single-file amalgamation.
 
 Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** (Win32 HAL
 via `src/hal_win.c`) runs the engine, scheduler, config, the in-process and
