@@ -9,6 +9,15 @@ even run **single-threaded with no libc heap** for embedded / bare-metal targets
 
 ---
 
+## Contents
+
+- [Quick start](#quick-start) · [Getting started](#getting-started) — build → run → embed
+- [API at a glance](#api-at-a-glance) · [Common tasks](#common-tasks) — step-by-step recipes
+- [Configuration file](#configuration-file-optional) · [Settings](#settings-runtime-introspectable-persistable)
+- [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
+- [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
+- [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
+
 ## Quick start
 
 ```c
@@ -49,9 +58,9 @@ int main(void) {
 }
 ```
 
-## Getting started — build → run → embed
+## Getting started
 
-New here? This is the whole path from zero to your own program. You need a C99 compiler
+**Build → run → embed** — the whole path from zero to your own program. You need a C99 compiler
 (`gcc`/`clang`) and **CMake ≥ 3.13** — nothing else on Linux/macOS (Windows uses MSVC or
 mingw-w64; the build auto-selects the Win32 backend).
 
@@ -122,6 +131,59 @@ either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --
 
 Inside a task you get a `gptps_ctx *`: `gptps_payload()`, `gptps_is_cancelled()` (poll it
 for cooperative timeout), `gptps_result_set()` / `gptps_result_set_nocopy()`.
+
+## Common tasks
+
+Short recipes for the things you'll actually do — each links to the full details below.
+
+**1. Run work and get the result back.** Register a task with a `run` function, set an
+event callback, and read the result on the `FINISHED` event — that's the
+[Quick start](#quick-start) above.
+
+**2. Give a task a timeout, retries, and a failure policy.** Set the policy on the task
+def *before* registering it:
+
+```c
+d.default_policy.timeout_seconds       = 5;
+d.default_policy.max_retries           = 3;
+d.default_policy.retry_backoff_seconds = 1;
+d.default_policy.on_failure            = GPTPS_ON_FAILURE_DEAD_LETTER;  /* or _DROP / _REQUEUE */
+```
+
+In-process tasks must poll `gptps_is_cancelled()` to honor the timeout. Tasks that
+exhaust their retries are kept in the dead-letter list — reprocess them with
+`gptps_dead_letter_drain()`.
+
+**3. Cap how much runs at once (the budget).** Open with explicit limits (or a
+[config file](#configuration-file-optional), so you can re-tune without recompiling):
+
+```c
+gptps_config cfg = { .struct_size = sizeof cfg };
+cfg.limits.struct_size = sizeof cfg.limits;
+cfg.limits.max_concurrent_tasks = 4;          /* 0 => auto-detect cores      */
+cfg.limits.max_memory_bytes     = 512u << 20; /* admission budget (declared) */
+gptps_open_ex(&cfg, &e);
+```
+
+**4. Run heavy or untrusted work isolated and killable.** Set the executor kind on the
+task: `d.exec = GPTPS_EXEC_OOP` (forked child, memory-capped, hard-killed on timeout) or
+`GPTPS_EXEC_PROGRAM` to run any external binary — see [Executor kinds](#executor-kinds-per-task-via-defexec).
+
+**5. Watch it live.** Install the dashboard add-on and run your program in a terminal —
+see [Live terminal dashboard](#live-terminal-dashboard).
+
+**6. Change a setting at runtime and persist it.**
+
+```c
+gptps_settings_set(e, "tasks.resize.timeout_seconds", "60");  /* validated + applied live */
+gptps_settings_save(e, "gptps.toml");                          /* atomic round-trip       */
+```
+
+See [Settings](#settings-runtime-introspectable-persistable).
+
+**7. Run with no background threads (embedded / bare-metal).** Open with
+`cfg.mode = GPTPS_RUN_MANUAL` and drive it yourself with `gptps_step()` — see
+[Embedded / single-threaded mode](#embedded-and-single-threaded-mode).
 
 ## Configuration file (optional)
 
@@ -242,7 +304,7 @@ flows to the module's stdin and its stdout comes back as the result, under the u
 timeout / retry. See [`examples/wasm_program.c`](examples/wasm_program.c). For a tighter,
 in-process binding, the [`wasm_exec`](addons/) add-on takes a pluggable runtime hook instead.
 
-## Embedded & single-threaded (no threads, no libc heap)
+## Embedded and single-threaded mode
 
 GPTPS runs in two execution modes, chosen at `gptps_open_ex` via `cfg.mode`:
 
