@@ -49,33 +49,56 @@ int main(void) {
 }
 ```
 
-## Build & link
+## Getting started — build → run → embed
 
-**Option A — single file (easiest).** Generate the amalgamation and drop two files into your project:
+New here? This is the whole path from zero to your own program. You need a C99 compiler
+(`gcc`/`clang`) and **CMake ≥ 3.13** — nothing else on Linux/macOS (Windows uses MSVC or
+mingw-w64; the build auto-selects the Win32 backend).
 
-```sh
-sh tools/amalgamate.sh out          # writes out/gptps.c and out/gptps.h
-cc -std=c99 yourapp.c out/gptps.c -Iout -lpthread -ldl   # Linux
-cc -std=c99 yourapp.c out/gptps.c -Iout -lpthread        # macOS (dlopen is in libSystem)
-```
-
-**Option B — CMake** (builds `libgptps`, the tests, and the demo):
+**1. Build.**
 
 ```sh
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure   # run the test suite
-./build/demo                                  # run the example
+cmake -S . -B build          # configure (once)
+cmake --build build -j       # libgptps.a + the examples + the test suite
 ```
 
-More runnable examples in [`examples/`](examples/): `demo` (in-process tasks + events),
-`config_file` (tuning from a TOML file), `external_program` (run any binary as a task), and
-`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below), and
-`dashboard` (a live terminal UI — counts, per-task table, recent log, hotkeys to add tasks).
+**2. See it run — the live dashboard.** Run it in a real terminal (it needs an interactive
+TTY; with no TTY it just prints a line and exits, which is how CI runs it headless):
 
-**Install / consume.** `cmake --install build --prefix <dir>` installs the header, static
-library, a CMake package config, and a pkg-config file. Downstream projects then use either
-`find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --libs gptps`.
+```sh
+./build/example_dashboard    # keys: w/f submit · k/j scroll · m KPI · p pause · s settings · ? help · q quit
+```
+
+It looks like [this](#live-terminal-dashboard) (screenshot below).
+
+**3. Run the other examples + the tests.**
+
+```sh
+./build/demo                 # in-process tasks + events (prints results)
+./build/example_config       # tune from a TOML file
+./build/example_embedded     # no threads + a static memory pool (manual mode)
+ctest --test-dir build --output-on-failure   # full suite (should be 100%)
+```
+
+More in [`examples/`](examples/): `external_program` (run any binary as a task) and
+`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below).
+
+**4. Embed it in your own program.** Generate the single-file amalgamation (two files, zero
+build system), drop the [Quick start](#quick-start) program into `myapp.c`, and link:
+
+```sh
+sh tools/amalgamate.sh out   # writes out/gptps.c and out/gptps.h
+cc -std=c99 myapp.c out/gptps.c -Iout -lpthread -ldl   # Linux
+cc -std=c99 myapp.c out/gptps.c -Iout -lpthread        # macOS (dlopen is in libSystem)
+./myapp
+```
+
+To embed the **dashboard** too, also compile the add-on: add `addons/tui.c -Iaddons`
+(`examples/demo.c` is a fuller starting template).
+
+**Install / consume (optional).** `cmake --install build --prefix <dir>` installs the header,
+static library, a CMake package config, and a pkg-config file. Downstream projects then use
+either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --libs gptps`.
 
 ## API at a glance
 
