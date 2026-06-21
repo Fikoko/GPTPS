@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(gptps VERSION 0.1.0 LANGUAGES C)
+project(gptps VERSION 0.2.0 LANGUAGES C)
 
 # GPTPS - General Purpose Task Processing System.
 # Embeddable, in-process C99 task-processing library. Core is strict C99;
