@@ -68,6 +68,7 @@ typedef struct {
     const char *title;         /* dashboard title (default "tasks") */
     FILE       *out;           /* output stream (NULL => stdout) */
     const char *settings_path; /* where the Settings pane's 'w' (save) writes (NULL => engine's open path) */
+    int         unicode;       /* -1 = auto (follow color), 0 = ASCII, 1 = box rules + block gauge */
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
@@ -87,7 +88,8 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
 
 /* Apply a key as if pressed: a bound hotkey submits its task (returns 1); 'q'/ESC
  * requests quit (returns -1); 'k'/'j' scroll the log (returns 2); 'm' cycles the
- * KPI level and 'p' toggles pause (returns 3, "reconfigured"); else 0. */
+ * KPI level and 'p' toggles pause (returns 3, "reconfigured"); 's' opens the
+ * settings editor and '?' toggles the help overlay (returns 4, "UI"); else 0. */
 int gptps_tui_press(gptps_tui *t, int key);
 
 /* Runtime reconfiguration (thread-safe; the live loop picks changes up next frame).

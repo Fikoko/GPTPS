@@ -32,6 +32,7 @@ static int  fd_is_tty(FILE *f)       { return _isatty(_fileno(f)); }
 #  include <unistd.h>
 #  include <termios.h>
 #  include <sys/select.h>
+#  include <sys/ioctl.h>
 #  include <pthread.h>
 typedef pthread_mutex_t tui_mutex;
 static void mu_init(tui_mutex *m)    { pthread_mutex_init(m, NULL); }
@@ -77,7 +78,9 @@ struct gptps_tui {
     int              sel;           /* selected setting index */
     int              editing, editlen;
     char             editbuf[GPTPS_SETTINGS_VALUE_MAX];
-    char             status[160];   /* last save / validation message */
+    char             status[160];   /* last save/validation message + dashboard action toast */
+    uint64_t         status_ms;     /* when the toast was set (it fades after a few seconds) */
+    int              cols, rows;    /* terminal size: run() refreshes it; 80x24 headless default */
     int              quit, show_tasks, show_recent;
     int              raw_active;
 #if !defined(_WIN32)
@@ -223,30 +226,102 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
     return pos;
 }
 
+/* set a transient action message ("toast") shown briefly on the dashboard */
+static void toast(gptps_tui *t, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t->status, sizeof t->status, fmt, ap);
+    va_end(ap);
+    t->status_ms = gptps_now_ms(NULL);
+}
+
+/* terminal width clamped to a sane drawing range */
+static int draw_width(const gptps_tui *t) { int W = t->cols > 0 ? t->cols : 80; if (W < 24) W = 24; if (W > 200) W = 200; return W; }
+
+/* full-width inverse title bar (color mode): left title, right-aligned stats */
+static size_t titlebar(char *buf, size_t cap, size_t pos, gptps_tui *t, int W, double up, double rate)
+{
+    char line[256], stats[64];
+    int len, sl;
+    if (W > (int)sizeof line - 1) W = (int)sizeof line - 1;
+    len = snprintf(line, sizeof line, " GPTPS  %s", t->cfg.title ? t->cfg.title : "tasks");
+    if (len < 0) len = 0;
+    sl = snprintf(stats, sizeof stats, "up %.1fs  %.1f done/s ", up, rate);
+    if (sl > 0 && len + 2 + sl <= W) { while (len < W - sl) line[len++] = ' '; memcpy(line + len, stats, (size_t)sl); len += sl; }
+    if (len > W) len = W;
+    while (len < W) line[len++] = ' ';
+    line[len] = 0;
+    return appendf(buf, cap, pos, "\x1b[7m\x1b[1m%s\x1b[0m\n", line);
+}
+
+/* horizontal rule across the width (color mode) */
+static size_t rule(char *buf, size_t cap, size_t pos, int W, int uni)
+{
+    int i;
+    pos = appendf(buf, cap, pos, "\x1b[2m");
+    for (i = 0; i < W; ++i) pos = appendf(buf, cap, pos, "%s", uni ? "\xe2\x94\x80" : "-");
+    return appendf(buf, cap, pos, "\x1b[0m\n");
+}
+
+/* Help overlay: every key + what it does. Pure; reads only cfg. */
+static size_t render_help(gptps_tui *t, char *buf, size_t cap)
+{
+    size_t pos = 0;
+    int color = t->cfg.color;
+    const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
+    const char *title = t->cfg.title ? t->cfg.title : "tasks";
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 help%s\n\n", B, title, X);
+    pos = appendf(buf, cap, pos, "%sDashboard%s\n", B, X);
+    pos = appendf(buf, cap, pos, "  %-9s submit its task\n", "<hotkey>");
+    pos = appendf(buf, cap, pos, "  %-9s scroll the event log (older / newer)\n", "k / j");
+    pos = appendf(buf, cap, pos, "  %-9s open the settings editor\n", "s");
+    pos = appendf(buf, cap, pos, "  %-9s cycle KPI detail (minimal/normal/full)\n", "m");
+    pos = appendf(buf, cap, pos, "  %-9s pause / resume live updates\n", "p");
+    pos = appendf(buf, cap, pos, "  %-9s toggle this help\n", "?");
+    pos = appendf(buf, cap, pos, "  %-9s quit\n\n", "q / Esc");
+    pos = appendf(buf, cap, pos, "%sSettings editor%s\n", B, X);
+    pos = appendf(buf, cap, pos, "  %-9s move selection\n", "k / j");
+    pos = appendf(buf, cap, pos, "  %-9s edit value (Enter commit, Esc cancel)\n", "Enter");
+    pos = appendf(buf, cap, pos, "  %-9s save settings to file\n", "w");
+    pos = appendf(buf, cap, pos, "  %-9s back to dashboard\n", "s / Esc");
+    pos = appendf(buf, cap, pos, "\n%spress any key to return%s\n", D, X);
+    if (pos >= cap) pos = cap - 1;
+    buf[pos] = 0;
+    return pos;
+}
+
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0;
-    int i, color;
+    int i, color, uni, W;
     const char *B, *D, *R, *G, *X;
-    double up;
+    double up, rate;
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
     if (t->pane == 1) return render_settings(t, buf, cap);
-    color = t->cfg.color;
+    if (t->pane == 2) return render_help(t, buf, cap);
+    color = t->cfg.color; uni = t->cfg.unicode; W = draw_width(t);
     B = color ? "\x1b[1m" : ""; D = color ? "\x1b[2m" : ""; R = color ? "\x1b[31m" : "";
     G = color ? "\x1b[32m" : ""; X = color ? "\x1b[0m" : "";
 
     mu_lock(&t->mu);
     up = (double)(gptps_now_ms(NULL) - t->start_ms) / 1000.0;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s%s   up %.1fs   %.1f done/s\n",
-                  B, t->cfg.title, X, up, (up > 0.05 ? (double)t->fin / up : 0.0));
-    {   /* in-flight gauge bar (ASCII; scaled to peak) */
-        unsigned inflt = t->s - t->fin - t->fail, w, j;
-        char bar[21];
-        w = (t->peak && inflt) ? (inflt * 20u / t->peak) : 0; if (w > 20u) w = 20u;
-        for (j = 0; j < 20u; ++j) bar[j] = (j < w) ? '#' : ' ';
-        bar[20] = 0;
-        pos = appendf(buf, cap, pos, "queued %u  started %u  in-flight %u [%s] peak %u\n",
-                      t->q, t->s, inflt, bar, t->peak);
+    rate = (up > 0.05) ? (double)t->fin / up : 0.0;
+
+    /* header: a framed title bar when color is on; a plain line otherwise */
+    if (color) { pos = titlebar(buf, cap, pos, t, W, up, rate); pos = rule(buf, cap, pos, W, uni); }
+    else pos = appendf(buf, cap, pos, "GPTPS \xc2\xb7 %s   up %.1fs   %.1f done/s\n", t->cfg.title, up, rate);
+
+    {   /* in-flight gauge, scaled to the terminal width */
+        unsigned inflt = t->s - t->fin - t->fail, j, gw, w;
+        const char *fillc = uni ? "\xe2\x96\x88" : "#";   /* full block / hash */
+        const char *trakc = uni ? "\xe2\x96\x91" : ".";   /* light shade / dot  */
+        const char *C = color ? "\x1b[36m" : "";          /* cyan bar */
+        gw = (unsigned)(W / 3); if (gw < 10) gw = 10; if (gw > 40) gw = 40;
+        w = (t->peak && inflt) ? (inflt * gw / t->peak) : 0; if (w > gw) w = gw;
+        pos = appendf(buf, cap, pos, "queued %u  started %u  in-flight %u  %s[%s", t->q, t->s, inflt, D, C);
+        for (j = 0; j < gw; ++j) pos = appendf(buf, cap, pos, "%s", j < w ? fillc : trakc);
+        pos = appendf(buf, cap, pos, "%s%s]%s peak %u\n", X, D, X, t->peak);
     }
     pos = appendf(buf, cap, pos, "%sfinished %u%s  %sfailed %u%s  retried %u  %sdead %u%s\n",
                   G, t->fin, X, (t->fail ? R : ""), t->fail, X, t->retr, (t->dead ? R : ""), t->dead, X);
@@ -255,23 +330,33 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 
     if (t->show_tasks && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
-        pos = appendf(buf, cap, pos, "  %-16s %5s %5s %5s %5s %5s %8s  key\n",
-                      "label", "run", "ok", "fail", "dead", "ok%", "avg ms");
+        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %8s  key%s\n",
+                      D, "label", "run", "ok", "fail", "dead", "ok%", "avg ms", X);
         for (i = 0; i < t->ntasks; ++i) {
             tui_task *k = &t->tasks[i];
             char key[8], pct[8], lat[12];
             unsigned terminal = k->finished + k->dead;
+            const char *pc = "";
             if (k->hotkey) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
-            if (terminal) snprintf(pct, sizeof pct, "%3u%%", k->finished * 100u / terminal); else strcpy(pct, "  --");
+            if (terminal) {
+                unsigned okp = k->finished * 100u / terminal;
+                snprintf(pct, sizeof pct, "%3u%%", okp);
+                if (color) pc = (okp >= 90) ? G : (okp >= 50) ? "\x1b[33m" : R;   /* green/yellow/red */
+            } else strcpy(pct, "  --");
             if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum_ms / k->lat_n); else strcpy(lat, "      --");
-            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %5s %8s  %s\n",
-                          k->label, k->started, k->finished, k->failed, k->dead, pct, lat, key);
+            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %s%5s%s %8s  %s\n",
+                          k->label, k->started, k->finished, k->failed, k->dead, pc, pct, color ? X : "", lat, key);
         }
     }
 
     if (t->show_recent && t->rcap > 0 && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
-        int shown = t->rn, start, maxoff;
+        int shown = t->rn, start, maxoff, used = 0, avail;
+        size_t z;
         if (shown > t->cfg.max_recent) shown = t->cfg.max_recent;
+        for (z = 0; z < pos; ++z) if (buf[z] == '\n') ++used;     /* vertical fit: stay within rows */
+        avail = (t->rows > 0 ? t->rows : 24) - used - 3;
+        if (avail < 1) avail = 1;
+        if (shown > avail) shown = avail;
         maxoff = t->rn - shown; if (maxoff < 0) maxoff = 0;
         if (t->scroll > maxoff) t->scroll = maxoff;     /* clamp (keys can over-scroll) */
         if (t->scroll < 0) t->scroll = 0;
@@ -288,12 +373,17 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         }
     }
 
-    /* hotkey legend */
+    /* transient action toast (fades after a few seconds) */
+    if (t->status[0] && t->status_ms && (gptps_now_ms(NULL) - t->status_ms) < 3000u)
+        pos = appendf(buf, cap, pos, "\n%s%s%s\n", (color ? "\x1b[36m" : ""), t->status, X);
+
+    /* key legend: task hotkeys first, then the global keys */
     pos = appendf(buf, cap, pos, "\n%skeys:%s ", D, X);
     for (i = 0; i < t->ntasks; ++i)
         if (t->tasks[i].hotkey)
             pos = appendf(buf, cap, pos, "[%c] %s  ", t->tasks[i].hotkey, t->tasks[i].label);
-    pos = appendf(buf, cap, pos, "[q] quit\n");
+    pos = appendf(buf, cap, pos, "%s%s? help  s settings  m kpi  p pause  k/j scroll  q quit%s\n",
+                  (t->ntasks ? " \xc2\xb7  " : ""), D, X);
     mu_unlock(&t->mu);
 
     if (pos >= cap) pos = cap - 1;
@@ -344,28 +434,33 @@ static int settings_press(gptps_tui *t, int key)
 
 int gptps_tui_press(gptps_tui *t, int key)
 {
-    const char *name = NULL;
+    const char *name = NULL, *label = NULL;
     const void *pl = NULL;
     size_t pn = 0;
     int i;
     if (!t) return 0;
     if (t->pane == 1) return settings_press(t, key);   /* settings editor handles its own keys */
+    if (t->pane == 2) {                                 /* help overlay: any key returns */
+        if (key == 'q' || key == 'Q') { mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1; }
+        t->pane = 0; return 4;
+    }
     if (key == 'q' || key == 'Q' || key == 27) {
         mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu);
         return -1;
     }
+    if (key == '?') { t->pane = 2; return 4; }      /* open the help overlay */
     mu_lock(&t->mu);
     for (i = 0; i < t->ntasks; ++i)
-        if (t->tasks[i].hotkey == key) { name = t->tasks[i].name; pl = t->tasks[i].payload; pn = t->tasks[i].plen; break; }
+        if (t->tasks[i].hotkey == key) { name = t->tasks[i].name; label = t->tasks[i].label; pl = t->tasks[i].payload; pn = t->tasks[i].plen; break; }
     mu_unlock(&t->mu);                 /* submit OUTSIDE the lock: QUEUED fires our observer */
-    if (name) { gptps_handle h; gptps_submit(t->e, name, pl, pn, &h); return 1; }
+    if (name) { gptps_handle h; gptps_submit(t->e, name, pl, pn, &h); toast(t, "submitted %s", label ? label : name); return 1; }
     if (key == 'm' || key == 'M') {                 /* cycle KPI level (configure cost live) */
         int nk; mu_lock(&t->mu); nk = (t->kpi >= GPTPS_TUI_KPI_FULL) ? GPTPS_TUI_KPI_MINIMAL : t->kpi + 1; mu_unlock(&t->mu);
-        gptps_tui_set_kpi(t, (gptps_tui_kpi)nk); return 3;
+        gptps_tui_set_kpi(t, (gptps_tui_kpi)nk); toast(t, "kpi -> %s", kpi_str(nk)); return 3;
     }
     if (key == 'p' || key == 'P') {                 /* toggle pause */
         int nm; mu_lock(&t->mu); nm = (t->mode == GPTPS_TUI_PAUSED) ? GPTPS_TUI_CONTINUOUS : GPTPS_TUI_PAUSED; mu_unlock(&t->mu);
-        gptps_tui_set_mode(t, (gptps_tui_mode)nm); return 3;
+        gptps_tui_set_mode(t, (gptps_tui_mode)nm); toast(t, nm == GPTPS_TUI_PAUSED ? "paused" : "resumed"); return 3;
     }
     if (key == 'k' || key == 'K') { mu_lock(&t->mu); t->scroll += 1; mu_unlock(&t->mu); return 2; } /* scroll to older */
     if (key == 'j' || key == 'J') { mu_lock(&t->mu); if (t->scroll > 0) t->scroll -= 1; mu_unlock(&t->mu); return 2; } /* newer */
@@ -413,6 +508,14 @@ static int term_poll_key(int ms)
     if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0 && read(STDIN_FILENO, &c, 1) == 1) return c;
     return -1;
 }
+static void term_size(gptps_tui *t)
+{
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        t->cols = ws.ws_col;
+        if (ws.ws_row > 0) t->rows = ws.ws_row;
+    }
+}
 #else
 static void term_enable(gptps_tui *t)
 {
@@ -429,7 +532,29 @@ static int term_poll_key(int ms)
     while (waited <= ms) { if (_kbhit()) return _getch(); Sleep(15); waited += 15; }
     return -1;
 }
+static void term_size(gptps_tui *t)
+{
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &ci)) {
+        int c = ci.srWindow.Right - ci.srWindow.Left + 1, r = ci.srWindow.Bottom - ci.srWindow.Top + 1;
+        if (c > 0) t->cols = c;
+        if (r > 0) t->rows = r;
+    }
+}
 #endif
+
+/* write a frame flicker-free: erase each line's tail (ESC[K) instead of clearing
+ * the whole screen, so unchanged regions don't flash. */
+static void write_frame(FILE *out, const char *s)
+{
+    const char *p = s, *nl;
+    while ((nl = strchr(p, '\n')) != NULL) {
+        fwrite(p, 1, (size_t)(nl - p), out);
+        fputs("\x1b[K\n", out);
+        p = nl + 1;
+    }
+    if (*p) { fputs(p, out); fputs("\x1b[K", out); }
+}
 
 void gptps_tui_run(gptps_tui *t)
 {
@@ -451,9 +576,13 @@ void gptps_tui_run(gptps_tui *t)
         if (!paint && md == GPTPS_TUI_ON_DEMAND) { mu_lock(&t->mu); paint = t->dirty; mu_unlock(&t->mu); }
         if (paint) {
             mu_lock(&t->mu); t->dirty = 0; mu_unlock(&t->mu);
-            fputs("\x1b[H\x1b[2J", t->cfg.out);      /* home + clear */
+            term_size(t);                            /* adapt the layout to the current window */
             gptps_tui_render(t, buf, cap);
-            fputs(buf, t->cfg.out); fflush(t->cfg.out);
+            if (first) fputs("\x1b[2J", t->cfg.out); /* clear once; then redraw in place */
+            fputs("\x1b[H", t->cfg.out);             /* home */
+            write_frame(t->cfg.out, buf);            /* per-line erase => no full-screen flash */
+            fputs("\x1b[J", t->cfg.out);             /* wipe any lines a shorter frame left behind */
+            fflush(t->cfg.out);
         }
         first = 0; kp = 0;
         key = term_poll_key((int)(rms ? rms : 250));
@@ -501,6 +630,8 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     if (t->cfg.refresh_ms == 0) t->cfg.refresh_ms = 250;
     if (t->cfg.color < 0)       t->cfg.color = fd_is_tty(t->cfg.out);
     if (t->cfg.interactive < 0) t->cfg.interactive = fd_is_tty(t->cfg.out);
+    if (t->cfg.unicode < 0)     t->cfg.unicode = t->cfg.color;   /* auto: follow color */
+    t->cols = 80; t->rows = 24;   /* headless defaults; the live loop refreshes from the terminal */
     t->show_tasks  = (t->cfg.show_tasks  >= 0);   /* default on; <0 hides */
     t->show_recent = (t->cfg.show_recent >= 0);
     max = (t->cfg.max_recent > 0) ? t->cfg.max_recent : 8;

@@ -23,6 +23,19 @@ versioning once it reaches 1.0.
 - **`examples/embedded.c`**: GPTPS with **no worker threads and no libc heap** —
   MANUAL mode + a static-arena allocator — the bare-metal shape end to end.
 
+### Changed — friendlier terminal dashboard (`tui` add-on)
+- **Discoverability:** a `?` **help overlay** documenting every key, and a complete
+  inline legend so `s`/`m`/`p`/`j`/`k` are no longer hidden.
+- **Action feedback:** a transient toast confirms actions ("submitted Work",
+  "paused", "kpi -> full").
+- **Adaptive layout:** the dashboard reads the terminal size (`TIOCGWINSZ` /
+  `GetConsoleScreenBufferInfo`, fallback 80×24) and scales the gauge, fits the
+  recent-log to the window height, and spans the title bar/rule to width.
+- **Polish:** a framed title bar, flicker-free redraw (per-line erase instead of a
+  full-screen clear), a Unicode block gauge with ASCII fallback, and semantic color
+  (ok% green/yellow/red). New `gptps_tui_config.unicode` (-1 auto / 0 ASCII / 1 on).
+  All changes preserve the pure render-to-string model and stay headless-testable.
+
 ## [0.2.0] - 2026-06-21
 
 A unified, runtime, persistable **settings subsystem** layered over the existing

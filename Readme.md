@@ -229,7 +229,10 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
 - **Live dashboard (optional):** `addons/tui.c` is a portable real-time terminal UI — throughput,
   in-flight gauge, a per-task table with success-rate + average latency, a scrollable recent log
-  (`k`/`j`), and hotkeys to submit tasks. Global + per-task configurable. Keyboard-driven (no mouse,
+  (`k`/`j`), and hotkeys to submit tasks. Press `?` for a **help overlay** of every key; actions
+  show a confirmation toast; the layout **adapts to the terminal size** and redraws flicker-free,
+  with a framed title bar, a Unicode block gauge (ASCII fallback), and semantic color. Global +
+  per-task configurable; an `s` pane edits the settings registry live. Keyboard-driven (no mouse,
   since mouse reporting isn't portable to every terminal).
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a

@@ -200,6 +200,24 @@ int main(void)
         CHECK(strstr(frame, "in-flight") != NULL);        /* dashboard again */
     }
 
+    /* ---- friendliness: help overlay + action toast ---- */
+    {
+        CHECK(gptps_tui_press(t, '?') == 4);              /* open help overlay */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "help")            != NULL);
+        CHECK(strstr(frame, "submit its task") != NULL);  /* documents the keys */
+        CHECK(strstr(frame, "settings editor") != NULL);
+        CHECK(strstr(frame, "in-flight")       == NULL);  /* dashboard hidden behind help */
+        CHECK(gptps_tui_press(t, 'x') == 4);              /* any key returns to dashboard */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "in-flight")       != NULL);  /* back on the dashboard */
+        /* a hotkey submit leaves a transient confirmation toast */
+        CHECK(gptps_tui_press(t, 'e') == 1);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "submitted Echo")  != NULL);
+        CHECK(strstr(frame, "? help")          != NULL);  /* global keys now discoverable */
+    }
+
     /* quit key */
     CHECK(gptps_tui_press(t, 'q') == -1);
 
