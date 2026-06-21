@@ -53,6 +53,7 @@ gptps_status    gptps_settings_set_by(gptps_settings *r, const char *key, const 
 gptps_status    gptps_settings_info_at(gptps_settings *r, size_t index, gptps_setting_info *out);
 gptps_status    gptps_settings_save_to(gptps_settings *r, const char *path);
 gptps_status    gptps_settings_apply_toml(gptps_settings *r, const gptps_toml *t);
+gptps_status    gptps_settings_watch_add(gptps_settings *r, gptps_settings_cb cb, void *ud);
 
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the

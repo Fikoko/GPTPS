@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 4u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry */
+#define GPTPS_ABI_VERSION_MINOR 5u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -365,6 +365,13 @@ GPTPS_API gptps_status gptps_settings_set(gptps *e, const char *key, const char 
  * path==NULL uses the path the engine was opened with (GPTPS_E_INVAL if none). */
 GPTPS_API gptps_status gptps_settings_save(gptps *e, const char *path);
 GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
+
+/* Watch for changes: `cb` fires (with the settings lock RELEASED) after each
+ * successful gptps_settings_set, with the key and its newly-applied value - for
+ * audit logs, auto-save, re-rendering, etc. Register watchers before concurrent
+ * settings activity. (reload re-applies known keys without firing watchers.) */
+typedef void (*gptps_settings_cb)(const char *key, const char *value, void *user_data);
+GPTPS_API gptps_status gptps_settings_watch(gptps *e, gptps_settings_cb cb, void *user_data);
 
 /* ============================================================================
  * HOST-TABLE ABI (for dlopen'd add-ons)

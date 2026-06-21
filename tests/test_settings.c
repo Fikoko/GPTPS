@@ -12,6 +12,16 @@ static int fails = 0;
 
 static gptps_status noop(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_OK; }
 
+/* change-watch capture */
+static int  w_fired;
+static char w_key[128], w_val[128];
+static void on_change(const char *key, const char *value, void *ud)
+{
+    (void)ud; ++w_fired;
+    snprintf(w_key, sizeof w_key, "%s", key);
+    snprintf(w_val, sizeof w_val, "%s", value);
+}
+
 static void reg(gptps *e, const char *name)
 {
     gptps_task_def d;
@@ -96,6 +106,16 @@ int main(void)
         if (strcmp(info.key, "limits.max_concurrent_tasks") == 0)
             CHECK(info.hot == 0);                    /* restart-only */
     }
+
+    /* ---- change-watch: fires on a successful set, not on a rejected one ---- */
+    CHECK(gptps_settings_watch(e, on_change, NULL) == GPTPS_OK);
+    w_fired = 0;
+    CHECK(gptps_settings_set(e, "tasks.bulk.timeout_seconds", "42") == GPTPS_OK);
+    CHECK(w_fired == 1);
+    CHECK(strcmp(w_key, "tasks.bulk.timeout_seconds") == 0 && strcmp(w_val, "42") == 0);
+    w_fired = 0;
+    CHECK(gptps_settings_set(e, "tasks.bulk.timeout_seconds", "-1") == GPTPS_E_CONFIG); /* uint rejects */
+    CHECK(w_fired == 0);
 
     /* ---- Phase 2: persistence round-trip ---- */
     CHECK(gptps_settings_set(e, "limits.max_memory_bytes", "12345678") == GPTPS_OK);

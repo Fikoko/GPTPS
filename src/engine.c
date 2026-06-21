@@ -983,6 +983,9 @@ gptps_status gptps_settings_reload(gptps *e, const char *path)
     return st;
 }
 
+gptps_status gptps_settings_watch(gptps *e, gptps_settings_cb cb, void *user_data)
+{ return e ? gptps_settings_watch_add(e->settings, cb, user_data) : GPTPS_E_INVAL; }
+
 /* ------------------------------------------------------------------------- */
 /* add-on loader (host-table ABI)                                            */
 /* ------------------------------------------------------------------------- */

@@ -32,10 +32,17 @@ typedef struct gptps_setting_entry {
     struct gptps_setting_entry *next;
 } gptps_setting_entry;
 
+typedef struct gptps_setting_watcher {
+    gptps_settings_cb            cb;
+    void                        *ud;
+    struct gptps_setting_watcher *next;
+} gptps_setting_watcher;
+
 struct gptps_settings {
-    gptps_mutex         *m;
-    gptps_setting_entry *head, *tail;
-    size_t               n;
+    gptps_mutex           *m;
+    gptps_setting_entry   *head, *tail;
+    size_t                 n;
+    gptps_setting_watcher *watchers;
 };
 
 static char *dupz(const char *s) { size_t n = strlen(s) + 1; char *o = (char *)malloc(n); if (o) memcpy(o, s, n); return o; }
@@ -55,8 +62,20 @@ void gptps_settings_destroy(gptps_settings *r)
     if (!r) return;
     e = r->head;
     while (e) { gptps_setting_entry *n = e->next; free(e->key); free(e->desc); free(e->defval); free(e); e = n; }
+    { gptps_setting_watcher *w = r->watchers; while (w) { gptps_setting_watcher *n = w->next; free(w); w = n; } }
     gptps_mutex_destroy(r->m);
     free(r);
+}
+
+gptps_status gptps_settings_watch_add(gptps_settings *r, gptps_settings_cb cb, void *ud)
+{
+    gptps_setting_watcher *w;
+    if (!r || !cb) return GPTPS_E_INVAL;
+    w = (gptps_setting_watcher *)calloc(1, sizeof *w);
+    if (!w) return GPTPS_E_NOMEM;
+    w->cb = cb; w->ud = ud;
+    gptps_mutex_lock(r->m); w->next = r->watchers; r->watchers = w; gptps_mutex_unlock(r->m);
+    return GPTPS_OK;
 }
 
 /* caller holds r->m */
@@ -167,12 +186,19 @@ gptps_status gptps_settings_set_by(gptps_settings *r, const char *key, const cha
 {
     gptps_setting_entry *e;
     gptps_status st;
+    char applied[GPTPS_SETTINGS_VALUE_MAX];
+    int ok = 0;
     if (!r || !key || !value) return GPTPS_E_INVAL;
     gptps_mutex_lock(r->m);
     e = setting_find(r, key);
     if (!e) { gptps_mutex_unlock(r->m); return GPTPS_E_NOTFOUND; }
     st = apply_entry(e, value);
+    if (st == GPTPS_OK) { applied[0] = 0; e->read(e->target, applied, sizeof applied); ok = 1; }
     gptps_mutex_unlock(r->m);
+    if (ok) {   /* notify watchers with the lock RELEASED (register-before-use; may re-enter get) */
+        gptps_setting_watcher *w;
+        for (w = r->watchers; w; w = w->next) w->cb(key, applied, w->ud);
+    }
     return st;
 }
 
