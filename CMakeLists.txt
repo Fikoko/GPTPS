@@ -21,6 +21,10 @@ if(MSVC)
     # Quiet the C4996 deprecation noise MSVC emits for ISO C (fopen, ...) and POSIX
     # (_isatty, ...) names; the code uses them portably and correctly.
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+    # The test/example suite uses GCC __atomic_* builtins for cross-thread counters;
+    # force-include a shim mapping them to Win32 Interlocked* under MSVC. Inert for
+    # the library itself (it routes atomics through the HAL, not these builtins).
+    add_compile_options(/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/test_atomic_compat.h)
 endif()
 
 # --- library (grows as modules land) ---------------------------------------
