@@ -66,6 +66,22 @@ jobs:
           cc -std=gnu99 -I amalgamation amalgamation/gptps.c examples/demo.c -o demo_amalg.exe
           ./demo_amalg.exe
 
+  # Windows build + test with the native MSVC toolchain (cl.exe) via the default
+  # Visual Studio (multi-config) generator. Complements the mingw-w64 gcc job: same
+  # Win32 HAL (src/hal_win.c / exec_win.c), different compiler. POSIX-only tests are
+  # gated out in CMake (if(UNIX)). C11 mode + CRT-deprecation defines come from
+  # CMakeLists' if(MSVC) block, so no compiler flags are needed here.
+  msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build --config Debug
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
+
   # AddressSanitizer + UBSan across the whole suite (memory errors, leaks, UB).
   # Uses CMake (not a hand-maintained source list) so it can't drift out of sync.
   asan:

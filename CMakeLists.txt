@@ -14,6 +14,14 @@ if(WIN32)
     # mingw's <windows.h> relies on GNU extensions; the core itself stays C99-portable.
     set(CMAKE_C_EXTENSIONS ON)
 endif()
+if(MSVC)
+    # MSVC has no /std:c99; C11 is its earliest selectable C mode and a superset of
+    # the C99 the core targets. (Default MSVC is C89 and would reject C99 syntax.)
+    set(CMAKE_C_STANDARD 11)
+    # Quiet the C4996 deprecation noise MSVC emits for ISO C (fopen, ...) and POSIX
+    # (_isatty, ...) names; the code uses them portably and correctly.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
 
 # --- library (grows as modules land) ---------------------------------------
 # Core is portable C99; the HAL + executor backend are selected per platform.
