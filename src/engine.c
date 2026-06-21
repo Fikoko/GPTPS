@@ -135,6 +135,7 @@ struct gptps {
 
     bool           stopping;
     bool           workers_exit;
+    bool           manual;         /* MANUAL mode: no threads; driven by gptps_step() */
 
     gptps_handle   next_handle;
     gptps_event_cb ev_cb;
@@ -428,20 +429,18 @@ static gptps_admit_decision run_constraints(gptps *e, gptps_item *it, uint32_t *
     return result;
 }
 
-static void *dispatcher_main(void *arg)
+/* One non-blocking scheduling pass, shared by the threaded dispatcher and the
+ * MANUAL-mode pump (gptps_step): drain completed work (release budget + retry /
+ * terminal decisions), promote backoff-ready retries, enforce running deadlines,
+ * and admit within budget. Lock held on entry & exit. Fills pend[0..*out_npend)
+ * (cap GPTPS_PENDING_CAP) for the caller to emit with the lock RELEASED; sets
+ * *out_next_wake to the nearest deadline/backoff (0 = none). Never sleeps/emits. */
+static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64_t *out_next_wake)
 {
-    gptps *e = (gptps *)arg;
-    gptps_pending_ev pend[GPTPS_PENDING_CAP];
-    int npend;
-
-    gptps_mutex_lock(e->m);
-    for (;;) {
-        uint64_t now = gptps_hal_monotonic_ms();
-        uint64_t next_wake = 0; /* 0 = none */
-        gptps_item *it;
-        int i;
-
-        npend = 0;
+    uint64_t now = gptps_hal_monotonic_ms();
+    uint64_t next_wake = 0; /* 0 = none */
+    int npend = 0;
+    gptps_item *it;
 
         /* 1) drain completed: release budget, then retry / terminal decision */
         while ((it = fifo_pop(&e->done)) != NULL) {
@@ -580,19 +579,39 @@ static void *dispatcher_main(void *arg)
             gptps_cond_signal(e->cv_work);
         }
 
-        /* 5) emit pending events (retry / dead-letter / denied) with lock RELEASED */
+        /* (the caller emits pend[] with the lock released, then re-runs a pass) */
+
+    *out_npend = npend;
+    *out_next_wake = next_wake;
+}
+
+/* ------------------------------------------------------------------------- */
+/* dispatcher thread (THREADED mode): engine_pass in a loop, emit, then sleep */
+/* ------------------------------------------------------------------------- */
+
+static void *dispatcher_main(void *arg)
+{
+    gptps *e = (gptps *)arg;
+    gptps_pending_ev pend[GPTPS_PENDING_CAP];
+    int npend, i;
+    uint64_t next_wake;
+
+    gptps_mutex_lock(e->m);
+    for (;;) {
+        engine_pass(e, pend, &npend, &next_wake);
+
+        /* emit buffered events with the lock RELEASED, then re-run: a submit /
+         * completion signal during the emit window may have been missed, so we
+         * loop again rather than risk a lost-wakeup sleep. */
         if (npend > 0) {
             gptps_event_cb cb = e->ev_cb; void *ud = e->ev_ud;
             gptps_mutex_unlock(e->m);
             for (i = 0; i < npend; ++i) emit_now(e, cb, ud, &pend[i]);
             gptps_mutex_lock(e->m);
-            /* the lock was released: a submit/completion cv_disp signal during
-             * the window may have been lost, so re-run the loop (re-drains done
-             * AND re-admits intake) instead of risking a lost-wakeup sleep. */
             continue;
         }
 
-        /* 6) shutdown when everything is drained */
+        /* shutdown once everything is drained */
         if (e->stopping && !e->intake.head && !e->ready.head && !e->done.head &&
             !e->delayed.head && !e->running_items.head && e->running == 0) {
             e->workers_exit = true;
@@ -600,15 +619,14 @@ static void *dispatcher_main(void *arg)
             break;
         }
 
-        /* 7) sleep until the next deadline/backoff, or until signalled. No unlock
-         * happened this pass (npend==0), so the lock is held from step 1 through
-         * cond_wait and no signal can be lost. */
-        if (next_wake == 0) {
-            gptps_cond_wait(e->cv_disp, e->m);
-        } else if (next_wake > now) {
-            gptps_cond_timedwait(e->cv_disp, e->m, next_wake - now);
+        /* sleep until the nearest deadline/backoff or a signal. No unlock happened
+         * this pass (npend==0), so no signal between the pass and the wait is lost. */
+        {
+            uint64_t now = gptps_hal_monotonic_ms();
+            if (next_wake == 0)       gptps_cond_wait(e->cv_disp, e->m);
+            else if (next_wake > now) gptps_cond_timedwait(e->cv_disp, e->m, next_wake - now);
+            /* else: already due -> loop immediately */
         }
-        /* else: a deadline/backoff is already due -> loop immediately */
     }
     gptps_mutex_unlock(e->m);
     return NULL;
@@ -752,15 +770,23 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
         if (e->config_path) memcpy(e->config_path, cfg->config_path, L);
     }
 
-    e->nworkers = e->limits.max_concurrent_tasks;
-    e->workers = (gptps_thread **)calloc(e->nworkers, sizeof *e->workers);
-    if (!e->workers) { s = GPTPS_E_NOMEM; goto fail; }
+    e->manual = (cfg && cfg->mode == GPTPS_RUN_MANUAL);
+    if (e->manual) {
+        /* MANUAL: no dispatcher/worker threads; the caller drives via gptps_step().
+         * max_concurrent_tasks still bounds how many items one step admits at once. */
+        e->nworkers = 0;
+        e->workers = NULL;
+    } else {
+        e->nworkers = e->limits.max_concurrent_tasks;
+        e->workers = (gptps_thread **)calloc(e->nworkers, sizeof *e->workers);
+        if (!e->workers) { s = GPTPS_E_NOMEM; goto fail; }
 
-    e->dispatcher = gptps_thread_start(dispatcher_main, e);
-    if (!e->dispatcher) { s = GPTPS_E_NOMEM; goto fail; }
-    for (i = 0; i < e->nworkers; ++i) {
-        e->workers[i] = gptps_thread_start(worker_main, e);
-        if (!e->workers[i]) { s = GPTPS_E_NOMEM; goto fail_threads; }
+        e->dispatcher = gptps_thread_start(dispatcher_main, e);
+        if (!e->dispatcher) { s = GPTPS_E_NOMEM; goto fail; }
+        for (i = 0; i < e->nworkers; ++i) {
+            e->workers[i] = gptps_thread_start(worker_main, e);
+            if (!e->workers[i]) { s = GPTPS_E_NOMEM; goto fail_threads; }
+        }
     }
 
     *out_engine = e;
@@ -1200,6 +1226,66 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
     return n;
 }
 
+/* Run one buffered batch of events with the lock released, then re-acquire.
+ * `*npend` is consumed (set to 0). Caller holds the lock on entry and exit. */
+static void flush_pending(gptps *e, gptps_pending_ev *pend, int *npend)
+{
+    if (*npend > 0) {
+        gptps_event_cb cb = e->ev_cb; void *ud = e->ev_ud;
+        int i;
+        gptps_mutex_unlock(e->m);
+        for (i = 0; i < *npend; ++i) emit_now(e, cb, ud, &pend[i]);
+        gptps_mutex_lock(e->m);
+        *npend = 0;
+    }
+}
+
+gptps_status gptps_step(gptps *e, size_t *out_ran)
+{
+    gptps_pending_ev pend[GPTPS_PENDING_CAP];
+    int npend;
+    uint64_t next_wake;
+    size_t ran = 0;
+    gptps_item *it;
+
+    if (out_ran) *out_ran = 0;
+    if (!e) return GPTPS_E_INVAL;
+    if (!e->manual) return GPTPS_E_INVAL;   /* threaded engines run themselves */
+
+    gptps_mutex_lock(e->m);
+
+    /* pass A: complete any prior work, promote backoff-ready retries, admit. */
+    engine_pass(e, pend, &npend, &next_wake);
+    flush_pending(e, pend, &npend);
+
+    /* run everything admitted into `ready` to completion, inline on THIS thread */
+    while ((it = fifo_pop(&e->ready)) != NULL) {
+        gptps_status eff;
+        gptps_event_cb cb = e->ev_cb; void *ud = e->ev_ud;  /* snapshot under lock */
+        it->deadline_ms = (it->policy.timeout_seconds && it->def->exec == GPTPS_EXEC_INPROC)
+            ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
+        gptps_flag_set(it->cancel, false);
+        fifo_push(&e->running_items, it);
+        gptps_mutex_unlock(e->m);
+
+        eff = execute(e, it, cb, ud);       /* STARTED + FINISHED/FAILED emitted here */
+
+        gptps_mutex_lock(e->m);
+        fifo_remove(&e->running_items, it);
+        it->outcome = eff;
+        fifo_push(&e->done, it);
+        ++ran;
+    }
+
+    /* pass B: account the work just run (release budget, schedule retries / dead-letter). */
+    engine_pass(e, pend, &npend, &next_wake);
+    flush_pending(e, pend, &npend);
+
+    gptps_mutex_unlock(e->m);
+    if (out_ran) *out_ran = ran;
+    return GPTPS_OK;
+}
+
 gptps_status gptps_shutdown(gptps *e)
 {
     unsigned i;
@@ -1213,8 +1299,10 @@ gptps_status gptps_shutdown(gptps *e)
     gptps_cond_signal(e->cv_disp);
     gptps_mutex_unlock(e->m);
 
-    gptps_thread_join(e->dispatcher);
-    for (i = 0; i < e->nworkers; ++i) gptps_thread_join(e->workers[i]);
+    if (!e->manual) {                       /* MANUAL spawns no threads to join */
+        gptps_thread_join(e->dispatcher);
+        for (i = 0; i < e->nworkers; ++i) gptps_thread_join(e->workers[i]);
+    }
 
     /* tear down add-ons (threads joined => no task code runs; last calls into
      * each .so, then unload) */
@@ -1229,10 +1317,16 @@ gptps_status gptps_shutdown(gptps *e)
         }
     }
 
-    /* free anything left (dead-letter retained items, etc.) */
+    /* free anything left (dead-letter retained items, etc.). The ready/done/
+     * running queues are already empty in THREADED mode (the dispatcher drains
+     * them before exit); in MANUAL mode they may hold items if the caller stopped
+     * stepping mid-drain, so free them here too. */
     while ((it = fifo_pop(&e->dead_letter)) != NULL) item_free(it);
     while ((it = fifo_pop(&e->intake)) != NULL) item_free(it);
     while ((it = fifo_pop(&e->delayed)) != NULL) item_free(it);
+    while ((it = fifo_pop(&e->ready)) != NULL) item_free(it);
+    while ((it = fifo_pop(&e->done)) != NULL) item_free(it);
+    while ((it = fifo_pop(&e->running_items)) != NULL) item_free(it);
 
     r = e->registry;
     while (r) {

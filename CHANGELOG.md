@@ -4,6 +4,18 @@ All notable changes to GPTPS are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); the project aims for semantic
 versioning once it reaches 1.0.
 
+## [Unreleased]
+
+### Added — portability: single-threaded / embeddable execution
+- **MANUAL execution mode** (`gptps_config.mode = GPTPS_RUN_MANUAL`): the engine
+  spawns **no threads** and is driven cooperatively by the caller via the new
+  `gptps_step()` pump, which runs runnable tasks to completion on the calling
+  thread. Needs only the HAL mutex/clock/flag primitives — never
+  `gptps_thread_start`/`cond_wait` — so it ports to single-threaded hosts and
+  bare-metal. The threaded dispatcher and the manual pump share one `engine_pass()`
+  (admission/retry/dead-letter logic), so scheduling semantics are identical.
+  ABI minor 5 → 6 (additive). Threaded engines reject `gptps_step` with `E_INVAL`.
+
 ## [0.2.0] - 2026-06-21
 
 A unified, runtime, persistable **settings subsystem** layered over the existing

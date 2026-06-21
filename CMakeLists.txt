@@ -142,6 +142,14 @@ target_link_libraries(test_settings PRIVATE gptps)
 add_test(NAME settings COMMAND test_settings)
 set_tests_properties(settings PROPERTIES TIMEOUT 30)
 
+add_executable(test_step tests/test_step.c) # MANUAL single-threaded pump (gptps_step)
+target_include_directories(test_step
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_step PRIVATE gptps)
+add_test(NAME step COMMAND test_step)
+set_tests_properties(step PROPERTIES TIMEOUT 30)
+
 # add-on shared libraries (compiled against the frozen header; no core link)
 add_library(addon_demo MODULE tests/addon_demo.c)
 target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

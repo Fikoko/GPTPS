@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 5u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch */
+#define GPTPS_ABI_VERSION_MINOR 6u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step) */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -203,10 +203,21 @@ typedef struct {
     uint64_t max_memory_bytes;     /* 0 => auto (fraction of detected RAM) */
 } gptps_limits;
 
+/* Execution model. THREADED (default, 0) spawns a dispatcher + worker pool and
+ * runs itself - needs HAL threads/condvars. MANUAL spawns NO threads; the caller
+ * drives the engine cooperatively via gptps_step() on its own thread. MANUAL is
+ * the portable/embeddable path for single-threaded hosts and bare-metal: it needs
+ * only the HAL mutex/clock/flag primitives, never gptps_thread_start/cond_wait. */
+typedef enum {
+    GPTPS_RUN_THREADED = 0,        /* default: dispatcher + worker pool */
+    GPTPS_RUN_MANUAL   = 1         /* no threads; pump via gptps_step() */
+} gptps_run_mode;
+
 typedef struct {
     size_t        struct_size;     /* = sizeof(gptps_config) */
     const char   *config_path;     /* optional TOML path; NULL => limits below + defaults */
     gptps_limits  limits;          /* explicit values win over auto-tune & file */
+    gptps_run_mode mode;           /* v1.6: THREADED (default) or MANUAL (gptps_step) */
 } gptps_config;
 
 GPTPS_API gptps_status gptps_open(const char *config_path, gptps **out_engine);
@@ -236,6 +247,17 @@ GPTPS_API gptps_status gptps_load_addon(gptps *e, const char *path);
 GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,
                                     const void *payload, size_t len,
                                     gptps_handle *out_handle);
+
+/* Single-threaded pump - MANUAL mode only (GPTPS_E_INVAL otherwise). Runs the
+ * engine on the CALLING thread with no dispatcher/worker threads: one call
+ * completes finished work, promotes backoff-ready retries, admits within budget,
+ * and runs the admitted tasks to completion inline. *out_ran (may be NULL)
+ * receives the number of task attempts executed this call - 0 when idle or only
+ * waiting on a retry backoff. Drain with `while (gptps_step(e,&n)==GPTPS_OK && n);`,
+ * or call periodically as your host's main loop ticks. Because a task runs to
+ * completion on this thread, a wall-clock timeout cannot preempt it; cooperative
+ * tasks should poll gptps_is_cancelled() / gptps_deadline_ms(). */
+GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
 
 GPTPS_API gptps_status gptps_shutdown(gptps *e); /* drain in-flight, join, free */
 
