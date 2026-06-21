@@ -7,6 +7,16 @@
 
 #include "gptps.h"
 
+/* --- core allocator seam (alloc.c) ---
+ * Every CORE allocation goes through these; they default to the C library and
+ * are redirected process-wide by the public gptps_set_allocator(). gptps_free
+ * tolerates NULL; gptps_calloc guards size overflow. (The HAL uses libc directly
+ * - it is replaced wholesale on exotic targets.) */
+void *gptps_malloc(size_t size);
+void *gptps_calloc(size_t n, size_t size);
+void *gptps_realloc(void *ptr, size_t size);
+void  gptps_free(void *ptr);
+
 /* config model + auto-tune (T6).
  * Resolves a caller's limits against detected hardware:
  *   - max_concurrent_tasks == 0  => detected CPU count

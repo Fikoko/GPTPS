@@ -91,6 +91,8 @@ library, a CMake package config, and a pkg-config file. Downstream projects then
 | `gptps_settings_save/reload(e, path)` | persist settings to / from a TOML file |
 | `gptps_register_setting(e, &def)` | add a custom setting (also a host-table routine for add-ons) |
 | `gptps_load_addon(e, path)` | load a shared-library add-on over the stable ABI |
+| `gptps_step(e, &ran)` | MANUAL mode: pump the engine on the calling thread (no worker threads) |
+| `gptps_set_allocator(&a)` | redirect all core allocation to a custom `malloc`/`realloc`/`free` |
 | `gptps_shutdown(e)` | drain in-flight + queued work, then free |
 
 Inside a task you get a `gptps_ctx *`: `gptps_payload()`, `gptps_is_cancelled()` (poll it
@@ -175,6 +177,38 @@ is just a program, so you can run one through `GPTPS_EXEC_PROGRAM` with **no new
 flows to the module's stdin and its stdout comes back as the result, under the usual budget /
 timeout / retry. See [`examples/wasm_program.c`](examples/wasm_program.c). For a tighter,
 in-process binding, the [`wasm_exec`](addons/) add-on takes a pluggable runtime hook instead.
+
+## Embedded & single-threaded (no threads, no libc heap)
+
+GPTPS runs in two execution modes, chosen at `gptps_open_ex` via `cfg.mode`:
+
+- **`GPTPS_RUN_THREADED`** (default) — a dispatcher + worker pool; the engine runs
+  itself. The headline hosted path.
+- **`GPTPS_RUN_MANUAL`** — **no threads.** You drive the engine cooperatively on
+  your own thread with `gptps_step(e, &ran)`: one call completes finished work,
+  promotes backoff-ready retries, admits within budget, and runs the admitted tasks
+  to completion inline. Drain with `while (gptps_step(e,&n)==GPTPS_OK && n);`, or
+  call it from your existing main loop / RTOS tick. Same admission, priority, retry,
+  and dead-letter semantics as threaded mode (one shared `engine_pass`).
+
+```c
+gptps_config cfg = { .struct_size = sizeof cfg, .mode = GPTPS_RUN_MANUAL };
+cfg.limits.struct_size = sizeof cfg.limits;
+gptps_open_ex(&cfg, &e);
+/* ... register + submit ... */
+size_t n; do { gptps_step(e, &n); } while (n);   /* runs on THIS thread */
+```
+
+Pair it with **`gptps_set_allocator()`** to take GPTPS off the libc heap entirely —
+point it at a static pool (SQLite-style; covers all core allocation). Together,
+MANUAL mode + a custom allocator are the **bare-metal shape**: zero threads, fixed
+RAM. The only thing a real MCU/RTOS port adds is a HAL backend (`hal_<target>.c`)
+for the mutex/clock/flag primitives — MANUAL mode never calls `gptps_thread_start`
+or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c).
+
+> Caveat: a MANUAL task runs to completion on your thread, so a wall-clock timeout
+> can't preempt it — cooperative tasks should poll `gptps_is_cancelled()` /
+> `gptps_deadline_ms()`. For hard kill/timeout, use an out-of-process executor.
 
 ## Resource budgets, failures, add-ons
 

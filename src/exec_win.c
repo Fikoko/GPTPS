@@ -36,7 +36,7 @@ static char *build_cmdline(const char *const *argv)
     size_t cap = 1, i;
     char *out, *w;
     for (i = 0; argv[i]; ++i) cap += 2 * strlen(argv[i]) + 3;
-    out = (char *)malloc(cap);
+    out = (char *)gptps_malloc(cap);
     if (!out) return NULL;
     w = out;
     for (i = 0; argv[i]; ++i) {
@@ -81,7 +81,7 @@ static DWORD WINAPI reader_proc(LPVOID p)
             char *nb;
             if (nc > GPTPS_WIN_RESULT_CAP) nc = GPTPS_WIN_RESULT_CAP;
             if (nc == r->cap) { r->oversize = 1; break; }
-            nb = (char *)realloc(r->buf, nc);
+            nb = (char *)gptps_realloc(r->buf, nc);
             if (!nb) { r->nomem = 1; break; }
             r->buf = nb; r->cap = nc;
         }
@@ -142,12 +142,12 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
 
     if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NO_WINDOW,
                         NULL, NULL, &si, &pi)) {
-        free(cmd);
+        gptps_free(cmd);
         CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
         if (job) CloseHandle(job);
         return GPTPS_E_TASK; /* program could not be started */
     }
-    free(cmd);
+    gptps_free(cmd);
     CloseHandle(inR); CloseHandle(outW); /* child owns these; parent keeps inW + outR */
 
     if (job && AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
@@ -180,7 +180,7 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
     else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
 
     if (eff == GPTPS_OK) { *out_result = rc.buf; *out_len = rc.len; }
-    else free(rc.buf);
+    else gptps_free(rc.buf);
     return eff;
 }
 

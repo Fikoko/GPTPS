@@ -29,7 +29,7 @@ endif()
 
 # --- library (grows as modules land) ---------------------------------------
 # Core is portable C99; the HAL + executor backend are selected per platform.
-set(GPTPS_SRC src/config.c src/config_toml.c src/settings.c src/engine.c)
+set(GPTPS_SRC src/alloc.c src/config.c src/config_toml.c src/settings.c src/engine.c)
 if(WIN32)
     list(APPEND GPTPS_SRC src/hal_win.c src/exec_win.c)        # Win32 HAL + CreateProcess/Job-Object program executor
 else()
@@ -150,6 +150,14 @@ target_link_libraries(test_step PRIVATE gptps)
 add_test(NAME step COMMAND test_step)
 set_tests_properties(step PROPERTIES TIMEOUT 30)
 
+add_executable(test_alloc tests/test_alloc.c) # process-wide allocator hook
+target_include_directories(test_alloc
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_alloc PRIVATE gptps)
+add_test(NAME alloc COMMAND test_alloc)
+set_tests_properties(alloc PROPERTIES TIMEOUT 30)
+
 # add-on shared libraries (compiled against the frozen header; no core link)
 add_library(addon_demo MODULE tests/addon_demo.c)
 target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -264,6 +272,13 @@ target_include_directories(example_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/in
 target_link_libraries(example_config PRIVATE gptps)
 add_test(NAME example_config COMMAND example_config)
 set_tests_properties(example_config PROPERTIES TIMEOUT 20)
+
+# single-thread + static memory pool (no worker threads, no libc heap)
+add_executable(example_embedded examples/embedded.c)
+target_include_directories(example_embedded PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(example_embedded PRIVATE gptps)
+add_test(NAME example_embedded COMMAND example_embedded)
+set_tests_properties(example_embedded PROPERTIES TIMEOUT 20)
 
 # live terminal dashboard demo (self-skips the live loop without a TTY)
 add_executable(example_dashboard examples/dashboard.c addons/tui.c)

@@ -15,6 +15,13 @@ versioning once it reaches 1.0.
   bare-metal. The threaded dispatcher and the manual pump share one `engine_pass()`
   (admission/retry/dead-letter logic), so scheduling semantics are identical.
   ABI minor 5 → 6 (additive). Threaded engines reject `gptps_step` with `E_INVAL`.
+- **Allocator hook** (`gptps_set_allocator`): redirect *all* core allocation
+  process-wide to a custom `malloc`/`realloc`/`free` (e.g. a static pool on a host
+  with no libc heap), SQLite-style. Defaults to the C library; pass `NULL` to reset.
+  Covers the portable core (engine, settings, config, executors); the HAL manages
+  its own memory (replace it for exotic RAM). ABI minor 6 → 7 (additive).
+- **`examples/embedded.c`**: GPTPS with **no worker threads and no libc heap** —
+  MANUAL mode + a static-arena allocator — the bare-metal shape end to end.
 
 ## [0.2.0] - 2026-06-21
 

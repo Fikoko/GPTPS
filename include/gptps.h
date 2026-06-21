@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 6u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step) */
+#define GPTPS_ABI_VERSION_MINOR 7u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator) */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -193,6 +193,24 @@ typedef struct {
      * Ignored for INPROC/OOP. Copied by the engine at registration. */
     const char *const    *argv;
 } gptps_task_def;
+
+/* ============================================================================
+ * ALLOCATOR (optional) - redirect ALL core allocation process-wide.
+ * Install ONCE before the first gptps_open and do not change it while engines
+ * exist (the override is configuration, not runtime state). Pass NULL to reset
+ * to the C library. All three function pointers are required. Lets a host with a
+ * static pool / no libc heap (embedded, bare-metal) own GPTPS's memory. Covers
+ * the portable core; the HAL manages its own memory (replace it for exotic RAM).
+ * ==========================================================================*/
+typedef struct {
+    size_t struct_size;                              /* = sizeof(gptps_allocator) */
+    void *(*malloc_fn)(size_t size, void *user_data);
+    void *(*realloc_fn)(void *ptr, size_t size, void *user_data);
+    void  (*free_fn)(void *ptr, void *user_data);
+    void  *user_data;                                /* opaque, passed to each call */
+} gptps_allocator;
+
+GPTPS_API gptps_status gptps_set_allocator(const gptps_allocator *a); /* NULL => reset to libc */
 
 /* ============================================================================
  * ENGINE LIFECYCLE

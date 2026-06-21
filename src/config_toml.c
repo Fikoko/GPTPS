@@ -38,7 +38,7 @@ struct gptps_toml {
 
 static char *dupn(const char *s, size_t n)
 {
-    char *o = (char *)malloc(n + 1);
+    char *o = (char *)gptps_malloc(n + 1);
     if (!o) return NULL;
     memcpy(o, s, n); o[n] = 0;
     return o;
@@ -59,7 +59,7 @@ static char *trim(char *s)
 /* unescape a quoted string body [start,end) into a fresh buffer */
 static char *unescape(const char *p, const char *end)
 {
-    char *o = (char *)malloc((size_t)(end - p) + 1), *w;
+    char *o = (char *)gptps_malloc((size_t)(end - p) + 1), *w;
     if (!o) return NULL;
     w = o;
     while (p < end) {
@@ -85,7 +85,7 @@ static toml_entry *push(struct gptps_toml *t)
 {
     if (t->n == t->cap) {
         size_t nc = t->cap ? t->cap * 2 : 16;
-        toml_entry *ne = (toml_entry *)realloc(t->e, nc * sizeof *ne);
+        toml_entry *ne = (toml_entry *)gptps_realloc(t->e, nc * sizeof *ne);
         if (!ne) return NULL;
         t->e = ne; t->cap = nc;
     }
@@ -132,12 +132,12 @@ static int parse_value(struct gptps_toml *t, const char *section, const char *ke
             }
             if (str) {
                 if (n == capn) { capn = capn ? capn * 2 : 4;
-                    arr = (char **)realloc(arr, (size_t)capn * sizeof *arr); }
-                if (arr) arr[n++] = str; else { free(str); }
+                    arr = (char **)gptps_realloc(arr, (size_t)capn * sizeof *arr); }
+                if (arr) arr[n++] = str; else { gptps_free(str); }
             }
         }
         e = push(t);
-        if (!e) { int k; for (k = 0; k < n; ++k) free(arr[k]); free(arr); return -1; }
+        if (!e) { int k; for (k = 0; k < n; ++k) gptps_free(arr[k]); gptps_free(arr); return -1; }
         e->section = dupn(section, strlen(section));
         e->key = dupn(key, strlen(key));
         e->type = TT_ARR; e->arr = arr; e->arrn = n;
@@ -180,14 +180,14 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
     if (!f) { if (errbuf && errlen) snprintf(errbuf, errlen, "cannot open %s", path); return NULL; }
     fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
     if (sz < 0) { fclose(f); return NULL; }
-    buf = (char *)malloc((size_t)sz + 1);
+    buf = (char *)gptps_malloc((size_t)sz + 1);
     if (!buf) { fclose(f); return NULL; }
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { /* tolerate short read */ }
     buf[sz] = 0;
     fclose(f);
 
-    t = (struct gptps_toml *)calloc(1, sizeof *t);
-    if (!t) { free(buf); return NULL; }
+    t = (struct gptps_toml *)gptps_calloc(1, sizeof *t);
+    if (!t) { gptps_free(buf); return NULL; }
     section[0] = 0;
 
     for (line = buf, save = buf; ; ++save) {
@@ -221,7 +221,7 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
             line = save + 1;
         }
     }
-    free(buf);
+    gptps_free(buf);
     return t;
 }
 
@@ -230,10 +230,10 @@ void gptps_toml_free(gptps_toml *t)
     size_t k; int j;
     if (!t) return;
     for (k = 0; k < t->n; ++k) {
-        free(t->e[k].section); free(t->e[k].key); free(t->e[k].s);
-        if (t->e[k].arr) { for (j = 0; j < t->e[k].arrn; ++j) free(t->e[k].arr[j]); free(t->e[k].arr); }
+        gptps_free(t->e[k].section); gptps_free(t->e[k].key); gptps_free(t->e[k].s);
+        if (t->e[k].arr) { for (j = 0; j < t->e[k].arrn; ++j) gptps_free(t->e[k].arr[j]); gptps_free(t->e[k].arr); }
     }
-    free(t->e); free(t);
+    gptps_free(t->e); gptps_free(t);
 }
 
 static const toml_entry *find(const gptps_toml *t, const char *section, const char *key)

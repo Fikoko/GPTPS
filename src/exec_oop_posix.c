@@ -74,12 +74,12 @@ static unsigned cgroup_seq(void)
 static int cg_write_file(const char *dir, const char *file, const char *val)
 {
     size_t n = strlen(dir) + strlen(file) + 2;
-    char *path = (char *)malloc(n);
+    char *path = (char *)gptps_malloc(n);
     int fd; ssize_t w;
     if (!path) return -1;
     snprintf(path, n, "%s/%s", dir, file);
     fd = open(path, O_WRONLY);
-    free(path);
+    gptps_free(path);
     if (fd < 0) return -1;
     w = write(fd, val, strlen(val));
     close(fd);
@@ -95,13 +95,13 @@ static char *cgroup_create(uint64_t mem_cap)
     if (!parent || !*parent) return NULL;
     if (mem_cap < GPTPS_OOP_MEMCAP_FLOOR) return NULL;
     n = strlen(parent) + 48;
-    dir = (char *)malloc(n);
+    dir = (char *)gptps_malloc(n);
     if (!dir) return NULL;
     snprintf(dir, n, "%s/gptps.%ld.%u", parent, (long)getpid(), cgroup_seq());
-    if (mkdir(dir, 0700) != 0) { free(dir); return NULL; }
+    if (mkdir(dir, 0700) != 0) { gptps_free(dir); return NULL; }
     snprintf(val, sizeof val, "%llu", (unsigned long long)mem_cap);
     if (cg_write_file(dir, "memory.max", val) != 0) { /* controller not delegated here */
-        rmdir(dir); free(dir); return NULL;
+        rmdir(dir); gptps_free(dir); return NULL;
     }
     cg_write_file(dir, "memory.swap.max", "0"); /* make the cap a hard ceiling, not swap */
     return dir;
@@ -119,13 +119,13 @@ static int cgroup_self_join(const char *dir)
 static int cgroup_oom_killed(const char *dir)
 {
     size_t n = strlen(dir) + 16;
-    char *path = (char *)malloc(n), key[32];
+    char *path = (char *)gptps_malloc(n), key[32];
     long v; int killed = 0;
     FILE *f;
     if (!path) return 0;
     snprintf(path, n, "%s/memory.events", dir);
     f = fopen(path, "r");
-    free(path);
+    gptps_free(path);
     if (!f) return 0;
     while (fscanf(f, "%31s %ld", key, &v) == 2)
         if (strcmp(key, "oom_kill") == 0 && v > 0) killed = 1;
@@ -135,7 +135,7 @@ static int cgroup_oom_killed(const char *dir)
 
 static void cgroup_destroy(char *dir)
 {
-    if (dir) { rmdir(dir); free(dir); } /* child reaped => cgroup empty => rmdir succeeds */
+    if (dir) { rmdir(dir); gptps_free(dir); } /* child reaped => cgroup empty => rmdir succeeds */
 }
 #endif /* __linux__ */
 
@@ -207,7 +207,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         write_all(p[1], &st32, sizeof st32);
         write_all(p[1], &len64, sizeof len64);
         if (rlen) write_all(p[1], res, rlen);
-        free(res);
+        gptps_free(res);
         close(p[1]);
         _exit(0);
     }
@@ -234,9 +234,9 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             if (read_all(p[0], &st32, sizeof st32) == 0 &&
                 read_all(p[0], &len64, sizeof len64) == 0) {
                 if (len64) {
-                    res = malloc((size_t)len64);
+                    res = gptps_malloc((size_t)len64);
                     if (!res || read_all(p[0], res, (size_t)len64) != 0) {
-                        free(res); res = NULL; len64 = 0; st32 = (int32_t)GPTPS_E_IO;
+                        gptps_free(res); res = NULL; len64 = 0; st32 = (int32_t)GPTPS_E_IO;
                     }
                 }
             } else {
@@ -249,7 +249,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         if (killed) {
             eff = GPTPS_E_TIMEOUT;
         } else if (WIFSIGNALED(wstatus)) {
-            free(res); res = NULL; len64 = 0;   /* crash / OOM-kill */
+            gptps_free(res); res = NULL; len64 = 0;   /* crash / OOM-kill */
             eff = GPTPS_E_TASK;
 #if defined(__linux__)
             if (cgdir && cgroup_oom_killed(cgdir)) eff = GPTPS_E_NOMEM; /* exceeded the memory cap */
@@ -346,7 +346,7 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
                 char *nb;
                 if (ncap > GPTPS_PROG_RESULT_CAP) ncap = GPTPS_PROG_RESULT_CAP;
                 if (ncap == cap) { oversize = 1; kill(pid, SIGKILL); break; } /* >16 MiB */
-                nb = (char *)realloc(buf, ncap);
+                nb = (char *)gptps_realloc(buf, ncap);
                 if (!nb) { nomem = 1; kill(pid, SIGKILL); break; }
                 buf = nb; cap = ncap;
             }
@@ -370,7 +370,7 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
 #endif
 
         if (eff == GPTPS_OK) { *out_result = buf; *out_len = len; }
-        else free(buf);
+        else gptps_free(buf);
         return eff;
     }
 }

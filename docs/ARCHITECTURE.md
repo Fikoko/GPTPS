@@ -68,6 +68,22 @@ Source layout:
 
 ## 3. Concurrency model
 
+GPTPS has two **execution modes**, selected at open via `gptps_config.mode`:
+
+- **`GPTPS_RUN_THREADED`** (default) — the dispatcher + worker pool below.
+- **`GPTPS_RUN_MANUAL`** — **no threads.** The caller drives the engine via
+  `gptps_step()`, which runs the same scheduling pass and then executes the
+  admitted tasks inline on the calling thread. This is the portable path for
+  single-threaded hosts and bare-metal; it needs only the HAL mutex/clock/flag
+  primitives, never `gptps_thread_start`/`cond_wait`. See §3.1.
+
+Steps 1–4 of the loop below are factored into one function, **`engine_pass()`**,
+shared verbatim by the threaded dispatcher and the manual pump — so admission,
+retry, dead-letter, and starvation semantics are identical across modes; only the
+*driver* (a thread that sleeps on a condvar vs. a caller that returns) differs.
+
+### Threaded mode
+
 One mutex `m` guards all shared engine state. Two thread roles:
 
 - **The dispatcher** (exactly one thread) is the *sole writer* of the admission
@@ -109,6 +125,39 @@ without deadlock or re-entrancy under the lock.
 > A subtle lost-wakeup bug lived in the emit window (step 5): releasing the lock
 > to emit could drop a `cv_disp` signal. The fix is the `continue` — re-running
 > the loop re-drains `done` and re-admits `intake` rather than risking a sleep.
+
+### 3.1 Manual mode (`gptps_step`)
+
+In MANUAL mode no dispatcher or worker threads are created. `gptps_step()` is the
+whole engine on one thread:
+
+1. `engine_pass()` — complete prior work, promote backoff-ready retries, admit
+   within budget (steps 1–4 above), then emit buffered events with the lock released.
+2. **Run inline** — pop each admitted item from `ready`, run it to completion on
+   the calling thread (the work a worker would do), and post it to `done`.
+3. `engine_pass()` again — account what just ran (release budget, schedule retries
+   / dead-letter) and emit.
+
+`*out_ran` reports how many task attempts executed; the caller loops
+`while (gptps_step(e,&n)==GPTPS_OK && n);` to drain, or ticks it from its own main
+loop. `max_concurrent_tasks` still bounds how many items one step admits at once
+(the memory budget is honored identically). The one semantic difference from
+threaded mode: a task runs to completion on the caller's thread, so a wall-clock
+deadline can't *preempt* it — cooperative tasks poll `gptps_is_cancelled()` /
+`gptps_deadline_ms()`; hard timeout/kill needs an out-of-process executor. Threaded
+engines reject `gptps_step` with `GPTPS_E_INVAL`; MANUAL `gptps_shutdown` skips the
+joins and drains the in-flight queues directly.
+
+### 3.2 The allocator seam (`gptps_set_allocator`)
+
+All **core** allocation (engine, settings, config, executors) routes through
+`gptps_malloc/calloc/realloc/free` in `src/alloc.c`, which default to the C library
+and can be redirected process-wide to a custom `malloc`/`realloc`/`free`
+(SQLite-style) — e.g. a static pool on a host with no libc heap. Install it once
+before the first `gptps_open` (the override is configuration, not runtime state).
+The **HAL deliberately uses libc directly**: it is the platform seam you replace
+wholesale on an exotic target, and it owns its thread/sync structs there. MANUAL
+mode + a custom allocator is the bare-metal shape; see `examples/embedded.c`.
 
 ---
 
@@ -231,6 +280,15 @@ Feature-test macros (`_GNU_SOURCE` / `_DARWIN_C_SOURCE`) are defined **in-source
 at the top of each backend (and at the top of the amalgamation), so a plain
 `cc -std=c99 gptps.c yourapp.c` exposes the POSIX APIs the HAL needs without any
 build-system `-D` flags.
+
+**Porting to a new target (RTOS / bare-metal).** Write one backend implementing
+this interface. In MANUAL mode (§3.1) the required subset is small: mutex,
+condvar (create/destroy/signal/broadcast — `wait`/`timedwait` and `thread_start`
+are *not* called, since there are no engine threads), the cancel flag, the
+monotonic clock, and hardware detection (return `cpu_count = 1`). `dlopen` and
+`atomic_replace` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use dynamic
+add-ons or settings persistence. Combined with `gptps_set_allocator` (§3.2) for a
+static memory pool, that is the whole bare-metal dependency surface.
 
 ---
 

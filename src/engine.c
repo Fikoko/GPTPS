@@ -48,7 +48,7 @@ struct gptps_ctx {
     void        *result;
     size_t        result_len;
     void       (*result_free)(void *);
-    bool          result_is_copy;    /* true => core malloc'd a copy; free() it */
+    bool          result_is_copy;    /* true => core allocated a copy; free it */
     bool          result_set;
 };
 
@@ -193,8 +193,8 @@ static void item_free(gptps_item *it)
 {
     if (!it) return;
     if (it->cancel) gptps_flag_destroy(it->cancel);
-    free(it->payload);
-    free(it);
+    gptps_free(it->payload);
+    gptps_free(it);
 }
 
 static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p)
@@ -245,7 +245,7 @@ void gptps_log(gptps_ctx *ctx, gptps_log_level lvl, const char *msg)
 static void ctx_clear_result(gptps_ctx *c)
 {
     if (c->result_set) {
-        if (c->result_is_copy)       free(c->result);          /* core-owned copy */
+        if (c->result_is_copy)       gptps_free(c->result);          /* core-owned copy */
         else if (c->result_free)     c->result_free(c->result); /* transferred w/ free_cb */
         /* else: borrowed (nocopy + NULL free_cb) -> caller owns it, do not free */
         c->result = NULL; c->result_len = 0; c->result_free = NULL;
@@ -259,7 +259,7 @@ gptps_status gptps_result_set(gptps_ctx *ctx, const void *bytes, size_t len)
     if (!ctx) return GPTPS_E_INVAL;
     ctx_clear_result(ctx);
     if (len == 0) { ctx->result = NULL; ctx->result_len = 0; ctx->result_is_copy = false; ctx->result_set = true; return GPTPS_OK; }
-    copy = malloc(len);
+    copy = gptps_malloc(len);
     if (!copy) return GPTPS_E_NOMEM;
     memcpy(copy, bytes, len);
     ctx->result = copy; ctx->result_len = len; ctx->result_free = NULL;
@@ -293,7 +293,7 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
 
     st = def->run(&ctx, def->user_data);
     if (ctx.result_set && ctx.result_len) {
-        void *copy = malloc(ctx.result_len);
+        void *copy = gptps_malloc(ctx.result_len);
         if (copy) { memcpy(copy, ctx.result, ctx.result_len); *out_result = copy; *out_len = ctx.result_len; }
     }
     ctx_clear_result(&ctx);
@@ -346,7 +346,7 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     emit_now(e, cb, ud, &p);
 
     if (inproc) ctx_clear_result(&ctx);
-    else        free(oop_res);
+    else        gptps_free(oop_res);
     return st;
 }
 
@@ -742,11 +742,11 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     if (cfg && cfg->struct_size < sizeof *cfg) return GPTPS_E_INVAL; /* ABI: reject undersized struct */
     *out_engine = NULL;
 
-    e = (gptps *)calloc(1, sizeof *e);
+    e = (gptps *)gptps_calloc(1, sizeof *e);
     if (!e) return GPTPS_E_NOMEM;
 
     s = gptps_config_resolve(in, &e->limits);
-    if (s != GPTPS_OK) { free(e); return s; }
+    if (s != GPTPS_OK) { gptps_free(e); return s; }
 
     e->next_handle = 1;
     e->reserve_after_skips = GPTPS_RESERVE_AFTER;
@@ -766,7 +766,7 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
 
     if (cfg && cfg->config_path) {   /* remember the open path for save/reload defaults */
         size_t L = strlen(cfg->config_path) + 1;
-        e->config_path = (char *)malloc(L);
+        e->config_path = (char *)gptps_malloc(L);
         if (e->config_path) memcpy(e->config_path, cfg->config_path, L);
     }
 
@@ -778,7 +778,7 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
         e->workers = NULL;
     } else {
         e->nworkers = e->limits.max_concurrent_tasks;
-        e->workers = (gptps_thread **)calloc(e->nworkers, sizeof *e->workers);
+        e->workers = (gptps_thread **)gptps_calloc(e->nworkers, sizeof *e->workers);
         if (!e->workers) { s = GPTPS_E_NOMEM; goto fail; }
 
         e->dispatcher = gptps_thread_start(dispatcher_main, e);
@@ -801,11 +801,11 @@ fail_threads:
     for (i = 0; i < e->nworkers; ++i) if (e->workers[i]) gptps_thread_join(e->workers[i]);
 fail:
     if (e->settings) gptps_settings_destroy(e->settings);
-    if (e->workers) free(e->workers);
+    if (e->workers) gptps_free(e->workers);
     if (e->cv_work) gptps_cond_destroy(e->cv_work);
     if (e->cv_disp) gptps_cond_destroy(e->cv_disp);
     if (e->m) gptps_mutex_destroy(e->m);
-    free(e);
+    gptps_free(e);
     return s;
 }
 
@@ -894,12 +894,12 @@ static char **argv_dup(const char *const *argv)
     size_t n = 0, i;
     char **out;
     while (argv[n]) ++n;
-    out = (char **)calloc(n + 1, sizeof *out);
+    out = (char **)gptps_calloc(n + 1, sizeof *out);
     if (!out) return NULL;
     for (i = 0; i < n; ++i) {
         size_t L = strlen(argv[i]) + 1;
-        out[i] = (char *)malloc(L);
-        if (!out[i]) { while (i--) free(out[i]); free(out); return NULL; }
+        out[i] = (char *)gptps_malloc(L);
+        if (!out[i]) { while (i--) gptps_free(out[i]); gptps_free(out); return NULL; }
         memcpy(out[i], argv[i], L);
     }
     return out;
@@ -927,15 +927,15 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     gptps_mutex_lock(e->m);
     if (registry_find(e, def->name)) {
         gptps_mutex_unlock(e->m);
-        if (argv_copy) { char **a = argv_copy; while (*a) free(*a++); free(argv_copy); }
+        if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
         return GPTPS_E_DUP;
     }
 
-    r = (gptps_reg *)calloc(1, sizeof *r);
-    name = (char *)malloc(strlen(def->name) + 1);
+    r = (gptps_reg *)gptps_calloc(1, sizeof *r);
+    name = (char *)gptps_malloc(strlen(def->name) + 1);
     if (!r || !name) {
-        free(r); free(name);
-        if (argv_copy) { char **a = argv_copy; while (*a) free(*a++); free(argv_copy); }
+        gptps_free(r); gptps_free(name);
+        if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
         gptps_mutex_unlock(e->m);
         return GPTPS_E_NOMEM;
     }
@@ -1075,7 +1075,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         if (s != GPTPS_OK) { gptps_dl_close(dl); return s; }
     }
 
-    node = (gptps_loaded *)calloc(1, sizeof *node);
+    node = (gptps_loaded *)gptps_calloc(1, sizeof *node);
     if (!node) {
         if (addon->teardown) addon->teardown(e);
         gptps_dl_close(dl);
@@ -1115,15 +1115,15 @@ gptps_status gptps_submit(gptps *e, const char *task_name,
     }
 
     if (len) {
-        pcopy = malloc(len);
+        pcopy = gptps_malloc(len);
         if (!pcopy) { gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
         memcpy(pcopy, payload, len);
     }
-    it = (gptps_item *)calloc(1, sizeof *it);
+    it = (gptps_item *)gptps_calloc(1, sizeof *it);
     if (it) it->cancel = gptps_flag_create(false);
     if (!it || !it->cancel) {
         if (it) gptps_flag_destroy(it->cancel);
-        free(it); free(pcopy);
+        gptps_free(it); gptps_free(pcopy);
         gptps_mutex_unlock(e->m);
         return GPTPS_E_NOMEM;
     }
@@ -1159,7 +1159,7 @@ gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_dat
 {
     gptps_observer *o;
     if (!e || !fn) return GPTPS_E_INVAL;
-    o = (gptps_observer *)calloc(1, sizeof *o);
+    o = (gptps_observer *)gptps_calloc(1, sizeof *o);
     if (!o) return GPTPS_E_NOMEM;
     o->fn = fn; o->ud = user_data;
     gptps_mutex_lock(e->m);
@@ -1172,7 +1172,7 @@ gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn fn, void *u
 {
     gptps_constraint *c;
     if (!e || !fn) return GPTPS_E_INVAL;
-    c = (gptps_constraint *)calloc(1, sizeof *c);
+    c = (gptps_constraint *)gptps_calloc(1, sizeof *c);
     if (!c) return GPTPS_E_NOMEM;
     c->fn = fn; c->ud = user_data;
     gptps_mutex_lock(e->m);
@@ -1312,7 +1312,7 @@ gptps_status gptps_shutdown(gptps *e)
             gptps_loaded *n = a->next;
             if (a->addon->teardown) a->addon->teardown(e);
             gptps_dl_close(a->dl);
-            free(a);
+            gptps_free(a);
             a = n;
         }
     }
@@ -1331,19 +1331,19 @@ gptps_status gptps_shutdown(gptps *e)
     r = e->registry;
     while (r) {
         gptps_reg *n = r->next;
-        if (r->argv_copy) { char **a = r->argv_copy; while (*a) free(*a++); free(r->argv_copy); }
-        free(r->name); free(r); r = n;
+        if (r->argv_copy) { char **a = r->argv_copy; while (*a) gptps_free(*a++); gptps_free(r->argv_copy); }
+        gptps_free(r->name); gptps_free(r); r = n;
     }
-    { gptps_observer  *o = e->observers;  while (o) { gptps_observer  *n = o->next; free(o); o = n; } }
-    { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; free(c); c = n; } }
+    { gptps_observer  *o = e->observers;  while (o) { gptps_observer  *n = o->next; gptps_free(o); o = n; } }
+    { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; gptps_free(c); c = n; } }
     gptps_settings_destroy(e->settings);  /* entries reference e / regs, which are freed above/after; destroy only frees the schema list */
     gptps_toml_free(e->toml);
-    free(e->config_path);
+    gptps_free(e->config_path);
 
-    free(e->workers);
+    gptps_free(e->workers);
     gptps_cond_destroy(e->cv_work);
     gptps_cond_destroy(e->cv_disp);
     gptps_mutex_destroy(e->m);
-    free(e);
+    gptps_free(e);
     return GPTPS_OK;
 }
