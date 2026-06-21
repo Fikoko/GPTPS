@@ -3,7 +3,9 @@
 **An embeddable, in-process C99 task processor — the "SQLite of task processors."**
 Link one library, register a task, submit work. GPTPS runs it on a worker pool under
 declared resource budgets, with retries / timeouts / dead-letter, and gives you the
-result back. No server, no broker, no mandatory dependency. Runs on Linux and macOS.
+result back — plus an optional **live terminal dashboard** to watch and steer it. No
+server, no broker, no mandatory dependency. Runs on Linux, macOS, and Windows, and can
+even run **single-threaded with no libc heap** for embedded / bare-metal targets.
 
 ---
 
@@ -157,6 +159,45 @@ size_t n = gptps_settings_count(e);                                   /* enumera
   host-table routine), so they show up in the registry, TOML, and editor uniformly.
 - **Editor:** the `tui` add-on includes a live **Settings pane** (`s`) to browse/edit/save.
 
+## Live terminal dashboard
+
+GPTPS ships an optional, dependency-free terminal dashboard (`addons/tui.c`) — link it,
+point it at your engine, and watch tasks flow in real time. Pure ANSI/VT (no ncurses),
+auto-enabled on a TTY, with the Windows console put into VT mode automatically.
+
+```text
+GPTPS · live demo   up 0.1s   28.6 done/s
+queued 18  started 8  in-flight 4  [##########################] peak 4
+finished 4  failed 0  retried 0  dead 0
+kpi:full mode:realtime refresh:250ms
+
+TASKS
+  label              run    ok  fail  dead   ok%   avg ms  key
+  Resize               8     4     0     0  100%     81.0  [r]
+  Thumbnail            0     0     0     0    --       --  [t]
+
+RECENT
+     0.1 FINISHED resize         #4
+     0.1 FINISHED resize         #1
+     0.1 STARTED  resize         #7
+     0.1 STARTED  resize         #8
+
+keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  m kpi  p pause  k/j scroll  q quit
+```
+
+- **Live metrics:** throughput, an in-flight gauge, cumulative counts, and a per-task
+  table (runs / ok / fail / dead / success-rate / average latency).
+- **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
+  dashboard's own CPU/RAM cost (minimal/normal/full) live; `p` pauses; `s` opens the live
+  **settings editor**; `?` shows a help overlay of every key.
+- **Friendly:** adapts to the terminal size, redraws flicker-free, confirms actions with a
+  toast, and on a real terminal adds a framed title bar, a Unicode block gauge, and color
+  (with an ASCII fallback shown above). Built on a pure render-to-string core, so it is
+  fully testable headlessly.
+
+Run it live in a terminal: `./build/example_dashboard` (source:
+[`examples/dashboard.c`](examples/dashboard.c)).
+
 ## Executor kinds (per task, via `def.exec`)
 
 | Kind | Runs as | Enforcement | Platforms |
@@ -227,13 +268,9 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
 - **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
-- **Live dashboard (optional):** `addons/tui.c` is a portable real-time terminal UI — throughput,
-  in-flight gauge, a per-task table with success-rate + average latency, a scrollable recent log
-  (`k`/`j`), and hotkeys to submit tasks. Press `?` for a **help overlay** of every key; actions
-  show a confirmation toast; the layout **adapts to the terminal size** and redraws flicker-free,
-  with a framed title bar, a Unicode block gauge (ASCII fallback), and semantic color. Global +
-  per-task configurable; an `s` pane edits the settings registry live. Keyboard-driven (no mouse,
-  since mouse reporting isn't portable to every terminal).
+- **Live dashboard (optional):** a portable real-time terminal UI with live metrics, a
+  per-task table, a scrollable event log, a settings editor, and hotkeys — see
+  [Live terminal dashboard](#live-terminal-dashboard) above.
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
   versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See
@@ -253,7 +290,7 @@ gptps/
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
 ├── addons/              ← optional modules on the public API (durable_queue, gpu_quota, wasm_exec, tui)
-├── examples/            ← runnable examples (demo, config_file, external_program)
+├── examples/            ← runnable examples (demo, config_file, external_program, dashboard, embedded, wasm_program)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/ARCHITECTURE.md ← how it works inside
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)
@@ -269,9 +306,11 @@ result delivery, retries/timeout/dead-letter + dead-letter drain, priority sched
 with skip-to-fit + reservation, accurate cgroup v2 memory enforcement (with RLIMIT_AS
 fallback), the add-on loader + ABI, constraints + observers, TOML config-file loading
 (limits + scheduler + per-task overrides + add-on auto-load), the unified settings
-registry (typed get/set + validation + round-trip persistence + add-on-extensible +
-a live TUI editor), the crash-durable queue, GPU-quota, and WASM-executor add-ons,
-the demo, CMake + CI + single-file amalgamation.
+registry (typed get/set + validation + round-trip persistence + add-on-extensible),
+**single-threaded MANUAL mode** (`gptps_step`) and a **custom-allocator hook** for
+embedded / bare-metal hosts, the **live terminal dashboard** (with the settings editor),
+the crash-durable queue, GPU-quota, and WASM-executor add-ons, the examples, CMake + CI +
+single-file amalgamation.
 
 Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** (Win32 HAL
 via `src/hal_win.c`) runs the engine, scheduler, config, the in-process and
