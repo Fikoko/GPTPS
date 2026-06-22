@@ -37,24 +37,29 @@
 /* internal types                                                            */
 /* ------------------------------------------------------------------------- */
 
+struct gptps_reg;   /* forward: ctx carries the running item's registry slot */
+
 struct gptps_ctx {
-    gptps        *engine;
-    gptps_handle  handle;
-    const char   *task_name;
-    const void   *payload;
-    size_t        payload_len;
-    uint64_t      deadline_ms;
-    gptps_flag   *cancel;            /* owned by the item, shared with the ctx */
-    void        *result;
-    size_t        result_len;
-    void       (*result_free)(void *);
-    bool          result_is_copy;    /* true => core allocated a copy; free it */
-    bool          result_set;
+    gptps            *engine;
+    struct gptps_reg *reg;           /* registry slot of the running task (for per-task setting reads) */
+    gptps_handle      handle;
+    const char       *task_name;
+    const void       *payload;
+    size_t            payload_len;
+    uint64_t          deadline_ms;
+    gptps_flag       *cancel;        /* owned by the item, shared with the ctx */
+    void             *result;
+    size_t            result_len;
+    void            (*result_free)(void *);
+    bool              result_is_copy;    /* true => core allocated a copy; free it */
+    bool              result_set;
 };
 
 typedef struct gptps_item {
     gptps_handle          handle;
-    const gptps_task_def *def;       /* points into the registry (stable) */
+    const gptps_task_def *def;       /* points into the registry (stable while it->reg lives) */
+    struct gptps_reg     *reg;       /* owning registry slot (NULL once detached for dead-letter) */
+    char                 *name_owned;/* owned name copy, set only when detached from a removed reg */
     void                 *payload;
     size_t                payload_len;
     gptps_cost            cost;
@@ -69,14 +74,48 @@ typedef struct gptps_item {
     struct gptps_item    *next;
 } gptps_item;
 
+/* One instance value of a generic per-task setting (see gptps_define_task_setting).
+ * Materialized per (task, schema); the settings entry's target points here. */
+typedef struct gptps_task_local {
+    const struct gptps_task_schema *schema;       /* borrowed: shared schema (leaf/type/range) */
+    struct gptps_reg               *reg;          /* owning task (locks reg->engine->m) */
+    char                            value[GPTPS_SETTINGS_VALUE_MAX];
+    struct gptps_task_local        *next;
+} gptps_task_local;
+
 typedef struct gptps_reg {
     gptps_task_def     def;
     char              *name;
     char             **argv_copy;  /* owned NULL-terminated copy for EXEC_PROGRAM */
     int32_t            priority;   /* scheduling priority for this task type (default 0) */
+    bool               enabled;    /* false => reject new submits (paused, reversible) */
+    bool               removed;    /* true => tombstoned, draining toward removal */
+    bool               cancelling; /* true => removal is CANCEL: drop in-flight items rather than dead-letter */
+    gptps_task_local  *locals;     /* owned generic per-task setting cells */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
     struct gptps_reg  *next;
 } gptps_reg;
+
+/* A generic per-task setting schema: materialized as tasks.<name>.<leaf> on every
+ * task (existing + future). The choices array (enum) is owned here. */
+typedef struct gptps_task_schema {
+    char                     *leaf;     /* owned bare key (no dots) */
+    gptps_setting_type        type;
+    char                     *defval;   /* owned default rendering */
+    int                       hot, has_range;
+    double                    min, max;
+    char                    **choices;  /* owned NULL-terminated (enum only) */
+    struct gptps_task_schema *next;
+} gptps_task_schema;
+
+/* A generic GLOBAL setting the engine stores for you (see gptps_define_global):
+ * a self-contained value cell with optional owned enum choices. */
+typedef struct gptps_owned_setting {
+    char                        *key;      /* owned full dotted key */
+    char                         value[GPTPS_SETTINGS_VALUE_MAX];
+    char                       **choices;  /* owned NULL-terminated (enum only) */
+    struct gptps_owned_setting  *next;
+} gptps_owned_setting;
 
 typedef struct gptps_loaded {
     gptps_dl            *dl;
@@ -98,17 +137,23 @@ typedef struct gptps_constraint {
 
 typedef struct { gptps_item *head, *tail; } gptps_fifo;
 
-/* pending event emitted after the lock is released */
+/* pending event emitted after the lock is released. `name` is an OWNED inline copy
+ * (not a borrowed pointer): a task type can be unregistered and freed during the
+ * lock-released emit window, so the buffered event must not alias reg/def memory. */
+#define GPTPS_EV_NAME_MAX 128
 typedef struct {
     gptps_event_kind kind;
     gptps_handle     handle;
-    const char      *name;
+    char             name[GPTPS_EV_NAME_MAX];
     gptps_status     status;
     uint32_t         attempt;
     uint64_t         mem;
     const void      *result;
     size_t           result_len;
 } gptps_pending_ev;
+
+static void ev_set_name(char *dst, const char *src)
+{ snprintf(dst, GPTPS_EV_NAME_MAX, "%s", src ? src : "?"); }
 
 struct gptps {
     gptps_limits   limits;
@@ -117,6 +162,7 @@ struct gptps {
     gptps_mutex   *m;
     gptps_cond    *cv_disp;
     gptps_cond    *cv_work;
+    gptps_cond    *cv_drain;        /* signalled after each pass; a blocked unregister re-checks drain */
 
     gptps_fifo     intake;
     gptps_fifo     ready;
@@ -149,6 +195,10 @@ struct gptps {
     uint32_t       reserve_after_skips; /* starvation guard: reserve a budget-blocked top task after this many backfill skips */
     gptps_settings *settings;     /* unified settings registry */
     char          *config_path;   /* the path opened with (NULL if none); default for save/reload */
+    gptps_owned_setting *owned_settings; /* engine-stored generic global knobs (gptps_define_global) */
+    gptps_task_schema   *task_schemas;   /* generic per-task setting schemas (gptps_define_task_setting) */
+    unsigned             active_defines; /* in-flight gptps_define_task_setting materializations; a reg
+                                          * must not be freed while >0 (it may hold a snapshotted reg ptr) */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -181,12 +231,22 @@ static void fifo_remove(gptps_fifo *q, gptps_item *target)
     }
 }
 
-static const gptps_reg *registry_find(const gptps *e, const char *name)
+/* Find a live (non-tombstoned) task by name. A draining task is logically gone:
+ * its name is free to submit-reject / re-register. */
+static gptps_reg *registry_find(const gptps *e, const char *name)
 {
-    const gptps_reg *r;
+    gptps_reg *r;
     for (r = e->registry; r; r = r->next)
-        if (strcmp(r->name, name) == 0) return r;
+        if (!r->removed && strcmp(r->name, name) == 0) return r;
     return NULL;
+}
+
+/* Resolved name for an item (owned copy once detached from a removed reg). */
+static const char *item_name(const gptps_item *it)
+{
+    if (it->name_owned) return it->name_owned;
+    if (it->reg)        return it->reg->name;
+    return it->def ? it->def->name : "?";
 }
 
 static void item_free(gptps_item *it)
@@ -194,6 +254,7 @@ static void item_free(gptps_item *it)
     if (!it) return;
     if (it->cancel) gptps_flag_destroy(it->cancel);
     gptps_free(it->payload);
+    gptps_free(it->name_owned);
     gptps_free(it);
 }
 
@@ -217,7 +278,7 @@ static void emit(gptps *e, gptps_event_kind kind, gptps_handle h,
                  const char *name, gptps_status st, uint32_t attempt, uint64_t mem)
 {
     gptps_pending_ev p;
-    p.kind = kind; p.handle = h; p.name = name; p.status = st; p.attempt = attempt; p.mem = mem;
+    p.kind = kind; p.handle = h; ev_set_name(p.name, name); p.status = st; p.attempt = attempt; p.mem = mem;
     p.result = NULL; p.result_len = 0;
     emit_now(e, e->ev_cb, e->ev_ud, &p);
 }
@@ -315,14 +376,14 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     size_t oop_len = 0;
     bool inproc = (it->def->exec == GPTPS_EXEC_INPROC);
 
-    p.handle = it->handle; p.name = it->def->name; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
+    p.handle = it->handle; ev_set_name(p.name, item_name(it)); p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
     p.result = NULL; p.result_len = 0;
     p.kind = GPTPS_EV_STARTED; p.status = GPTPS_OK; emit_now(e, cb, ud, &p);
 
     if (inproc) {
         /* in-process path: cooperative cancel via the deadline flag */
         memset(&ctx, 0, sizeof ctx);
-        ctx.engine = e; ctx.handle = it->handle; ctx.task_name = it->def->name;
+        ctx.engine = e; ctx.reg = it->reg; ctx.handle = it->handle; ctx.task_name = it->def->name;
         ctx.payload = it->payload; ctx.payload_len = it->payload_len;
         ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
         st = it->def->run(&ctx, it->def->user_data);
@@ -365,6 +426,15 @@ static void *worker_main(void *arg)
         if (!e->ready.head && e->workers_exit) break;
 
         it = fifo_pop(&e->ready);
+        if (it->reg && it->reg->removed && it->reg->cancelling) {
+            /* the type is being CANCELled: don't start an admitted-but-unstarted
+             * item (the worker would otherwise reset its cancel flag and run it,
+             * letting a cooperative task spin forever and hang the drain). */
+            it->outcome = GPTPS_E_CANCELLED;
+            fifo_push(&e->done, it);
+            gptps_cond_signal(e->cv_disp);
+            continue;                       /* lock still held; loop top re-checks ready */
+        }
         cb = e->ev_cb; ud = e->ev_ud;      /* snapshot callback under the lock */
         /* deadline flag is the in-process cooperative path; OOP enforces its own
          * deadline in the worker (poll + hard-kill), so it gets no flag deadline */
@@ -451,13 +521,31 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                 item_free(it);
                 continue;
             }
+            if (it->reg && it->reg->removed) {
+                /* task is being removed: never retry (keeps the drain bounded).
+                 * CANCEL discards in-flight work; DROP frees; otherwise (DRAIN) a
+                 * genuine failure is preserved in the dead-letter list. */
+                if (it->reg->cancelling || it->policy.on_failure == GPTPS_ON_FAILURE_DROP) {
+                    item_free(it);
+                } else {
+                    if (npend < GPTPS_PENDING_CAP) {
+                        pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
+                        ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
+                        pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    }
+                    fifo_push(&e->dead_letter, it);
+                    e->dead_letter_count += 1;
+                }
+                continue;
+            }
             if (it->attempt <= it->policy.max_retries) {
                 /* schedule a retry after backoff */
                 it->attempt += 1;
                 it->not_before_ms = now + (uint64_t)it->policy.retry_backoff_seconds * 1000u;
                 if (npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_RETRIED; pend[npend].handle = it->handle;
-                    pend[npend].name = it->def->name; pend[npend].status = it->outcome;
+                    ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
@@ -485,7 +573,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                     default:
                         if (npend < GPTPS_PENDING_CAP) {
                             pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
-                            pend[npend].name = it->def->name; pend[npend].status = it->outcome;
+                            ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                         }
@@ -562,7 +650,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                 best->outcome = GPTPS_E_DENIED;          /* recorded for dead-letter drain */
                 if (npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = best->handle;
-                    pend[npend].name = best->def->name; pend[npend].status = GPTPS_E_DENIED;
+                    ev_set_name(pend[npend].name, item_name(best)); pend[npend].status = GPTPS_E_DENIED;
                     pend[npend].attempt = best->attempt; pend[npend].mem = best->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
@@ -599,6 +687,7 @@ static void *dispatcher_main(void *arg)
     gptps_mutex_lock(e->m);
     for (;;) {
         engine_pass(e, pend, &npend, &next_wake);
+        gptps_cond_broadcast(e->cv_drain);   /* let a blocked gptps_unregister_task re-check its drain */
 
         /* emit buffered events with the lock RELEASED, then re-run: a submit /
          * completion signal during the emit window may have been missed, so we
@@ -654,6 +743,7 @@ const char *gptps_strerror(gptps_status s)
         case GPTPS_E_TASK:      return "task error";
         case GPTPS_E_SHUTDOWN:  return "engine shutting down";
         case GPTPS_E_DENIED:    return "admission denied by a constraint";
+        case GPTPS_E_BUSY:      return "task busy: work is queued or in-flight";
         default:                return "unknown error";
     }
 }
@@ -731,6 +821,173 @@ static void register_task_settings(gptps *e, gptps_reg *r)
     reg_task_setting(e, r, "on_failure",            GPTPS_SETTING_ENUM, ONFAIL_CHOICES, st_rd_onfail,  st_wr_onfail);
 }
 
+/* ------------------------------------------------------------------------- */
+/* generic settings: engine-stored global knobs + per-task setting schemas    */
+/* ------------------------------------------------------------------------- */
+
+/* Validate a value against a schema the same way the registry does, so a bad
+ * default_val is rejected at define time (returns 1 ok, 0 invalid). */
+static int gval_ok(gptps_setting_type type, int has_range, double mn, double mx,
+                   const char *const *choices, const char *v)
+{
+    char *end;
+    if (!v) return 0;
+    switch (type) {
+        case GPTPS_SETTING_INT: {
+            long long x = strtoll(v, &end, 10);
+            if (end == v || *end) return 0;
+            return !(has_range && ((double)x < mn || (double)x > mx));
+        }
+        case GPTPS_SETTING_UINT: {
+            unsigned long long x; const char *p = v;
+            while (*p == ' ' || *p == '\t') ++p;
+            if (*p == '-') return 0;
+            x = strtoull(v, &end, 10);
+            if (end == v || *end) return 0;
+            return !(has_range && ((double)x < mn || (double)x > mx));
+        }
+        case GPTPS_SETTING_DOUBLE: {
+            double x = strtod(v, &end);
+            if (end == v || *end) return 0;
+            return !(has_range && (x < mn || x > mx));
+        }
+        case GPTPS_SETTING_BOOL:
+            return strcmp(v, "true") == 0 || strcmp(v, "false") == 0;
+        case GPTPS_SETTING_ENUM: {
+            const char *const *c;
+            if (!choices) return 0;
+            for (c = choices; *c; ++c)
+                if (strcmp(*c, v) == 0) return 1;
+            return 0;
+        }
+        case GPTPS_SETTING_STRING:
+            return strlen(v) < GPTPS_SETTINGS_VALUE_MAX;
+    }
+    return 0;
+}
+
+/* a type's zero/default rendering when the caller passes default_val == NULL */
+static const char *gtype_zero(gptps_setting_type type, const char *const *choices)
+{
+    switch (type) {
+        case GPTPS_SETTING_BOOL:   return "false";
+        case GPTPS_SETTING_ENUM:   return (choices && choices[0]) ? choices[0] : "";
+        case GPTPS_SETTING_STRING: return "";
+        default:                   return "0";
+    }
+}
+
+/* parse a "min..max" constraint; *has_range=0 (no range) when c is NULL/empty.
+ * returns 1 on success, 0 if c is malformed (has no "..") */
+static int parse_range(const char *c, int *has_range, double *mn, double *mx)
+{
+    const char *dd;
+    *has_range = 0; *mn = 0; *mx = 0;
+    if (!c || !*c) return 1;
+    dd = strstr(c, "..");
+    if (!dd) return 0;
+    *mn = strtod(c, NULL);
+    *mx = strtod(dd + 2, NULL);
+    *has_range = 1;
+    return 1;
+}
+
+/* parse "a|b|c" into a fresh NULL-terminated, gptps_malloc'd choices array
+ * (caller owns). Returns NULL on empty/none. */
+static char **parse_choices(const char *c)
+{
+    char **arr; size_t n = 1, i = 0; const char *p;
+    if (!c || !*c) return NULL;
+    for (p = c; *p; ++p) if (*p == '|') ++n;              /* count tokens */
+    arr = (char **)gptps_calloc(n + 1, sizeof *arr);
+    if (!arr) return NULL;
+    while (*c) {
+        const char *bar = strchr(c, '|');
+        size_t len = bar ? (size_t)(bar - c) : strlen(c);
+        char *tok = (char *)gptps_malloc(len + 1);
+        if (!tok) { while (i) gptps_free(arr[--i]); gptps_free(arr); return NULL; }
+        memcpy(tok, c, len); tok[len] = 0;
+        arr[i++] = tok;
+        if (!bar) break;
+        c = bar + 1;
+    }
+    arr[i] = NULL;
+    return arr;
+}
+
+static void free_choices(char **arr)
+{
+    char **p;
+    if (!arr) return;
+    for (p = arr; *p; ++p) gptps_free(*p);
+    gptps_free(arr);
+}
+
+/* ---- engine-stored GLOBAL setting (target = gptps_owned_setting*) ----
+ * Accessed only through the registry (under settings->m), so the cell needs no
+ * lock of its own. */
+static size_t       os_rd(void *t, char *b, size_t c) { gptps_owned_setting *o = (gptps_owned_setting *)t; return (size_t)snprintf(b, c, "%s", o->value); }
+static gptps_status os_wr(void *t, const char *v) { gptps_owned_setting *o = (gptps_owned_setting *)t; snprintf(o->value, sizeof o->value, "%s", v); return GPTPS_OK; }
+
+/* ---- generic PER-TASK setting instance (target = gptps_task_local*) ----
+ * Locks the engine mutex (consistent with the built-in per-task knobs). */
+static size_t       stl_rd(void *t, char *b, size_t c) { gptps_task_local *L = (gptps_task_local *)t; size_t n; gptps_mutex_lock(L->reg->engine->m); n = (size_t)snprintf(b, c, "%s", L->value); gptps_mutex_unlock(L->reg->engine->m); return n; }
+static gptps_status stl_wr(void *t, const char *v) { gptps_task_local *L = (gptps_task_local *)t; gptps_mutex_lock(L->reg->engine->m); snprintf(L->value, sizeof L->value, "%s", v); gptps_mutex_unlock(L->reg->engine->m); return GPTPS_OK; }
+
+/* Materialize one generic per-task schema as tasks.<r->name>.<schema->leaf>,
+ * bound to a fresh owned value cell. Called with e->m NOT held (settings add
+ * takes settings->m then e->m via the read callback). */
+static void materialize_task_local(gptps *e, gptps_reg *r, const gptps_task_schema *sc)
+{
+    gptps_task_local *L;
+    gptps_setting_def d;
+    char key[320];
+    L = (gptps_task_local *)gptps_calloc(1, sizeof *L);
+    if (!L) return;
+    L->schema = sc; L->reg = r;
+    snprintf(L->value, sizeof L->value, "%s", sc->defval ? sc->defval : "");
+    memset(&d, 0, sizeof d);
+    snprintf(key, sizeof key, "tasks.%s.%s", r->name, sc->leaf);
+    d.struct_size = sizeof d; d.key = key; d.type = sc->type; d.hot = sc->hot; d.desc = "per-task setting";
+    d.has_range = sc->has_range; d.min = sc->min; d.max = sc->max;
+    d.choices = (const char *const *)sc->choices;
+    d.target = L; d.read = stl_rd; d.write = stl_wr;
+    if (gptps_settings_add(e->settings, &d) == GPTPS_OK) {
+        gptps_mutex_lock(e->m); L->next = r->locals; r->locals = L; gptps_mutex_unlock(e->m);
+    } else {
+        gptps_free(L);   /* duplicate leaf or OOM: not bound */
+    }
+}
+
+/* Materialize ALL defined per-task schemas onto a freshly-registered task. The
+ * schema list is snapshotted under e->m (schemas are freed only at shutdown, so the
+ * pointers stay valid) to avoid racing a concurrent gptps_define_task_setting that
+ * prepends to it; materialization itself runs with e->m released (lock order). */
+static void register_task_local_settings(gptps *e, gptps_reg *r)
+{
+    const gptps_task_schema *stack_snap[32];
+    const gptps_task_schema **snap = stack_snap;
+    size_t n = 0, cap = 32, i;
+    const gptps_task_schema *sc;
+
+    gptps_mutex_lock(e->m);
+    for (sc = e->task_schemas; sc; sc = sc->next) {
+        if (n == cap) {
+            size_t nc = cap * 2;
+            const gptps_task_schema **ns = (const gptps_task_schema **)gptps_malloc(nc * sizeof *ns);
+            if (!ns) break;
+            memcpy(ns, snap, n * sizeof *ns);
+            if (snap != stack_snap) gptps_free(snap);
+            snap = ns; cap = nc;
+        }
+        snap[n++] = sc;
+    }
+    gptps_mutex_unlock(e->m);
+
+    for (i = 0; i < n; ++i) materialize_task_local(e, r, snap[i]);
+    if (snap != stack_snap) gptps_free(snap);
+}
+
 gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
 {
     gptps *e;
@@ -753,8 +1010,9 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     e->m = gptps_mutex_create();
     e->cv_disp = gptps_cond_create();
     e->cv_work = gptps_cond_create();
+    e->cv_drain = gptps_cond_create();
     e->settings = gptps_settings_create();
-    if (!e->m || !e->cv_disp || !e->cv_work || !e->settings) { s = GPTPS_E_NOMEM; goto fail; }
+    if (!e->m || !e->cv_disp || !e->cv_work || !e->cv_drain || !e->settings) { s = GPTPS_E_NOMEM; goto fail; }
 
     /* core settings (read live engine state; hot ones apply immediately) */
     reg_core_setting(e, "limits.max_memory_bytes", GPTPS_SETTING_UINT, 1, 0, 0, 0,
@@ -802,6 +1060,7 @@ fail_threads:
 fail:
     if (e->settings) gptps_settings_destroy(e->settings);
     if (e->workers) gptps_free(e->workers);
+    if (e->cv_drain) gptps_cond_destroy(e->cv_drain);
     if (e->cv_work) gptps_cond_destroy(e->cv_work);
     if (e->cv_disp) gptps_cond_destroy(e->cv_disp);
     if (e->m) gptps_mutex_destroy(e->m);
@@ -948,6 +1207,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->def.argv = (const char *const *)argv_copy; /* point at our owned copy (NULL for non-PROGRAM) */
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
     r->priority = 0;
+    r->enabled = true;
     r->engine = e;
     apply_task_config(e->toml, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
     r->next = e->registry;
@@ -957,6 +1217,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     /* expose this task's knobs in the settings registry (after releasing e->m:
      * registry add takes settings->m then e->m, preserving the lock order) */
     register_task_settings(e, r);
+    register_task_local_settings(e, r);   /* + any generic per-task settings defined so far */
     return GPTPS_OK;
 }
 
@@ -965,11 +1226,363 @@ gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priori
     gptps_reg *r;
     if (!e || !task_name) return GPTPS_E_INVAL;
     gptps_mutex_lock(e->m);
-    for (r = e->registry; r; r = r->next)
-        if (strcmp(r->name, task_name) == 0) break;
+    r = registry_find(e, task_name);
     if (r) r->priority = (int32_t)priority;   /* applies to subsequently-submitted items */
     gptps_mutex_unlock(e->m);
     return r ? GPTPS_OK : GPTPS_E_NOTFOUND;
+}
+
+/* ------------------------------------------------------------------------- */
+/* task management: enumerate / enable / clone / unregister                   */
+/* ------------------------------------------------------------------------- */
+
+/* item bookkeeping helpers (caller holds e->m) */
+static unsigned fifo_count_reg(const gptps_fifo *q, const gptps_reg *r)
+{ const gptps_item *it; unsigned n = 0; for (it = q->head; it; it = it->next) if (it->reg == r) ++n; return n; }
+
+/* live (non-dead-letter) items still referencing r */
+static unsigned reg_live_refs(const gptps *e, const gptps_reg *r)
+{
+    return fifo_count_reg(&e->intake, r) + fifo_count_reg(&e->delayed, r)
+         + fifo_count_reg(&e->ready, r)  + fifo_count_reg(&e->done, r)
+         + fifo_count_reg(&e->running_items, r);
+}
+
+/* remove + free every item in q referencing r (caller holds e->m). Only used on
+ * queues whose items have NOT reserved admission budget (intake / delayed). */
+static unsigned fifo_drop_reg(gptps_fifo *q, const gptps_reg *r)
+{
+    gptps_item *it = q->head, *prev = NULL; unsigned n = 0;
+    while (it) {
+        gptps_item *next = it->next;
+        if (it->reg == r) {
+            if (prev) prev->next = next; else q->head = next;
+            if (q->tail == it) q->tail = prev;
+            it->next = NULL; item_free(it); ++n;
+        } else prev = it;
+        it = next;
+    }
+    return n;
+}
+
+/* give every retained dead-letter item referencing r its own name copy and sever
+ * the reg pointer, so freeing r leaves those items valid (caller holds e->m). */
+static void detach_dead_letter(gptps *e, gptps_reg *r)
+{
+    gptps_item *it;
+    for (it = e->dead_letter.head; it; it = it->next) {
+        if (it->reg == r) {
+            if (!it->name_owned) {
+                size_t L = strlen(r->name) + 1;
+                char *nm = (char *)gptps_malloc(L);
+                if (nm) { memcpy(nm, r->name, L); it->name_owned = nm; }
+            }
+            it->reg = NULL; it->def = NULL;   /* only name_owned is read hereafter */
+        }
+    }
+}
+
+static void registry_unlink(gptps *e, gptps_reg *r)
+{
+    gptps_reg *cur = e->registry, *prev = NULL;
+    while (cur) {
+        if (cur == r) { if (prev) prev->next = cur->next; else e->registry = cur->next; cur->next = NULL; return; }
+        prev = cur; cur = cur->next;
+    }
+}
+
+/* free a reg's owned resources (r already unlinked + its settings removed) */
+static void reg_destroy(gptps_reg *r)
+{
+    gptps_task_local *L = r->locals;
+    while (L) { gptps_task_local *n = L->next; gptps_free(L); L = n; }
+    if (r->argv_copy) { char **a = r->argv_copy; while (*a) gptps_free(*a++); gptps_free(r->argv_copy); }
+    gptps_free(r->name);
+    gptps_free(r);
+}
+
+size_t gptps_task_count(gptps *e)
+{
+    size_t n = 0; gptps_reg *r;
+    if (!e) return 0;
+    gptps_mutex_lock(e->m);
+    for (r = e->registry; r; r = r->next) ++n;   /* includes draining types */
+    gptps_mutex_unlock(e->m);
+    return n;
+}
+
+gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
+{
+    gptps_reg *r; size_t i = 0;
+    if (!e || !out) return GPTPS_E_INVAL;
+    if (out->struct_size < sizeof *out) return GPTPS_E_INVAL;   /* ABI: reject undersized struct */
+    gptps_mutex_lock(e->m);
+    for (r = e->registry; r && i < index; r = r->next) ++i;
+    if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+    out->name = r->name; out->exec = r->def.exec; out->priority = r->priority;
+    out->default_cost = r->def.default_cost; out->default_policy = r->def.default_policy;
+    out->enabled = r->enabled ? 1 : 0; out->removed = r->removed ? 1 : 0;
+    out->queued  = fifo_count_reg(&e->intake, r) + fifo_count_reg(&e->delayed, r);
+    out->running = fifo_count_reg(&e->ready, r) + fifo_count_reg(&e->running_items, r) + fifo_count_reg(&e->done, r);
+    out->dead    = fifo_count_reg(&e->dead_letter, r);
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+int gptps_task_exists(gptps *e, const char *task_name)
+{
+    gptps_reg *r; int yes;
+    if (!e || !task_name) return 0;
+    gptps_mutex_lock(e->m);
+    r = registry_find(e, task_name);          /* skips draining types */
+    yes = (r && r->enabled) ? 1 : 0;
+    gptps_mutex_unlock(e->m);
+    return yes;
+}
+
+gptps_status gptps_set_task_enabled(gptps *e, const char *task_name, int enabled)
+{
+    gptps_reg *r;
+    if (!e || !task_name) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    r = registry_find(e, task_name);
+    if (r) r->enabled = enabled ? true : false;
+    gptps_mutex_unlock(e->m);
+    return r ? GPTPS_OK : GPTPS_E_NOTFOUND;
+}
+
+gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_name)
+{
+    gptps_task_def def;
+    gptps_reg *r;
+    int32_t prio;
+    char **argv_snapshot = NULL;
+    gptps_status st;
+
+    if (!e || !src_name || !dst_name) return GPTPS_E_INVAL;
+
+    gptps_mutex_lock(e->m);
+    r = registry_find(e, src_name);
+    if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+    if (registry_find(e, dst_name)) { gptps_mutex_unlock(e->m); return GPTPS_E_DUP; }
+    def = r->def;                       /* shares run/cost/user_data; copies exec/cost/policy */
+    prio = r->priority;
+    if (def.exec == GPTPS_EXEC_PROGRAM && r->argv_copy) {
+        argv_snapshot = argv_dup((const char *const *)r->argv_copy);   /* own a copy across the unlock */
+        if (!argv_snapshot) { gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+    }
+    gptps_mutex_unlock(e->m);
+
+    def.name = dst_name;
+    def.argv = (const char *const *)argv_snapshot;   /* register_task deep-copies this */
+    st = gptps_register_task(e, &def);               /* re-applies [tasks.<dst>] config too */
+    if (argv_snapshot) { char **a = argv_snapshot; while (*a) gptps_free(*a++); gptps_free(argv_snapshot); }
+    if (st != GPTPS_OK) return st;
+    gptps_set_task_priority(e, dst_name, prio);   /* carry the source priority (incl. 0) over config */
+    return GPTPS_OK;
+}
+
+gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned flags)
+{
+    gptps_reg *r;
+    unsigned mode = flags & GPTPS_REMOVE_MODE_MASK;
+    char prefix[320];
+
+    if (!e || !task_name) return GPTPS_E_INVAL;
+    if (strlen(task_name) > sizeof prefix - 8) return GPTPS_E_INVAL;
+
+    gptps_mutex_lock(e->m);
+    if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
+    r = registry_find(e, task_name);
+    if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+
+    if (e->manual) {
+        /* MANUAL: no worker threads => nothing is in-flight between gptps_step calls. */
+        if (mode == GPTPS_REMOVE_CANCEL) {
+            r->removed = true; r->cancelling = true;
+            fifo_drop_reg(&e->intake, r);
+            fifo_drop_reg(&e->delayed, r);
+        } else if (reg_live_refs(e, r) > 0) {
+            gptps_mutex_unlock(e->m);     /* DRAIN/REJECT: step the queue empty first, then remove */
+            return GPTPS_E_BUSY;
+        } else {
+            r->removed = true;
+        }
+    } else {
+        /* THREADED: tombstone, optionally cancel, then block until the type drains. */
+        if (mode == GPTPS_REMOVE_REJECT_IF_BUSY && reg_live_refs(e, r) > 0) {
+            gptps_mutex_unlock(e->m);
+            return GPTPS_E_BUSY;
+        }
+        r->removed = true;               /* reject new submits + stop retries (bounded drain) */
+        if (mode == GPTPS_REMOVE_CANCEL) {
+            gptps_item *it;
+            r->cancelling = true;             /* in-flight items are discarded, not dead-lettered */
+            fifo_drop_reg(&e->intake, r);     /* drop the queued backlog (no budget reserved yet) */
+            fifo_drop_reg(&e->delayed, r);
+            for (it = e->running_items.head; it; it = it->next)
+                if (it->reg == r) gptps_flag_set(it->cancel, true);   /* cooperative cancel in-flight */
+            gptps_cond_broadcast(e->cv_work);
+        }
+        gptps_cond_signal(e->cv_disp);        /* wake the dispatcher to drive the drain */
+        while (reg_live_refs(e, r) > 0)
+            gptps_cond_wait(e->cv_drain, e->m);
+    }
+
+    /* A concurrent gptps_define_task_setting may hold a snapshot of this reg and be
+     * materializing onto it; wait for that to finish before freeing the slot (the
+     * define broadcasts cv_drain on completion, so this terminates even in MANUAL). */
+    while (e->active_defines > 0)
+        gptps_cond_wait(e->cv_drain, e->m);
+
+    /* teardown (still holding e->m): make any retained dead-letter items self-owning,
+     * then unlink the slot from the registry. */
+    detach_dead_letter(e, r);
+    registry_unlink(e, r);
+    gptps_mutex_unlock(e->m);
+
+    /* tear down its settings with e->m RELEASED (settings->m -> e->m order), then free */
+    snprintf(prefix, sizeof prefix, "tasks.%s.", task_name);
+    gptps_settings_remove_prefix(e->settings, prefix);
+    reg_destroy(r);
+    return GPTPS_OK;
+}
+
+/* --- generic settings: public entry points --- */
+gptps_status gptps_define_global(gptps *e, const char *key, gptps_setting_type type,
+                                 const char *default_val, const char *constraint, unsigned flags)
+{
+    gptps_owned_setting *o;
+    gptps_setting_def d;
+    int has_range = 0; double mn = 0, mx = 0;
+    char **choices = NULL;
+    const char *dv;
+    gptps_status st;
+    size_t klen;
+
+    if (!e || !key || !*key) return GPTPS_E_INVAL;
+    if (type == GPTPS_SETTING_ENUM) {
+        choices = parse_choices(constraint);
+        if (!choices) return GPTPS_E_CONFIG;            /* enum needs a choice set */
+    } else if (type == GPTPS_SETTING_INT || type == GPTPS_SETTING_UINT || type == GPTPS_SETTING_DOUBLE) {
+        if (!parse_range(constraint, &has_range, &mn, &mx)) return GPTPS_E_CONFIG;
+    }
+    dv = default_val ? default_val : gtype_zero(type, (const char *const *)choices);
+    if (!gval_ok(type, has_range, mn, mx, (const char *const *)choices, dv)) { free_choices(choices); return GPTPS_E_CONFIG; }
+
+    o = (gptps_owned_setting *)gptps_calloc(1, sizeof *o);
+    klen = strlen(key) + 1;
+    if (o) o->key = (char *)gptps_malloc(klen);
+    if (!o || !o->key) { if (o) gptps_free(o->key); gptps_free(o); free_choices(choices); return GPTPS_E_NOMEM; }
+    memcpy(o->key, key, klen);
+    o->choices = choices;
+    snprintf(o->value, sizeof o->value, "%s", dv);
+
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = key; d.type = type; d.hot = !(flags & GPTPS_SETTING_RESTART);
+    d.desc = "custom setting"; d.has_range = has_range; d.min = mn; d.max = mx;
+    d.choices = (const char *const *)choices; d.target = o; d.read = os_rd; d.write = os_wr;
+    st = gptps_register_setting(e, &d);   /* copies key/desc; takes settings->m */
+    if (st != GPTPS_OK) { free_choices(choices); gptps_free(o->key); gptps_free(o); return st; }
+
+    gptps_mutex_lock(e->m); o->next = e->owned_settings; e->owned_settings = o; gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting_type type,
+                                       const char *default_val, const char *constraint, unsigned flags)
+{
+    gptps_task_schema *sc, *it;
+    int has_range = 0; double mn = 0, mx = 0;
+    char **choices = NULL;
+    const char *dv;
+    gptps_reg **snap = NULL; size_t nsnap = 0, cap = 0, i;
+    gptps_reg *r;
+
+    if (!e || !leaf || !*leaf || strchr(leaf, '.')) return GPTPS_E_INVAL;  /* leaf is a bare key */
+    {   /* reject collisions with the six built-in per-task leaves (they are not in
+         * task_schemas, so they would otherwise pass the dup check yet fail to materialize) */
+        static const char *const BUILTIN[] = { "timeout_seconds", "max_retries", "retry_backoff_seconds",
+                                               "mem_bytes", "priority", "on_failure", 0 };
+        const char *const *b;
+        for (b = BUILTIN; *b; ++b) if (strcmp(*b, leaf) == 0) return GPTPS_E_DUP;
+    }
+    if (type == GPTPS_SETTING_ENUM) {
+        choices = parse_choices(constraint);
+        if (!choices) return GPTPS_E_CONFIG;
+    } else if (type == GPTPS_SETTING_INT || type == GPTPS_SETTING_UINT || type == GPTPS_SETTING_DOUBLE) {
+        if (!parse_range(constraint, &has_range, &mn, &mx)) return GPTPS_E_CONFIG;
+    }
+    dv = default_val ? default_val : gtype_zero(type, (const char *const *)choices);
+    if (!gval_ok(type, has_range, mn, mx, (const char *const *)choices, dv)) { free_choices(choices); return GPTPS_E_CONFIG; }
+
+    sc = (gptps_task_schema *)gptps_calloc(1, sizeof *sc);
+    if (sc) { sc->leaf = (char *)gptps_malloc(strlen(leaf) + 1); sc->defval = (char *)gptps_malloc(strlen(dv) + 1); }
+    if (!sc || !sc->leaf || !sc->defval) {
+        if (sc) { gptps_free(sc->leaf); gptps_free(sc->defval); gptps_free(sc); }
+        free_choices(choices); return GPTPS_E_NOMEM;
+    }
+    strcpy(sc->leaf, leaf); strcpy(sc->defval, dv);
+    sc->type = type; sc->hot = !(flags & GPTPS_SETTING_RESTART);
+    sc->has_range = has_range; sc->min = mn; sc->max = mx; sc->choices = choices;
+
+    gptps_mutex_lock(e->m);
+    for (it = e->task_schemas; it; it = it->next)
+        if (strcmp(it->leaf, leaf) == 0) {            /* leaf already defined */
+            gptps_mutex_unlock(e->m);
+            gptps_free(sc->leaf); gptps_free(sc->defval); gptps_free(sc); free_choices(choices);
+            return GPTPS_E_DUP;
+        }
+    sc->next = e->task_schemas; e->task_schemas = sc;
+    for (r = e->registry; r; r = r->next) {           /* snapshot existing live tasks */
+        if (r->removed) continue;
+        if (nsnap == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            gptps_reg **ns = (gptps_reg **)gptps_realloc(snap, nc * sizeof *ns);
+            if (!ns) break;                            /* best-effort: materialize what we captured */
+            snap = ns; cap = nc;
+        }
+        snap[nsnap++] = r;
+    }
+    e->active_defines += 1;          /* pin: gptps_unregister_task must not free a reg while we materialize */
+    gptps_mutex_unlock(e->m);
+
+    for (i = 0; i < nsnap; ++i) materialize_task_local(e, snap[i], sc);   /* e->m released */
+
+    gptps_mutex_lock(e->m);
+    e->active_defines -= 1;
+    gptps_cond_broadcast(e->cv_drain);   /* wake any unregister waiting on the pin */
+    gptps_mutex_unlock(e->m);
+
+    gptps_free(snap);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_task_setting_str(gptps_ctx *ctx, const char *key, char *buf, size_t cap)
+{
+    gptps_task_local *L = NULL;
+    gptps *e;
+    if (!ctx || !ctx->engine || !ctx->reg || !key || !buf || cap == 0) return GPTPS_E_INVAL;
+    e = ctx->engine;
+    gptps_mutex_lock(e->m);
+    for (L = ctx->reg->locals; L; L = L->next)
+        if (strcmp(L->schema->leaf, key) == 0) { snprintf(buf, cap, "%s", L->value); break; }
+    gptps_mutex_unlock(e->m);
+    return L ? GPTPS_OK : GPTPS_E_NOTFOUND;
+}
+
+gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out)
+{
+    char b[GPTPS_SETTINGS_VALUE_MAX], *end;
+    long v;
+    gptps_status st;
+    if (!out) return GPTPS_E_INVAL;
+    st = gptps_task_setting_str(ctx, key, b, sizeof b);
+    if (st != GPTPS_OK) return st;
+    v = strtol(b, &end, 10);
+    if (end == b || *end) return GPTPS_E_INVAL;   /* not an integer setting */
+    *out = v;
+    return GPTPS_OK;
 }
 
 /* --- settings: public forwarders onto the registry --- */
@@ -1039,7 +1652,11 @@ static const gptps_api_routines G_API = {
     gptps_payload,
     gptps_register_constraint,
     gptps_register_observer,
-    gptps_register_setting
+    gptps_register_setting,
+    gptps_unregister_task,
+    gptps_task_exists,
+    gptps_define_global,
+    gptps_define_task_setting
 };
 
 gptps_status gptps_load_addon(gptps *e, const char *path)
@@ -1091,7 +1708,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
 gptps_status gptps_submit(gptps *e, const char *task_name,
                           const void *payload, size_t len, gptps_handle *out_handle)
 {
-    const gptps_reg *r;
+    gptps_reg *r;
     gptps_item *it;
     gptps_cost cost;
     void *pcopy = NULL;
@@ -1102,7 +1719,7 @@ gptps_status gptps_submit(gptps *e, const char *task_name,
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
 
     r = registry_find(e, task_name);
-    if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; } /* unknown, draining, or paused */
 
     cost = r->def.default_cost;
     if (r->def.cost) {
@@ -1130,6 +1747,7 @@ gptps_status gptps_submit(gptps *e, const char *task_name,
 
     it->handle = e->next_handle++;
     it->def = &r->def;
+    it->reg = r;
     it->payload = pcopy;
     it->payload_len = len;
     it->cost = cost;
@@ -1213,7 +1831,7 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
             memset(&dl, 0, sizeof dl);
             dl.struct_size = sizeof dl;
             dl.handle = it->handle;
-            dl.task_name = it->def->name;   /* registry-owned; stable until shutdown */
+            dl.task_name = item_name(it);   /* reg name, or an owned copy if the task was removed */
             dl.status = it->outcome;
             dl.attempts = it->attempt;
             dl.payload = it->payload;
@@ -1331,16 +1949,21 @@ gptps_status gptps_shutdown(gptps *e)
     r = e->registry;
     while (r) {
         gptps_reg *n = r->next;
-        if (r->argv_copy) { char **a = r->argv_copy; while (*a) gptps_free(*a++); gptps_free(r->argv_copy); }
-        gptps_free(r->name); gptps_free(r); r = n;
+        reg_destroy(r);   /* frees locals + argv_copy + name + r */
+        r = n;
     }
     { gptps_observer  *o = e->observers;  while (o) { gptps_observer  *n = o->next; gptps_free(o); o = n; } }
     { gptps_constraint *c = e->constraints; while (c) { gptps_constraint *n = c->next; gptps_free(c); c = n; } }
+    /* generic global setting cells + per-task setting schemas (their settings-registry
+     * entries are freed by gptps_settings_destroy; these are the owned backing stores) */
+    { gptps_owned_setting *o = e->owned_settings; while (o) { gptps_owned_setting *n = o->next; free_choices(o->choices); gptps_free(o->key); gptps_free(o); o = n; } }
+    { gptps_task_schema *s = e->task_schemas; while (s) { gptps_task_schema *n = s->next; free_choices(s->choices); gptps_free(s->leaf); gptps_free(s->defval); gptps_free(s); s = n; } }
     gptps_settings_destroy(e->settings);  /* entries reference e / regs, which are freed above/after; destroy only frees the schema list */
     gptps_toml_free(e->toml);
     gptps_free(e->config_path);
 
     gptps_free(e->workers);
+    gptps_cond_destroy(e->cv_drain);
     gptps_cond_destroy(e->cv_work);
     gptps_cond_destroy(e->cv_disp);
     gptps_mutex_destroy(e->m);

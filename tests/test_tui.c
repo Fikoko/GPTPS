@@ -218,6 +218,104 @@ int main(void)
         CHECK(strstr(frame, "? help")          != NULL);  /* global keys now discoverable */
     }
 
+    /* ---- task manager pane: list, inspect+edit, clone, pause, new, delete ---- */
+    {
+        char b[GPTPS_SETTINGS_VALUE_MAX];
+        int guard;
+
+        CHECK(gptps_tui_press(t, 't') == 4);              /* open the tasks pane */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "tasks")  != NULL);
+        CHECK(strstr(frame, "echo")   != NULL);           /* the registered task is listed */
+        CHECK(strstr(frame, "inproc") != NULL);           /* with its executor kind */
+
+        /* inspect 'echo' -> detail pane shows its settings (leaf names, no prefix) */
+        for (guard = 0; guard < 16; ++guard) {
+            gptps_tui_render(t, frame, sizeof frame);
+            if (strstr(frame, "> echo ")) break;
+            gptps_tui_press(t, 'j');
+        }
+        CHECK(gptps_tui_press(t, '\r') == 4);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "task 'echo'")     != NULL);
+        CHECK(strstr(frame, "timeout_seconds") != NULL);
+        /* edit the first setting (timeout_seconds) to 9, then read it back */
+        CHECK(gptps_tui_press(t, '\r') == 4);             /* begin edit */
+        gptps_tui_press(t, 127); gptps_tui_press(t, 127); gptps_tui_press(t, 127);
+        gptps_tui_press(t, '9');
+        CHECK(gptps_tui_press(t, '\r') == 4);             /* commit */
+        CHECK(gptps_settings_get(e, "tasks.echo.timeout_seconds", b, sizeof b) == GPTPS_OK && strcmp(b, "9") == 0);
+        CHECK(gptps_tui_press(t, 27) == 4);               /* back to tasks pane */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "j/k move") != NULL);
+
+        /* clone echo -> echo_hi (typed) */
+        CHECK(gptps_tui_press(t, 'c') == 4);
+        gptps_tui_press(t, 'e'); gptps_tui_press(t, 'c'); gptps_tui_press(t, 'h');
+        gptps_tui_press(t, 'o'); gptps_tui_press(t, '_'); gptps_tui_press(t, 'h'); gptps_tui_press(t, 'i');
+        CHECK(gptps_tui_press(t, '\r') == 4);
+        CHECK(gptps_task_exists(e, "echo_hi") == 1);
+
+        /* navigate to echo_hi, pause it, then resume */
+        for (guard = 0; guard < 16; ++guard) {
+            gptps_tui_render(t, frame, sizeof frame);
+            if (strstr(frame, "> echo_hi ")) break;
+            gptps_tui_press(t, 'j');
+        }
+        CHECK(strstr(frame, "> echo_hi ") != NULL);
+        CHECK(gptps_tui_press(t, 'a') == 4);              /* pause */
+        CHECK(gptps_task_exists(e, "echo_hi") == 0);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "paused") != NULL);
+        CHECK(gptps_tui_press(t, 'a') == 4);              /* resume */
+        CHECK(gptps_task_exists(e, "echo_hi") == 1);
+
+        /* create a new PROGRAM task entirely from the terminal (name then argv) */
+        CHECK(gptps_tui_press(t, 'n') == 4);
+        gptps_tui_press(t, 'p'); gptps_tui_press(t, 'r'); gptps_tui_press(t, 'o'); gptps_tui_press(t, 'g');
+        CHECK(gptps_tui_press(t, '\r') == 4);             /* name done -> argv prompt */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "argv") != NULL);
+        gptps_tui_press(t, 't'); gptps_tui_press(t, 'r'); gptps_tui_press(t, 'u'); gptps_tui_press(t, 'e');
+        CHECK(gptps_tui_press(t, '\r') == 4);             /* register the program task */
+        CHECK(gptps_task_exists(e, "prog") == 1);
+        { gptps_task_info ti; size_t z, tn = gptps_task_count(e); int found = 0;
+          for (z = 0; z < tn; ++z) { memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+            if (gptps_task_get_info(e, z, &ti) == GPTPS_OK && strcmp(ti.name, "prog") == 0) { found = 1; CHECK(ti.exec == GPTPS_EXEC_PROGRAM); } }
+          CHECK(found); }
+
+        /* delete 'prog' via the confirm dialog (drain) */
+        for (guard = 0; guard < 16; ++guard) {
+            gptps_tui_render(t, frame, sizeof frame);
+            if (strstr(frame, "> prog ")) break;
+            gptps_tui_press(t, 'j');
+        }
+        CHECK(strstr(frame, "> prog ") != NULL);
+        CHECK(gptps_tui_press(t, 'd') == 4);              /* open confirm */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "Delete 'prog'?") != NULL);
+        CHECK(gptps_tui_press(t, 'y') == 4);              /* confirm (drain) */
+        CHECK(gptps_task_exists(e, "prog") == 0);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "deleted prog") != NULL);
+
+        CHECK(gptps_tui_press(t, 27) == 4);               /* back to dashboard */
+    }
+
+    /* ---- dead-letter pane: open, discard all ---- */
+    {
+        CHECK(gptps_tui_press(t, 'l') == 4);              /* open the dead-letter view */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "dead letter")     != NULL);
+        CHECK(strstr(frame, "re-submit all")   != NULL);
+        CHECK(gptps_tui_press(t, 'D') == 4);              /* discard all (none expected) */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "discarded")       != NULL);
+        CHECK(gptps_tui_press(t, 27) == 4);               /* back to dashboard */
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "in-flight")       != NULL);
+    }
+
     /* quit key */
     CHECK(gptps_tui_press(t, 'q') == -1);
 

@@ -64,6 +64,11 @@ gptps_status    gptps_settings_info_at(gptps_settings *r, size_t index, gptps_se
 gptps_status    gptps_settings_save_to(gptps_settings *r, const char *path);
 gptps_status    gptps_settings_apply_toml(gptps_settings *r, const gptps_toml *t);
 gptps_status    gptps_settings_watch_add(gptps_settings *r, gptps_settings_cb cb, void *ud);
+/* Remove every entry whose key begins with `prefix` (e.g. "tasks.resize."); used
+ * to tear down a task type's settings when it is unregistered. Returns the count
+ * removed. Takes only the settings lock (never the engine lock), so callers must
+ * NOT hold the engine lock (preserve the settings->m -> engine->m order). */
+size_t          gptps_settings_remove_prefix(gptps_settings *r, const char *prefix);
 
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the

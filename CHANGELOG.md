@@ -6,6 +6,43 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — runtime task management + generic settings (control plane)
+- **Task lifecycle API** turns the registry into a live control surface:
+  - `gptps_unregister_task(e, name, flags)` removes a task type at runtime with a
+    chosen policy — `GPTPS_REMOVE_REJECT_IF_BUSY` (default; fails `E_BUSY` if work
+    is queued/in-flight), `GPTPS_REMOVE_DRAIN` (tombstone, let queued + in-flight
+    finish without retries, then free), or `GPTPS_REMOVE_CANCEL` (drop queued,
+    cooperatively cancel in-flight, then free). THREADED mode blocks until the
+    drain/cancel completes; MANUAL mode (no in-flight work between `gptps_step`s)
+    drains by stepping first, or CANCEL drops the backlog. A removed name is free
+    to re-register, its `tasks.<name>.*` settings are torn down, and retained
+    dead-letter items survive (their name still resolves after the type is gone).
+  - `gptps_task_count` / `gptps_task_get_info` / `gptps_task_exists` enumerate the
+    registry (name, exec kind, priority, cost, policy, enabled/draining state, and
+    live queued/running/dead counts) — the introspection the TUI renders from.
+  - `gptps_set_task_enabled` pauses/resumes a type reversibly (rejects new submits
+    while keeping its config and stats).
+  - `gptps_clone_task` duplicates a type under a new name (shares run/exec/argv,
+    copies cost+policy+priority, re-layers `[tasks.<dst>]` config) — the "tweak a
+    copy" operation.
+- **Generic settings without per-key glue:**
+  - `gptps_define_global` registers an engine-stored, typed, validated global knob
+    under any dotted key (round-trips through TOML, editable in the settings pane).
+  - `gptps_define_task_setting` registers a per-task schema materialized as
+    `tasks.<name>.<leaf>` on every task (existing + future), each instance carrying
+    its own value; `gptps_task_setting_int` / `gptps_task_setting_str` read this
+    task's resolved value from inside an in-process `run()`.
+  - Both validate by type with `"min..max"` ranges and `"a|b|c"` enum choices.
+- **Host-table ABI** grows by four routines (`unregister_task`, `task_exists`,
+  `define_global`, `define_task_setting`) so add-ons share the control plane.
+- **Terminal control plane (`tui` add-on):** a **task manager** pane (list with
+  live counts; inspect → per-task settings editor; pause/resume; clone; create a
+  `GPTPS_EXEC_PROGRAM` task from a typed name + argv; delete with a confirm dialog
+  showing the queued/in-flight count, drain or cancel-force) and a **dead-letter**
+  pane (bulk re-submit / discard). New dashboard keys `t` (tasks) and `l` (dead
+  letter). All still pure render-to-string + headless-testable.
+- ABI minor 7 → 8 (additive). New status `GPTPS_E_BUSY`.
+
 ### Added — portability: single-threaded / embeddable execution
 - **MANUAL execution mode** (`gptps_config.mode = GPTPS_RUN_MANUAL`): the engine
   spawns **no threads** and is driven cooperatively by the caller via the new

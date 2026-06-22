@@ -14,7 +14,7 @@ even run **single-threaded with no libc heap** for embedded / bare-metal targets
 - [Quick start](#quick-start) · [Getting started](#getting-started) — build → run → embed
 - [API at a glance](#api-at-a-glance) · [Common tasks](#common-tasks) — step-by-step recipes
 - [Configuration file](#configuration-file-optional) · [Settings](#settings-runtime-introspectable-persistable)
-- [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
+- [Manage tasks at runtime](#manage-tasks-at-runtime-control-plane) · [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
 
@@ -75,7 +75,7 @@ cmake --build build -j       # libgptps.a + the examples + the test suite
 TTY; with no TTY it just prints a line and exits, which is how CI runs it headless):
 
 ```sh
-./build/example_dashboard    # keys: w/f submit · k/j scroll · m KPI · p pause · s settings · ? help · q quit
+./build/example_dashboard    # keys: w/f submit · t tasks · l dead-letter · s settings · m KPI · p pause · ? help · q quit
 ```
 
 It looks like [this](#live-terminal-dashboard) (screenshot below).
@@ -117,6 +117,12 @@ either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --
 | `gptps_register_task(e, &def)` | register a task type (in-process fn **or** external program) |
 | `gptps_set_task_priority(e, name, prio)` | set a task type's scheduling priority (higher runs first) |
 | `gptps_submit(e, name, payload, len, &handle)` | enqueue work |
+| `gptps_task_count/get_info/exists(e, …)` | enumerate / introspect registered task types |
+| `gptps_set_task_enabled(e, name, on)` | pause / resume a task type (reversible) |
+| `gptps_clone_task(e, src, dst)` | duplicate a task type under a new name |
+| `gptps_unregister_task(e, name, flags)` | remove a task type (reject-if-busy / drain / cancel) |
+| `gptps_define_global/define_task_setting(e, …)` | declare a custom typed global / per-task setting |
+| `gptps_task_setting_int/str(ctx, key, …)` | read this task's per-task setting from inside `run()` |
 | `gptps_set_event_cb(e, cb, ud)` | observe lifecycle events (results arrive on `FINISHED`) |
 | `gptps_register_constraint(e, fn, ud)` | gate admission (rate limit, quota, time window) |
 | `gptps_register_observer(e, cb, ud)` | extra event sink (e.g. analytics) |
@@ -242,7 +248,38 @@ size_t n = gptps_settings_count(e);                                   /* enumera
   not preserved); `gptps_settings_reload` re-applies it.
 - **Extensible:** add-ons register their own settings (via `gptps_register_setting` or the
   host-table routine), so they show up in the registry, TOML, and editor uniformly.
+- **Generic, no glue:** declare your own typed knobs at runtime — `gptps_define_global(e,
+  "app.max_upload_mb", GPTPS_SETTING_UINT, "10", "0..4096", 0)` for a global, or
+  `gptps_define_task_setting(e, "quality", GPTPS_SETTING_UINT, "75", "0..100", 0)` to
+  materialize `tasks.<name>.quality` on every task. A `run()` reads its own value with
+  `gptps_task_setting_int(ctx, "quality", &q)`. The engine stores and validates them; both
+  round-trip through TOML and appear in the editor.
 - **Editor:** the `tui` add-on includes a live **Settings pane** (`s`) to browse/edit/save.
+
+## Manage tasks at runtime (control plane)
+
+The registry is itself live and mutable — enumerate, pause, clone, and remove task types
+without recompiling or restarting:
+
+```c
+size_t n = gptps_task_count(e);                       /* enumerate for a UI ... */
+gptps_task_info ti = { .struct_size = sizeof ti };
+gptps_task_get_info(e, 0, &ti);                       /* name, exec, prio, queued/running/dead */
+
+gptps_set_task_enabled(e, "resize", 0);               /* pause: reject new submits, reversibly */
+gptps_clone_task(e, "resize", "resize_hi");           /* duplicate, then retune the copy */
+gptps_unregister_task(e, "resize", GPTPS_REMOVE_DRAIN);   /* finish in-flight work, then remove */
+```
+
+- **Removal policy** (the `flags`): `GPTPS_REMOVE_REJECT_IF_BUSY` (default — refuse with
+  `GPTPS_E_BUSY` while work is outstanding), `GPTPS_REMOVE_DRAIN` (stop new submits, let
+  queued + in-flight finish, then free), or `GPTPS_REMOVE_CANCEL` (drop queued, cancel
+  in-flight, then free). A removed name is free to re-register; its `tasks.<name>.*` settings
+  are torn down; retained dead-letter items survive and stay drainable.
+- **Behavior still arrives in code.** These calls own *configuration and lifecycle*. New
+  in-process logic comes from a `run` fn (code or an add-on); a `GPTPS_EXEC_PROGRAM` task,
+  though, is fully creatable at runtime (and from the TUI) since its behavior is an external
+  argv. Add-ons get the same control plane via the host-table ABI.
 
 ## Live terminal dashboard
 
@@ -267,7 +304,7 @@ RECENT
      0.1 STARTED  resize         #7
      0.1 STARTED  resize         #8
 
-keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  m kpi  p pause  k/j scroll  q quit
+keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter  m kpi  p pause  q quit
 ```
 
 - **Live metrics:** throughput, an in-flight gauge, cumulative counts, and a per-task
@@ -275,6 +312,12 @@ keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  m kpi  p pause  k/j sc
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
   dashboard's own CPU/RAM cost (minimal/normal/full) live; `p` pauses; `s` opens the live
   **settings editor**; `?` shows a help overlay of every key.
+- **Task control plane:** `t` opens a **task manager** — list every type with live
+  queued/running/dead counts, inspect one to edit its settings inline, pause/resume (`a`),
+  clone (`c`), create a `GPTPS_EXEC_PROGRAM` task from a typed name + argv (`n`), or delete
+  with a confirm dialog (`d`) that shows the outstanding count and offers drain or
+  cancel-force. `l` opens a **dead-letter** view to bulk re-submit or discard retained
+  failures.
 - **Friendly:** adapts to the terminal size, redraws flicker-free, confirms actions with a
   toast, and on a real terminal adds a framed title bar, a Unicode block gauge, and color
   (with an ASCII fallback shown above). Built on a pure render-to-string core, so it is
@@ -353,9 +396,13 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
 - **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
+- **Runtime task management:** enumerate, pause/resume, clone, and unregister task types
+  live (`gptps_task_*`, `gptps_unregister_task` with reject-if-busy / drain / cancel) — the
+  control plane behind the dashboard's task manager. See
+  [Manage tasks at runtime](#manage-tasks-at-runtime-control-plane).
 - **Live dashboard (optional):** a portable real-time terminal UI with live metrics, a
-  per-task table, a scrollable event log, a settings editor, and hotkeys — see
-  [Live terminal dashboard](#live-terminal-dashboard) above.
+  per-task table, a scrollable event log, a settings editor, a **task manager** + dead-letter
+  panes, and hotkeys — see [Live terminal dashboard](#live-terminal-dashboard) above.
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
   priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
   versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See
@@ -375,7 +422,7 @@ gptps/
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
 │   └── exec_oop_posix.c out-of-process + external-program executors
 ├── addons/              ← optional modules on the public API (durable_queue, gpu_quota, wasm_exec, tui)
-├── examples/            ← runnable examples (demo, config_file, external_program, dashboard, embedded, wasm_program)
+├── examples/            ← runnable examples (demo, config_file, task_control, external_program, dashboard, embedded, wasm_program)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/ARCHITECTURE.md ← how it works inside
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)

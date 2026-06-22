@@ -142,6 +142,14 @@ target_link_libraries(test_settings PRIVATE gptps)
 add_test(NAME settings COMMAND test_settings)
 set_tests_properties(settings PROPERTIES TIMEOUT 30)
 
+add_executable(test_taskmgmt tests/test_taskmgmt.c) # runtime task management + generic settings
+target_include_directories(test_taskmgmt
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_taskmgmt PRIVATE gptps)
+add_test(NAME taskmgmt COMMAND test_taskmgmt)
+set_tests_properties(taskmgmt PROPERTIES TIMEOUT 30)
+
 add_executable(test_step tests/test_step.c) # MANUAL single-threaded pump (gptps_step)
 target_include_directories(test_step
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -272,6 +280,13 @@ target_include_directories(example_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/in
 target_link_libraries(example_config PRIVATE gptps)
 add_test(NAME example_config COMMAND example_config)
 set_tests_properties(example_config PROPERTIES TIMEOUT 20)
+
+# runtime control plane: enumerate / generic settings / clone / unregister
+add_executable(example_task_control examples/task_control.c)
+target_include_directories(example_task_control PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(example_task_control PRIVATE gptps)
+add_test(NAME example_task_control COMMAND example_task_control)
+set_tests_properties(example_task_control PROPERTIES TIMEOUT 20)
 
 # single-thread + static memory pool (no worker threads, no libc heap)
 add_executable(example_embedded examples/embedded.c)

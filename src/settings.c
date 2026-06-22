@@ -118,6 +118,30 @@ size_t gptps_settings_size(gptps_settings *r)
     return n;
 }
 
+size_t gptps_settings_remove_prefix(gptps_settings *r, const char *prefix)
+{
+    gptps_setting_entry *e, *prev = NULL;
+    size_t plen, removed = 0;
+    if (!r || !prefix) return 0;
+    plen = strlen(prefix);
+    gptps_mutex_lock(r->m);
+    e = r->head;
+    while (e) {
+        gptps_setting_entry *next = e->next;
+        if (strncmp(e->key, prefix, plen) == 0) {
+            if (prev) prev->next = next; else r->head = next;
+            if (r->tail == e) r->tail = prev;
+            gptps_free(e->key); gptps_free(e->desc); gptps_free(e->defval); gptps_free(e);
+            r->n -= 1; ++removed;
+            e = next;        /* prev unchanged */
+        } else {
+            prev = e; e = next;
+        }
+    }
+    gptps_mutex_unlock(r->m);
+    return removed;
+}
+
 /* parse + range/enum check; 0 = invalid, 1 = ok */
 static int valid_value(const gptps_setting_entry *e, const char *v)
 {

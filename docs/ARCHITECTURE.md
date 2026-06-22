@@ -357,6 +357,47 @@ in the add-on. Validation (range / enum / parseable) runs in the generic layer
   or the host-table `register_setting` routine; the `tui` Settings pane (`s`) is a
   thin editor over the registry.
 
+### Generic settings (define without per-key glue)
+
+`gptps_register_setting` binds to *your* state; the convenience helpers let a host
+declare typed knobs the engine stores and validates for it:
+
+- `gptps_define_global` allocates an engine-owned value cell, parses the
+  `"min..max"` / `"a|b|c"` constraint, validates the default, and registers a normal
+  registry entry whose `read/write` target the cell. The cell needs no lock of its
+  own — every read/write runs under `settings->m`. Cells are freed at shutdown.
+- `gptps_define_task_setting` records a **schema** (`leaf`, type, default, range/
+  choices) and *materializes* it as `tasks.<name>.<leaf>` on every registered task
+  (snapshotting the live regs under `e->m`, then adding the entries with `e->m`
+  released to honor the lock order) and on every task registered later (via
+  `register_task_local_settings` in `gptps_register_task`). Each (task, schema) pair
+  owns a value cell hung off the `gptps_reg`. `gptps_task_setting_int/str` reads the
+  running task's resolved value from `ctx->reg->locals` — INPROC only, since an
+  OOP/PROGRAM body runs in a child with no live engine handle (`ctx->reg == NULL`).
+
+### Task management (runtime control plane)
+
+The registry is itself mutable at runtime. The hazard: a `gptps_item` points at
+`&reg->def`, so a `gptps_reg` must not be freed while any live item references it
+(handles are opaque IDs never resolved back to a task, so no generation counter is
+needed). Removal is therefore **tombstone + drain**:
+
+- `gptps_unregister_task` marks `reg->removed` (so `registry_find` hides it from new
+  submits and `engine_pass` stops retrying its items — a bounded drain). REJECT
+  fails `E_BUSY` if any item is live; CANCEL drops the queued backlog, sets the
+  cancel flag on in-flight items, and marks `cancelling` so they are *discarded* (not
+  dead-lettered) when they finish; DRAIN lets queued+in-flight finish. In THREADED
+  mode the caller then blocks on `cv_drain` (broadcast by the dispatcher after each
+  pass) until no live item references the reg; MANUAL mode never has in-flight work
+  between steps. Teardown detaches retained dead-letter items (they take an owned
+  name copy and sever the reg pointer), unlinks the reg, removes its `tasks.<name>.*`
+  settings (with `e->m` released — lock order), then frees it.
+- `gptps_clone_task` deep-copies a reg's def under a new name (sharing the run fn);
+  `gptps_set_task_enabled` flips a reversible `enabled` flag; `gptps_task_count/
+  get_info/exists` enumerate (including draining types, with live queue counts).
+- The `tui` add-on's **tasks** and **dead-letter** panes are thin views over these
+  calls; deleting from the TUI uses DRAIN (cancel-force on demand).
+
 ---
 
 ## 11. ABI versioning & stability
@@ -369,9 +410,11 @@ in the add-on. Validation (range / enum / parseable) runs in the generic layer
 
 New capabilities have so far been added without breaking the ABI: result
 delivery, the external-program executor, constraints/observers, task priority
-(`gptps_set_task_priority`), the dead-letter drain, and the settings registry
-(new symbols + a `register_setting` routine appended to the host table, minor
-3 → 4) — each a new symbol or an appended field, never a reshape.
+(`gptps_set_task_priority`), the dead-letter drain, the settings registry
+(`register_setting` appended to the host table, minor 3 → 4), and runtime task
+management + generic settings (new symbols, an appended `GPTPS_E_BUSY` status, a
+`struct_size`-fronted `gptps_task_info`, and four more host-table routines, minor
+7 → 8) — each a new symbol or an appended field, never a reshape.
 
 ---
 

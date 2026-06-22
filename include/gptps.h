@@ -58,7 +58,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 7u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator) */
+#define GPTPS_ABI_VERSION_MINOR 8u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- export / visibility ------------------------------------------------- */
@@ -100,7 +100,8 @@ typedef enum {
     GPTPS_E_IO,           /* transport / child-process I/O error */
     GPTPS_E_TASK,         /* task returned a non-OK application error */
     GPTPS_E_SHUTDOWN,     /* engine is shutting down */
-    GPTPS_E_DENIED        /* a constraint hook rejected admission */
+    GPTPS_E_DENIED,       /* a constraint hook rejected admission */
+    GPTPS_E_BUSY          /* task removal refused while work is queued / in-flight (REJECT_IF_BUSY, or DRAIN in MANUAL mode) */
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);
@@ -255,6 +256,76 @@ GPTPS_API gptps_status gptps_register_task(gptps *e, const gptps_task_def *def);
  * task in the config file ([task_defaults] / [tasks.<name>] `priority`). */
 GPTPS_API gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priority);
 
+/* ============================================================================
+ * TASK MANAGEMENT (enumerate / enable / clone / unregister)
+ *
+ * The registry is itself introspectable and mutable at runtime, so an operator
+ * (or a control-plane / TUI) can manage the whole task lifecycle live - not just
+ * submit against compiled-in types. Behavior (the run fn / executor) still arrives
+ * via code or an add-on; these calls own the *configuration and lifecycle* of the
+ * types that exist.
+ * ==========================================================================*/
+
+/* A task type's removal policy (passed as the `flags` argument; the low bits are
+ * the mode). The conservative default (0) never drops or blocks on work. */
+#define GPTPS_REMOVE_MODE_MASK     0x3u
+#define GPTPS_REMOVE_REJECT_IF_BUSY 0x0u /* DEFAULT: fail GPTPS_E_BUSY if any work is queued/in-flight */
+#define GPTPS_REMOVE_DRAIN          0x1u /* tombstone (reject new submits), let queued+in-flight finish (no retries), then free */
+#define GPTPS_REMOVE_CANCEL         0x2u /* drop queued work, cooperatively cancel in-flight, then free */
+
+/* Snapshot of one registered task type (introspection; struct_size first). */
+typedef struct {
+    size_t               struct_size;   /* = sizeof(gptps_task_info) */
+    const char          *name;          /* borrowed; stable until the registry is next mutated */
+    gptps_exec_kind      exec;
+    int32_t              priority;
+    gptps_cost           default_cost;
+    gptps_failure_policy default_policy;
+    int                  enabled;        /* 0 => submits rejected (paused); 1 => accepting work */
+    int                  removed;        /* 1 => tombstoned and draining toward removal */
+    uint32_t             queued;         /* items waiting (intake + backoff) for this type */
+    uint32_t             running;        /* items admitted / in-flight for this type */
+    uint32_t             dead;           /* dead-lettered items retained for this type */
+} gptps_task_info;
+
+/* Number of registered task types (includes types that are draining toward removal). */
+GPTPS_API size_t       gptps_task_count(gptps *e);
+/* Fill *out for the task at `index` (0-based; order stable until the registry is
+ * mutated). GPTPS_E_NOTFOUND past the end. */
+GPTPS_API gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out);
+/* 1 if a task of this name is registered AND accepting submits (enabled, not draining). */
+GPTPS_API int          gptps_task_exists(gptps *e, const char *task_name);
+
+/* Pause / resume a task type without removing it: a disabled type keeps its config
+ * and stats but rejects new gptps_submit (GPTPS_E_NOTFOUND), reversibly. */
+GPTPS_API gptps_status gptps_set_task_enabled(gptps *e, const char *task_name, int enabled);
+
+/* Duplicate an existing task type under a new name (same run/exec/argv/user_data).
+ * Cost + failure policy are copied from `src` and then re-layered from any open
+ * config file's [task_defaults]/[tasks.<dst>]; the scheduling priority is carried
+ * over from `src` as-is. The most common "tweak a copy" operation - e.g. clone
+ * "resize" to "resize_hi" then raise its quality. GPTPS_E_NOTFOUND if `src` is
+ * unknown, GPTPS_E_DUP if `dst` already exists. */
+GPTPS_API gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_name);
+
+/* Remove a task type. `flags` selects the policy (GPTPS_REMOVE_* above). On a
+ * successful return the type is gone: its name is free to re-register and its
+ * tasks.<name>.* settings are torn down. Dead-lettered items for the type are
+ * retained (they carry the name as data) and remain drainable. GPTPS_E_NOTFOUND if
+ * unknown, GPTPS_E_BUSY (REJECT_IF_BUSY only) if work is outstanding.
+ *
+ * THREADED mode blocks until the drain/cancel completes. DRAIN waits for queued +
+ * in-flight work to finish, so it can block indefinitely if that work cannot make
+ * progress (e.g. the budget stays saturated or a constraint keeps deferring it) -
+ * use CANCEL to force removal in that case. In MANUAL mode there is no in-flight
+ * work between gptps_step calls, so DRAIN/REJECT_IF_BUSY refuse with GPTPS_E_BUSY
+ * when work is still queued (drain it by stepping first); CANCEL drops the queued
+ * backlog and removes immediately. NOTE: a CANCEL/DRAIN of an in-flight in-process
+ * task that never polls gptps_is_cancelled() blocks until it returns (same
+ * cooperative limit as timeouts). Do not register/re-register the same name
+ * concurrently with its removal (registration is a setup-time operation). */
+GPTPS_API gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned flags);
+
 /* Load a dynamic add-on (shared library) via the host-table ABI below. The
  * add-on must export gptps_addon_init; the core validates magic/version/size
  * before use and tears the add-on down at gptps_shutdown. */
@@ -356,6 +427,11 @@ typedef enum {
 
 #define GPTPS_SETTINGS_VALUE_MAX 256   /* cap for any rendered/parsed value string */
 
+/* Flags for the convenience registration helpers below (gptps_define_global /
+ * gptps_define_task_setting). Default (0) is a `hot` setting that applies live. */
+#define GPTPS_SETTING_HOT      0x0u /* applies live (default) */
+#define GPTPS_SETTING_RESTART  0x1u /* effective only after restart (sets info.hot = 0) */
+
 /* Schema + accessor binding for ONE setting, supplied at registration. `key`,
  * `desc` are copied; `choices` (enum only) is BORROWED and must outlive the engine
  * (use a static array). `target` is opaque, passed back to read/write. */
@@ -389,6 +465,48 @@ typedef struct {
 
 /* Register a setting into the engine's registry (GPTPS_E_DUP on a duplicate key). */
 GPTPS_API gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def);
+
+/* ---- generic settings without write-your-own get/set glue --------------------
+ * The primitive above binds a setting to YOUR live state via read/write callbacks.
+ * The two helpers below let you declare arbitrary typed knobs that the engine
+ * stores and validates for you - so a host (or a control plane) can grow the
+ * configuration surface at runtime without per-key code.
+ *
+ *   `constraint` shapes validation by type:
+ *     numeric  -> "min..max"  (e.g. "0..4096"); NULL for unbounded
+ *     enum     -> "a|b|c"     (the allowed choices; required for GPTPS_SETTING_ENUM)
+ *     other    -> ignored (pass NULL)
+ *   `default_val` is the initial rendered value (validated; NULL => type's zero).
+ *   `flags` is GPTPS_SETTING_HOT (default) or GPTPS_SETTING_RESTART.
+ */
+
+/* A GLOBAL knob, engine-stored. Appears under its full dotted `key` (no tasks.
+ * prefix), round-trips through TOML, and shows up in the settings editor like any
+ * core setting. Read/write it with gptps_settings_get/set. GPTPS_E_DUP on a
+ * duplicate key, GPTPS_E_CONFIG if default_val/constraint is invalid. */
+GPTPS_API gptps_status gptps_define_global(gptps *e, const char *key, gptps_setting_type type,
+                                           const char *default_val, const char *constraint,
+                                           unsigned flags);
+
+/* A PER-TASK knob schema. The engine materializes `tasks.<name>.<leaf>` for every
+ * registered task (existing and future), each task instance carrying its own value
+ * (defaulted from `default_val`, overridable via TOML or the settings API). `leaf`
+ * must be a bare key with no dots. GPTPS_E_DUP if the leaf is already defined.
+ * Like task registration, this is a SETUP-time call: it walks the registry to
+ * apply the schema to existing tasks, so do not run it concurrently with
+ * gptps_unregister_task / gptps_clone_task on this engine. */
+GPTPS_API gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting_type type,
+                                                 const char *default_val, const char *constraint,
+                                                 unsigned flags);
+
+/* Read THIS task instance's resolved value for a generic per-task setting, from
+ * inside its run() (closes the loop opened by gptps_define_task_setting). `key` is
+ * the bare leaf. GPTPS_OK on success; GPTPS_E_NOTFOUND if no such per-task setting;
+ * GPTPS_E_INVAL for a bad arg or when the value does not parse as the requested
+ * type. Available only to in-process (INPROC) tasks - an OOP/PROGRAM body runs in a
+ * separate process with no live engine handle and gets GPTPS_E_INVAL. */
+GPTPS_API gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out);
+GPTPS_API gptps_status gptps_task_setting_str(gptps_ctx *ctx, const char *key, char *buf, size_t cap);
 
 /* Introspection (index-based; indices are stable until a new task/add-on registers). */
 GPTPS_API size_t       gptps_settings_count(gptps *e);
@@ -464,6 +582,13 @@ typedef struct {
     gptps_status (*register_observer)(gptps *e, gptps_event_cb fn, void *user_data);
     /* --- v1.4 routines (append-only); guard with `struct_size` before calling --- */
     gptps_status (*register_setting)(gptps *e, const gptps_setting_def *def);
+    /* --- v1.8 routines (append-only); guard with `struct_size` before calling --- */
+    gptps_status (*unregister_task)(gptps *e, const char *task_name, unsigned flags);
+    int          (*task_exists)(gptps *e, const char *task_name);
+    gptps_status (*define_global)(gptps *e, const char *key, gptps_setting_type type,
+                                  const char *default_val, const char *constraint, unsigned flags);
+    gptps_status (*define_task_setting)(gptps *e, const char *leaf, gptps_setting_type type,
+                                        const char *default_val, const char *constraint, unsigned flags);
 } gptps_api_routines;
 
 typedef struct {

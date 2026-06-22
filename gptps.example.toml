@@ -58,3 +58,14 @@ timeout_seconds = 300
 max_retries     = 3
 on_failure      = "requeue"          # bodies MUST be idempotent to use requeue
 priority        = -5                 # background work: yields to everything else
+
+# Generic settings round-trip here too. A host can declare its own typed knobs at
+# runtime: gptps_define_global("app.max_upload_mb", ...) lands under its own dotted
+# section, and gptps_define_task_setting("quality", ...) materializes a per-task
+# value as tasks.<name>.quality. Both are saved/reloaded like the keys above. The
+# engine only writes keys it currently knows about, so re-declare a custom setting
+# (same key) on a fresh engine, then gptps_settings_reload to re-apply saved values.
+# [app]
+# max_upload_mb = 20
+# [tasks.resize]
+# quality = 85                        # a generic per-task setting (tasks.<name>.<leaf>)
