@@ -58,6 +58,18 @@ size_t gptps_dq_recover(gptps_dq *dq);
 /* Number of records currently persisted-but-not-completed. */
 size_t gptps_dq_pending(gptps_dq *dq);
 
+/* Quarantine: a task that exhausts its retries under the dead_letter policy is
+ * RETAINED in the journal (its poison payload survives a crash) rather than
+ * silently dropped. Inspect / recover these out-of-band. */
+size_t gptps_dq_quarantined(gptps_dq *dq);   /* count of retained dead-lettered records */
+
+/* Drain quarantined records: `cb` is called for each (payload valid only for the
+ * call; cb must not re-enter this queue), the records are then cleared and the
+ * journal compacted. Returns the number drained. cb may be NULL to discard. */
+typedef void (*gptps_dq_quarantine_cb)(const char *task_name, const void *payload,
+                                       size_t len, void *user_data);
+size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *user_data);
+
 /* Rewrite the journal to contain only still-pending records, bounding its growth
  * within a long-running process. Returns GPTPS_OK or GPTPS_E_IO. */
 gptps_status gptps_dq_compact(gptps_dq *dq);

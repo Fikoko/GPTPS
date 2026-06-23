@@ -96,6 +96,51 @@ static void test_happy(void)
     remove(JOURNAL_A);
 }
 
+/* dead-letter quarantine: a task that exhausts retries is RETAINED (its poison
+ * payload survives), not silently dropped; drain returns it. */
+static char          g_drained_name[64];
+static unsigned char g_drained_payload;
+static int           g_drained_n;
+static void quarantine_cb(const char *name, const void *payload, size_t len, void *ud)
+{
+    (void)ud;
+    snprintf(g_drained_name, sizeof g_drained_name, "%s", name ? name : "");
+    if (payload && len == 1) g_drained_payload = *(const unsigned char *)payload;
+    inc(&g_drained_n);
+}
+static gptps_status task_poison(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_E_TASK; }
+
+static void test_quarantine(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; gptps_task_def d;
+    remove(JOURNAL_A);
+    g_drained_n = 0; g_drained_payload = 0; g_drained_name[0] = 0;
+
+    e = open_engine(2); CHECK(e != NULL); if (!e) return;
+    memset(&d, 0, sizeof d); d.struct_size = sizeof d; d.name = "poison";
+    d.run = task_poison; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;  /* dead_letter, 0 retries */
+    gptps_register_task(e, &d);
+
+    dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    { unsigned char b = 0xAB; CHECK(gptps_dq_submit(dq, "poison", &b, 1, &h) == GPTPS_OK); }
+
+    gptps_shutdown(e);   /* fails -> dead-lettered -> quarantined by the observer */
+    CHECK(gptps_dq_pending(dq) == 0);       /* not pending */
+    CHECK(gptps_dq_quarantined(dq) == 1);   /* retained, not dropped */
+
+    CHECK(gptps_dq_drain_quarantine(dq, quarantine_cb, NULL) == 1);
+    CHECK(get(&g_drained_n) == 1);
+    CHECK(strcmp(g_drained_name, "poison") == 0);
+    CHECK(g_drained_payload == 0xAB);       /* the poison payload survived */
+    CHECK(gptps_dq_quarantined(dq) == 0);   /* cleared after drain */
+
+    gptps_dq_close(dq);
+    remove(JOURNAL_A);
+}
+
 #if defined(TEST_DURABLE_FORK)
 static void test_recovery(void)
 {
@@ -160,6 +205,7 @@ static void test_recovery(void)
 int main(void)
 {
     test_happy();      /* portable: dq_open/submit/observer/pending/fsync/close */
+    test_quarantine(); /* portable: dead-letter quarantine + drain */
 #if defined(TEST_DURABLE_FORK)
     test_recovery();   /* crash-recovery via fork (POSIX) */
 #endif

@@ -36,7 +36,8 @@ typedef struct {
     char        *name;
     void        *payload;
     size_t       len;
-    int          done;
+    int          done;        /* terminal + discarded (finished or dropped) */
+    int          quarantined; /* terminal + RETAINED (dead-lettered): poison kept for inspection */
 } dq_rec;
 
 struct gptps_dq {
@@ -62,6 +63,23 @@ static uint32_t fnv(const void *d, size_t n, uint32_t h)
 
 static char *dup_str(const char *s) { size_t n = strlen(s) + 1; char *o = (char *)malloc(n); if (o) memcpy(o, s, n); return o; }
 static void *dup_mem(const void *s, size_t n) { void *o; if (!n) return NULL; o = malloc(n); if (o) memcpy(o, s, n); return o; }
+
+/* fsync the directory holding `path` so a rename of a file in it is durable. */
+static int fsync_parent_dir(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    int rc;
+    if (!slash) return apx_dir_fsync(".");
+    {
+        size_t n = (size_t)(slash - path);
+        char *dir = (char *)malloc(n + 1);
+        if (!dir) return -1;
+        memcpy(dir, path, n); dir[n] = 0;
+        rc = apx_dir_fsync(n ? dir : "/");
+        free(dir);
+    }
+    return rc;
+}
 
 /* ---- record I/O ---- */
 static void write_file_header(FILE *f)
@@ -156,6 +174,9 @@ static int replay(gptps_dq *dq)
         } else if (type == 'D') {
             dq_rec *rc = find_by_seq(dq, seq);
             if (rc) rc->done = 1;
+        } else if (type == 'Q') {
+            dq_rec *rc = find_by_seq(dq, seq);
+            if (rc) rc->quarantined = 1;   /* dead-lettered: retained, not re-submitted */
         }
         free(body);
     }
@@ -175,18 +196,27 @@ static gptps_status do_rewrite(gptps_dq *dq)
     t = fopen(tmp, "wb");
     if (!t) { free(tmp); return GPTPS_E_IO; }
     write_file_header(t);
-    for (i = 0; i < dq->n; ++i)
-        if (!dq->recs[i].done)
-            write_record(t, 'P', dq->recs[i].seq, dq->recs[i].name, dq->recs[i].payload, (uint32_t)dq->recs[i].len);
-    fflush(t); apx_fsync(t); fclose(t);
+    for (i = 0; i < dq->n; ++i) {
+        if (dq->recs[i].done) continue;
+        /* retain both still-pending and quarantined (dead-lettered) records; a
+         * quarantined one is rewritten as P (to keep its poison payload) plus a Q
+         * marker so replay reclassifies it without re-submitting it. */
+        if (write_record(t, 'P', dq->recs[i].seq, dq->recs[i].name, dq->recs[i].payload, (uint32_t)dq->recs[i].len) != 0 ||
+            (dq->recs[i].quarantined && write_record(t, 'Q', dq->recs[i].seq, "", NULL, 0) != 0)) {
+            fclose(t); free(tmp); return GPTPS_E_IO;
+        }
+    }
+    if (fflush(t) != 0 || apx_fsync(t) != 0) { fclose(t); free(tmp); return GPTPS_E_IO; }
+    fclose(t);
 
     if (dq->fp) { fclose(dq->fp); dq->fp = NULL; }
     if (rename(tmp, dq->path) != 0) { free(tmp); return GPTPS_E_IO; }
+    fsync_parent_dir(dq->path);   /* make the rename's directory entry durable */
     free(tmp);
     dq->fp = fopen(dq->path, "ab");
     if (!dq->fp) return GPTPS_E_IO;
 
-    /* compact memory: keep only !done */
+    /* compact memory: drop done records, keep pending + quarantined */
     for (i = 0; i < dq->n; ++i) {
         if (dq->recs[i].done) { free(dq->recs[i].name); free(dq->recs[i].payload); }
         else dq->recs[keep++] = dq->recs[i];
@@ -200,16 +230,24 @@ static void dq_on_event(const gptps_event *ev, void *ud)
 {
     gptps_dq *dq = (gptps_dq *)ud;
     size_t i;
-    if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DEAD_LETTERED) return;
+    if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DROPPED &&
+        ev->kind != GPTPS_EV_DEAD_LETTERED) return;
     apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
-        if (!dq->recs[i].done && dq->recs[i].handle == ev->handle) {
+        if (dq->recs[i].done || dq->recs[i].quarantined) continue;
+        if (dq->recs[i].handle != ev->handle) continue;
+        if (ev->kind == GPTPS_EV_DEAD_LETTERED) {
+            /* dead-lettered: RETAIN the poison payload (quarantine), don't drop it */
+            dq->recs[i].quarantined = 1;
+            write_record(dq->fp, 'Q', dq->recs[i].seq, "", NULL, 0);
+        } else {
+            /* finished or dropped: terminally gone, discard */
             dq->recs[i].done = 1;
-            if (dq->pending) dq->pending -= 1;
             write_record(dq->fp, 'D', dq->recs[i].seq, "", NULL, 0);
-            fflush(dq->fp); /* DONE: no fsync (a lost DONE just replays = harmless) */
-            break;
         }
+        if (dq->pending) dq->pending -= 1;
+        fflush(dq->fp); /* marker: a lost marker just replays/re-quarantines = harmless */
+        break;
     }
     apx_mutex_unlock(&dq->mu);
 }
@@ -227,8 +265,8 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path)
     if (!dq->path) { apx_mutex_destroy(&dq->mu); free(dq); return NULL; }
 
     if (replay(dq) != 0) goto fail;          /* corrupt journal header */
-    /* pending count after replay */
-    { size_t i; for (i = 0; i < dq->n; ++i) if (!dq->recs[i].done) dq->pending += 1; }
+    /* pending count after replay (quarantined records are retained, not pending) */
+    { size_t i; for (i = 0; i < dq->n; ++i) if (!dq->recs[i].done && !dq->recs[i].quarantined) dq->pending += 1; }
     if (do_rewrite(dq) != GPTPS_OK) goto fail;
     if (gptps_register_observer(e, dq_on_event, dq) != GPTPS_OK) goto fail;
     return dq;
@@ -257,7 +295,12 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
         apx_mutex_unlock(&dq->mu);
         return GPTPS_E_IO;
     }
-    fflush(dq->fp); apx_fsync(dq->fp);   /* durable before we enqueue */
+    /* durable before we enqueue: a swallowed fsync error would be a false
+     * durability claim (a torn/buffered tail is tolerated by replay's checksum). */
+    if (fflush(dq->fp) != 0 || apx_fsync(dq->fp) != 0) {
+        apx_mutex_unlock(&dq->mu);
+        return GPTPS_E_IO;
+    }
     dq->next_seq = seq + 1;
 
     rc = push_rec(dq);
@@ -304,6 +347,34 @@ size_t gptps_dq_pending(gptps_dq *dq)
     if (!dq) return 0;
     apx_mutex_lock(&dq->mu);
     n = dq->pending;
+    apx_mutex_unlock(&dq->mu);
+    return n;
+}
+
+size_t gptps_dq_quarantined(gptps_dq *dq)
+{
+    size_t i, n = 0;
+    if (!dq) return 0;
+    apx_mutex_lock(&dq->mu);
+    for (i = 0; i < dq->n; ++i) if (dq->recs[i].quarantined) ++n;
+    apx_mutex_unlock(&dq->mu);
+    return n;
+}
+
+size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *user_data)
+{
+    size_t i, n = 0;
+    if (!dq) return 0;
+    apx_mutex_lock(&dq->mu);
+    for (i = 0; i < dq->n; ++i) {
+        if (!dq->recs[i].quarantined) continue;
+        /* payload valid only for this call; cb must NOT re-enter this dq (lock held) */
+        if (cb) cb(dq->recs[i].name, dq->recs[i].payload, dq->recs[i].len, user_data);
+        dq->recs[i].quarantined = 0;
+        dq->recs[i].done = 1;        /* drained => terminally gone */
+        ++n;
+    }
+    if (n) do_rewrite(dq);           /* compact the drained records out of the journal */
     apx_mutex_unlock(&dq->mu);
     return n;
 }
