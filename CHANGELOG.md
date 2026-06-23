@@ -6,6 +6,56 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — ABI 1.9: modularity & portability gap-closure
+- **Per-item constraint context.** The constraint/admission hook now receives a
+  `gptps_constraint_input` (task name, cost, **item handle**, and **payload**)
+  instead of just `(name, cost)`. This is the keystone that makes per-item
+  add-ons — dependencies, dedup/idempotency, per-tenant admission — buildable on
+  the seam. The `GPTPS_SEAM_CONSTRAINT`/`GPTPS_SEAM_OBSERVER` seams are now frozen.
+- **`gptps_cancel(handle)`** cancels a single submitted item (queued, admitted, or
+  in-flight) with a terminal event and a no-op on unknown/already-terminal handles.
+- **Backpressure.** `gptps_limits.max_intake_depth` (and the live
+  `limits.max_intake_depth` setting) bound the intake queue; `gptps_submit` returns
+  the long-reserved `GPTPS_E_FULL` once it is full.
+- **`gptps_submit_ex`** applies per-submit overrides (priority / failure policy /
+  sub-second deadline) without cloning the task type.
+- **`gptps_unregister_constraint` / `gptps_unregister_observer`** (also in the
+  host table) close the register-only asymmetry and enable add-on hot-unload.
+- **`gptps_set_log_sink`** redirects/silences the core's diagnostics (no-stdio hosts).
+- **`gptps_version()` / `GPTPS_VERSION_*`** expose the release version (distinct
+  from the ABI version).
+- **`gptps_task_def.child_setup`** — an optional fork-time hook for OOP/PROGRAM
+  children to harden themselves (chdir, setenv, setrlimit, drop privs, seccomp,
+  close fds) before exec.
+- **`GPTPS_EV_DROPPED`** — a terminal event when an item is discarded under the
+  DROP policy, so observers can reconcile every submitted item.
+- **Orchestration add-on** (`addons/gptps_orch.*`): run-after / fan-in task
+  dependencies built purely on the public seams (observer + submit), no core changes.
+- **Freestanding reference** (`freestanding/`): a stub HAL + demo proving the C99
+  core runs in MANUAL mode with no pthread/dl/fork and no libc heap, compiled
+  `-ffreestanding` and run in CI.
+- **CI:** a 32-bit (i386) + big-endian (s390x under QEMU) job, a freestanding job,
+  and TSan coverage extended from 5 to 10 tests.
+
+### Changed
+- Container-aware auto-tune: `gptps_hal_detect` clamps CPU/RAM to cgroup v2
+  `cpu.max` / `memory.max` and the CPU affinity mask, so sizing fits the container.
+- `GPTPS_EV_QUEUED` is emitted with the engine lock released (a slow observer no
+  longer stalls admission); it now fires on the submitting thread.
+
+### Fixed
+- **`durable_queue`**: propagate fsync/fflush errors as `GPTPS_E_IO` (was a silent
+  false-success), fsync the parent directory after the compaction rename, and
+  **quarantine** dead-lettered records (retain the poison payload across crashes;
+  `gptps_dq_quarantined` / `gptps_dq_drain_quarantine`) instead of dropping it.
+- OOP/PROGRAM pipe fds are now close-on-exec, fixing a hang where a concurrent
+  PROGRAM child could pin another executor's pipe open.
+- Documentation truthfulness: removed the stale "no implementation yet" header
+  banner; corrected `event.mem_bytes` (declared cost, not measured RSS, for OOP);
+  clarified the embedded example's "no libc heap" claim (core only; see
+  `freestanding/` for a true no-libc build).
+- Test suite: fixed a timing race in `test_taskmgmt` (deterministic under load).
+
 ### Added — runtime task management + generic settings (control plane)
 - **Task lifecycle API** turns the registry into a live control surface:
   - `gptps_unregister_task(e, name, flags)` removes a task type at runtime with a

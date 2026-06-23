@@ -103,9 +103,55 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build + run under ThreadSanitizer
         run: |
-          for t in test_engine test_failure test_scheduler test_settings test_step; do
+          for t in test_engine test_failure test_scheduler test_settings test_step \
+                   test_taskmgmt test_constraint test_deadletter test_cancel test_backpressure; do
             cc -fsanitize=thread -std=c99 -D_GNU_SOURCE -g -I include -I src \
                src/alloc.c src/hal_posix.c src/config.c src/config_toml.c src/settings.c src/engine.c src/exec_oop_posix.c \
                tests/$t.c -lpthread -ldl -o $t.tsan
             setarch "$(uname -m)" -R ./$t.tsan
           done
+
+  # Exercise the two most fragile portability axes the native x86_64 + arm64
+  # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
+  # (s390x, 64-bit big-endian, run under QEMU). The journal/TOML/settings
+  # serialization and every fixed-width type are validated here.
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 32-bit (i386) build + full test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib
+          cmake -S . -B build32 -DCMAKE_C_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32
+          cmake --build build32 -j
+          ctest --test-dir build32 --output-on-failure
+      - name: big-endian (s390x) build + serialization tests under QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
+          cmake -S . -B build-s390x -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-s390x.cmake"
+          cmake --build build-s390x -j
+          # byte-order-sensitive subset; skip the fork/exec + TTY tests that are
+          # unreliable under qemu-user (their logic is covered on native runners).
+          ctest --test-dir build-s390x --output-on-failure \
+            -E 'oop|program|wasm|tui|example_dashboard|example_program'
+
+  # Prove the C99 core runs "on any hardware": compile under -ffreestanding
+  # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL
+  # mode with a static memory pool (no libc heap). Backs the portability claim
+  # that the HAL (gptps_hal.h) is the only platform seam.
+  freestanding:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build core with the stub HAL (-ffreestanding, no pthread/dl)
+        run: sh freestanding/build.sh ./gptps_freestanding_demo
+      - name: Run the MANUAL-mode demo (exit 0 = ran via the HAL seam only)
+        run: ./gptps_freestanding_demo
+      - name: Assert no pthread/dl linkage
+        run: |
+          if ldd ./gptps_freestanding_demo | grep -Eiq 'pthread|libdl'; then
+            echo "ERROR: freestanding build pulled in pthread/dl"; exit 1
+          fi
+          echo "OK: no libpthread / libdl"
