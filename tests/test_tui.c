@@ -247,7 +247,7 @@ int main(void)
         CHECK(gptps_settings_get(e, "tasks.echo.timeout_seconds", b, sizeof b) == GPTPS_OK && strcmp(b, "9") == 0);
         CHECK(gptps_tui_press(t, 27) == 4);               /* back to tasks pane */
         gptps_tui_render(t, frame, sizeof frame);
-        CHECK(strstr(frame, "j/k move") != NULL);
+        CHECK(strstr(frame, "move") != NULL);   /* nav legend present (arrows: "Up/Dn move" / "↑↓ move") */
 
         /* clone echo -> echo_hi (typed) */
         CHECK(gptps_tui_press(t, 'c') == 4);

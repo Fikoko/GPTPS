@@ -210,6 +210,13 @@ static size_t appendf(char *buf, size_t cap, size_t pos, const char *fmt, ...)
     return pos > cap ? cap : pos;
 }
 
+/* Arrow glyphs for the key legends: real arrows when unicode is on, ASCII words
+ * otherwise. Arrows reuse j/k/Enter/Esc, so both still work; the legend just
+ * showcases the arrows. */
+static const char *a_ud(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x91\xe2\x86\x93" : "Up/Dn"; }
+static const char *a_lt(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x90"             : "Left";  }
+static const char *a_rt(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x92"             : "Right"; }
+
 /* Settings pane (no t->mu: reads only run-thread-local pane state + the registry,
  * whose get_info takes its own locks - holding t->mu here would deadlock the tui
  * read_fns). */
@@ -232,7 +239,7 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
     }
     if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_\n", B, X, t->editbuf);
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s j/k move  enter edit  w save  s/esc back  q quit\n", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
@@ -394,7 +401,7 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
         pos = appendf(buf, cap, pos, "\n%snew task '%s' \xc2\xb7 argv:%s %s_  %s(space-separated; enter ok, esc cancel)%s\n", B, t->prompt_name, X, t->editbuf, D, X);
     }
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s j/k move  enter inspect  a pause/resume  c clone  n new  d delete  s/esc back  q quit\n", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s inspect  %s back  a pause  c clone  n new  d delete  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
@@ -427,7 +434,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
     }
     if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_\n", B, X, t->editbuf);
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s j/k move  enter edit  w save  s/esc back  q quit\n", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
@@ -443,7 +450,7 @@ static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "  %s%lu%s retained terminal failure%s\n", dn ? R : "", (unsigned long)dn, X, dn == 1 ? "" : "s");
     pos = appendf(buf, cap, pos, "  %sthese exhausted retries (or were denied); re-submit to retry, or discard.%s\n", D, X);
     if (t->status[0]) pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, t->status, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s r re-submit all  D discard all  l/s/esc back  q quit\n", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s r re-submit all  D discard all  %s back  q quit\n", D, X, a_lt(t));
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
@@ -543,8 +550,8 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     for (i = 0; i < t->ntasks; ++i)
         if (t->tasks[i].hotkey)
             pos = appendf(buf, cap, pos, "[%c] %s  ", t->tasks[i].hotkey, t->tasks[i].label);
-    pos = appendf(buf, cap, pos, "%s%s? help  s settings  t tasks  l dead-letter  m kpi  p pause  q quit%s\n",
-                  (t->ntasks ? " \xc2\xb7  " : ""), D, X);
+    pos = appendf(buf, cap, pos, "%s%s%s scroll  s settings  t tasks  l dead-letter  m kpi  p pause  ? help  q quit%s\n",
+                  (t->ntasks ? " \xc2\xb7  " : ""), D, a_ud(t), X);
     mu_unlock(&t->mu);
 
     if (pos >= cap) pos = cap - 1;
