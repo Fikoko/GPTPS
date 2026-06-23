@@ -293,7 +293,8 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "  %-9s cycle KPI detail (minimal/normal/full)\n", "m");
     pos = appendf(buf, cap, pos, "  %-9s pause / resume live updates\n", "p");
     pos = appendf(buf, cap, pos, "  %-9s toggle this help\n", "?");
-    pos = appendf(buf, cap, pos, "  %-9s quit\n\n", "q / Esc");
+    pos = appendf(buf, cap, pos, "  %-9s quit\n", "q / Esc");
+    pos = appendf(buf, cap, pos, "  %s%-9s Up/Down move, Right select, Left back (= k / j / Enter / Esc)%s\n\n", D, "Arrows", X);
     pos = appendf(buf, cap, pos, "%sSettings editor%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s move selection\n", "k / j");
     pos = appendf(buf, cap, pos, "  %-9s edit value (Enter commit, Esc cancel)\n", "Enter");
@@ -849,13 +850,39 @@ static void term_enable(gptps_tui *t)
 }
 static void term_restore(gptps_tui *t)
 { if (t->raw_active) { tcsetattr(STDIN_FILENO, TCSANOW, &t->saved_termios); t->raw_active = 0; } }
-static int term_poll_key(int ms)
+/* Read one byte within `ms`; -1 if none arrived. */
+static int term_read_byte(int ms)
 {
     fd_set fds; struct timeval tv; unsigned char c;
     FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
     tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
     if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0 && read(STDIN_FILENO, &c, 1) == 1) return c;
     return -1;
+}
+/* After an ESC, decode an arrow / Home / End sequence (CSI "ESC [ X" or SS3
+ * "ESC O X") into the matching navigation key. The follow-up reads use a short
+ * timeout so a BARE Esc (quit on the dashboard, back in a sub-pane) never blocks.
+ * Arrows reuse the existing keys, so no pane logic changes: Up=k, Down=j,
+ * Right=Enter (select), Left=Tab (back; a no-op on the dashboard, so an arrow can
+ * never quit). */
+static int term_decode_escape(void)
+{
+    int b1 = term_read_byte(30), b2;
+    if (b1 != '[' && b1 != 'O') return 27;        /* bare Esc (or an Alt-combo) => Esc */
+    b2 = term_read_byte(30);
+    switch (b2) {
+        case 'A': case 'H': return 'k';            /* Up    / Home */
+        case 'B': case 'F': return 'j';            /* Down  / End  */
+        case 'C':           return '\r';           /* Right => select */
+        case 'D':           return '\t';           /* Left  => back   */
+        default:            return 27;             /* unrecognized => Esc */
+    }
+}
+static int term_poll_key(int ms)
+{
+    int c = term_read_byte(ms);
+    if (c == 27) return term_decode_escape();      /* may be an arrow key; else a bare Esc */
+    return c;
 }
 static void term_size(gptps_tui *t)
 {
@@ -878,7 +905,22 @@ static void term_restore(gptps_tui *t)
 static int term_poll_key(int ms)
 {
     int waited = 0;
-    while (waited <= ms) { if (_kbhit()) return _getch(); Sleep(15); waited += 15; }
+    while (waited <= ms) {
+        if (_kbhit()) {
+            int c = _getch();
+            if (c == 0 || c == 0xE0) {              /* extended key: a scan code follows */
+                switch (_getch()) {
+                    case 72: case 71: return 'k';   /* Up    / Home */
+                    case 80: case 79: return 'j';   /* Down  / End  */
+                    case 77:          return '\r';  /* Right => select */
+                    case 75:          return '\t';  /* Left  => back   */
+                    default:          return 0;     /* other extended key => ignore */
+                }
+            }
+            return c;
+        }
+        Sleep(15); waited += 15;
+    }
     return -1;
 }
 static void term_size(gptps_tui *t)
