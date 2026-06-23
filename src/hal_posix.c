@@ -23,12 +23,14 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
+#  include <sched.h>   /* sched_getaffinity / CPU_COUNT (container CPU bound) */
 #elif defined(__APPLE__)
 #  include <sys/sysctl.h>
 #endif
@@ -104,6 +106,48 @@ uint64_t gptps_hal_monotonic_ms(void)
 /* hardware detection                                                        */
 /* ------------------------------------------------------------------------- */
 
+#if defined(__linux__)
+/* Clamp detected CPU/RAM to this process's cgroup v2 limits + CPU affinity, so
+ * auto-tune inside a container sizes to the container, not the host. Best-effort:
+ * any unreadable/absent control file or "max" value leaves the host figure. */
+static void cgroup_v2_clamp(gptps_hwinfo *out)
+{
+    FILE *f;
+    /* CPU quota: cpu.max = "<quota> <period>" (or "max <period>" for unlimited). */
+    f = fopen("/sys/fs/cgroup/cpu.max", "r");
+    if (f) {
+        char q[32]; unsigned long long period = 0;
+        if (fscanf(f, "%31s %llu", q, &period) == 2 && period > 0 && strcmp(q, "max") != 0) {
+            unsigned long long quota = strtoull(q, NULL, 10);
+            if (quota > 0) {
+                unsigned eff = (unsigned)((quota + period - 1) / period); /* ceil */
+                if (eff < 1u) eff = 1u;
+                if (eff < out->cpu_count) out->cpu_count = eff;
+            }
+        }
+        fclose(f);
+    }
+    /* CPU affinity mask: a tighter bound than online CPUs (e.g. cpuset pinning). */
+    {
+        cpu_set_t set;
+        if (sched_getaffinity(0, sizeof set, &set) == 0) {
+            int c = CPU_COUNT(&set);
+            if (c > 0 && (unsigned)c < out->cpu_count) out->cpu_count = (unsigned)c;
+        }
+    }
+    /* Memory limit: memory.max = "<bytes>" (or "max" for unlimited). */
+    f = fopen("/sys/fs/cgroup/memory.max", "r");
+    if (f) {
+        char m[64];
+        if (fscanf(f, "%63s", m) == 1 && strcmp(m, "max") != 0) {
+            uint64_t lim = strtoull(m, NULL, 10);
+            if (lim > 0 && (out->ram_bytes == 0 || lim < out->ram_bytes)) out->ram_bytes = lim;
+        }
+        fclose(f);
+    }
+}
+#endif
+
 gptps_status gptps_hal_detect(gptps_hwinfo *out)
 {
     long n;
@@ -134,6 +178,10 @@ gptps_status gptps_hal_detect(gptps_hwinfo *out)
         if (pages > 0 && psize > 0)
             out->ram_bytes = (uint64_t)pages * (uint64_t)psize;
     }
+#endif
+
+#if defined(__linux__)
+    cgroup_v2_clamp(out);   /* size to the container, not the host */
 #endif
 
     out->has_gpu = false; /* unknown without a vendor GPU add-on */

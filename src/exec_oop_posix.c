@@ -43,6 +43,21 @@
 
 #define GPTPS_OOP_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, a mem cap is meaningless */
 
+/* Create a pipe with both ends close-on-exec so a concurrently-forked child
+ * (especially a PROGRAM child that exec()s) cannot inherit and pin open another
+ * executor's pipe ends - which would hang that executor's parent waiting for EOF. */
+static int make_pipe_cloexec(int fds[2])
+{
+#if defined(__linux__) && defined(O_CLOEXEC)
+    if (pipe2(fds, O_CLOEXEC) == 0) return 0;
+    /* fall through if pipe2 is unavailable on this (old) kernel */
+#endif
+    if (pipe(fds) != 0) return -1;
+    (void)fcntl(fds[0], F_SETFD, fcntl(fds[0], F_GETFD) | FD_CLOEXEC);
+    (void)fcntl(fds[1], F_SETFD, fcntl(fds[1], F_GETFD) | FD_CLOEXEC);
+    return 0;
+}
+
 /* Coarse fallback cap: bound the child's virtual address space. Approximate
  * (caps VSZ not RSS; absent on macOS) but needs no privileges - used whenever
  * the accurate cgroup v2 path below is unavailable. */
@@ -174,7 +189,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #endif
 
     *out_result = NULL; *out_len = 0;
-    if (pipe(p) != 0) {
+    if (make_pipe_cloexec(p) != 0) {
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -202,6 +217,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap */
 #endif
         if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
+        if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook */
         st = gptps_run_capture(def, payload, plen, &res, &rlen);
         st32 = (int32_t)st; len64 = (uint64_t)rlen;
         write_all(p[1], &st32, sizeof st32);
@@ -267,10 +283,11 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 
 #define GPTPS_PROG_RESULT_CAP (16u * 1024u * 1024u) /* max captured stdout */
 
-gptps_status gptps_program_execute(const char *const *argv, const void *payload, size_t plen,
+gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s,
                                    void **out_result, size_t *out_len)
 {
+    const char *const *argv = def ? def->argv : NULL;
     int inp[2], outp[2];
     pid_t pid;
 #if defined(__linux__)
@@ -284,13 +301,13 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
 #endif
         return GPTPS_E_INVAL;
     }
-    if (pipe(inp) != 0) {
+    if (make_pipe_cloexec(inp) != 0) {
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
         return GPTPS_E_IO;
     }
-    if (pipe(outp) != 0) {
+    if (make_pipe_cloexec(outp) != 0) {
         close(inp[0]); close(inp[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
@@ -318,6 +335,7 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap before exec */
 #endif
         if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
+        if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook (chdir/seccomp/drop-privs/...) */
         execvp(argv[0], (char *const *)argv); /* PATH-resolves a bare name (e.g. "wasmtime") */
         _exit(127); /* exec failed */
     }

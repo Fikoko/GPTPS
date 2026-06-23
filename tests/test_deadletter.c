@@ -32,8 +32,8 @@ static void on_ev(const gptps_event *ev, void *ud)
 static gptps_status task_fail(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_E_TASK; }
 static gptps_status task_ok(gptps_ctx *ctx, void *ud)   { (void)ctx; (void)ud; return GPTPS_OK; }
 
-static gptps_admit_decision deny_all(const char *name, const gptps_cost *c, uint32_t *ra, void *ud)
-{ (void)name; (void)c; (void)ra; (void)ud; return GPTPS_DENY; }
+static gptps_admit_decision deny_all(const gptps_constraint_input *in, uint32_t *ra, void *ud)
+{ (void)in; (void)ra; (void)ud; return GPTPS_DENY; }
 
 static void def_init(gptps_task_def *d, const char *name, gptps_run_fn run,
                      uint32_t retries, gptps_on_failure on_fail)

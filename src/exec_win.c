@@ -92,10 +92,11 @@ static DWORD WINAPI reader_proc(LPVOID p)
     return 0;
 }
 
-gptps_status gptps_program_execute(const char *const *argv, const void *payload, size_t plen,
+gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s,
                                    void **out_result, size_t *out_len)
 {
+    const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
     HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
     STARTUPINFOA si;
@@ -107,6 +108,8 @@ gptps_status gptps_program_execute(const char *const *argv, const void *payload,
     int killed = 0, assigned = 0;
     gptps_status eff;
 
+    /* def->child_setup is a POSIX fork-time hook; Windows has no fork model, so
+     * it does not apply to CreateProcess and is intentionally ignored here. */
     *out_result = NULL; *out_len = 0;
     if (!argv || !argv[0]) return GPTPS_E_INVAL;
 

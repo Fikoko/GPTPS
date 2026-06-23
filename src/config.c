@@ -46,5 +46,6 @@ gptps_status gptps_config_resolve(const gptps_limits *in, gptps_limits *out)
     out->struct_size = sizeof *out;
     out->max_concurrent_tasks = conc;
     out->max_memory_bytes = mem;
+    out->max_intake_depth = in ? in->max_intake_depth : 0; /* 0 => unbounded intake */
     return GPTPS_OK;
 }

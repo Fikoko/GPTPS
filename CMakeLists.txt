@@ -86,6 +86,30 @@ target_link_libraries(test_constraint PRIVATE gptps)
 add_test(NAME constraint COMMAND test_constraint)
 set_tests_properties(constraint PROPERTIES TIMEOUT 30)
 
+add_executable(test_cancel tests/test_cancel.c)
+target_include_directories(test_cancel
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_cancel PRIVATE gptps)
+add_test(NAME cancel COMMAND test_cancel)
+set_tests_properties(cancel PROPERTIES TIMEOUT 30)
+
+add_executable(test_backpressure tests/test_backpressure.c)
+target_include_directories(test_backpressure
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_backpressure PRIVATE gptps)
+add_test(NAME backpressure COMMAND test_backpressure)
+set_tests_properties(backpressure PROPERTIES TIMEOUT 30)
+
+add_executable(test_submit_ex tests/test_submit_ex.c)
+target_include_directories(test_submit_ex
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_submit_ex PRIVATE gptps)
+add_test(NAME submit_ex COMMAND test_submit_ex)
+set_tests_properties(submit_ex PROPERTIES TIMEOUT 30)
+
 add_executable(test_foundation tests/test_foundation.c)
 target_include_directories(test_foundation
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -236,6 +260,12 @@ target_include_directories(test_durable PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(test_durable PRIVATE gptps)
 add_test(NAME durable COMMAND test_durable)
 set_tests_properties(durable PROPERTIES TIMEOUT 30)
+
+add_executable(test_orch tests/test_orch.c addons/gptps_orch.c)           # run-after / fan-in orchestration built on the public seams
+target_include_directories(test_orch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_orch PRIVATE gptps)
+add_test(NAME orch COMMAND test_orch)
+set_tests_properties(orch PROPERTIES TIMEOUT 30)
 
 add_executable(test_wasm tests/test_wasm.c addons/wasm_exec.c)            # module-as-task; OOP case POSIX-only
 target_include_directories(test_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)

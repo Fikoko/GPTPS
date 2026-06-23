@@ -52,18 +52,19 @@ int main(void)
     if (!e) return 1;
 
     /* core settings present before any task */
-    CHECK(gptps_settings_count(e) == 3);
+    CHECK(gptps_settings_count(e) == 4);
     CHECK(has_key(e, "limits.max_memory_bytes"));
     CHECK(has_key(e, "limits.max_concurrent_tasks"));
+    CHECK(has_key(e, "limits.max_intake_depth"));
     CHECK(has_key(e, "scheduler.reserve_after_skips"));
 
     /* a task adds its six knobs */
     reg(e, "work");
-    CHECK(gptps_settings_count(e) == 9);
+    CHECK(gptps_settings_count(e) == 10);
     CHECK(has_key(e, "tasks.work.timeout_seconds"));
     CHECK(has_key(e, "tasks.work.on_failure"));
     reg(e, "bulk");
-    CHECK(gptps_settings_count(e) == 15);
+    CHECK(gptps_settings_count(e) == 16);
 
     /* get a default */
     CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", buf, sizeof buf) == GPTPS_OK);

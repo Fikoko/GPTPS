@@ -7,8 +7,9 @@
  * auto-tuned to the host hardware. Task logic is supplied directly (in-process
  * C function pointers) or by add-ons loaded via the stable host-table ABI.
  *
- * STATUS: v1 frozen-on-paper public header (no implementation yet). This file
- * is the one can't-reverse decision; everything else hangs off it.
+ * STATUS: implemented and tested (Linux + macOS full; Windows core). This public
+ * header is the one can't-reverse decision; everything else hangs off it - grow
+ * it by APPENDING only (see ABI DISCIPLINE below).
  *
  * ============================================================================
  * DATA FLOW (M1)
@@ -58,8 +59,20 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 8u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings */
+#define GPTPS_ABI_VERSION_MINOR 9u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel) */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
+
+/* --- release version (distinct from the ABI version above) ----------------
+ * GPTPS_VERSION_* track the project RELEASE; GPTPS_ABI_VERSION_* track the binary
+ * add-on contract (host-table + structs) and bump only when that changes. They
+ * move INDEPENDENTLY. Versioning policy: until 1.0 the release version may break
+ * compatibility between minors; from 1.0 the project follows semantic versioning
+ * (a breaking change bumps MAJOR) and deprecated API is kept for one MAJOR with a
+ * documented replacement. */
+#define GPTPS_VERSION_MAJOR 0
+#define GPTPS_VERSION_MINOR 2
+#define GPTPS_VERSION_PATCH 0
+#define GPTPS_VERSION_STRING "0.2.0"
 
 /* --- export / visibility ------------------------------------------------- */
 /* Default build is a STATIC library, so GPTPS_API is undecorated. Define
@@ -105,6 +118,9 @@ typedef enum {
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);
+
+/* Release version string (== GPTPS_VERSION_STRING the library was built from). */
+GPTPS_API const char *gptps_version(void);
 
 /* --- on-failure policy --------------------------------------------------- */
 typedef enum {
@@ -193,6 +209,12 @@ typedef struct {
      * its result from stdout; exit code 0 => success, non-zero => GPTPS_E_TASK.
      * Ignored for INPROC/OOP. Copied by the engine at registration. */
     const char *const    *argv;
+    /* GPTPS_EXEC_OOP / GPTPS_EXEC_PROGRAM only (v1.9): optional hook run IN THE
+     * CHILD after fork - before exec (PROGRAM) or before the run fn (OOP). Harden
+     * the child here: chdir, setenv, setrlimit, drop privileges, install seccomp,
+     * close inherited fds. MUST be async-signal-safe (it runs between fork and
+     * exec). Receives `user_data`. Ignored for INPROC and on Windows (no fork). */
+    void (*child_setup)(void *user_data);
 } gptps_task_def;
 
 /* ============================================================================
@@ -214,12 +236,58 @@ typedef struct {
 GPTPS_API gptps_status gptps_set_allocator(const gptps_allocator *a); /* NULL => reset to libc */
 
 /* ============================================================================
+ * DIAGNOSTIC SINK (optional) - redirect the core's WARN/ERROR diagnostics.
+ * By default the core writes them to stderr. A host with no stdio (embedded /
+ * bare-metal / freestanding) can install a sink to redirect or silence them
+ * (pass a no-op callback to silence; pass NULL to reset to the stderr default).
+ * Process-wide, like gptps_set_allocator; set it once before gptps_open.
+ * ==========================================================================*/
+typedef void (*gptps_log_sink_fn)(gptps_log_level lvl, const char *msg, void *user_data);
+GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NULL => stderr default */
+
+/* ============================================================================
+ * THREADING & REENTRANCY CONTRACT (read before writing callbacks or bindings)
+ *
+ * The engine is INTERNALLY SYNCHRONIZED. THREADED mode (default) runs a single
+ * dispatcher + a worker pool; MANUAL mode runs entirely on the thread that calls
+ * gptps_step().
+ *
+ *  - Concurrent calls: gptps_submit / gptps_submit_ex / gptps_cancel /
+ *    gptps_settings_get / gptps_settings_set / gptps_task_* may be called from
+ *    MANY threads at once on the same engine. Registration-style setup
+ *    (gptps_register_task, gptps_register/unregister_constraint/observer,
+ *    gptps_define_*) is SETUP-time: do it before submitting work or while quiescent.
+ *  - Which thread a callback fires on (THREADED mode):
+ *      QUEUED                  -> the thread that called gptps_submit;
+ *      STARTED/FINISHED/FAILED -> a worker thread;
+ *      RETRIED/DEAD_LETTERED   -> the dispatcher thread.
+ *    In MANUAL mode every callback fires on the thread that called gptps_step().
+ *  - Event callbacks (gptps_event_cb, observers) and the dead-letter drain
+ *    callback ALWAYS run with the engine lock RELEASED, so they MAY call back
+ *    into the engine (e.g. gptps_submit to retry) without deadlock. Keep them
+ *    quick - a slow drain callback holds up the drain.
+ *  - Constraint hooks (gptps_constraint_fn) are the EXCEPTION: they run on the
+ *    dispatcher thread UNDER the engine lock, so they MUST be fast / non-blocking
+ *    and MUST NOT call back into this engine (that would re-enter the lock).
+ *  - In-process task bodies run with the lock released and must poll
+ *    gptps_is_cancelled() to be stoppable (timeouts and gptps_cancel are
+ *    cooperative for INPROC; OOP/PROGRAM are hard-killed at their deadline).
+ *  - Settings write callbacks take their own lock; the fixed lock order is
+ *    settings-lock -> engine-lock -> add-on lock.
+ * ==========================================================================*/
+
+/* ============================================================================
  * ENGINE LIFECYCLE
  * ==========================================================================*/
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_limits) */
     uint32_t max_concurrent_tasks; /* 0 => auto (detected cores); 1 => strictly sequential */
     uint64_t max_memory_bytes;     /* 0 => auto (fraction of detected RAM) */
+    /* v1.9: backpressure. 0 => unbounded intake (default). Otherwise gptps_submit
+     * returns GPTPS_E_FULL once this many items are queued (not yet admitted),
+     * bounding memory an overproducing client can pin (max_memory_bytes caps only
+     * the RUNNING set). Also tunable live via the "limits.max_intake_depth" setting. */
+    uint32_t max_intake_depth;
 } gptps_limits;
 
 /* Execution model. THREADED (default, 0) spawns a dispatcher + worker pool and
@@ -337,6 +405,39 @@ GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,
                                     const void *payload, size_t len,
                                     gptps_handle *out_handle);
 
+/* Per-submit overrides for gptps_submit_ex. struct_size first (additive). Only
+ * the fields whose GPTPS_SUBMIT_* bit is set in `flags` are applied; the others
+ * fall back to the task type's registered defaults. Lets a one-off submit carry
+ * its own scheduling priority, failure policy, or sub-second deadline without
+ * cloning the task type. */
+#define GPTPS_SUBMIT_PRIORITY    0x1u  /* apply `priority`   */
+#define GPTPS_SUBMIT_POLICY      0x2u  /* apply `policy`     (timeout/retries/backoff/on_failure) */
+#define GPTPS_SUBMIT_TIMEOUT_MS  0x4u  /* apply `timeout_ms` (sub-second deadline; in-process cooperative path) */
+typedef struct {
+    size_t               struct_size;  /* = sizeof(gptps_submit_options) */
+    unsigned             flags;        /* OR of GPTPS_SUBMIT_* selecting which overrides apply */
+    int32_t              priority;     /* this item's scheduling priority (higher runs first) */
+    gptps_failure_policy policy;       /* this item's failure policy */
+    uint32_t             timeout_ms;   /* this item's deadline in ms (in-process cooperative path) */
+} gptps_submit_options;
+
+/* Like gptps_submit, but applies the per-item overrides in `opts` (NULL =>
+ * identical to gptps_submit). GPTPS_E_INVAL if opts is non-NULL and undersized. */
+GPTPS_API gptps_status gptps_submit_ex(gptps *e, const char *task_name,
+                                       const void *payload, size_t len,
+                                       const gptps_submit_options *opts,
+                                       gptps_handle *out_handle);
+
+/* Cancel one submitted work item by its handle. A still-queued item is removed
+ * before it runs; an in-flight or admitted item gets the cooperative cancel flag
+ * (in-process tasks MUST poll gptps_is_cancelled() to stop; OOP/PROGRAM children
+ * stop at their deadline). The item ends terminal (a FAILED event, never a retry
+ * or dead-letter). Returns GPTPS_OK if a matching item was found and cancelled,
+ * GPTPS_E_NOTFOUND if the handle is unknown or already terminal (cancel-after-
+ * completion is a harmless no-op), GPTPS_E_SHUTDOWN during teardown. Safe to call
+ * from any thread, including from inside an event callback. */
+GPTPS_API gptps_status gptps_cancel(gptps *e, gptps_handle h);
+
 /* Single-threaded pump - MANUAL mode only (GPTPS_E_INVAL otherwise). Runs the
  * engine on the CALLING thread with no dispatcher/worker threads: one call
  * completes finished work, promotes backoff-ready retries, admits within budget,
@@ -355,7 +456,11 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e); /* drain in-flight, join, free 
  * ==========================================================================*/
 typedef enum {
     GPTPS_EV_QUEUED, GPTPS_EV_STARTED, GPTPS_EV_FINISHED,
-    GPTPS_EV_FAILED, GPTPS_EV_RETRIED, GPTPS_EV_DEAD_LETTERED
+    GPTPS_EV_FAILED, GPTPS_EV_RETRIED, GPTPS_EV_DEAD_LETTERED,
+    /* v1.9: terminal event after retries are exhausted under the DROP policy
+     * (the item is discarded, not retained). Lets an observer reconcile every
+     * submitted item - DROP previously emitted no terminal event. */
+    GPTPS_EV_DROPPED
 } gptps_event_kind;
 
 typedef struct {
@@ -366,8 +471,11 @@ typedef struct {
     uint64_t         ts_ms;         /* monotonic */
     gptps_status     status;        /* terminal status for FINISHED/FAILED */
     uint32_t         attempt;
-    /* memory: DECLARED cost for in-process tasks (RSS is not measurable in a
-     * shared address space); MEASURED RSS for out-of-process tasks. */
+    /* memory: the task's DECLARED cost (cost.mem_bytes), for both in-process and
+     * OOP/PROGRAM tasks. RSS is not reported here: in-process it is not observable
+     * in a shared address space, and although an OOP/PROGRAM task's cap is ENFORCED
+     * (cgroup memory.max on Linux, else RLIMIT_AS), its measured peak RSS is not
+     * plumbed back into this field. */
     uint64_t         mem_bytes;
     /* task result bytes, present on GPTPS_EV_FINISHED (NULL/0 otherwise).
      * Valid only for the duration of the callback - copy it if you need it. */
@@ -549,20 +657,35 @@ GPTPS_API gptps_status gptps_settings_watch(gptps *e, gptps_settings_cb cb, void
 typedef enum {
     GPTPS_SEAM_TASK = 0,   /* frozen v1.0 */
     GPTPS_SEAM_TRANSPORT,  /* EXPERIMENTAL until M2 (exec-bridge); frozen with first consumer */
-    GPTPS_SEAM_CONSTRAINT, /* EXPERIMENTAL: admit/deny/defer hook; MUST be non-blocking */
-    GPTPS_SEAM_OBSERVER    /* EXPERIMENTAL: analytics / dead-letter sink */
+    GPTPS_SEAM_CONSTRAINT, /* frozen v1.9 (gptps_constraint_input): admit/deny/defer hook; MUST be non-blocking */
+    GPTPS_SEAM_OBSERVER    /* frozen v1.9: analytics / dead-letter sink */
 } gptps_seam_kind;
 
-/* Constraint hook result (constraint seam, experimental). retry_after_ms is
+/* Constraint hook result (constraint seam, frozen v1.9). retry_after_ms is
  * honored on DEFER so the dispatcher schedules a wake at T (no busy-spin). */
 typedef enum { GPTPS_ADMIT = 0, GPTPS_DENY, GPTPS_DEFER } gptps_admit_decision;
+
+/* Per-item admission context handed to a constraint hook. `struct_size` is
+ * first so future per-item fields are additive - the hook signature never has
+ * to change again. All pointers are BORROWED and valid only for the duration of
+ * the call. The `handle` gives the hook ITEM IDENTITY (not just the task type),
+ * which is what makes per-item constraints - dependencies, dedup / idempotency,
+ * per-tenant admission - buildable as pure add-ons. */
+typedef struct {
+    size_t            struct_size;   /* = sizeof(gptps_constraint_input) */
+    const char       *task_name;     /* task type id */
+    const gptps_cost *cost;          /* this item's declared cost */
+    gptps_handle      handle;        /* the submitted work item being admitted */
+    const void       *payload;       /* item payload bytes (NULL if none) */
+    size_t            payload_len;
+} gptps_constraint_input;
 
 /* A constraint hook is consulted at admission time (in the dispatcher, so it
  * MUST be fast / non-blocking). Return GPTPS_ADMIT to allow, GPTPS_DENY to
  * reject (task is dead-lettered with GPTPS_E_DENIED), or GPTPS_DEFER and set
- * *retry_after_ms to re-check later. */
-typedef gptps_admit_decision (*gptps_constraint_fn)(const char *task_name,
-                                                    const gptps_cost *cost,
+ * *retry_after_ms to re-check later. Inspect the item via `in` (check
+ * in->struct_size before reading fields appended in a later minor). */
+typedef gptps_admit_decision (*gptps_constraint_fn)(const gptps_constraint_input *in,
                                                     uint32_t *retry_after_ms,
                                                     void *user_data);
 
@@ -589,6 +712,10 @@ typedef struct {
                                   const char *default_val, const char *constraint, unsigned flags);
     gptps_status (*define_task_setting)(gptps *e, const char *leaf, gptps_setting_type type,
                                         const char *default_val, const char *constraint, unsigned flags);
+    /* --- v1.9 routines (append-only); guard with `struct_size` before calling --- */
+    gptps_status (*cancel)(gptps *e, gptps_handle h);
+    gptps_status (*unregister_constraint)(gptps *e, gptps_constraint_fn fn, void *user_data);
+    gptps_status (*unregister_observer)(gptps *e, gptps_event_cb fn, void *user_data);
 } gptps_api_routines;
 
 typedef struct {
@@ -629,6 +756,14 @@ GPTPS_API gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn f
 /* Additional event sink beyond gptps_set_event_cb (many allowed). Register
  * before submitting work. */
 GPTPS_API gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_data);
+
+/* Remove a constraint / observer previously registered with the same (fn,
+ * user_data). Like registration, this is a SETUP-time operation: do not call it
+ * while the engine is actively emitting events or admitting work (sinks are
+ * iterated lock-free on the hot path) - unregister when quiescent / before
+ * submitting. Enables add-on hot-unload. GPTPS_E_NOTFOUND if no match. */
+GPTPS_API gptps_status gptps_unregister_constraint(gptps *e, gptps_constraint_fn fn, void *user_data);
+GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, void *user_data);
 
 #ifdef __cplusplus
 } /* extern "C" */

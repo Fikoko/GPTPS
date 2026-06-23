@@ -96,6 +96,18 @@ static void wait_started(int target)
     while (get(&started) < target && gptps_now_ms(NULL) - s < 2000) { }
 }
 
+/* Wait until a task type has no queued/in-flight work (or is gone), so a
+ * REJECT_IF_BUSY unregister is deterministic instead of timing-dependent. */
+static void wait_idle(gptps *e, const char *name)
+{
+    gptps_task_info info;
+    uint64_t s = gptps_now_ms(NULL);
+    while (gptps_now_ms(NULL) - s < 2000) {
+        if (!find_info(e, name, &info)) break;            /* gone => idle */
+        if (info.queued == 0 && info.running == 0) break; /* nothing outstanding */
+    }
+}
+
 static void dl_capture(const gptps_dead_letter *dl, void *ud)
 { char *out = (char *)ud; snprintf(out, 64, "%s", dl->task_name); }
 
@@ -142,7 +154,11 @@ int main(void)
     CHECK(gptps_task_exists(e, "spin") == 0);
     CHECK(has_setting(e, "tasks.spin.timeout_seconds") == 0);  /* settings torn down */
 
-    /* an idle task removes cleanly with REJECT_IF_BUSY (the default) */
+    /* an idle task removes cleanly with REJECT_IF_BUSY (the default).
+     * Wait for the "fast" submit above (line ~129) to actually finish first:
+     * under suite load it may still be in-flight, and REJECT_IF_BUSY would then
+     * correctly refuse with E_BUSY (a test race, not an engine bug). */
+    wait_idle(e, "fast");
     CHECK(gptps_unregister_task(e, "fast", 0) == GPTPS_OK);
     CHECK(gptps_task_count(e) == 1);                           /* only "work" remains */
     CHECK(gptps_submit(e, "fast", NULL, 0, &h) == GPTPS_E_NOTFOUND);

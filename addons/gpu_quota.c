@@ -9,9 +9,10 @@
  * reserve corresponds to an admitted task that will emit exactly one run-end
  * event - so reserve/release stays balanced (install as the GPU constraint).
  *
- * The constraint sees (name, cost) but no handle; the observer sees (name,
- * handle) but no cost - so we learn name->units from the constraint and look it
- * up by name on release, assuming gpu_units is fixed per task type.
+ * Since v1.9 the constraint also sees the item handle + payload (see
+ * gptps_constraint_input), so a per-item handle->units map is now possible; this
+ * add-on keeps the simpler name->units table because gpu_units is fixed per task
+ * type here, and the observer release path still only carries (name, handle).
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
@@ -62,15 +63,15 @@ static uint64_t lookup(gptps_gpu_quota *q, const char *name)
     return 0;
 }
 
-static gptps_admit_decision gpu_gate(const char *name, const gptps_cost *cost,
+static gptps_admit_decision gpu_gate(const gptps_constraint_input *in,
                                      uint32_t *retry_after_ms, void *ud)
 {
     gptps_gpu_quota *q = (gptps_gpu_quota *)ud;
-    uint64_t need = cost ? cost->gpu_units : 0;
+    uint64_t need = in->cost ? in->cost->gpu_units : 0;
     gptps_admit_decision dec;
     if (need == 0) return GPTPS_ADMIT;          /* non-GPU work isn't gated */
     apx_mutex_lock(&q->mu);
-    remember(q, name, need);
+    remember(q, in->task_name, need);
     if (q->reserved + need <= q->budget) {
         q->reserved += need;
         dec = GPTPS_ADMIT;

@@ -2,13 +2,16 @@
  * embedded.c - GPTPS on a single thread with a fixed memory pool.
  *
  * The "bare-metal shape": NO worker/dispatcher threads (GPTPS_RUN_MANUAL, driven
- * by gptps_step) and NO libc heap (gptps_set_allocator routes every core
- * allocation into a static arena). The only thing a real MCU/RTOS port adds is a
- * HAL backend (hal_<target>.c) for the mutex/clock/flag primitives.
+ * by gptps_step) and a static-arena allocator (gptps_set_allocator routes every
+ * CORE allocation into the arena instead of the libc heap). Built as a hosted
+ * program so CI can run it, it still links the stock POSIX HAL, whose own
+ * primitives (the per-item cancel flag, the mutex) use libc malloc - so this
+ * particular binary is not literally libc-heap-free. A real MCU/RTOS port swaps
+ * in a HAL backend (hal_<target>.c); for a genuinely no-libc-heap, no-pthread/dl
+ * build see the freestanding/ reference (stub HAL + static pool, -ffreestanding).
  *
- * Builds and runs as a normal hosted program so CI can exercise it; the arena
- * allocator below is a compact first-fit free list with coalescing - illustrative,
- * not optimized.
+ * The arena allocator below is a compact first-fit free list with coalescing -
+ * illustrative, not optimized.
  */
 #include "gptps.h"
 #include <stdio.h>

@@ -73,7 +73,7 @@ size_t          gptps_settings_remove_prefix(gptps_settings *r, const char *pref
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the
  * result, hard-kill on the deadline. Exit 0 => OK, non-zero => GPTPS_E_TASK. */
-gptps_status gptps_program_execute(const char *const *argv, const void *payload, size_t plen,
+gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s,
                                    void **out_result, size_t *out_len);
 
