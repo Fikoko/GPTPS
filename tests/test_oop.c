@@ -43,11 +43,14 @@ static gptps_status t_hang(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; for 
 #if defined(__linux__) /* RLIMIT_AS-enforced memory cap is Linux-only for now */
 static gptps_status t_bigmem(gptps_ctx *ctx, void *ud)
 {
+    /* 1 GiB: over the 512 MiB cap, and fits a 32-bit size_t (4 GiB would truncate
+     * to 0 there). Triggers an RLIMIT_AS denial or a cgroup OOM-kill on memset. */
+    size_t big = (size_t)1024 * 1024 * 1024;
     void *p;
     (void)ctx; (void)ud;
-    p = malloc(4ull * 1024 * 1024 * 1024); /* 4 GiB, well over the 512 MiB AS cap */
+    p = malloc(big);
     if (!p) return GPTPS_E_TASK;
-    memset(p, 1, 4ull * 1024 * 1024 * 1024);
+    memset(p, 1, big);
     free(p);
     return GPTPS_OK;
 }
