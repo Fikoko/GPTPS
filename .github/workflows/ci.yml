@@ -132,10 +132,15 @@ jobs:
           sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
           cmake -S . -B build-s390x -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-s390x.cmake"
           cmake --build build-s390x -j
-          # byte-order-sensitive subset; skip the fork/exec + TTY tests that are
-          # unreliable under qemu-user (their logic is covered on native runners).
+          # qemu-user needs the guest sysroot to find the s390x dynamic loader + libs
+          # (without this every test dies on '/lib/ld64.so.1: No such file').
+          export QEMU_LD_PREFIX=/usr/s390x-linux-gnu
+          # Run the byte-order-critical, qemu-safe subset: serialization (toml /
+          # journal-parser fuzz / settings) + core logic + the new features. Skip
+          # fork/exec/dlopen/TTY tests (flaky under user-mode emulation; covered on
+          # the native x86_64/arm64 runners).
           ctest --test-dir build-s390x --output-on-failure \
-            -E 'oop|program|wasm|tui|example_dashboard|example_program'
+            -R 'constraint|cancel|backpressure|submit_ex|foundation|engine|failure|toml|scheduler|deadletter|settings|taskmgmt|step|alloc|result|orch|fuzz'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
   # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL
