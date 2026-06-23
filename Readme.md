@@ -116,7 +116,9 @@ either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --
 | `gptps_open(path, &e)` / `gptps_open_ex(cfg, &e)` | create an engine (auto-tunes workers + memory budget) |
 | `gptps_register_task(e, &def)` | register a task type (in-process fn **or** external program) |
 | `gptps_set_task_priority(e, name, prio)` | set a task type's scheduling priority (higher runs first) |
-| `gptps_submit(e, name, payload, len, &handle)` | enqueue work |
+| `gptps_define_resource(e, name, budget)` · `gptps_set_task_resource_cost(e, name, res, n)` | declare a named admission budget (GPU/IO/seats/quota) and a task's per-item cost against it |
+| `gptps_submit(e, name, payload, len, &handle)` / `gptps_submit_ex(…, &opts, …)` | enqueue work (`_ex`: per-submit priority / policy / deadline) |
+| `gptps_cancel(e, handle)` | cancel one queued / in-flight item |
 | `gptps_task_count/get_info/exists(e, …)` | enumerate / introspect registered task types |
 | `gptps_set_task_enabled(e, name, on)` | pause / resume a task type (reversible) |
 | `gptps_clone_task(e, src, dst)` | duplicate a task type under a new name |

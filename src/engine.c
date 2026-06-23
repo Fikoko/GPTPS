@@ -73,6 +73,8 @@ typedef struct gptps_item {
     gptps_status          outcome;   /* effective status of the last attempt */
     int                   cancelled; /* gptps_cancel(handle) requested: never retry/dead-letter */
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
+    uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed at item_free */
+    size_t                res_n;
     struct gptps_item    *next;
 } gptps_item;
 
@@ -94,6 +96,7 @@ typedef struct gptps_reg {
     bool               removed;    /* true => tombstoned, draining toward removal */
     bool               cancelling; /* true => removal is CANCEL: drop in-flight items rather than dead-letter */
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
+    uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
     struct gptps_reg  *next;
 } gptps_reg;
@@ -157,6 +160,14 @@ typedef struct {
 static void ev_set_name(char *dst, const char *src)
 { snprintf(dst, GPTPS_EV_NAME_MAX, "%s", src ? src : "?"); }
 
+/* A generic named admission resource: a total budget and the amount currently
+ * reserved by in-flight items (DISPATCHER-only, like reserved_mem). */
+typedef struct {
+    char    *name;       /* owned */
+    uint64_t budget;
+    uint64_t reserved;   /* DISPATCHER-ONLY */
+} gptps_resource;
+
 struct gptps {
     gptps_limits   limits;
     gptps_reg     *registry;
@@ -176,6 +187,9 @@ struct gptps {
 
     uint64_t       reserved_mem;   /* DISPATCHER-ONLY */
     uint32_t       running;        /* DISPATCHER-ONLY */
+
+    gptps_resource *resources;     /* generic named admission budgets (gptps_define_resource) */
+    size_t          nres, rescap;
 
     gptps_thread  *dispatcher;
     gptps_thread **workers;
@@ -259,6 +273,7 @@ static void item_free(gptps_item *it)
     if (it->cancel) gptps_flag_destroy(it->cancel);
     gptps_free(it->payload);
     gptps_free(it->name_owned);
+    gptps_free(it->res_reserved);
     gptps_free(it);
 }
 
@@ -527,6 +542,18 @@ static gptps_admit_decision run_constraints(gptps *e, gptps_item *it, uint32_t *
  * and admit within budget. Lock held on entry & exit. Fills pend[0..*out_npend)
  * (cap GPTPS_PENDING_CAP) for the caller to emit with the lock RELEASED; sets
  * *out_next_wake to the nearest deadline/backoff (0 = none). Never sleeps/emits. */
+/* Does this item's named-resource cost still fit every resource's budget?
+ * (Memory is checked separately.) DISPATCHER context, e->m held. */
+static int res_fits(const gptps *e, const gptps_item *it)
+{
+    size_t i;
+    const uint64_t *cost = (it->reg ? it->reg->res_cost : NULL);
+    if (!e->nres || !cost) return 1;
+    for (i = 0; i < e->nres; ++i)
+        if (cost[i] && e->resources[i].reserved + cost[i] > e->resources[i].budget) return 0;
+    return 1;
+}
+
 static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64_t *out_next_wake)
 {
     uint64_t now = gptps_hal_monotonic_ms();
@@ -538,6 +565,11 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
         while ((it = fifo_pop(&e->done)) != NULL) {
             e->reserved_mem -= it->cost.mem_bytes;
             e->running      -= 1;
+            if (it->res_reserved) {                          /* release named-resource reservations */
+                size_t ri;
+                for (ri = 0; ri < it->res_n && ri < e->nres; ++ri)
+                    e->resources[ri].reserved -= it->res_reserved[ri];
+            }
 
             if (it->outcome == GPTPS_OK) {
                 item_free(it);
@@ -675,6 +707,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
             for (cur = e->intake.head; cur; cur = cur->next) {
                 if (!top || cur->priority > top->priority) top = cur;
                 if (e->reserved_mem + cur->cost.mem_bytes <= e->limits.max_memory_bytes &&
+                    res_fits(e, cur) &&
                     (!best || cur->priority > best->priority))
                     best = cur;
             }
@@ -709,6 +742,16 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
             fifo_remove(&e->intake, best);
             e->reserved_mem += best->cost.mem_bytes;
             e->running      += 1;
+            if (e->nres && best->reg && best->reg->res_cost) {   /* reserve named resources + snapshot for release */
+                best->res_reserved = (uint64_t *)gptps_malloc(e->nres * sizeof(uint64_t));
+                if (best->res_reserved) {
+                    size_t ri; best->res_n = e->nres;
+                    for (ri = 0; ri < e->nres; ++ri) {
+                        best->res_reserved[ri] = best->reg->res_cost[ri];
+                        e->resources[ri].reserved += best->reg->res_cost[ri];
+                    }
+                }
+            }
             fifo_push(&e->ready, best);
             gptps_cond_signal(e->cv_work);
         }
@@ -1253,6 +1296,15 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
         return GPTPS_E_NOMEM;
     }
     strcpy(name, def->name);
+    if (e->nres) {                            /* per-item cost vector for the defined resources */
+        r->res_cost = (uint64_t *)gptps_calloc(e->nres, sizeof(uint64_t));
+        if (!r->res_cost) {
+            gptps_free(r); gptps_free(name);
+            if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
+            gptps_mutex_unlock(e->m);
+            return GPTPS_E_NOMEM;
+        }
+    }
 
     r->def = *def;
     r->name = name;
@@ -1284,6 +1336,82 @@ gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priori
     if (r) r->priority = (int32_t)priority;   /* applies to subsequently-submitted items */
     gptps_mutex_unlock(e->m);
     return r ? GPTPS_OK : GPTPS_E_NOTFOUND;
+}
+
+/* ---- named resource budgets (generic admission limits) ---- */
+gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
+{
+    size_t i, oldn;
+    gptps_reg *r;
+    char *nm;
+    if (!e || !name || !*name) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
+    for (i = 0; i < e->nres; ++i)                       /* existing => just re-budget */
+        if (strcmp(e->resources[i].name, name) == 0) {
+            e->resources[i].budget = budget;
+            gptps_mutex_unlock(e->m);
+            return GPTPS_OK;
+        }
+    if (e->nres == e->rescap) {
+        size_t nc = e->rescap ? e->rescap * 2 : 4;
+        gptps_resource *nr = (gptps_resource *)gptps_realloc(e->resources, nc * sizeof *nr);
+        if (!nr) { gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+        e->resources = nr; e->rescap = nc;
+    }
+    nm = (char *)gptps_malloc(strlen(name) + 1);
+    if (!nm) { gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+    strcpy(nm, name);
+    /* grow every task's per-resource cost vector by one (zeroed) slot */
+    oldn = e->nres;
+    for (r = e->registry; r; r = r->next) {
+        uint64_t *nc2 = (uint64_t *)gptps_realloc(r->res_cost, (oldn + 1) * sizeof(uint64_t));
+        if (!nc2) { gptps_free(nm); gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+        nc2[oldn] = 0;
+        r->res_cost = nc2;
+    }
+    e->resources[e->nres].name = nm;
+    e->resources[e->nres].budget = budget;
+    e->resources[e->nres].reserved = 0;
+    e->nres += 1;
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_set_task_resource_cost(gptps *e, const char *task_name,
+                                          const char *resource, uint64_t amount)
+{
+    size_t i;
+    gptps_reg *r;
+    if (!e || !task_name || !resource) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    r = registry_find(e, task_name);
+    if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+    for (i = 0; i < e->nres; ++i)
+        if (strcmp(e->resources[i].name, resource) == 0) {
+            if (r->res_cost) r->res_cost[i] = amount;
+            gptps_mutex_unlock(e->m);
+            return GPTPS_OK;
+        }
+    gptps_mutex_unlock(e->m);
+    return GPTPS_E_NOTFOUND;                            /* unknown resource */
+}
+
+gptps_status gptps_resource_usage(gptps *e, const char *name,
+                                  uint64_t *out_reserved, uint64_t *out_budget)
+{
+    size_t i;
+    if (!e || !name) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    for (i = 0; i < e->nres; ++i)
+        if (strcmp(e->resources[i].name, name) == 0) {
+            if (out_reserved) *out_reserved = e->resources[i].reserved;
+            if (out_budget)   *out_budget   = e->resources[i].budget;
+            gptps_mutex_unlock(e->m);
+            return GPTPS_OK;
+        }
+    gptps_mutex_unlock(e->m);
+    return GPTPS_E_NOTFOUND;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1352,6 +1480,7 @@ static void reg_destroy(gptps_reg *r)
     gptps_task_local *L = r->locals;
     while (L) { gptps_task_local *n = L->next; gptps_free(L); L = n; }
     if (r->argv_copy) { char **a = r->argv_copy; while (*a) gptps_free(*a++); gptps_free(r->argv_copy); }
+    gptps_free(r->res_cost);
     gptps_free(r->name);
     gptps_free(r);
 }
@@ -1714,7 +1843,10 @@ static const gptps_api_routines G_API = {
     gptps_define_task_setting,
     gptps_cancel,
     gptps_unregister_constraint,
-    gptps_unregister_observer
+    gptps_unregister_observer,
+    gptps_define_resource,
+    gptps_set_task_resource_cost,
+    gptps_resource_usage
 };
 
 gptps_status gptps_load_addon(gptps *e, const char *path)
@@ -1790,6 +1922,11 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     if (cost.mem_bytes > e->limits.max_memory_bytes) {
         gptps_mutex_unlock(e->m);
         return GPTPS_E_BUDGET; /* never-fits: reject at submit */
+    }
+    if (e->nres && r->res_cost) {           /* a resource cost that can never fit its budget */
+        size_t ri;
+        for (ri = 0; ri < e->nres; ++ri)
+            if (r->res_cost[ri] > e->resources[ri].budget) { gptps_mutex_unlock(e->m); return GPTPS_E_BUDGET; }
     }
     /* backpressure: bound the intake queue so an overproducing client cannot grow
      * it without limit (max_memory_bytes bounds only the RUNNING set). 0 = off. */
@@ -2152,6 +2289,7 @@ gptps_status gptps_shutdown(gptps *e)
     { gptps_owned_setting *o = e->owned_settings; while (o) { gptps_owned_setting *n = o->next; free_choices(o->choices); gptps_free(o->key); gptps_free(o); o = n; } }
     { gptps_task_schema *s = e->task_schemas; while (s) { gptps_task_schema *n = s->next; free_choices(s->choices); gptps_free(s->leaf); gptps_free(s->defval); gptps_free(s); s = n; } }
     gptps_settings_destroy(e->settings);  /* entries reference e / regs, which are freed above/after; destroy only frees the schema list */
+    { size_t i; for (i = 0; i < e->nres; ++i) gptps_free(e->resources[i].name); gptps_free(e->resources); }
     gptps_toml_free(e->toml);
     gptps_free(e->config_path);
 

@@ -110,6 +110,14 @@ target_link_libraries(test_submit_ex PRIVATE gptps)
 add_test(NAME submit_ex COMMAND test_submit_ex)
 set_tests_properties(submit_ex PROPERTIES TIMEOUT 30)
 
+add_executable(test_resource tests/test_resource.c)
+target_include_directories(test_resource
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_resource PRIVATE gptps)
+add_test(NAME resource COMMAND test_resource)
+set_tests_properties(resource PROPERTIES TIMEOUT 30)
+
 add_executable(test_foundation tests/test_foundation.c)
 target_include_directories(test_foundation
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

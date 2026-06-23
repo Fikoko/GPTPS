@@ -6,6 +6,19 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — ABI 1.10: generic named-resource budgets
+- **`gptps_define_resource(e, name, budget)`** declares an arbitrary named,
+  budgeted admission resource (GPUs, I/O bandwidth, license seats, a per-tenant
+  quota — anything). **`gptps_set_task_resource_cost(e, task, resource, amount)`**
+  declares a task type's per-item cost against it, and **`gptps_resource_usage`**
+  introspects budget vs. reserved. The dispatcher admits an item only while every
+  resource it costs still fits, reserving on admit and releasing on terminal —
+  generalizing admission beyond the dedicated memory budget. An item whose cost
+  exceeds a whole budget is rejected at submit with `GPTPS_E_BUDGET`. This makes
+  the cost/admission side as generic as the settings registry; "gpu" is now just a
+  named resource (the `gpu_units` field and gpu_quota add-on remain for back-compat).
+  All three are also on the host-table ABI for add-ons.
+
 ### Added — ABI 1.9: modularity & portability gap-closure
 - **Per-item constraint context.** The constraint/admission hook now receives a
   `gptps_constraint_input` (task name, cost, **item handle**, and **payload**)

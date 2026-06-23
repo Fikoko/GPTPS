@@ -59,7 +59,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 9u  /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel) */
+#define GPTPS_ABI_VERSION_MINOR 10u /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel), bounded intake (max_intake_depth/E_FULL), submit_ex overrides, unregister constraint/observer, log sink, child_setup, EV_DROPPED; v1.10: generic named-resource budgets (define_resource/set_task_resource_cost/resource_usage) */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -323,6 +323,33 @@ GPTPS_API gptps_status gptps_register_task(gptps *e, const gptps_task_def *def);
  * from starving. Applies to tasks submitted AFTER this call; also settable per
  * task in the config file ([task_defaults] / [tasks.<name>] `priority`). */
 GPTPS_API gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priority);
+
+/* ============================================================================
+ * NAMED RESOURCE BUDGETS (generic admission limits)
+ *
+ * Declare arbitrary named resources with a total budget (GPUs, I/O bandwidth,
+ * license seats, a per-tenant quota - anything). A task type declares how much of
+ * each resource one of its items costs; the dispatcher then admits an item only
+ * when EVERY resource it costs still fits its budget, reserving on admit and
+ * releasing when the item reaches a terminal state. This generalizes admission
+ * beyond the dedicated memory budget (limits.max_memory_bytes), which stays its
+ * own dimension (it is wired to OS enforcement + auto-tune). Costs are per task
+ * TYPE; an item that costs more of a resource than its whole budget is rejected
+ * at submit with GPTPS_E_BUDGET. Setup-time calls (define before submitting work).
+ * ==========================================================================*/
+
+/* Declare (or, if it already exists, re-budget) a named resource. */
+GPTPS_API gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget);
+
+/* Set a task type's per-item cost against a named resource (0 = no cost). The
+ * resource must already be defined; GPTPS_E_NOTFOUND for an unknown task/resource. */
+GPTPS_API gptps_status gptps_set_task_resource_cost(gptps *e, const char *task_name,
+                                                    const char *resource, uint64_t amount);
+
+/* Introspect a resource: *out_reserved (currently in flight) and *out_budget
+ * (either may be NULL). GPTPS_E_NOTFOUND if the name is not defined. */
+GPTPS_API gptps_status gptps_resource_usage(gptps *e, const char *name,
+                                            uint64_t *out_reserved, uint64_t *out_budget);
 
 /* ============================================================================
  * TASK MANAGEMENT (enumerate / enable / clone / unregister)
@@ -716,6 +743,10 @@ typedef struct {
     gptps_status (*cancel)(gptps *e, gptps_handle h);
     gptps_status (*unregister_constraint)(gptps *e, gptps_constraint_fn fn, void *user_data);
     gptps_status (*unregister_observer)(gptps *e, gptps_event_cb fn, void *user_data);
+    /* --- v1.10 routines (append-only); guard with `struct_size` before calling --- */
+    gptps_status (*define_resource)(gptps *e, const char *name, uint64_t budget);
+    gptps_status (*set_task_resource_cost)(gptps *e, const char *task_name, const char *resource, uint64_t amount);
+    gptps_status (*resource_usage)(gptps *e, const char *name, uint64_t *out_reserved, uint64_t *out_budget);
 } gptps_api_routines;
 
 typedef struct {
