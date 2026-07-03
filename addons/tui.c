@@ -99,6 +99,7 @@ struct gptps_tui {
     struct termios   saved_termios;
 #else
     DWORD            saved_out_mode; int modes_saved;
+    UINT             saved_cp;      /* console output codepage to restore (0 = none saved) */
 #endif
 };
 
@@ -905,10 +906,18 @@ static void term_enable(gptps_tui *t)
     HANDLE ho = GetStdHandle(STD_OUTPUT_HANDLE); DWORD m;
     if (GetConsoleMode(ho, &m)) { t->saved_out_mode = m; t->modes_saved = 1;
         SetConsoleMode(ho, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING); }
+    /* Our frames are UTF-8 bytes; put the console in UTF-8 so box-drawing and
+     * other glyphs render (a legacy OEM codepage - e.g. CP857 - shows mojibake).
+     * Save the old codepage and restore it in term_restore. If UTF-8 can't be
+     * established, demote the frame set to pure ASCII. */
+    t->saved_cp = GetConsoleOutputCP();
+    if (!SetConsoleOutputCP(CP_UTF8)) t->cfg.unicode = 0;
     t->raw_active = 1;
 }
 static void term_restore(gptps_tui *t)
-{ if (t->modes_saved) { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), t->saved_out_mode); t->modes_saved = 0; } t->raw_active = 0; }
+{ if (t->modes_saved) { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), t->saved_out_mode); t->modes_saved = 0; }
+  if (t->saved_cp) { SetConsoleOutputCP(t->saved_cp); t->saved_cp = 0; }
+  t->raw_active = 0; }
 static int term_poll_key(int ms)
 {
     int waited = 0;
