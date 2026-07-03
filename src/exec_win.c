@@ -22,10 +22,10 @@
 #define GPTPS_WIN_RESULT_CAP   (16u * 1024u * 1024u)        /* max captured stdout */
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s,
+                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                void **out_result, size_t *out_len)
 {
-    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s;
+    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel;
     *out_result = NULL; *out_len = 0;
     return GPTPS_E_INVAL; /* fork-based isolation is POSIX-only */
 }
@@ -93,7 +93,7 @@ static DWORD WINAPI reader_proc(LPVOID p)
 }
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s,
+                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                    void **out_result, size_t *out_len)
 {
     const char *const *argv = def ? def->argv : NULL;
@@ -104,7 +104,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     writer_ctx wc;
     reader_ctx rc;
     char *cmd;
-    DWORD code = 1, tmo, waited;
+    DWORD code = 1, waited;
     int killed = 0, assigned = 0;
     gptps_status eff;
 
@@ -163,11 +163,29 @@ return GPTPS_E_NOMEM; }
     if (!wt) CloseHandle(inW);                 /* no writer => close stdin so the child sees EOF */
     rt = CreateThread(NULL, 0, reader_proc, &rc, 0, NULL);
 
-    tmo = (timeout_s == 0) ? INFINITE : (timeout_s > 2000000u ? INFINITE : timeout_s * 1000u);
-    waited = WaitForSingleObject(pi.hProcess, tmo);
-    if (waited == WAIT_TIMEOUT) {
-        killed = 1;
-        if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
+    /* Wait for the child in bounded slices so a raised cancel flag (gptps_cancel /
+     * shutdown / task removal) OR the deadline hard-kills it - including when
+     * timeout_s==0 (no deadline), which otherwise waited forever and could not be
+     * cancelled. The writer/reader threads run concurrently, so there is no stdin/
+     * stdout deadlock to solve here (unlike the POSIX single-thread pump). */
+    {
+        uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
+        for (;;) {
+            DWORD slice = 200;
+            if (deadline) {
+                uint64_t now = gptps_hal_monotonic_ms();
+                if (now >= deadline) { killed = 1; break; }
+                if (deadline - now < (uint64_t)slice) slice = (DWORD)(deadline - now);
+            }
+            waited = WaitForSingleObject(pi.hProcess, slice);
+            if (waited == WAIT_OBJECT_0) break;                       /* child exited */
+            if (cancel && gptps_flag_get(cancel)) { killed = 1; break; } /* cancelled */
+            if (waited == WAIT_FAILED) { killed = 1; break; }        /* defensive: never spin */
+            /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
+        }
+        if (killed) {
+            if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
+        }
     }
     WaitForSingleObject(pi.hProcess, INFINITE); /* fully gone => its stdout closes => reader ends */
     if (wt) { WaitForSingleObject(wt, INFINITE); CloseHandle(wt); }

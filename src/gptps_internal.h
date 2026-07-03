@@ -6,6 +6,7 @@
 #define GPTPS_INTERNAL_H
 
 #include "gptps.h"
+#include "gptps_hal.h"   /* gptps_flag (executor cancel), gptps_hal_monotonic_ms */
 
 #include <stddef.h>   /* offsetof */
 
@@ -71,10 +72,12 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
  * path cannot provide. The memory cap is accurate cgroup v2 (memory.max +
  * swap.max=0, exceeding it => GPTPS_E_NOMEM) when GPTPS_CGROUP_PARENT names a
  * memory-delegated cgroup; otherwise a coarse RLIMIT_AS fallback. mem_cap==0 or
- * below a floor => no cap; timeout_s==0 => no timeout (a hanging task with no
- * timeout will block its worker). */
+ * below a floor => no cap. `cancel` (may be NULL) is the running item's cooperative
+ * cancel flag: the parent waits in bounded slices and hard-kills the child when it is
+ * raised (returns GPTPS_E_TIMEOUT), so a cancel / shutdown / task-removal stops even a
+ * no-timeout (timeout_s==0) child instead of blocking its worker forever. */
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s,
+                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                void **out_result, size_t *out_len);
 
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
@@ -107,9 +110,13 @@ size_t          gptps_settings_remove_prefix(gptps_settings *r, const char *pref
 
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the
- * result, hard-kill on the deadline. Exit 0 => OK, non-zero => GPTPS_E_TASK. */
+ * result, hard-kill on the deadline. Exit 0 => OK, non-zero => GPTPS_E_TASK. The
+ * parent pumps stdin and stdout CONCURRENTLY (a single poll loop), so a large
+ * payload through a streaming child does not deadlock. `cancel` (may be NULL) is
+ * the item's cooperative cancel flag - the pump kills the child when it is raised,
+ * so a no-timeout program can still be cancelled / shut down (returns E_TIMEOUT). */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s,
+                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                    void **out_result, size_t *out_len);
 
 #endif /* GPTPS_INTERNAL_H */

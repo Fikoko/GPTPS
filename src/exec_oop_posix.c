@@ -88,13 +88,13 @@ static unsigned cgroup_seq(void)
 
 static int cg_write_file(const char *dir, const char *file, const char *val)
 {
-    size_t n = strlen(dir) + strlen(file) + 2;
-    char *path = (char *)gptps_malloc(n);
+    char path[512];   /* stack, not malloc: cgroup_self_join() calls this in the CHILD
+                       * between fork and work/exec, where allocating in a threaded
+                       * process can deadlock. Cgroup paths are short; bail if not. */
     int fd; ssize_t w;
-    if (!path) return -1;
-    snprintf(path, n, "%s/%s", dir, file);
+    if (strlen(dir) + 1 + strlen(file) + 1 > sizeof path) return -1;
+    snprintf(path, sizeof path, "%s/%s", dir, file);
     fd = open(path, O_WRONLY);
-    gptps_free(path);
     if (fd < 0) return -1;
     w = write(fd, val, strlen(val));
     close(fd);
@@ -179,7 +179,7 @@ static int read_all(int fd, void *buf, size_t n)
 }
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s,
+                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                void **out_result, size_t *out_len)
 {
     int p[2];
@@ -236,15 +236,29 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         uint64_t len64 = 0;
         void *res = NULL;
         gptps_status eff;
-        int tmo;
+        uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
 
         close(p[1]);
-        tmo = (timeout_s == 0) ? -1
-            : (timeout_s > 2000000u ? -1 : (int)(timeout_s * 1000u));
-
         pfd.fd = p[0]; pfd.events = POLLIN; pfd.revents = 0;
-        do { pr = poll(&pfd, 1, tmo); } while (pr < 0 && errno == EINTR);
-        if (pr == 0) { kill(pid, SIGKILL); killed = 1; }      /* deadline -> hard kill */
+
+        /* Wait for the child's result in bounded slices so a raised cancel flag (a
+         * gptps_cancel / shutdown / task removal) OR the deadline hard-kills the child
+         * instead of blocking this worker forever - including when timeout_s==0. */
+        for (;;) {
+            int slice = 200;
+            if (deadline) {
+                uint64_t now = gptps_hal_monotonic_ms();
+                if (now >= deadline) { kill(pid, SIGKILL); killed = 1; break; }    /* deadline */
+                if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
+            }
+            pr = poll(&pfd, 1, slice);
+            if (cancel && gptps_flag_get(cancel)) { kill(pid, SIGKILL); killed = 1; break; } /* cancelled */
+            /* a genuine poll error must kill (killed=1 skips the blocking read_all below,
+             * which would otherwise hang this worker on a still-live child). */
+            if (pr < 0) { if (errno == EINTR) continue; kill(pid, SIGKILL); killed = 1; break; }
+            if (pr == 0) continue;                            /* slice elapsed: re-check */
+            break;                                            /* readable: read the record */
+        }
 
         if (!killed) {
             if (read_all(p[0], &st32, sizeof st32) == 0 &&
@@ -284,7 +298,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #define GPTPS_PROG_RESULT_CAP (16u * 1024u * 1024u) /* max captured stdout */
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s,
+                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                    void **out_result, size_t *out_len)
 {
     const char *const *argv = def ? def->argv : NULL;
@@ -340,39 +354,75 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         _exit(127); /* exec failed */
     }
 
-    /* ---- PARENT: feed payload to stdin, read stdout up to the deadline ---- */
+    /* ---- PARENT: pump payload->stdin and stdout->buf CONCURRENTLY, up to the
+     * deadline / until cancelled. A single poll loop over both pipes is what avoids
+     * the deadlock the old "write all of stdin, THEN read stdout" had: a streaming
+     * child that emits output while still reading a large input would fill its stdout
+     * pipe (parent not yet reading) while the parent blocked filling its stdin pipe. */
     {
         gptps_status eff = GPTPS_OK;
         int killed = 0, oversize = 0, nomem = 0, wstatus = 0;
         char *buf = NULL; size_t cap = 0, len = 0;
-        int tmo = (timeout_s == 0) ? -1 : (timeout_s > 2000000u ? -1 : (int)(timeout_s * 1000u));
+        const char *wp = (const char *)payload;   /* unwritten payload cursor */
+        size_t wleft = plen;
+        int in_open = 1;                           /* inp[1] still open for writing */
+        uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
 
         close(inp[0]); close(outp[1]);
-        setpgid(pid, pid);                        /* idempotent with the child: race-free group setup */
-        signal(SIGPIPE, SIG_IGN);                 /* program may exit before reading all stdin */
-        if (plen) (void)write_all(inp[1], payload, plen);
-        close(inp[1]);                            /* EOF on the child's stdin */
+        setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
+        signal(SIGPIPE, SIG_IGN);                  /* a closed-stdin write must EPIPE, not kill us */
+        /* non-blocking stdin so a POLLOUT-guarded write never stalls the read side */
+        (void)fcntl(inp[1], F_SETFL, fcntl(inp[1], F_GETFL) | O_NONBLOCK);
+        if (!wleft) { close(inp[1]); in_open = 0; } /* no payload: EOF the child's stdin now */
 
         for (;;) {
-            struct pollfd pfd; int pr; ssize_t r;
-            pfd.fd = outp[0]; pfd.events = POLLIN; pfd.revents = 0;
-            pr = poll(&pfd, 1, tmo);
-            if (pr < 0) { if (errno == EINTR) continue; break; }
-            if (pr == 0) { killed = 1; kill(-pid, SIGKILL); break; }   /* idle past deadline: kill the group */
-            if (len == cap) {
-                size_t ncap = cap ? cap * 2 : 65536;
-                char *nb;
-                if (ncap > GPTPS_PROG_RESULT_CAP) ncap = GPTPS_PROG_RESULT_CAP;
-                if (ncap == cap) { oversize = 1; kill(pid, SIGKILL); break; } /* >16 MiB */
-                nb = (char *)gptps_realloc(buf, ncap);
-                if (!nb) { nomem = 1; kill(pid, SIGKILL); break; }
-                buf = nb; cap = ncap;
+            struct pollfd pfd[2]; int nfd = 0, oidx, iidx = -1, pr; int slice = 200;
+
+            oidx = nfd; pfd[nfd].fd = outp[0]; pfd[nfd].events = POLLIN;  pfd[nfd].revents = 0; nfd++;
+            if (in_open) { iidx = nfd; pfd[nfd].fd = inp[1]; pfd[nfd].events = POLLOUT; pfd[nfd].revents = 0; nfd++; }
+
+            if (deadline) {
+                uint64_t now = gptps_hal_monotonic_ms();
+                if (now >= deadline) { killed = 1; kill(-pid, SIGKILL); break; }
+                if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
-            r = read(outp[0], buf + len, cap - len);
-            if (r < 0) { if (errno == EINTR) continue; break; }
-            if (r == 0) break;                    /* EOF: child closed stdout */
-            len += (size_t)r;
+            pr = poll(pfd, (nfds_t)nfd, slice);
+            if (cancel && gptps_flag_get(cancel)) { killed = 1; kill(-pid, SIGKILL); break; }
+            /* a genuine poll error (e.g. ENOMEM) must still kill the child, or the
+             * blocking waitpid below would hang this worker on a still-live child -
+             * the very thing this executor promises never to do. */
+            if (pr < 0) { if (errno == EINTR) continue; kill(-pid, SIGKILL); break; }
+            if (pr == 0) continue;                 /* slice elapsed: re-check deadline/cancel */
+
+            /* drain stdout */
+            if (pfd[oidx].revents & (POLLIN | POLLHUP | POLLERR)) {
+                ssize_t r;
+                if (len == cap) {
+                    size_t ncap = cap ? cap * 2 : 65536;
+                    char *nb;
+                    if (ncap > GPTPS_PROG_RESULT_CAP) ncap = GPTPS_PROG_RESULT_CAP;
+                    if (ncap == cap) { oversize = 1; kill(-pid, SIGKILL); break; } /* >16 MiB */
+                    nb = (char *)gptps_realloc(buf, ncap);
+                    if (!nb) { nomem = 1; kill(-pid, SIGKILL); break; }
+                    buf = nb; cap = ncap;
+                }
+                r = read(outp[0], buf + len, cap - len);
+                if (r > 0) len += (size_t)r;
+                else if (r == 0) break;            /* stdout EOF: child is done */
+                else if (errno != EINTR && errno != EAGAIN) { kill(-pid, SIGKILL); break; } /* I/O error: kill so waitpid can't hang */
+            }
+            /* feed stdin */
+            if (in_open && (pfd[iidx].revents & (POLLOUT | POLLERR | POLLHUP))) {
+                if (pfd[iidx].revents & (POLLERR | POLLHUP)) {   /* child closed its stdin */
+                    close(inp[1]); in_open = 0;
+                } else {
+                    ssize_t w = write(inp[1], wp, wleft);
+                    if (w > 0) { wp += w; wleft -= (size_t)w; if (!wleft) { close(inp[1]); in_open = 0; } }
+                    else if (w < 0 && errno != EINTR && errno != EAGAIN) { close(inp[1]); in_open = 0; }
+                }
+            }
         }
+        if (in_open) close(inp[1]);
         close(outp[0]);
         while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { }
 

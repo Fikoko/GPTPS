@@ -210,6 +210,13 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * only, THREADED mode only (a service's infinite loop cannot be run to completion
  * by the MANUAL gptps_step pump), and no timeout_seconds. */
 #define GPTPS_TASK_SERVICE 0x1u
+/* RETIRE_ON_OK (services only; ignored otherwise): by default a service is
+ * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a
+ * clean GPTPS_OK return. Set this to instead RESTART ONLY ON FAILURE: a run() that
+ * returns GPTPS_OK (uncancelled) terminally retires that instance (its handle
+ * becomes unknown), while a non-OK return still restarts it. This is the
+ * "Restart=on-failure" semantic; the default is "Restart=always". */
+#define GPTPS_TASK_RETIRE_ON_OK 0x2u
 
 typedef struct {
     size_t                struct_size;   /* = sizeof(gptps_task_def) */

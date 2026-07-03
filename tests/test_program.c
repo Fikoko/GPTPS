@@ -32,6 +32,30 @@ static void on_ev(const gptps_event *ev, void *ud)
     }
 }
 
+/* ---- large-payload / cancel regression harness (cases E/F/G) --------------- *
+ * Results here are far bigger than g_result, so track length + a rolling checksum
+ * and a STARTED count instead of copying the bytes. */
+#define BIG_LEN (256u * 1024u)   /* > any pipe buffer, so the old "write all stdin
+                                  * then read stdout" path would deadlock */
+static unsigned char   g_big[BIG_LEN];
+static int             g_started, g_big_finished, g_big_timeout;
+static unsigned long   g_big_sum; static size_t g_big_len;
+static unsigned long   sum_bytes(const unsigned char *p, size_t n)
+{ unsigned long s = 1469598103u; size_t i; for (i = 0; i < n; ++i) s = (s ^ p[i]) * 16777619u; return s; }
+static void reset_big(void) { g_started = g_big_finished = g_big_timeout = 0; g_big_sum = 0; g_big_len = 0; }
+static void on_ev_big(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_STARTED) inc(&g_started);
+    else if (ev->kind == GPTPS_EV_FINISHED) {
+        __atomic_store_n(&g_big_len, ev->result_len, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_big_sum, sum_bytes((const unsigned char *)ev->result, ev->result_len), __ATOMIC_SEQ_CST);
+        inc(&g_big_finished);
+    } else if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_TIMEOUT) inc(&g_big_timeout);
+}
+static void fill_big(void) { size_t i; for (i = 0; i < BIG_LEN; ++i) g_big[i] = (unsigned char)((i * 1103515245u + 12345u) >> 16); }
+static int wait_started(unsigned ms) { uint64_t s = gptps_now_ms(NULL); while (get(&g_started) < 1 && gptps_now_ms(NULL) - s < ms) { } return get(&g_started) >= 1; }
+
 static gptps *open_prog(const char *name, const char *const *argv, unsigned timeout_s)
 {
     gptps *e = NULL;
@@ -55,6 +79,7 @@ int main(void)
     static const char *upper[] = { "/bin/sh", "-c", "tr a-z A-Z", (const char *)0 };
     static const char *fail[]  = { "/bin/sh", "-c", "exit 7", (const char *)0 };
     static const char *hang[]  = { "/bin/sh", "-c", "sleep 10", (const char *)0 };
+    static const char *inf[]   = { "/bin/sh", "-c", "sleep 100000", (const char *)0 };
 
     /* register-time validation: PROGRAM needs an argv */
     {
@@ -97,6 +122,38 @@ int main(void)
     gptps_shutdown(e);
     CHECK(get(&g_timeout) >= 1);
     CHECK(get(&g_finished) == 0);
+
+    /* E) large streaming round-trip through `cat`: the deadlock regression - a
+     * >pipe-buffer payload through a child that emits as it reads. Must complete
+     * with every byte echoed back (checksum), not hang. */
+    reset_big(); fill_big();
+    e = open_prog("bigcat", echo, 10); CHECK(e);
+    gptps_set_event_cb(e, on_ev_big, NULL);
+    CHECK(gptps_submit(e, "bigcat", g_big, BIG_LEN, &h) == GPTPS_OK);
+    gptps_shutdown(e);
+    CHECK(get(&g_big_finished) == 1);
+    CHECK(g_big_len == BIG_LEN);
+    CHECK(g_big_sum == sum_bytes(g_big, BIG_LEN));
+
+    /* F) large payload to a child that never reads stdin (`sleep`): the old code
+     * blocked forever writing stdin BEFORE it ever enforced the deadline. Must
+     * time out, not hang. */
+    reset_big(); fill_big();
+    e = open_prog("bighang", hang, 1); CHECK(e);
+    gptps_set_event_cb(e, on_ev_big, NULL);
+    CHECK(gptps_submit(e, "bighang", g_big, BIG_LEN, &h) == GPTPS_OK);
+    gptps_shutdown(e);
+    CHECK(get(&g_big_timeout) >= 1);
+
+    /* G) cancel a NO-timeout program mid-flight: without cancel plumbing the parent
+     * waited forever (poll timeout -1) and shutdown could never return. */
+    reset_big();
+    e = open_prog("nocancel", inf, 0); CHECK(e);   /* timeout 0 => no deadline */
+    gptps_set_event_cb(e, on_ev_big, NULL);
+    CHECK(gptps_submit(e, "nocancel", NULL, 0, &h) == GPTPS_OK);
+    CHECK(wait_started(3000));
+    CHECK(gptps_cancel(e, h) == GPTPS_OK);
+    gptps_shutdown(e);                             /* returns => the cancel killed the child */
 
     if (fails) { printf("%d program check(s) FAILED\n", fails); return 1; }
     printf("all program-executor checks passed\n");

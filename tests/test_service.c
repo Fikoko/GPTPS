@@ -56,6 +56,9 @@ static gptps_status svc_ok_then_block(gptps_ctx *c, void *u)
     return GPTPS_OK;
 }
 
+/* A service that returns GPTPS_OK immediately (a clean, uncancelled exit). */
+static gptps_status svc_ok_immediate(gptps_ctx *c, void *u) { (void)c; (void)u; inc(&g_runs); return GPTPS_OK; }
+
 /* A plain one-shot task, for the negative/registration tests. */
 static gptps_status one_shot(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 
@@ -69,17 +72,21 @@ static gptps_status open_threaded(gptps **out, uint32_t conc)
     return gptps_open_ex(&cfg, out);
 }
 
-/* register a service (INPROC, no timeout, backoff seconds as given) */
-static gptps_status reg_service(gptps *e, const char *name, gptps_run_fn fn, uint32_t backoff_s)
+/* register a service (INPROC, no timeout, backoff seconds as given), OR-ing any
+ * extra GPTPS_TASK_* flags (e.g. GPTPS_TASK_RETIRE_ON_OK) onto GPTPS_TASK_SERVICE */
+static gptps_status reg_service_ex(gptps *e, const char *name, gptps_run_fn fn,
+                                   uint32_t backoff_s, uint64_t extra_flags)
 {
     gptps_task_def d; memset(&d, 0, sizeof d);
     d.struct_size = sizeof d; d.name = name; d.run = fn; d.exec = GPTPS_EXEC_INPROC;
-    d.flags = GPTPS_TASK_SERVICE;
+    d.flags = GPTPS_TASK_SERVICE | extra_flags;
     d.default_cost.struct_size = sizeof d.default_cost;
     d.default_policy.struct_size = sizeof d.default_policy;
     d.default_policy.retry_backoff_seconds = backoff_s;
     return gptps_register_task(e, &d);
 }
+static gptps_status reg_service(gptps *e, const char *name, gptps_run_fn fn, uint32_t backoff_s)
+{ return reg_service_ex(e, name, fn, backoff_s, 0); }
 
 /* poll a counter up to a bound, so the test never blocks forever on a bug */
 static int wait_ge(int *p, int target, unsigned ms)
@@ -290,6 +297,35 @@ static void test_service_with_resource(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
+/* ---- 7) GPTPS_TASK_RETIRE_ON_OK: clean OK exit retires; failure still restarts -- */
+static void test_retire_on_ok(void)
+{
+    gptps *e = NULL;
+    gptps_handle h = 0;
+
+    set0(&g_runs);
+    CHECK(open_threaded(&e, 2) == GPTPS_OK);
+    if (!e) return;
+
+    /* a clean GPTPS_OK return retires the instance (opts out of restart-always) */
+    CHECK(reg_service_ex(e, "once", svc_ok_immediate, 0, GPTPS_TASK_RETIRE_ON_OK) == GPTPS_OK);
+    CHECK(gptps_submit(e, "once", NULL, 0, &h) == GPTPS_OK);
+    CHECK(wait_ge(&g_runs, 1, 3000));
+    { uint64_t s = gptps_now_ms(NULL); while (gptps_now_ms(NULL) - s < 200) { } }  /* settle */
+    CHECK(get(&g_runs) == 1);                        /* ran exactly once - NOT restarted */
+    CHECK(gptps_cancel(e, h) == GPTPS_E_NOTFOUND);   /* the instance is gone (retired) */
+
+    /* but a RETIRE_ON_OK service that FAILS is still restarted (restart-on-failure) */
+    set0(&g_runs);
+    __atomic_store_n(&g_crash_budget, 3, __ATOMIC_SEQ_CST);
+    CHECK(reg_service_ex(e, "crashy", svc_crashy, 0, GPTPS_TASK_RETIRE_ON_OK) == GPTPS_OK);
+    CHECK(gptps_submit(e, "crashy", NULL, 0, &h) == GPTPS_OK);
+    CHECK(wait_ge(&g_runs, 4, 3000));                /* 3 crashes still restart */
+    CHECK(gptps_cancel(e, h) == GPTPS_OK);
+
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
 int main(void)
 {
     test_registration_rules();
@@ -298,6 +334,7 @@ int main(void)
     test_unregister_drain_upgrades();
     test_ok_exit_restarts();
     test_service_with_resource();
+    test_retire_on_ok();
 
     if (fails) { printf("%d service check(s) FAILED\n", fails); return 1; }
     printf("all service checks passed\n");

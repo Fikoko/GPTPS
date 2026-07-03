@@ -96,6 +96,7 @@ typedef struct gptps_reg {
     bool               removed;    /* true => tombstoned, draining toward removal */
     bool               cancelling; /* true => removal is CANCEL: drop in-flight items rather than dead-letter */
     bool               service;    /* true => GPTPS_TASK_SERVICE: supervised long-running instances (restart-on-exit) */
+    bool               retire_on_ok;/* service only: a clean GPTPS_OK return retires the instance instead of restarting it */
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
     uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
@@ -411,13 +412,14 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         st = it->def->run(&ctx, it->def->user_data);
         if (gptps_flag_get(it->cancel)) st = GPTPS_E_TIMEOUT;
     } else if (it->def->exec == GPTPS_EXEC_OOP) {
-        /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed */
+        /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed.
+         * it->cancel lets gptps_cancel / shutdown / removal hard-kill the child. */
         st = gptps_oop_execute(it->def, it->payload, it->payload_len,
-                               it->cost.mem_bytes, it->policy.timeout_seconds, &oop_res, &oop_len);
+                               it->cost.mem_bytes, it->policy.timeout_seconds, it->cancel, &oop_res, &oop_len);
     } else {
         /* enforced path: fork+exec an external program; payload->stdin, stdout->result */
         st = gptps_program_execute(it->def, it->payload, it->payload_len,
-                                   it->cost.mem_bytes, it->policy.timeout_seconds, &oop_res, &oop_len);
+                                   it->cost.mem_bytes, it->policy.timeout_seconds, it->cancel, &oop_res, &oop_len);
     }
 
     /* deliver the result on the FINISHED event (valid for the callback's duration) */
@@ -579,13 +581,15 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
             }
 
             if (it->outcome == GPTPS_OK) {
-                /* A SERVICE is supervised to stay up: a clean return that was NOT an
-                 * external stop (cancel / removal / shutdown) is an unexpected exit,
-                 * so restart it after backoff - the same crash-restart contract the
-                 * failure path gives (a service normally exits only via the flag,
-                 * which makes outcome != OK). A normal task's OK is terminal. */
-                if (it->reg && it->reg->service && !it->cancelled &&
-                    !it->reg->removed && !e->stopping) {
+                /* A SERVICE is supervised to stay up: by default a clean return that
+                 * was NOT an external stop (cancel / removal / shutdown) is an
+                 * unexpected exit, so restart it after backoff - the same crash-restart
+                 * contract the failure path gives (a service normally exits only via
+                 * the flag, which makes outcome != OK). GPTPS_TASK_RETIRE_ON_OK opts out:
+                 * a clean OK return then terminally retires the instance. A normal
+                 * task's OK is always terminal. */
+                if (it->reg && it->reg->service && !it->reg->retire_on_ok &&
+                    !it->cancelled && !it->reg->removed && !e->stopping) {
                     it->attempt = 1;
                     it->not_before_ms = now + (uint64_t)it->policy.retry_backoff_seconds * 1000u;
                     fifo_push(&e->delayed, it);
@@ -1359,6 +1363,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->engine = e;
     apply_task_config(e->toml, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
     r->service = (svc_flags & GPTPS_TASK_SERVICE) != 0;
+    r->retire_on_ok = (svc_flags & GPTPS_TASK_RETIRE_ON_OK) != 0; /* service only; consulted on a clean OK exit */
     if (r->service) {
         /* supervised restart-on-exit. Re-assert the policy AFTER file overrides so a
          * config file cannot un-service the type; each submitted item is normalized

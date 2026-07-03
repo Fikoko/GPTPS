@@ -71,6 +71,25 @@ cmake -S . -B build          # configure (once)
 cmake --build build -j       # libgptps.a + the examples + the test suite
 ```
 
+**Building on Windows with mingw-w64.** The core is pure C99 and the Win32 backend
+(`hal_win.c` + `exec_win.c`) is selected automatically; mingw-w64 gcc is a first-class,
+CI-tested toolchain (native PE binaries, full `<windows.h>`, `__atomic` support). Using
+[MSYS2](https://www.msys2.org/) with the **UCRT64** environment:
+
+```sh
+# in the MSYS2 UCRT64 shell
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug   # gcc + ninja is auto-detected
+cmake --build build
+ctest --test-dir build --output-on-failure              # full suite (should be 100%)
+```
+
+The single-file amalgamation builds the same way (`gnu99` for the `<windows.h>` GNU
+extensions): `sh tools/amalgamate.sh && cc -std=gnu99 -I amalgamation amalgamation/gptps.c
+myapp.c -o myapp.exe` — no `-lpthread`/`-ldl` needed (the Win32 HAL uses the OS threads
+and `LoadLibrary` directly). The native **MSVC** (`cl.exe`) toolchain is also supported —
+open the folder in Visual Studio or `cmake -S . -B build` with the default VS generator.
+
 **2. See it run — the live dashboard.** Run it in a real terminal (it needs an interactive
 TTY; with no TTY it just prints a line and exits, which is how CI runs it headless):
 

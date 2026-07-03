@@ -25,6 +25,10 @@ versioning once it reaches 1.0.
   - v1 restrictions, rejected at registration with `GPTPS_E_INVAL`: `INPROC` executor
     only, `THREADED` mode only (an infinite loop cannot be run to completion by the
     `MANUAL` `gptps_step` pump), and no `timeout_seconds`.
+  - **`GPTPS_TASK_RETIRE_ON_OK`** (a second flag) opts a service out of "always up":
+    a clean `GPTPS_OK` return then terminally retires that instance (only a non-OK
+    return restarts it) — the `Restart=on-failure` semantic vs. the default
+    `Restart=always`.
 - **Append-safe ABI struct guards.** Input structs are now validated against a frozen
   minimum size (`GPTPS_TASK_DEF_MIN_SIZE`) and later-appended fields are read only when
   the caller's `struct_size` covers them (`GPTPS_STRUCT_HAS`), instead of rejecting any
@@ -36,6 +40,20 @@ versioning once it reaches 1.0.
   `struct_size` detection ambiguous; a compile-time assertion enforces this invariant.
 
 ### Fixed
+- **External-program executor deadlock on a large payload (POSIX).** `gptps_program_execute`
+  wrote the *entire* payload to the child's stdin before it began reading stdout, so a
+  streaming child (one that emits output while still consuming input) deadlocked once both
+  pipes filled — reachable with any payload larger than the pipe buffer. The parent now pumps
+  stdin and stdout **concurrently** in a single `poll` loop (non-blocking stdin writes
+  interleaved with stdout reads). The same bug also meant a large payload to a stdin-ignoring
+  child blocked *before* the deadline was ever enforced; the deadline now governs the whole
+  exchange.
+- **Out-of-process / program tasks are now cancellable.** Both POSIX executors and the Win32
+  program executor take the item's cooperative cancel flag and wait in bounded (~200 ms)
+  slices, so `gptps_cancel(handle)` and `gptps_unregister_task(..., CANCEL)` hard-kill a
+  running child — even one with `timeout_seconds == 0`, which previously waited forever and
+  could not be stopped. The child's cgroup-join path (`cg_write_file`) is now allocation-free,
+  closing a malloc-between-fork-and-exec hazard under a custom allocator.
 - **Named-resource reservation leak on retry/restart.** A task with a `gptps_define_resource`
   cost allocated a per-item reservation snapshot on admission that was only released from the
   budget ledger — not freed — on completion, so a re-admitted item (a retry, or a service's
