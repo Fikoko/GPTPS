@@ -7,6 +7,38 @@
 
 #include "gptps.h"
 
+#include <stddef.h>   /* offsetof */
+
+/* --- append-safe ABI struct guards ---
+ * A caller-extensible struct only ever GROWS by appending (see gptps.h "ABI
+ * DISCIPLINE"), so validating an INPUT struct with `struct_size < sizeof(current)`
+ * would reject a caller compiled against an OLDER header the moment the core adds a
+ * field. Instead validate against a FROZEN minimum (the layout at the point the
+ * field became required) and read any later-appended field only when struct_size
+ * proves the caller actually has it.
+ *
+ *   GPTPS_STRUCT_HAS(type, ptr, field): true iff `ptr` is large enough to contain
+ *   `field` (guard before reading an appended field).
+ *   GPTPS_<STRUCT>_MIN_SIZE: the frozen minimum a caller must supply. Growing a
+ *   struct must NOT move its MIN_SIZE (that would be an incompatible change). */
+#define GPTPS_STRUCT_HAS(type, ptr, field) \
+    ((ptr)->struct_size >= offsetof(type, field) + sizeof((ptr)->field))
+/* gptps_task_def froze at the v1.11 prefix: everything through child_setup is
+ * required; `flags` (v1.11) and anything appended later is optional. `flags` is a
+ * uint64_t and the struct is 8-aligned, so offsetof(flags) == the pre-v1.11 padded
+ * sizeof on every ABI (the field sits exactly at the old size boundary, never inside
+ * old trailing padding) - so this equals the pre-v1.11 sizeof(gptps_task_def) and
+ * every existing caller still validates, while GPTPS_STRUCT_HAS(flags) stays a true
+ * distinguisher (a pre-v1.11 struct_size is strictly below its +8 threshold). */
+#define GPTPS_TASK_DEF_MIN_SIZE (offsetof(gptps_task_def, flags))
+/* Compile-time guard against the tail-padding hazard: the first appended field
+ * (`flags`) MUST begin on the struct's 8-byte alignment boundary (== the pre-v1.11
+ * padded sizeof), otherwise a pre-v1.11 struct_size could be mistaken for "has flags"
+ * on an ABI where the field hid in old trailing padding. `flags` is uint64_t so this
+ * holds everywhere; a uint32_t here would fail this on ARM32/AAPCS (offset 84). C99
+ * negative-array-size assertion. */
+typedef char gptps__task_def_flags_no_tailpad[(offsetof(gptps_task_def, flags) % 8u == 0u) ? 1 : -1];
+
 /* --- core allocator seam (alloc.c) ---
  * Every CORE allocation goes through these; they default to the C library and
  * are redirected process-wide by the public gptps_set_allocator(). gptps_free

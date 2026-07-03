@@ -59,7 +59,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 10u /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel), bounded intake (max_intake_depth/E_FULL), submit_ex overrides, unregister constraint/observer, log sink, child_setup, EV_DROPPED; v1.10: generic named-resource budgets (define_resource/set_task_resource_cost/resource_usage) */
+#define GPTPS_ABI_VERSION_MINOR 11u /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel), bounded intake (max_intake_depth/E_FULL), submit_ex overrides, unregister constraint/observer, log sink, child_setup, EV_DROPPED; v1.10: generic named-resource budgets (define_resource/set_task_resource_cost/resource_usage); v1.11: long-running SERVICE tasks (gptps_task_def.flags + GPTPS_TASK_SERVICE): supervised restart-on-exit instances stopped cooperatively at cancel/unregister/shutdown */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -194,6 +194,23 @@ typedef gptps_status (*gptps_run_fn)(gptps_ctx *ctx, void *user_data);
 typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
                                       gptps_cost *out, void *user_data);
 
+/* --- task flags (gptps_task_def.flags; OR together) ----------------------- */
+/* SERVICE: a long-running, supervised instance rather than a one-shot task. Its
+ * run() is expected to loop until told to stop (poll gptps_is_cancelled()); when
+ * it returns for any reason OTHER than a stop request it is automatically
+ * RESTARTED after retry_backoff_seconds (crash-restart supervision). The engine
+ * normalizes the failure policy for you (on_failure = REQUEUE, max_retries = 0,
+ * no timeout). Start an instance with gptps_submit (start several for a pool); the
+ * returned handle stays valid across restarts, so gptps_cancel(handle) stops that
+ * one instance for good. gptps_unregister_task stops every instance of the type
+ * (a DRAIN is auto-upgraded to CANCEL, since a service never drains on its own),
+ * and gptps_shutdown stops them all. A service must poll gptps_is_cancelled() to
+ * be stoppable - the same cooperative contract as any in-process cancel.
+ * v1 restrictions (rejected at registration with GPTPS_E_INVAL): INPROC executor
+ * only, THREADED mode only (a service's infinite loop cannot be run to completion
+ * by the MANUAL gptps_step pump), and no timeout_seconds. */
+#define GPTPS_TASK_SERVICE 0x1u
+
 typedef struct {
     size_t                struct_size;   /* = sizeof(gptps_task_def) */
     const char           *name;          /* unique task-type id (borrowed) */
@@ -215,6 +232,15 @@ typedef struct {
      * close inherited fds. MUST be async-signal-safe (it runs between fork and
      * exec). Receives `user_data`. Ignored for INPROC and on Windows (no fork). */
     void (*child_setup)(void *user_data);
+    /* v1.11: OR of GPTPS_TASK_* flags (0 = a normal one-shot task). GPTPS_TASK_SERVICE
+     * marks a supervised long-running instance (see the flag's doc above). Appended
+     * field: read only when struct_size covers it, so pre-v1.11 callers stay valid.
+     * Deliberately uint64_t (not uint32_t): the struct is 8-byte aligned (its cost
+     * fields hold uint64_t), so an 8-byte field cannot fall inside a pre-v1.11
+     * struct's <8-byte trailing padding - it always grows sizeof, which keeps the
+     * struct_size feature-detection unambiguous even on 32-bit ABIs (ARM32/AAPCS,
+     * MIPS32) where a uint32_t here would have hidden in that padding. */
+    uint64_t flags;
 } gptps_task_def;
 
 /* ============================================================================

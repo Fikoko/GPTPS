@@ -94,6 +94,14 @@ target_link_libraries(test_cancel PRIVATE gptps)
 add_test(NAME cancel COMMAND test_cancel)
 set_tests_properties(cancel PROPERTIES TIMEOUT 30)
 
+add_executable(test_service tests/test_service.c)
+target_include_directories(test_service
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_service PRIVATE gptps)
+add_test(NAME service COMMAND test_service)
+set_tests_properties(service PROPERTIES TIMEOUT 30)
+
 add_executable(test_backpressure tests/test_backpressure.c)
 target_include_directories(test_backpressure
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

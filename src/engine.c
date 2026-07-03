@@ -73,7 +73,7 @@ typedef struct gptps_item {
     gptps_status          outcome;   /* effective status of the last attempt */
     int                   cancelled; /* gptps_cancel(handle) requested: never retry/dead-letter */
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
-    uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed at item_free */
+    uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed+NULLed at release (done-drain), else at item_free */
     size_t                res_n;
     struct gptps_item    *next;
 } gptps_item;
@@ -95,6 +95,7 @@ typedef struct gptps_reg {
     bool               enabled;    /* false => reject new submits (paused, reversible) */
     bool               removed;    /* true => tombstoned, draining toward removal */
     bool               cancelling; /* true => removal is CANCEL: drop in-flight items rather than dead-letter */
+    bool               service;    /* true => GPTPS_TASK_SERVICE: supervised long-running instances (restart-on-exit) */
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
     uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
@@ -569,10 +570,28 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                 size_t ri;
                 for (ri = 0; ri < it->res_n && ri < e->nres; ++ri)
                     e->resources[ri].reserved -= it->res_reserved[ri];
+                /* free the snapshot NOW (symmetric with the admit-time alloc) so a
+                 * re-admitted item - a retry, or a service's REQUEUE restart - cannot
+                 * overwrite a live pointer and leak it. item_free tolerates NULL. */
+                gptps_free(it->res_reserved);
+                it->res_reserved = NULL;
+                it->res_n = 0;
             }
 
             if (it->outcome == GPTPS_OK) {
-                item_free(it);
+                /* A SERVICE is supervised to stay up: a clean return that was NOT an
+                 * external stop (cancel / removal / shutdown) is an unexpected exit,
+                 * so restart it after backoff - the same crash-restart contract the
+                 * failure path gives (a service normally exits only via the flag,
+                 * which makes outcome != OK). A normal task's OK is terminal. */
+                if (it->reg && it->reg->service && !it->cancelled &&
+                    !it->reg->removed && !e->stopping) {
+                    it->attempt = 1;
+                    it->not_before_ms = now + (uint64_t)it->policy.retry_backoff_seconds * 1000u;
+                    fifo_push(&e->delayed, it);
+                } else {
+                    item_free(it);
+                }
                 continue;
             }
             if (it->cancelled) {
@@ -1266,13 +1285,29 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     gptps_reg *r;
     char *name;
     char **argv_copy = NULL;
+    uint64_t svc_flags;
 
     if (!e || !def || !def->name) return GPTPS_E_INVAL;
-    if (def->struct_size < sizeof *def) return GPTPS_E_INVAL; /* ABI: reject undersized struct */
+    if (def->struct_size < GPTPS_TASK_DEF_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: below the frozen minimum */
     if (def->exec == GPTPS_EXEC_PROGRAM) {
         if (!def->argv || !def->argv[0]) return GPTPS_E_INVAL; /* program needs an argv */
     } else if (!def->run) {
         return GPTPS_E_INVAL;                                 /* in-process kinds need a run fn */
+    }
+
+    /* v1.11 SERVICE flag (an appended field: read it only if the caller's struct
+     * actually carries it, so a pre-v1.11 def stays valid). */
+    svc_flags = GPTPS_STRUCT_HAS(gptps_task_def, def, flags) ? def->flags : 0u;
+    if (svc_flags & GPTPS_TASK_SERVICE) {
+        /* A service is a cooperative in-process loop, supervised by the worker pool,
+         * that runs until stopped - so v1 forbids configs that contradict that:
+         * an OS-enforced executor (its child-cancel plumbing is a later step), the
+         * MANUAL pump (gptps_step runs a task to completion inline, so an infinite
+         * loop would wedge the caller's thread), and a wall-clock timeout (would kill
+         * the service rather than let it run). */
+        if (def->exec != GPTPS_EXEC_INPROC)           return GPTPS_E_INVAL;
+        if (e->manual)                                return GPTPS_E_INVAL;
+        if (def->default_policy.timeout_seconds != 0) return GPTPS_E_INVAL;
     }
 
     if (def->exec == GPTPS_EXEC_PROGRAM) {
@@ -1306,7 +1341,14 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
         }
     }
 
-    r->def = *def;
+    /* append-safe copy: a pre-v1.11 caller's def may be smaller than ours, so
+     * zero-fill first, then copy only the bytes it actually supplied (clamped to
+     * our size so a future, larger caller cannot overflow r->def). */
+    {
+        size_t copy = def->struct_size < sizeof r->def ? def->struct_size : sizeof r->def;
+        memset(&r->def, 0, sizeof r->def);
+        memcpy(&r->def, def, copy);
+    }
     r->name = name;
     r->def.name = name;
     r->argv_copy = argv_copy;
@@ -1316,6 +1358,15 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->enabled = true;
     r->engine = e;
     apply_task_config(e->toml, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
+    r->service = (svc_flags & GPTPS_TASK_SERVICE) != 0;
+    if (r->service) {
+        /* supervised restart-on-exit. Re-assert the policy AFTER file overrides so a
+         * config file cannot un-service the type; each submitted item is normalized
+         * again at submit time, so a live settings edit cannot break it either. */
+        r->def.default_policy.on_failure      = GPTPS_ON_FAILURE_REQUEUE;
+        r->def.default_policy.max_retries     = 0;
+        r->def.default_policy.timeout_seconds = 0;
+    }
     r->next = e->registry;
     e->registry = r;
     gptps_mutex_unlock(e->m);
@@ -1438,6 +1489,25 @@ static unsigned fifo_drop_reg(gptps_fifo *q, const gptps_reg *r)
     while (it) {
         gptps_item *next = it->next;
         if (it->reg == r) {
+            if (prev) prev->next = next; else q->head = next;
+            if (q->tail == it) q->tail = prev;
+            it->next = NULL; item_free(it); ++n;
+            q->count -= 1;
+        } else prev = it;
+        it = next;
+    }
+    return n;
+}
+
+/* free every SERVICE item in q (caller holds e->m). Only for queues whose items
+ * have NOT reserved admission budget (intake / delayed); running/ready items must
+ * flow through `done` so their budget is released. */
+static unsigned fifo_drop_services(gptps_fifo *q)
+{
+    gptps_item *it = q->head, *prev = NULL; unsigned n = 0;
+    while (it) {
+        gptps_item *next = it->next;
+        if (it->reg && it->reg->service) {
             if (prev) prev->next = next; else q->head = next;
             if (q->tail == it) q->tail = prev;
             it->next = NULL; item_free(it); ++n;
@@ -1579,6 +1649,12 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
     r = registry_find(e, task_name);
     if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+
+    /* A service's instances run until stopped, so a DRAIN (wait for work to finish)
+     * would block forever in THREADED mode / refuse forever in MANUAL. Upgrade it to
+     * CANCEL, which cooperatively stops the running instances. REJECT_IF_BUSY is left
+     * as-is: "remove only if idle" is still a meaningful request for a service. */
+    if (r->service && mode == GPTPS_REMOVE_DRAIN) mode = GPTPS_REMOVE_CANCEL;
 
     if (e->manual) {
         /* MANUAL: no worker threads => nothing is in-flight between gptps_step calls. */
@@ -1966,6 +2042,15 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         if (opts->flags & GPTPS_SUBMIT_POLICY)     it->policy = opts->policy;
         if (opts->flags & GPTPS_SUBMIT_TIMEOUT_MS) it->timeout_ms_override = opts->timeout_ms;
     }
+    if (r->service) {
+        /* a service instance is supervised: restart-on-exit, never a wall-clock kill.
+         * Re-assert here so a submit_ex override (or a live tasks.<name>.* edit that
+         * changed the type default) cannot turn one instance into a one-shot. */
+        it->policy.on_failure      = GPTPS_ON_FAILURE_REQUEUE;
+        it->policy.max_retries     = 0;
+        it->policy.timeout_seconds = 0;
+        it->timeout_ms_override    = 0;
+    }
 
     fifo_push(&e->intake, it);
     if (out_handle) *out_handle = it->handle;
@@ -2031,6 +2116,16 @@ gptps_status gptps_cancel(gptps *e, gptps_handle h)
         if (it->handle == h) {
             it->cancelled = 1; gptps_flag_set(it->cancel, true);
             gptps_cond_broadcast(e->cv_work);   /* wake a worker to discard it */
+            gptps_mutex_unlock(e->m); return GPTPS_OK;
+        }
+    /* finished-but-not-yet-reaped (in `done`): a worker has posted it and the
+     * dispatcher has not made its terminal decision yet. Mark cancelled so that
+     * decision frees it instead of retrying / REQUEUEing - without this a crash-
+     * restarting service momentarily in `done` would dodge the cancel and restart.
+     * Budget is released by the done-drain, so no ledger bookkeeping here. */
+    for (it = e->done.head; it; it = it->next)
+        if (it->handle == h) {
+            it->cancelled = 1; gptps_flag_set(it->cancel, true);
             gptps_mutex_unlock(e->m); return GPTPS_OK;
         }
 
@@ -2234,6 +2329,26 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
     return GPTPS_OK;
 }
 
+/* Stop every SERVICE instance so the dispatcher can reach its drain condition.
+ * A service run() loops until the cancel flag is raised, and its REQUEUE policy
+ * would otherwise restart it forever - so without this, a running service would
+ * hang shutdown (running_items never empties) or a backing-off one would keep the
+ * delayed queue non-empty. Running/ready instances (budget reserved) are marked
+ * cancelled + flagged so they exit / are discarded through the normal `done` path
+ * (which releases their budget); queued + backing-off instances (no budget) are
+ * freed outright. Non-service in-flight work is untouched, so it still drains
+ * gracefully. Caller holds e->m. */
+static void stop_services(gptps *e)
+{
+    gptps_item *it;
+    for (it = e->running_items.head; it; it = it->next)
+        if (it->reg && it->reg->service) { it->cancelled = 1; gptps_flag_set(it->cancel, true); }
+    for (it = e->ready.head; it; it = it->next)
+        if (it->reg && it->reg->service) { it->cancelled = 1; gptps_flag_set(it->cancel, true); }
+    fifo_drop_services(&e->intake);
+    fifo_drop_services(&e->delayed);
+}
+
 gptps_status gptps_shutdown(gptps *e)
 {
     unsigned i;
@@ -2244,7 +2359,9 @@ gptps_status gptps_shutdown(gptps *e)
 
     gptps_mutex_lock(e->m);
     e->stopping = true;
+    stop_services(e);                   /* cooperatively stop long-running service instances */
     gptps_cond_signal(e->cv_disp);
+    gptps_cond_broadcast(e->cv_work);   /* wake idle workers to discard cancelled service instances */
     gptps_mutex_unlock(e->m);
 
     if (!e->manual) {                       /* MANUAL spawns no threads to join */

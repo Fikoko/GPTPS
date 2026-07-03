@@ -6,6 +6,47 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — ABI 1.11: long-running service tasks
+- **`GPTPS_TASK_SERVICE`** (a new `gptps_task_def.flags` bit) marks a task type as a
+  supervised, long-running **service** instead of a one-shot job. You start an
+  instance with `gptps_submit` (start several for a pool); its `run()` is expected to
+  loop until told to stop (polling `gptps_is_cancelled()`), and when it returns for
+  any reason other than a stop request it is **automatically restarted** after
+  `retry_backoff_seconds` (crash-restart supervision). The engine normalizes the
+  failure policy for you (`on_failure = REQUEUE`, `max_retries = 0`, no timeout), at
+  registration and again per submit so neither a config file nor a live settings edit
+  nor a `submit_ex` override can quietly un-service an instance.
+  - The submit **handle stays valid across restarts**, so `gptps_cancel(handle)` stops
+    that one instance for good (no restart). `gptps_unregister_task` stops every
+    instance of the type — a `DRAIN` is auto-upgraded to `CANCEL`, since a service
+    never drains on its own — and **`gptps_shutdown` now stops running services**
+    (raising their cooperative cancel flag) so a resident service no longer hangs
+    teardown. Non-service in-flight work still drains gracefully.
+  - v1 restrictions, rejected at registration with `GPTPS_E_INVAL`: `INPROC` executor
+    only, `THREADED` mode only (an infinite loop cannot be run to completion by the
+    `MANUAL` `gptps_step` pump), and no `timeout_seconds`.
+- **Append-safe ABI struct guards.** Input structs are now validated against a frozen
+  minimum size (`GPTPS_TASK_DEF_MIN_SIZE`) and later-appended fields are read only when
+  the caller's `struct_size` covers them (`GPTPS_STRUCT_HAS`), instead of rejecting any
+  struct smaller than the current `sizeof`. This is what lets `gptps_task_def` grow the
+  `flags` field without breaking a caller compiled against an older header — honoring
+  the header's append-only ABI promise. `gptps_task_def.flags` is a `uint64_t` (not
+  `uint32_t`) specifically so the appended field cannot fall inside a pre-v1.11 struct's
+  trailing padding on 32-bit ABIs (ARM32/AAPCS, MIPS32) — which would have made
+  `struct_size` detection ambiguous; a compile-time assertion enforces this invariant.
+
+### Fixed
+- **Named-resource reservation leak on retry/restart.** A task with a `gptps_define_resource`
+  cost allocated a per-item reservation snapshot on admission that was only released from the
+  budget ledger — not freed — on completion, so a re-admitted item (a retry, or a service's
+  REQUEUE restart) leaked the previous snapshot. For a long-running service this was an
+  unbounded leak. The snapshot is now freed at release, symmetric with admission.
+- **`gptps_cancel` could miss an item briefly sitting in the completion queue.** A cancel
+  arriving in the narrow window between a worker posting a finished item and the dispatcher
+  reaping it returned `GPTPS_E_NOTFOUND` without cancelling, so a crash-restarting service
+  could dodge the cancel and restart. `gptps_cancel` now also scans that queue, honoring the
+  "stops the instance for good" guarantee.
+
 ### Added — ABI 1.10: generic named-resource budgets
 - **`gptps_define_resource(e, name, budget)`** declares an arbitrary named,
   budgeted admission resource (GPUs, I/O bandwidth, license seats, a per-tenant
