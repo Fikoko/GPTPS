@@ -31,13 +31,16 @@
  * every existing caller still validates, while GPTPS_STRUCT_HAS(flags) stays a true
  * distinguisher (a pre-v1.11 struct_size is strictly below its +8 threshold). */
 #define GPTPS_TASK_DEF_MIN_SIZE (offsetof(gptps_task_def, flags))
-/* Compile-time guard against the tail-padding hazard: the first appended field
- * (`flags`) MUST begin on the struct's 8-byte alignment boundary (== the pre-v1.11
- * padded sizeof), otherwise a pre-v1.11 struct_size could be mistaken for "has flags"
- * on an ABI where the field hid in old trailing padding. `flags` is uint64_t so this
- * holds everywhere; a uint32_t here would fail this on ARM32/AAPCS (offset 84). C99
- * negative-array-size assertion. */
-typedef char gptps__task_def_flags_no_tailpad[(offsetof(gptps_task_def, flags) % 8u == 0u) ? 1 : -1];
+/* Compile-time guard against the tail-padding hazard: `flags` must stay the struct's
+ * widest (hence most-aligned) member, so it lands exactly at the pre-v1.11 padded
+ * size boundary and never inside old trailing padding (which would let a pre-v1.11
+ * struct_size be misread as "has flags"). Enforced portably by keeping it 8 bytes: a
+ * uint64_t is the widest scalar in this struct, so on EVERY ABI - i386 (4-aligned
+ * uint64) through ARM32/AAPCS (8-aligned) and s390x - it sits at offsetof == the
+ * predecessor sizeof. A uint32_t would drop this to 4 and reintroduce the hazard.
+ * (Checking `offsetof(flags) % 8` would be wrong: it false-fails on i386, where the
+ * struct is only 4-aligned yet perfectly safe.) C99 negative-array-size assertion. */
+typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flags) == 8u) ? 1 : -1];
 
 /* --- core allocator seam (alloc.c) ---
  * Every CORE allocation goes through these; they default to the C library and
