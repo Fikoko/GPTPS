@@ -134,7 +134,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 
     cmd = build_cmdline(argv);
     if (!cmd) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
-                if (job) CloseHandle(job); return GPTPS_E_NOMEM; }
+                if (job) CloseHandle(job);
+return GPTPS_E_NOMEM; }
 
     memset(&si, 0, sizeof si); si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
