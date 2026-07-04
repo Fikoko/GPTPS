@@ -289,6 +289,12 @@ target_link_libraries(test_wasm PRIVATE gptps)
 add_test(NAME wasm COMMAND test_wasm)
 set_tests_properties(wasm PROPERTIES TIMEOUT 30)
 
+add_executable(test_pool tests/test_pool.c addons/gptps_pool.c)           # N-shard router: scale-up by composition
+target_include_directories(test_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_pool PRIVATE gptps)
+add_test(NAME pool COMMAND test_pool)
+set_tests_properties(pool PROPERTIES TIMEOUT 30)
+
 add_executable(test_fuzz tests/test_fuzz.c addons/durable_queue.c)        # TOML + journal parser robustness
 target_include_directories(test_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_fuzz PRIVATE gptps)

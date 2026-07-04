@@ -6,6 +6,16 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — scale-up by composition: the shard/router add-on
+- **`addons/gptps_pool`** runs N independent engine shards (each its own lock +
+  dispatcher + worker pool) and routes each submit to one of them, scaling past the
+  single-node single-writer ceiling **without any core change** — the proof that the
+  engine scales the modular way. `gptps_pool_submit` spreads load round-robin;
+  `gptps_pool_submit_keyed` pins a key to a fixed shard (per-tenant affinity / per-key
+  order); a returned `gptps_pool_handle` tags the shard so `gptps_pool_cancel` routes
+  back. Built entirely on the public API. (`test_pool`: even spread, affinity,
+  handle-routed cancel, cross-shard dead-letter aggregation.)
+
 ### Added — ABI 1.11: long-running service tasks
 - **`GPTPS_TASK_SERVICE`** (a new `gptps_task_def.flags` bit) marks a task type as a
   supervised, long-running **service** instead of a one-shot job. You start an
