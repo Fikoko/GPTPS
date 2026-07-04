@@ -6,6 +6,19 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — ABI 1.12: pluggable scheduler seam
+- **`gptps_set_scheduler(e, fn, ud)`** makes the admission ORDERING a swappable
+  policy without touching the core. The dispatcher's *mechanism* stays fixed and
+  general — admit the best-ordered pending item that fits the live budget, skip a
+  too-large item to backfill smaller work (no head-of-line blocking), reserve for a
+  repeatedly-skipped top item so it can't starve. What "best-ordered" *means* was
+  hard-wired to scheduling priority; now a hook returns an `int64` score per item
+  (`gptps_sched_input`: task, cost, priority, attempt, enqueue time, payload) and the
+  dispatcher admits the highest score that fits — so deadline-first, per-tenant
+  fair-share, cost-aware, or aging disciplines are composable, not core forks. Default
+  (no hook) is unchanged priority/FIFO ordering, with zero added overhead. Also on the
+  host-table ABI (`GPTPS_SEAM_SCHEDULER`) so add-ons can install one. (`test_sched_seam`.)
+
 ### Added — scale-up by composition: the shard/router add-on
 - **`addons/gptps_pool`** runs N independent engine shards (each its own lock +
   dispatcher + worker pool) and routes each submit to one of them, scaling past the

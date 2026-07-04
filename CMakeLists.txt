@@ -289,6 +289,12 @@ target_link_libraries(test_wasm PRIVATE gptps)
 add_test(NAME wasm COMMAND test_wasm)
 set_tests_properties(wasm PROPERTIES TIMEOUT 30)
 
+add_executable(test_sched_seam tests/test_sched_seam.c)                   # pluggable scheduler seam: swap the admission order
+target_include_directories(test_sched_seam PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_sched_seam PRIVATE gptps)
+add_test(NAME sched_seam COMMAND test_sched_seam)
+set_tests_properties(sched_seam PROPERTIES TIMEOUT 30)
+
 add_executable(test_pool tests/test_pool.c addons/gptps_pool.c)           # N-shard router: scale-up by composition
 target_include_directories(test_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_pool PRIVATE gptps)

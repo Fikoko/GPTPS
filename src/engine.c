@@ -65,8 +65,10 @@ typedef struct gptps_item {
     gptps_cost            cost;
     gptps_failure_policy  policy;
     int32_t               priority;  /* higher = admitted first (default 0) */
+    int64_t               sched_score;/* admission ordering key: priority by default, or the scheduler hook's score (stamped per pass) */
     uint32_t              skips;     /* times a backfill admission jumped ahead while budget-blocked */
     uint32_t              attempt;   /* 1 = first try */
+    uint64_t              enqueue_ms;    /* monotonic ms when first submitted (for the scheduler seam: age/deadline/FIFO) */
     uint64_t              deadline_ms;   /* 0 = no timeout */
     uint64_t              not_before_ms; /* backoff gate for delayed retries */
     gptps_flag           *cancel;
@@ -204,6 +206,8 @@ struct gptps {
     gptps_handle   next_handle;
     gptps_event_cb ev_cb;
     void          *ev_ud;
+    gptps_sched_fn sched_fn;      /* swappable admission ordering (NULL => built-in priority) */
+    void          *sched_ud;
 
     gptps_loaded  *addons;        /* dlopen'd add-ons, torn down at shutdown */
     gptps_observer *observers;    /* extra event sinks (registered before submit) */
@@ -714,24 +718,42 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
             }
         }
 
-        /* 4) admit in priority order with skip-to-fit backfill + starvation guard.
-         *    Each iteration scans intake for `top` (highest-priority item overall)
-         *    and `best` (highest-priority item that fits the live budget; ties
-         *    resolve to the older item, preserving FIFO within a priority). When
-         *    `best != top` we are about to skip the higher-priority `top` because
-         *    it does not fit yet: allowed (backfill) until `top` has been skipped
-         *    reserve_after_skips times, after which we reserve for it - admit
-         *    nothing and let running tasks drain until it fits (bounded). */
+        /* 4) admit in SCHEDULER order with skip-to-fit backfill + starvation guard.
+         *    Each iteration scans intake for `top` (highest-score item overall) and
+         *    `best` (highest-score item that fits the live budget; ties resolve to
+         *    the older item, preserving FIFO within a score). When `best != top` we
+         *    are about to skip the higher-score `top` because it does not fit yet:
+         *    allowed (backfill) until `top` has been skipped reserve_after_skips
+         *    times, after which we reserve for it - admit nothing and let running
+         *    tasks drain until it fits (bounded). The ORDERING KEY (sched_score) is
+         *    the one swappable policy: priority by default, or a scheduler hook's
+         *    score; the skip-to-fit / budget / starvation MECHANISM stays fixed. */
+        /* scheduler seam: with a custom ordering installed, (re)score every pending
+         * item for this pass (scores may depend on time). The default ordering left
+         * sched_score == priority, stamped at submit, so it needs no rescoring. */
+        if (e->sched_fn && e->intake.head && e->running < e->limits.max_concurrent_tasks) {
+            gptps_item *cur;
+            for (cur = e->intake.head; cur; cur = cur->next) {
+                gptps_sched_input si;
+                memset(&si, 0, sizeof si);
+                si.struct_size = sizeof si;
+                si.task_name = item_name(cur);   si.cost = &cur->cost;
+                si.handle = cur->handle;         si.priority = cur->priority;
+                si.attempt = cur->attempt;       si.enqueue_ms = cur->enqueue_ms;
+                si.payload = cur->payload;       si.payload_len = cur->payload_len;
+                cur->sched_score = e->sched_fn(&si, e->sched_ud);
+            }
+        }
         while (e->intake.head && e->running < e->limits.max_concurrent_tasks) {
             gptps_item *best = NULL, *top = NULL, *cur;
             uint32_t retry_after = 0;
             gptps_admit_decision dec;
 
             for (cur = e->intake.head; cur; cur = cur->next) {
-                if (!top || cur->priority > top->priority) top = cur;
+                if (!top || cur->sched_score > top->sched_score) top = cur;
                 if (e->reserved_mem + cur->cost.mem_bytes <= e->limits.max_memory_bytes &&
                     res_fits(e, cur) &&
-                    (!best || cur->priority > best->priority))
+                    (!best || cur->sched_score > best->sched_score))
                     best = cur;
             }
 
@@ -1927,7 +1949,8 @@ static const gptps_api_routines G_API = {
     gptps_unregister_observer,
     gptps_define_resource,
     gptps_set_task_resource_cost,
-    gptps_resource_usage
+    gptps_resource_usage,
+    gptps_set_scheduler
 };
 
 gptps_status gptps_load_addon(gptps *e, const char *path)
@@ -2040,6 +2063,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     it->priority = r->priority;
     it->skips = 0;
     it->attempt = 1;
+    it->enqueue_ms = gptps_hal_monotonic_ms();   /* age basis for the scheduler seam */
 
     /* per-submit overrides (gptps_submit_ex): only flagged fields apply */
     if (opts) {
@@ -2047,6 +2071,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         if (opts->flags & GPTPS_SUBMIT_POLICY)     it->policy = opts->policy;
         if (opts->flags & GPTPS_SUBMIT_TIMEOUT_MS) it->timeout_ms_override = opts->timeout_ms;
     }
+    it->sched_score = it->priority;   /* default ordering key; a scheduler hook re-scores per pass */
     if (r->service) {
         /* a service instance is supervised: restart-on-exit, never a wall-clock kill.
          * Re-assert here so a submit_ex override (or a live tasks.<name>.* edit that
@@ -2160,6 +2185,19 @@ gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data)
     if (!e) return GPTPS_E_INVAL;
     gptps_mutex_lock(e->m);
     e->ev_cb = cb; e->ev_ud = user_data;
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+/* Scheduler seam: swap the admission ORDERING key (fn == NULL resets to the
+ * built-in priority ordering). Setup-time; the hook runs under e->m on the
+ * dispatcher hot path (must be fast / non-reentrant). */
+gptps_status gptps_set_scheduler(gptps *e, gptps_sched_fn fn, void *user_data)
+{
+    if (!e) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    e->sched_fn = fn; e->sched_ud = user_data;
+    gptps_cond_signal(e->cv_disp);   /* re-evaluate ordering on the next pass */
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
 }

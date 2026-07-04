@@ -59,7 +59,7 @@ extern "C" {
 
 /* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
 #define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 11u /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel), bounded intake (max_intake_depth/E_FULL), submit_ex overrides, unregister constraint/observer, log sink, child_setup, EV_DROPPED; v1.10: generic named-resource budgets (define_resource/set_task_resource_cost/resource_usage); v1.11: long-running SERVICE tasks (gptps_task_def.flags + GPTPS_TASK_SERVICE): supervised restart-on-exit instances stopped cooperatively at cancel/unregister/shutdown */
+#define GPTPS_ABI_VERSION_MINOR 12u /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel), bounded intake (max_intake_depth/E_FULL), submit_ex overrides, unregister constraint/observer, log sink, child_setup, EV_DROPPED; v1.10: generic named-resource budgets (define_resource/set_task_resource_cost/resource_usage); v1.11: long-running SERVICE tasks (gptps_task_def.flags + GPTPS_TASK_SERVICE + GPTPS_TASK_RETIRE_ON_OK); v1.12: pluggable scheduler seam (gptps_set_scheduler + gptps_sched_input): the admission ORDERING is a swappable policy over the core's fixed skip-to-fit/budget/starvation mechanism */
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -718,7 +718,8 @@ typedef enum {
     GPTPS_SEAM_TASK = 0,   /* frozen v1.0 */
     GPTPS_SEAM_TRANSPORT,  /* EXPERIMENTAL until M2 (exec-bridge); frozen with first consumer */
     GPTPS_SEAM_CONSTRAINT, /* frozen v1.9 (gptps_constraint_input): admit/deny/defer hook; MUST be non-blocking */
-    GPTPS_SEAM_OBSERVER    /* frozen v1.9: analytics / dead-letter sink */
+    GPTPS_SEAM_OBSERVER,   /* frozen v1.9: analytics / dead-letter sink */
+    GPTPS_SEAM_SCHEDULER   /* frozen v1.12 (gptps_sched_input): the admission ordering key; MUST be non-blocking */
 } gptps_seam_kind;
 
 /* Constraint hook result (constraint seam, frozen v1.9). retry_after_ms is
@@ -748,6 +749,23 @@ typedef struct {
 typedef gptps_admit_decision (*gptps_constraint_fn)(const gptps_constraint_input *in,
                                                     uint32_t *retry_after_ms,
                                                     void *user_data);
+
+/* Per-item ORDERING context handed to a scheduler hook (scheduler seam, frozen
+ * v1.12). struct_size first (additive). All pointers BORROWED, valid only for the
+ * call. Declared here so the host-table below can reference gptps_sched_fn; the
+ * public gptps_set_scheduler + full doc are in the SCHEDULER SEAM section. */
+typedef struct {
+    size_t            struct_size;   /* = sizeof(gptps_sched_input) */
+    const char       *task_name;
+    const gptps_cost *cost;
+    gptps_handle      handle;
+    int32_t           priority;      /* the item's priority (the default score) */
+    uint32_t          attempt;       /* 1 = first try */
+    uint64_t          enqueue_ms;    /* monotonic time it first entered intake */
+    const void       *payload;
+    size_t            payload_len;
+} gptps_sched_input;
+typedef int64_t (*gptps_sched_fn)(const gptps_sched_input *in, void *user_data);
 
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_api_routines) */
@@ -780,6 +798,8 @@ typedef struct {
     gptps_status (*define_resource)(gptps *e, const char *name, uint64_t budget);
     gptps_status (*set_task_resource_cost)(gptps *e, const char *task_name, const char *resource, uint64_t amount);
     gptps_status (*resource_usage)(gptps *e, const char *name, uint64_t *out_reserved, uint64_t *out_budget);
+    /* --- v1.12 routines (append-only); guard with `struct_size` before calling --- */
+    gptps_status (*set_scheduler)(gptps *e, gptps_sched_fn fn, void *user_data);
 } gptps_api_routines;
 
 typedef struct {
@@ -828,6 +848,40 @@ GPTPS_API gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void
  * submitting. Enables add-on hot-unload. GPTPS_E_NOTFOUND if no match. */
 GPTPS_API gptps_status gptps_unregister_constraint(gptps *e, gptps_constraint_fn fn, void *user_data);
 GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, void *user_data);
+
+/* ============================================================================
+ * SCHEDULER SEAM (swappable admission ORDER; the mechanism stays in the core)
+ *
+ * The dispatcher's mechanism is fixed and general: it admits the best-ordered
+ * pending item that fits the live budget, skips a too-large item to backfill
+ * smaller work behind it (no head-of-line blocking), and reserves for a
+ * repeatedly-skipped top item so it cannot starve. What "best-ordered" MEANS is
+ * the one policy knob - by default it is scheduling PRIORITY (higher first, ties
+ * FIFO). Install a scheduler to replace that ordering key with your own discipline
+ * (deadline-first, per-tenant fair-share, cost-aware, aging, ...) WITHOUT touching
+ * the core: return a score for an item; the dispatcher admits the highest score
+ * that fits, keeping all of the skip-to-fit / budget / starvation machinery.
+ *
+ * The hook returns an int64 score; the dispatcher admits the HIGHEST-scoring
+ * pending item that fits the live budget (ties resolve FIFO). It runs on the
+ * dispatcher thread UNDER the engine lock on the hot path, so it MUST be fast /
+ * non-blocking and MUST NOT call back into this engine. `gptps_sched_input` and
+ * `gptps_sched_fn` are declared up in the host-table ABI section (so add-ons can
+ * install a scheduler through the routines table); check in->struct_size before
+ * reading fields appended in a later minor.
+ *
+ * NOTE: a score should be a reasonably STABLE ordering key for a given item across
+ * passes. The starvation guard charges "skips" to whichever item is currently
+ * top-of-order, so a scheduler that returns wildly fluctuating scores for the same
+ * item can spread those skips across different items and weaken the per-item
+ * anti-starvation bound. Age-based aging is fine (it is monotonic); prefer a key
+ * that only moves an item UP over time (e.g. -deadline, or priority + age).
+ * ==========================================================================*/
+
+/* Install (or, with fn == NULL, reset to the built-in priority ordering) the
+ * scheduler. One per engine; a later call replaces the previous. A SETUP-time call
+ * like the other seams - set it before submitting work / while quiescent. */
+GPTPS_API gptps_status gptps_set_scheduler(gptps *e, gptps_sched_fn fn, void *user_data);
 
 #ifdef __cplusplus
 } /* extern "C" */
