@@ -3,9 +3,16 @@
  * arbitrary external program as a task. Payload -> stdin, stdout -> result,
  * exit code -> status, hard-killed on timeout. Language-agnostic by construction.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE          /* expose POSIX sigaction under -std=c99 */
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE
+#endif
 #include "gptps.h"
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -154,6 +161,22 @@ int main(void)
     CHECK(wait_started(3000));
     CHECK(gptps_cancel(e, h) == GPTPS_OK);
     gptps_shutdown(e);                             /* returns => the cancel killed the child */
+
+    /* H) the program executor must NOT mutate the host's process-wide SIGPIPE
+     * disposition: it suppresses SIGPIPE per-thread / per-fd now, not with a global
+     * signal(SIGPIPE, SIG_IGN). Set a known disposition, run a program task, verify
+     * it is untouched (the old global-ignore code would flip it to SIG_IGN). */
+    {
+        struct sigaction want, got;
+        memset(&want, 0, sizeof want); want.sa_handler = SIG_DFL; sigemptyset(&want.sa_mask);
+        CHECK(sigaction(SIGPIPE, &want, NULL) == 0);
+        reset();
+        e = open_prog("dispo", echo, 5); CHECK(e);
+        CHECK(gptps_submit(e, "dispo", "hi", 2, &h) == GPTPS_OK);
+        gptps_shutdown(e);
+        CHECK(sigaction(SIGPIPE, NULL, &got) == 0);
+        CHECK(got.sa_handler == SIG_DFL);          /* not SIG_IGN => host disposition preserved */
+    }
 
     if (fails) { printf("%d program check(s) FAILED\n", fails); return 1; }
     printf("all program-executor checks passed\n");

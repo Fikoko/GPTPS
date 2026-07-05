@@ -37,6 +37,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <poll.h>
+#include <pthread.h>   /* pthread_sigmask: per-thread SIGPIPE block (program executor) */
+#include <time.h>      /* struct timespec for the sigtimedwait drain */
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -367,10 +369,24 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         size_t wleft = plen;
         int in_open = 1;                           /* inp[1] still open for writing */
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
+#if !defined(F_SETNOSIGPIPE)
+        sigset_t sp_old; int sp_masked = 0;
+#endif
 
         close(inp[0]); close(outp[1]);
         setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
-        signal(SIGPIPE, SIG_IGN);                  /* a closed-stdin write must EPIPE, not kill us */
+        /* A write to the child's closed stdin must EPIPE, not kill us - but suppress
+         * SIGPIPE WITHOUT mutating the host's process-wide disposition: per-fd on
+         * macOS/BSD (F_SETNOSIGPIPE), else per-THREAD (block SIGPIPE now; drain any it
+         * leaves pending and restore after the pump - see below). */
+#if defined(F_SETNOSIGPIPE)
+        (void)fcntl(inp[1], F_SETNOSIGPIPE, 1);
+#else
+        {
+            sigset_t sp; sigemptyset(&sp); sigaddset(&sp, SIGPIPE);
+            sp_masked = (pthread_sigmask(SIG_BLOCK, &sp, &sp_old) == 0);
+        }
+#endif
         /* non-blocking stdin so a POLLOUT-guarded write never stalls the read side */
         (void)fcntl(inp[1], F_SETFL, fcntl(inp[1], F_GETFL) | O_NONBLOCK);
         if (!wleft) { close(inp[1]); in_open = 0; } /* no payload: EOF the child's stdin now */
@@ -424,6 +440,17 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         }
         if (in_open) close(inp[1]);
         close(outp[0]);
+#if !defined(F_SETNOSIGPIPE)
+        if (sp_masked) {
+            /* consume a SIGPIPE our blocked writes may have left pending (else it
+             * would fire on restore), then restore this thread's original mask. */
+            struct timespec z; sigset_t sp;
+            z.tv_sec = 0; z.tv_nsec = 0;
+            sigemptyset(&sp); sigaddset(&sp, SIGPIPE);
+            while (sigtimedwait(&sp, NULL, &z) >= 0) { }
+            pthread_sigmask(SIG_SETMASK, &sp_old, NULL);
+        }
+#endif
         while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { }
 
         if (killed)                  eff = GPTPS_E_TIMEOUT;

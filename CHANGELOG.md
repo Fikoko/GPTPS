@@ -109,6 +109,13 @@ versioning once it reaches 1.0.
   `struct_size` detection ambiguous; a compile-time assertion enforces this invariant.
 
 ### Fixed
+- **Program executor no longer mutates the host's SIGPIPE disposition.** The POSIX
+  external-program executor suppressed SIGPIPE for its stdin writes with a process-wide
+  `signal(SIGPIPE, SIG_IGN)` — a side effect on the embedding application. It now
+  suppresses SIGPIPE without touching global state: per-fd (`F_SETNOSIGPIPE`) on
+  macOS/BSD, and per-thread (`pthread_sigmask` block, with a `sigtimedwait` drain of any
+  pending signal before restoring the mask) on Linux. `test_program` now asserts the
+  host's SIGPIPE disposition is unchanged after a program task.
 - **External-program executor deadlock on a large payload (POSIX).** `gptps_program_execute`
   wrote the *entire* payload to the child's stdin before it began reading stdout, so a
   streaming child (one that emits output while still consuming input) deadlocked once both
