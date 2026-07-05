@@ -43,6 +43,18 @@
  * struct is only 4-aligned yet perfectly safe.) C99 negative-array-size assertion. */
 typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flags) == 8u) ? 1 : -1];
 
+/* Frozen minimums for the other caller-supplied INPUT structs: the point just past
+ * the current LAST field. This does NOT track sizeof (unlike `< sizeof *x`), so
+ * appending a field later leaves the minimum where it is and a caller compiled
+ * against today's header keeps validating - i.e. it is the append-safe floor. A
+ * field appended past here is read via GPTPS_STRUCT_HAS and, to stay unambiguous,
+ * must GROW sizeof (not hide in trailing padding - see the task_def note above). */
+#define GPTPS_LAST_FIELD_END(type, last) (offsetof(type, last) + sizeof(((type *)0)->last))
+#define GPTPS_CONFIG_MIN_SIZE         GPTPS_LAST_FIELD_END(gptps_config, mode)
+#define GPTPS_SUBMIT_OPTIONS_MIN_SIZE GPTPS_LAST_FIELD_END(gptps_submit_options, timeout_ms)
+#define GPTPS_ALLOCATOR_MIN_SIZE      GPTPS_LAST_FIELD_END(gptps_allocator, user_data)
+#define GPTPS_ADDON_MIN_SIZE          GPTPS_LAST_FIELD_END(gptps_addon, teardown)
+
 /* --- core allocator seam (alloc.c) ---
  * Every CORE allocation goes through these; they default to the C library and
  * are redirected process-wide by the public gptps_set_allocator(). gptps_free

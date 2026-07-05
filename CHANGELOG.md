@@ -6,6 +6,16 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed — append-safe ABI guards for all input structs
+- The remaining caller-supplied input structs — `gptps_config`, `gptps_submit_options`,
+  `gptps_allocator`, `gptps_addon` — now validate `struct_size` against a **frozen
+  minimum** (the end of the last current field) instead of the live `sizeof`. Freezing
+  the floor means appending a field to any of them later will not reject a caller
+  compiled against today's header — finishing the append-only ABI discipline the header
+  promises (previously only `gptps_task_def` was append-safe). No behavior change for a
+  normal caller (which passes `struct_size == sizeof`); `test_abi` checks the floor is
+  accepted and one byte below it rejected.
+
 ### Changed — shorter submit critical section (contention relief)
 - `gptps_submit` / `gptps_submit_ex` now copy the payload, allocate the work item, and
   create its cancel flag **before** taking the engine lock, instead of inside it. None

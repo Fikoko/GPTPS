@@ -111,6 +111,12 @@ target_link_libraries(test_service PRIVATE gptps)
 add_test(NAME service COMMAND test_service)
 set_tests_properties(service PROPERTIES TIMEOUT 30)
 
+add_executable(test_abi tests/test_abi.c)   # append-safe input-struct guards (frozen minimums)
+target_include_directories(test_abi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_abi PRIVATE gptps)
+add_test(NAME abi COMMAND test_abi)
+set_tests_properties(abi PROPERTIES TIMEOUT 30)
+
 add_executable(test_backpressure tests/test_backpressure.c)
 target_include_directories(test_backpressure
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

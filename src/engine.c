@@ -1134,7 +1134,7 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     unsigned i;
 
     if (!out_engine) return GPTPS_E_INVAL;
-    if (cfg && cfg->struct_size < sizeof *cfg) return GPTPS_E_INVAL; /* ABI: reject undersized struct */
+    if (cfg && cfg->struct_size < GPTPS_CONFIG_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: append-safe floor */
     *out_engine = NULL;
 
     e = (gptps *)gptps_calloc(1, sizeof *e);
@@ -1976,7 +1976,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
     if (!addon ||
         addon->magic != GPTPS_ABI_MAGIC ||
         addon->abi_version_major != GPTPS_ABI_VERSION_MAJOR ||
-        addon->struct_size < sizeof *addon) {
+        addon->struct_size < GPTPS_ADDON_MIN_SIZE) {   /* ABI: append-safe floor */
         gptps_dl_close(dl);
         return GPTPS_E_ABI;
     }
@@ -2010,7 +2010,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     void *pcopy = NULL;
 
     if (!e || !task_name) return GPTPS_E_INVAL;
-    if (opts && opts->struct_size < sizeof *opts) return GPTPS_E_INVAL; /* ABI: reject undersized */
+    if (opts && opts->struct_size < GPTPS_SUBMIT_OPTIONS_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: append-safe floor */
 
     /* Copy the payload + allocate the item + create the cancel flag OUTSIDE the
      * engine lock: none of it needs engine state, and keeping it off-lock shortens

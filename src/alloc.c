@@ -32,7 +32,7 @@ gptps_status gptps_set_allocator(const gptps_allocator *a)
         g_have = 0;
         return GPTPS_OK;
     }
-    if (a->struct_size < sizeof *a) return GPTPS_E_INVAL;          /* ABI guard */
+    if (a->struct_size < GPTPS_ALLOCATOR_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: append-safe floor */
     if (!a->malloc_fn || !a->realloc_fn || !a->free_fn) return GPTPS_E_INVAL;
     g_alloc = *a;
     g_have  = 1;
