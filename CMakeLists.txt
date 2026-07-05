@@ -282,6 +282,12 @@ if(UNIX)
     target_link_libraries(test_stress PRIVATE gptps)
     add_test(NAME stress COMMAND test_stress)
     set_tests_properties(stress PROPERTIES TIMEOUT 60)
+
+    add_executable(bench_pool examples/bench_pool.c addons/gptps_pool.c) # empirical scale-up proof (throughput vs shards)
+    target_include_directories(bench_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(bench_pool PRIVATE gptps)
+    add_test(NAME bench_pool COMMAND bench_pool)   # runs the CI-quick default; prints the scaling table
+    set_tests_properties(bench_pool PROPERTIES TIMEOUT 60)
 endif()
 
 # Portable add-on tests (all platforms): the add-on sources are portable
