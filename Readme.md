@@ -1,11 +1,15 @@
 # GPTPS — General Purpose Task Processing System
 
-**An embeddable, in-process C99 task processor (Control Plane) aimed for modularity and portability — the "General Purpose Task Processing System"**
+**An embeddable, in-process C99 task processor (Control Plane) aimed for modularity, portability, and scalability — the "General Purpose Task Processing System"**
 Link one library, register a task, submit work. GPTPS runs it on a worker pool under
 declared resource budgets, with retries / timeouts / dead-letter, and gives you the
 result back — plus an optional **live terminal dashboard** to watch and steer it. No
 server, no broker, no mandatory dependency. Runs on Linux, macOS, and Windows, and can
 even run **single-threaded with no libc heap** for embedded / bare-metal targets.
+
+Long-running **services** are supervised (restart-on-exit, stopped cleanly at shutdown),
+and scale is **opt-in and by composition** — shard across engines, route across worker
+processes, or swap the scheduler — never baked into the mechanism-only core.
 
 ---
 
@@ -13,6 +17,7 @@ even run **single-threaded with no libc heap** for embedded / bare-metal targets
 
 - [Quick start](#quick-start) · [Getting started](#getting-started) — build → run → embed
 - [API at a glance](#api-at-a-glance) · [Common tasks](#common-tasks) — step-by-step recipes
+- [Long-running services](#long-running-services) · [Scaling](#scaling-opt-in-by-composition) — services + scale-up/out
 - [Configuration file](#configuration-file-optional) · [Settings](#settings-runtime-introspectable-persistable)
 - [Manage tasks at runtime](#manage-tasks-at-runtime-control-plane) · [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
@@ -71,11 +76,10 @@ cmake -S . -B build          # configure (once)
 cmake --build build -j       # libgptps.a + the examples + the test suite
 ```
 
-Scaling is opt-in and pay-for-what-you-use, never baked into the default build: run
-several independent engine shards behind a router (the `gptps_pool` add-on) to scale
-throughput, swap the admission ordering (`gptps_set_scheduler`), and add
-`-DGPTPS_HAL_FAST=ON` for a platform-optimized HAL (adaptive mutexes on glibc; OFF by
-default keeps the portable path). None of these touch the mechanism-only core.
+Scaling is opt-in and never in the default build — shard across engines, route across
+worker processes, or swap the scheduler (see [Scaling](#scaling-opt-in-by-composition)).
+The one build-time knob is `-DGPTPS_HAL_FAST=ON` for a platform-optimized HAL (adaptive
+mutexes on glibc; OFF by default keeps the portable pthread path).
 
 **Building on Windows with mingw-w64.** The core is pure C99 and the Win32 backend
 (`hal_win.c` + `exec_win.c`) is selected automatically; mingw-w64 gcc is a first-class,
@@ -152,6 +156,7 @@ either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --
 | `gptps_task_setting_int/str(ctx, key, …)` | read this task's per-task setting from inside `run()` |
 | `gptps_set_event_cb(e, cb, ud)` | observe lifecycle events (results arrive on `FINISHED`) |
 | `gptps_register_constraint(e, fn, ud)` | gate admission (rate limit, quota, time window) |
+| `gptps_set_scheduler(e, fn, ud)` | swap the admission *ordering* (deadline-first, fair-share, …) over the fixed mechanism |
 | `gptps_register_observer(e, cb, ud)` | extra event sink (e.g. analytics) |
 | `gptps_dead_letter_count(e)` / `gptps_dead_letter_drain(e, cb, ud)` | inspect / reprocess retained failures |
 | `gptps_settings_get/set(e, key, …)` · `gptps_settings_count/get_info(e, …)` | read / change / introspect any setting at runtime |
@@ -217,6 +222,14 @@ See [Settings](#settings-runtime-introspectable-persistable).
 **7. Run with no background threads (embedded / bare-metal).** Open with
 `cfg.mode = GPTPS_RUN_MANUAL` and drive it yourself with `gptps_step()` — see
 [Embedded / single-threaded mode](#embedded-and-single-threaded-mode).
+
+**8. Run a supervised background service.** Flag the task `GPTPS_TASK_SERVICE`: its
+`run()` loops until told to stop and is restarted if it exits — see
+[Long-running services](#long-running-services).
+
+**9. Scale beyond one engine.** Shard across engines behind a router, ship work to
+worker processes, or swap the scheduler — all opt-in, all on the public API, no core
+change — see [Scaling](#scaling-opt-in-by-composition).
 
 ## Configuration file (optional)
 
@@ -308,6 +321,99 @@ gptps_unregister_task(e, "resize", GPTPS_REMOVE_DRAIN);   /* finish in-flight wo
   though, is fully creatable at runtime (and from the TUI) since its behavior is an external
   argv. Add-ons get the same control plane via the host-table ABI.
 
+## Long-running services
+
+Some work isn't a one-shot task — it's a resident loop (a poller, a listener, a metrics
+collector) that should run until the process stops and come back if it crashes. Flag the
+task type `GPTPS_TASK_SERVICE` and submit it like any task; the engine supervises it:
+
+```c
+static gptps_status poller(gptps_ctx *ctx, void *ud) {
+    (void)ud;
+    while (!gptps_is_cancelled(ctx)) { poll_once(); }   /* loop until told to stop */
+    return GPTPS_OK;
+}
+
+gptps_task_def d = { .struct_size = sizeof d, .name = "metrics",
+                     .run = poller, .exec = GPTPS_EXEC_INPROC,
+                     .flags = GPTPS_TASK_SERVICE };
+d.default_cost.struct_size = sizeof d.default_cost;
+d.default_policy.struct_size = sizeof d.default_policy;
+d.default_policy.retry_backoff_seconds = 2;             /* restart delay after a crash */
+gptps_register_task(e, &d);
+
+gptps_handle h;
+gptps_submit(e, "metrics", NULL, 0, &h);   /* start one instance (submit N for a pool) */
+```
+
+- **Supervised restart.** When the loop exits, the engine restarts the instance after
+  `retry_backoff_seconds` — crash-restart supervision, for free. The failure policy is
+  normalized (restart-on-exit, no timeout) so a config or settings edit can't un-service it.
+- **Stop it.** The submit handle stays valid across restarts, so `gptps_cancel(e, h)`
+  stops that one instance for good; `gptps_unregister_task` stops the whole type; and
+  **`gptps_shutdown` stops running services** (raising their cooperative cancel flag) so a
+  resident service never hangs teardown. Non-service in-flight work still drains gracefully.
+- **Restart-always vs. on-failure.** By default a service is "always up" (even a clean
+  `GPTPS_OK` return restarts it). Add `GPTPS_TASK_RETIRE_ON_OK` for the `Restart=on-failure`
+  semantic: a clean return retires the instance; only a failure restarts it.
+- v1 services are `GPTPS_EXEC_INPROC`, `GPTPS_RUN_THREADED`, and have no timeout.
+
+## Scaling (opt-in, by composition)
+
+The core is a single-writer engine — one lock, one dispatcher — which is simple, correct,
+and the per-node throughput ceiling. Rather than complicate the core, GPTPS scales by
+**composing modules on top of it**: you pay for scale only when you reach for it, and the
+default stays small and portable. None of the below touches the mechanism-only core.
+
+**Scale up — shard across engines (`gptps_pool`).** Run N independent engines (each its own
+lock + dispatcher + worker pool) behind a router:
+
+```c
+gptps_pool *pool = gptps_pool_open(4, &cfg);          /* 4 independent shards */
+gptps_pool_register_task(pool, &def);                 /* same task type on every shard */
+gptps_pool_submit(pool, "resize", buf, len, &h);      /* round-robin */
+gptps_pool_submit_keyed(pool, tenant_id, "resize", buf, len, &h);  /* per-key affinity */
+gptps_pool_cancel(pool, h);
+gptps_pool_close(pool);
+```
+
+The router's only shared state is a round-robin cursor (keyed routing is lock-free); each
+shard is a full engine. [`examples/bench_pool`](examples/bench_pool.c) measures it: on a
+32-core box, aggregate tiny-task throughput rose from ~15k/s at 1 shard to ~290k/s at 8
+(≈19×) — the single-writer ceiling, then composition breaking past it.
+
+**Scale out — worker processes (`gptps_xport`).** Fork N persistent worker *processes* and
+ship each submit to one over IPC, marshalling the result back — work runs in a separate
+address space (crash-isolated), and swapping the local socketpair for a TCP socket reaches
+another machine (POSIX only, like `EXEC_OOP`):
+
+```c
+gptps_xport *xp = gptps_xport_open(4, my_handler, ud);   /* 4 worker processes */
+gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);
+gptps_xport_close(xp);
+```
+
+**Swap the scheduling discipline (`gptps_set_scheduler`).** The admission *mechanism*
+(skip-to-fit, budget, starvation guard) is fixed; the *ordering* is a hook. Return a score
+per item and the dispatcher admits the highest that fits — so deadline-first, per-tenant
+fair-share, cost-aware, or aging disciplines compose without a core fork (default is
+priority/FIFO):
+
+```c
+static int64_t earliest_deadline_first(const gptps_sched_input *in, void *ud) {
+    (void)ud; return -(int64_t)in->enqueue_ms;   /* older enqueue = higher score */
+}
+gptps_set_scheduler(e, earliest_deadline_first, NULL);
+```
+
+**Faster locks (`-DGPTPS_HAL_FAST`).** An opt-in build knob swaps in adaptive
+(spin-then-block) mutexes on glibc — a latency knob for the engine's contended critical
+sections; OFF by default keeps the portable pthread HAL. The HAL is a module boundary, so a
+downstream can drop in its own platform-optimized backend.
+
+`gptps_pool` and `gptps_xport` are add-ons ([`addons/`](addons/)) built entirely on the
+public API — the proof that scaling here needs no core change.
+
 ## Live terminal dashboard
 
 GPTPS ships an optional, dependency-free terminal dashboard (`addons/tui.c`) — link it,
@@ -358,8 +464,14 @@ Run it live in a terminal: `./build/example_dashboard` (source:
 | Kind | Runs as | Enforcement | Platforms |
 |---|---|---|---|
 | `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | all |
-| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout | POSIX only (needs `fork`) |
-| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout | all (POSIX `fork`+exec; Windows `CreateProcess` + Job Object) |
+| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout **or cancel** | POSIX only (needs `fork`) |
+| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout **or cancel** | all (POSIX `fork`+exec; Windows `CreateProcess` + Job Object) |
+
+The out-of-process executors are fully **cancellable**: `gptps_cancel` (and
+`gptps_unregister_task(…, CANCEL)`) hard-kill a running child in bounded time — even one
+with no timeout, which used to run unstoppably. The POSIX program executor pumps the
+payload to stdin and reads stdout *concurrently* (a single `poll` loop), so a large payload
+through a streaming child never deadlocks.
 
 On POSIX the out-of-process executors enforce the per-task memory cap accurately with
 **cgroup v2** (`memory.max`, exceeding it ⇒ `GPTPS_E_NOMEM`) when `GPTPS_CGROUP_PARENT`
@@ -443,19 +555,21 @@ gptps/
 │   ├── gptps.h          ← the public API (start here)
 │   └── gptps_hal.h      ← internal platform-abstraction interface
 ├── src/                 ← the library
-│   ├── engine.c         core: dispatcher, queue, admission, failure engine, loader
-│   ├── config.c         config model + hardware auto-tune
-│   ├── config_toml.c    TOML-subset config-file parser
-│   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection)
-│   └── exec_oop_posix.c out-of-process + external-program executors
-├── addons/              ← optional modules on the public API (durable_queue, gpu_quota, wasm_exec, tui)
-├── examples/            ← runnable examples (demo, config_file, task_control, external_program, dashboard, embedded, wasm_program)
+│   ├── engine.c         core: dispatcher, queue, admission, scheduler, failure engine, loader
+│   ├── settings.c       typed settings registry;  alloc.c  custom-allocator seam
+│   ├── config.c         config model + hardware auto-tune;  config_toml.c  TOML parser
+│   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection);  hal_win.c  Win32 backend
+│   └── exec_oop_posix.c out-of-process + external-program executors;  exec_win.c  Win32 executor
+├── addons/              ← optional modules on the public API: gptps_pool (scale-up), gptps_xport (scale-out),
+│                          gptps_orch (dependencies), durable_queue, gpu_quota, wasm_exec, tui
+├── examples/            ← runnable examples (demo, config_file, task_control, external_program, dashboard,
+│                          embedded, wasm_program, bench_pool)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/ARCHITECTURE.md ← how it works inside
 ├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)
 ├── tools/amalgamate.sh  ← generates the single-file gptps.c + gptps.h
 ├── CMakeLists.txt
-└── .github/workflows/ci.yml   Linux + macOS + Windows build/test, ASan/UBSan, ThreadSanitizer
+└── .github/workflows/ci.yml   Linux/macOS/Windows (mingw + MSVC), i386 + s390x + freestanding, ASan/UBSan + TSan
 ```
 
 ## Status
@@ -467,9 +581,12 @@ fallback), the add-on loader + ABI, constraints + observers, TOML config-file lo
 (limits + scheduler + per-task overrides + add-on auto-load), the unified settings
 registry (typed get/set + validation + round-trip persistence + add-on-extensible),
 **single-threaded MANUAL mode** (`gptps_step`) and a **custom-allocator hook** for
-embedded / bare-metal hosts, the **live terminal dashboard** (with the settings editor),
-the crash-durable queue, GPU-quota, and WASM-executor add-ons, the examples, CMake + CI +
-single-file amalgamation.
+embedded / bare-metal hosts, **supervised long-running services** (`GPTPS_TASK_SERVICE`),
+the **pluggable scheduler seam** (`gptps_set_scheduler`), **scale-up** (`gptps_pool`
+shards) and **scale-out** (`gptps_xport` worker processes) add-ons, the optional
+platform-optimized HAL (`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the
+settings editor), the crash-durable queue, GPU-quota, and WASM-executor add-ons, the
+examples + benchmark, CMake + CI + single-file amalgamation.
 
 Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** (Win32 HAL
 via `src/hal_win.c`) runs the engine, scheduler, config, the in-process and
@@ -483,11 +600,13 @@ future work: a bundled default wasm runtime so neither a CLI nor an adapter is n
 
 ## Design notes
 
-The core is deliberately small and general: a mechanism-only engine with four add-on seams
-(task / constraint / transport / observer). Anything specific — GPU quotas, rate limits,
-priority, time-of-day windows — is a **constraint add-on**, so the core stays minimal while
-the variety lives in add-ons. The novel piece is single-process *self-throttling* admission:
-"can my own process afford to start this task right now, given my own remaining budget?"
+The core is deliberately small and general: a mechanism-only engine with five add-on seams
+(task / constraint / scheduler / transport / observer). Anything specific — GPU quotas, rate
+limits, priority, time-of-day windows — is a **constraint add-on**; the admission *order* is
+a **scheduler** hook; scale-up (`gptps_pool`) and scale-out (`gptps_xport`) are **transport /
+composition** add-ons — so the core stays minimal while the variety, and the scaling, live on
+the seams. The novel piece is single-process *self-throttling* admission: "can my own process
+afford to start this task right now, given my own remaining budget?"
 
 For the full internals — concurrency model, dispatch loop, scheduler, executors, HAL, and the
 add-on ABI — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
