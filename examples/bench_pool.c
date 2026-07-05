@@ -12,7 +12,14 @@
  * Numbers are machine- and load-dependent; the SHAPE (throughput rising with shards)
  * is the point, not the absolute figures. POSIX (spawns producer pthreads).
  */
-#define _POSIX_C_SOURCE 200809L   /* clock_gettime/CLOCK_MONOTONIC, sysconf, pthreads under -std=c99 */
+/* feature-test macros before any header (match hal_posix.c): expose clock_gettime,
+ * _SC_NPROCESSORS_ONLN, and pthreads under -std=c99 on each platform. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE
+#endif
 #include "gptps_pool.h"
 #include <stdio.h>
 #include <stdlib.h>
