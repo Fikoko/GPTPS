@@ -6,6 +6,17 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed — shorter submit critical section (contention relief)
+- `gptps_submit` / `gptps_submit_ex` now copy the payload, allocate the work item, and
+  create its cancel flag **before** taking the engine lock, instead of inside it. None
+  of that needs engine state, so moving it off-lock shortens the critical section every
+  producer contends on — a measurable win for large payloads and many concurrent
+  submitters (and for each `gptps_pool` shard). Strictly a default improvement: no API
+  change, no behavior change, and no second concurrency model — the engine keeps its one
+  simple, correct lock. (A rejected submit now does a wasted copy, but reject is the rare
+  path.) New `test_stress`: 8 producer threads × 400 submits with checksummed payloads,
+  all delivered intact; TSan- and ASan-clean.
+
 ### Added — optional platform-optimized HAL (scale knob)
 - **`-DGPTPS_HAL_FAST=ON`** builds the POSIX HAL with **adaptive (spin-then-block)
   mutexes** on glibc — a latency knob for the engine's short, contended critical
@@ -27,6 +38,19 @@ versioning once it reaches 1.0.
   fair-share, cost-aware, or aging disciplines are composable, not core forks. Default
   (no hook) is unchanged priority/FIFO ordering, with zero added overhead. Also on the
   host-table ABI (`GPTPS_SEAM_SCHEDULER`) so add-ons can install one. (`test_sched_seam`.)
+
+### Added — scale-OUT by composition: the worker-process transport add-on
+- **`addons/gptps_xport`** forks N persistent worker **processes** and ships each submit
+  to one over IPC (a socketpair), marshalling the result back — so work runs in a
+  SEPARATE address space (crash-isolated, independently capped), the reference consumer
+  of `GPTPS_SEAM_TRANSPORT`. The local socketpair is the only thing between this and
+  cross-MACHINE execution: swap it for a TCP socket and the same length-prefixed protocol
+  reaches another host. Engine-agnostic (you supply a handler; inside it you may drive a
+  gptps engine or anything), round-robin routed, thread-safe, **no core change**. POSIX
+  only (fork), like `EXEC_OOP`. Two adversarial reviews (fork/fd lifecycle + protocol/
+  concurrency) found it correct; the fixes from them (SO_NOSIGPIPE on the worker socket
+  for macOS, a message-length cap) are included. (`test_xport`: proves out-of-process
+  execution via the worker pid, fan-out across workers, error/empty round-trips.)
 
 ### Added — scale-up by composition: the shard/router add-on
 - **`addons/gptps_pool`** runs N independent engine shards (each its own lock +

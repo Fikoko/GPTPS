@@ -270,6 +270,18 @@ if(UNIX)
     target_link_libraries(test_cgroup PRIVATE gptps)
     add_test(NAME cgroup COMMAND test_cgroup)
     set_tests_properties(cgroup PROPERTIES TIMEOUT 30)
+
+    add_executable(test_xport tests/test_xport.c addons/gptps_xport.c) # scale-out: worker-process transport (fork+socketpair)
+    target_include_directories(test_xport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(test_xport PRIVATE gptps)
+    add_test(NAME xport COMMAND test_xport)
+    set_tests_properties(xport PROPERTIES TIMEOUT 30)
+
+    add_executable(test_stress tests/test_stress.c) # concurrent-producer submit stress (off-lock copy under contention)
+    target_include_directories(test_stress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_stress PRIVATE gptps)
+    add_test(NAME stress COMMAND test_stress)
+    set_tests_properties(stress PROPERTIES TIMEOUT 60)
 endif()
 
 # Portable add-on tests (all platforms): the add-on sources are portable

@@ -2012,36 +2012,15 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     if (!e || !task_name) return GPTPS_E_INVAL;
     if (opts && opts->struct_size < sizeof *opts) return GPTPS_E_INVAL; /* ABI: reject undersized */
 
-    gptps_mutex_lock(e->m);
-    if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
-
-    r = registry_find(e, task_name);
-    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; } /* unknown, draining, or paused */
-
-    cost = r->def.default_cost;
-    if (r->def.cost) {
-        gptps_status cs = r->def.cost(payload, len, &cost, r->def.user_data);
-        if (cs != GPTPS_OK) { gptps_mutex_unlock(e->m); return cs; }
-    }
-    if (cost.mem_bytes > e->limits.max_memory_bytes) {
-        gptps_mutex_unlock(e->m);
-        return GPTPS_E_BUDGET; /* never-fits: reject at submit */
-    }
-    if (e->nres && r->res_cost) {           /* a resource cost that can never fit its budget */
-        size_t ri;
-        for (ri = 0; ri < e->nres; ++ri)
-            if (r->res_cost[ri] > e->resources[ri].budget) { gptps_mutex_unlock(e->m); return GPTPS_E_BUDGET; }
-    }
-    /* backpressure: bound the intake queue so an overproducing client cannot grow
-     * it without limit (max_memory_bytes bounds only the RUNNING set). 0 = off. */
-    if (e->limits.max_intake_depth && e->intake.count >= e->limits.max_intake_depth) {
-        gptps_mutex_unlock(e->m);
-        return GPTPS_E_FULL;
-    }
-
+    /* Copy the payload + allocate the item + create the cancel flag OUTSIDE the
+     * engine lock: none of it needs engine state, and keeping it off-lock shortens
+     * the critical section every producer contends on - a real win for large
+     * payloads / many concurrent submitters (and for each pool shard). item_free
+     * cleans up uniformly if a check below rejects the submit. (A reject now does a
+     * wasted copy, but rejects are the rare path; the common accept path wins.) */
     if (len) {
         pcopy = gptps_malloc(len);
-        if (!pcopy) { gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+        if (!pcopy) return GPTPS_E_NOMEM;
         memcpy(pcopy, payload, len);
     }
     it = (gptps_item *)gptps_calloc(1, sizeof *it);
@@ -2049,15 +2028,41 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     if (!it || !it->cancel) {
         if (it) gptps_flag_destroy(it->cancel);
         gptps_free(it); gptps_free(pcopy);
-        gptps_mutex_unlock(e->m);
         return GPTPS_E_NOMEM;
+    }
+    it->payload = pcopy;          /* set now so item_free frees it on any reject below */
+    it->payload_len = len;
+
+    gptps_mutex_lock(e->m);
+    if (e->stopping) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_SHUTDOWN; }
+
+    r = registry_find(e, task_name);
+    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_NOTFOUND; } /* unknown, draining, or paused */
+
+    cost = r->def.default_cost;
+    if (r->def.cost) {
+        gptps_status cs = r->def.cost(payload, len, &cost, r->def.user_data);
+        if (cs != GPTPS_OK) { gptps_mutex_unlock(e->m); item_free(it); return cs; }
+    }
+    if (cost.mem_bytes > e->limits.max_memory_bytes) {
+        gptps_mutex_unlock(e->m); item_free(it);
+        return GPTPS_E_BUDGET; /* never-fits: reject at submit */
+    }
+    if (e->nres && r->res_cost) {           /* a resource cost that can never fit its budget */
+        size_t ri;
+        for (ri = 0; ri < e->nres; ++ri)
+            if (r->res_cost[ri] > e->resources[ri].budget) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_BUDGET; }
+    }
+    /* backpressure: bound the intake queue so an overproducing client cannot grow
+     * it without limit (max_memory_bytes bounds only the RUNNING set). 0 = off. */
+    if (e->limits.max_intake_depth && e->intake.count >= e->limits.max_intake_depth) {
+        gptps_mutex_unlock(e->m); item_free(it);
+        return GPTPS_E_FULL;
     }
 
     it->handle = e->next_handle++;
     it->def = &r->def;
     it->reg = r;
-    it->payload = pcopy;
-    it->payload_len = len;
     it->cost = cost;
     it->policy = r->def.default_policy;
     it->priority = r->priority;
