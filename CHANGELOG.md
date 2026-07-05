@@ -6,6 +6,15 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added — optional platform-optimized HAL (scale knob)
+- **`-DGPTPS_HAL_FAST=ON`** builds the POSIX HAL with **adaptive (spin-then-block)
+  mutexes** on glibc — a latency knob for the engine's short, contended critical
+  sections under high submit/dispatch load. Same lock semantics (no correctness
+  change); it stays **OFF by default**, so the portable pthread HAL is the untouched
+  default. The whole HAL is a module boundary, so scaling here needs no core change —
+  and a downstream can swap the HAL source wholesale for its own platform-optimized
+  one. CI builds and tests the fast variant (`hal_fast` job).
+
 ### Added — ABI 1.12: pluggable scheduler seam
 - **`gptps_set_scheduler(e, fn, ud)`** makes the admission ORDERING a swappable
   policy without touching the core. The dispatcher's *mechanism* stays fixed and

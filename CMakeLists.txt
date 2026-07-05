@@ -47,6 +47,15 @@ if(NOT MSVC)
     target_compile_options(gptps PRIVATE -Wall -Wextra)
 endif()
 
+# Optional platform-optimized HAL: a build-time scale knob (adaptive/spin mutexes on
+# glibc) that stays OFF by default, so the portable C99 path is the untouched default.
+# The whole HAL is a module boundary, so scaling here needs no core change. A downstream
+# can also replace the HAL source wholesale via -DGPTPS_HAL_SOURCE=<file>.
+option(GPTPS_HAL_FAST "Build the platform-optimized HAL (adaptive mutexes; glibc)" OFF)
+if(GPTPS_HAL_FAST)
+    target_compile_definitions(gptps PRIVATE GPTPS_HAL_FAST)
+endif()
+
 # threads (HAL uses pthreads on POSIX)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)

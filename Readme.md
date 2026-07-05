@@ -71,6 +71,12 @@ cmake -S . -B build          # configure (once)
 cmake --build build -j       # libgptps.a + the examples + the test suite
 ```
 
+Scaling is opt-in and pay-for-what-you-use, never baked into the default build: run
+several independent engine shards behind a router (the `gptps_pool` add-on) to scale
+throughput, swap the admission ordering (`gptps_set_scheduler`), and add
+`-DGPTPS_HAL_FAST=ON` for a platform-optimized HAL (adaptive mutexes on glibc; OFF by
+default keeps the portable path). None of these touch the mechanism-only core.
+
 **Building on Windows with mingw-w64.** The core is pure C99 and the Win32 backend
 (`hal_win.c` + `exec_win.c`) is selected automatically; mingw-w64 gcc is a first-class,
 CI-tested toolchain (native PE binaries, full `<windows.h>`, `__atomic` support). Using

@@ -205,7 +205,26 @@ static void *gptps__thread_trampoline(void *p)
 gptps_mutex *gptps_mutex_create(void)
 {
     struct gptps_mutex *m = (struct gptps_mutex *)malloc(sizeof *m);
-    if (m && pthread_mutex_init(&m->m, NULL) != 0) { free(m); m = NULL; }
+    if (!m) return NULL;
+#if defined(GPTPS_HAL_FAST) && defined(__GLIBC__)
+    /* Fast HAL (opt-in build knob, glibc): an ADAPTIVE mutex spins briefly before
+     * blocking, cutting the syscall/wakeup cost of the engine's short, contended
+     * critical sections under high submit/dispatch load. Same lock semantics as a
+     * plain mutex (non-recursive, no correctness change) - purely a latency knob.
+     * Gated on __GLIBC__ because PTHREAD_MUTEX_ADAPTIVE_NP is a glibc ENUM constant
+     * (not a macro, so it can't be #if defined-tested); non-glibc toolchains fall
+     * through to the portable default below. Requires _GNU_SOURCE (set at the top). */
+    {
+        pthread_mutexattr_t a; int rc;
+        pthread_mutexattr_init(&a);
+        pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ADAPTIVE_NP);
+        rc = pthread_mutex_init(&m->m, &a);
+        pthread_mutexattr_destroy(&a);
+        if (rc != 0) { free(m); return NULL; }
+    }
+#else
+    if (pthread_mutex_init(&m->m, NULL) != 0) { free(m); return NULL; }
+#endif
     return m;
 }
 void gptps_mutex_destroy(gptps_mutex *m) { if (m) { pthread_mutex_destroy(&m->m); free(m); } }

@@ -111,6 +111,19 @@ jobs:
             setarch "$(uname -m)" -R ./$t.tsan
           done
 
+  # Optional platform-optimized HAL (adaptive mutexes, glibc): build with the opt-in
+  # scale knob ON and run the whole suite, so the fast path stays correct on CI. The
+  # default (knob OFF) is the portable pthread HAL exercised by every other job.
+  hal_fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure + build + test with GPTPS_HAL_FAST=ON
+        run: |
+          cmake -S . -B build-fast -DGPTPS_HAL_FAST=ON
+          cmake --build build-fast -j
+          ctest --test-dir build-fast --output-on-failure
+
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
   # (s390x, 64-bit big-endian, run under QEMU). The journal/TOML/settings
