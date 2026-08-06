@@ -22,15 +22,20 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build + test at the tag
         # Do not ship an artifact from a tree that does not pass its own suite.
+        #
+        # --no-tests=error because `ctest` exits 0 when it finds no tests at all,
+        # which would turn this gate - the one thing standing between a broken tree
+        # and a published artifact - into a no-op that reports success.
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --no-tests=error
 
       - name: Generate the amalgamation
         run: sh tools/amalgamate.sh amalgamation
@@ -94,6 +99,11 @@ jobs:
         with:
           name: "GPTPS ${{ steps.stage.outputs.version }}"
           body_path: NOTES.md
+          # Default is false, and the action only warns before publishing anyway -
+          # so a `files:` entry that staging never produced would ship a release
+          # QUIETLY missing an asset. Every path below is literal, not a glob, so
+          # this can only fire on a real staging bug.
+          fail_on_unmatched_files: true
           files: |
             dist/gptps.c
             dist/gptps.h

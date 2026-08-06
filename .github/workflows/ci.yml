@@ -9,6 +9,23 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 
+# Two conventions every job below follows, both of which exist so a green run means
+# what it says:
+#
+#   --no-tests=error  - `ctest` exits 0 when it finds NO tests. Since the suite moved
+#     behind `if(GPTPS_BUILD_TESTS)` in CMakeLists, a typo in that guard (or anything
+#     that stops the tests being registered) would configure clean, build clean, and
+#     produce a green run that executed nothing. A test runner that reports success
+#     for work it never ran is worse than no test runner. The flag makes "no tests"
+#     the failure it always was. Note the count is platform-dependent - nine add_test
+#     calls sit inside if(UNIX), so Windows registers 34 where POSIX registers 43 -
+#     which is why this is a zero/non-zero gate and not a count floor.
+#
+#   timeout-minutes   - the default is SIX HOURS. Every test carries its own CTest
+#     TIMEOUT, so the exposure is the unbounded non-test work: pacman -Syuu in the
+#     msys2 setup, the two apt-get calls in `cross`, checkout, and the builds. The
+#     values below sit at 8x or more over each job's worst observed green runtime.
+
 jobs:
   # Build + test on the POSIX targets. Windows has its own jobs below (mingw-w64
   # and MSVC), both running the same suite against the Win32 HAL.
@@ -18,14 +35,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
       - name: Build
         run: cmake --build build
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
 
   # Optimised build with warnings as errors. Every other job builds -O0, which
   # makes the whole FLOW-SENSITIVE diagnostic family (-Wformat-truncation,
@@ -34,21 +52,23 @@ jobs:
   # what keeps them from accumulating as ignorable noise.
   werror:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure (-O2, -Werror)
         run: cmake -S . -B build-werror -DCMAKE_BUILD_TYPE=Release
              -DCMAKE_C_FLAGS="-std=c99 -O2 -Wall -Wextra -Werror -Wno-unused-parameter"
       - name: Build
         run: cmake --build build-werror -j
       - name: Test
-        run: ctest --test-dir build-werror --output-on-failure
+        run: ctest --test-dir build-werror --output-on-failure --no-tests=error
 
   # Verify the single-file amalgamation compiles and runs (drop-in path).
   amalgamation:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Generate amalgamation
         run: sh tools/amalgamate.sh amalgamation
       - name: Assert the generated files carry the MIT notice
@@ -74,11 +94,12 @@ jobs:
   # (fork/pthread executors + add-ons) are gated out in CMake.
   windows:
     runs-on: windows-latest
+    timeout-minutes: 25
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -92,7 +113,7 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure --no-tests=error
       - name: Single-file amalgamation build
         run: |
           sh tools/amalgamate.sh
@@ -106,28 +127,30 @@ jobs:
   # CMakeLists' if(MSVC) block, so no compiler flags are needed here.
   msvc:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: cmake -S . -B build
       - name: Build
         run: cmake --build build --config Debug
       - name: Test
-        run: ctest --test-dir build -C Debug --output-on-failure
+        run: ctest --test-dir build -C Debug --output-on-failure --no-tests=error
 
   # AddressSanitizer + UBSan across the whole suite (memory errors, leaks, UB).
   # Uses CMake (not a hand-maintained source list) so it can't drift out of sync.
   asan:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure (ASan + UBSan)
         run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug
              -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g"
       - name: Build
         run: cmake --build build-asan
       - name: Test
-        run: ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build-asan --output-on-failure
+        run: ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build-asan --output-on-failure --no-tests=error
 
   # ThreadSanitizer (ASLR disabled for TSan in CI).
   #
@@ -139,8 +162,9 @@ jobs:
   # the worst place to have one: it reports success for work it never ran.
   tsan:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure + build under ThreadSanitizer
         run: |
           cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
@@ -149,20 +173,21 @@ jobs:
       - name: Run the suite under ThreadSanitizer
         # Only bench_pool is excluded, and only for runtime (~25s under TSan for a
         # throughput benchmark that asserts nothing a race detector can use).
-        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E 'bench_pool'
+        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure --no-tests=error -E 'bench_pool'
 
   # Optional platform-optimized HAL (adaptive mutexes, glibc): build with the opt-in
   # scale knob ON and run the whole suite, so the fast path stays correct on CI. The
   # default (knob OFF) is the portable pthread HAL exercised by every other job.
   hal_fast:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure + build + test with GPTPS_HAL_FAST=ON
         run: |
           cmake -S . -B build-fast -DGPTPS_HAL_FAST=ON
           cmake --build build-fast -j
-          ctest --test-dir build-fast --output-on-failure
+          ctest --test-dir build-fast --output-on-failure --no-tests=error
 
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
@@ -170,15 +195,16 @@ jobs:
   # serialization and every fixed-width type are validated here.
   cross:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 32-bit (i386) build + full test
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-multilib
           cmake -S . -B build32 -DCMAKE_C_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32
           cmake --build build32 -j
-          ctest --test-dir build32 --output-on-failure
+          ctest --test-dir build32 --output-on-failure --no-tests=error
       - name: big-endian (s390x) build + serialization tests under QEMU
         run: |
           sudo apt-get update
@@ -199,7 +225,7 @@ jobs:
           # and all three are covered on the native x86_64/arm64 + macOS runners.
           # Everything else - byte-order-critical serialization, the scheduler, the
           # failure engine, and every future pure-logic test - now runs by default.
-          ctest --test-dir build-s390x --output-on-failure \
+          ctest --test-dir build-s390x --output-on-failure --no-tests=error \
             -E 'oop|program|cgroup|addon|xport|wasm|tui|hang|durable|stress|bench_pool|demo|example_'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
@@ -208,8 +234,9 @@ jobs:
   # that the HAL (gptps_hal.h) is the only platform seam.
   freestanding:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build core with the stub HAL (-ffreestanding, no pthread/dl)
         run: sh freestanding/build.sh ./gptps_freestanding_demo
       - name: Run the MANUAL-mode demo (exit 0 = ran via the HAL seam only)
