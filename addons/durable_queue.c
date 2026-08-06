@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * durable_queue.c - crash-durable submission for GPTPS (see durable_queue.h).
  *
@@ -111,6 +113,44 @@ static int write_record(FILE *f, char type, uint64_t seq,
     w = fwrite(buf, 1, total, f);
     free(buf);
     return (w == total) ? 0 : -1;
+}
+
+/* Roll `f` back to `start` bytes and clear stdio's sticky error flag.
+ * Called after a failed append. Two things are being repaired:
+ *  1. The PARTIAL record a short write left behind. Replay stops at the first
+ *     record whose magic or checksum does not verify, so a torn record sitting in
+ *     the MIDDLE of the journal silently discards every valid record after it.
+ *  2. The error indicator itself, which stdio latches - without clearing it the
+ *     stream keeps refusing writes even once the condition (a full disk, say) is
+ *     gone, so one transient ENOSPC bricked the queue for the process's lifetime. */
+static void rollback_to(FILE *f, long start)
+{
+    clearerr(f);
+    if (start < 0) return;
+    fflush(f);
+    clearerr(f);
+    if (apx_truncate(f, start) == 0) fseek(f, start, SEEK_SET);
+    clearerr(f);
+}
+
+/* Append one record and make it durable, rolling the journal back to its previous
+ * length if either step fails. Returns 0 on success. */
+static int append_durable(FILE *f, char type, uint64_t seq,
+                          const char *name, const void *payload, uint32_t plen)
+{
+    long start = ftell(f);
+    if (write_record(f, type, seq, name, payload, plen) != 0) { rollback_to(f, start); return -1; }
+    if (fflush(f) != 0 || apx_fsync(f) != 0)                  { rollback_to(f, start); return -1; }
+    return 0;
+}
+
+/* Append a state MARKER ('D'one / 'Q'uarantined) and flush it. A lost marker is
+ * harmless (replay just re-runs or re-quarantines that record), but a TORN one is
+ * not - it would truncate the journal's tail at replay - so this rolls back too. */
+static void append_marker(FILE *f, char type, uint64_t seq)
+{
+    long start = ftell(f);
+    if (write_record(f, type, seq, "", NULL, 0) != 0 || fflush(f) != 0) rollback_to(f, start);
 }
 
 /* ---- in-memory record list ---- */
@@ -239,14 +279,13 @@ static void dq_on_event(const gptps_event *ev, void *ud)
         if (ev->kind == GPTPS_EV_DEAD_LETTERED) {
             /* dead-lettered: RETAIN the poison payload (quarantine), don't drop it */
             dq->recs[i].quarantined = 1;
-            write_record(dq->fp, 'Q', dq->recs[i].seq, "", NULL, 0);
+            append_marker(dq->fp, 'Q', dq->recs[i].seq);
         } else {
             /* finished or dropped: terminally gone, discard */
             dq->recs[i].done = 1;
-            write_record(dq->fp, 'D', dq->recs[i].seq, "", NULL, 0);
+            append_marker(dq->fp, 'D', dq->recs[i].seq);
         }
         if (dq->pending) dq->pending -= 1;
-        fflush(dq->fp); /* marker: a lost marker just replays/re-quarantines = harmless */
         break;
     }
     apx_mutex_unlock(&dq->mu);
@@ -291,13 +330,11 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
 
     apx_mutex_lock(&dq->mu);
     seq = dq->next_seq;
-    if (write_record(dq->fp, 'P', seq, task_name, payload, (uint32_t)len) != 0) {
-        apx_mutex_unlock(&dq->mu);
-        return GPTPS_E_IO;
-    }
-    /* durable before we enqueue: a swallowed fsync error would be a false
-     * durability claim (a torn/buffered tail is tolerated by replay's checksum). */
-    if (fflush(dq->fp) != 0 || apx_fsync(dq->fp) != 0) {
+    /* Durable before we enqueue: a swallowed fsync error would be a false
+     * durability claim. On failure the journal is rolled back to its previous
+     * length, so a transient full disk costs this one submit rather than every
+     * submit for the rest of the process's life. */
+    if (append_durable(dq->fp, 'P', seq, task_name, payload, (uint32_t)len) != 0) {
         apx_mutex_unlock(&dq->mu);
         return GPTPS_E_IO;
     }
@@ -317,7 +354,7 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     } else {
         /* engine refused it: mark done so recovery won't replay a rejected task */
         rc->done = 1; if (dq->pending) dq->pending -= 1;
-        write_record(dq->fp, 'D', seq, "", NULL, 0); fflush(dq->fp);
+        append_marker(dq->fp, 'D', seq);
     }
     apx_mutex_unlock(&dq->mu);
     return st;

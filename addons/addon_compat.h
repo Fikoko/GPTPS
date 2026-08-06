@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * addon_compat.h - tiny portable primitives shared by the bundled add-ons, so
  * they build and run on POSIX and Windows from the same source. Just a mutex and
@@ -26,6 +28,7 @@ static APX_UNUSED void apx_mutex_lock(apx_mutex *m)    { EnterCriticalSection(m)
 static APX_UNUSED void apx_mutex_unlock(apx_mutex *m)  { LeaveCriticalSection(m); }
 static APX_UNUSED void apx_mutex_destroy(apx_mutex *m) { DeleteCriticalSection(m); }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return _commit(_fileno(f)); }
+static APX_UNUSED int  apx_truncate(FILE *f, long len) { return _chsize(_fileno(f), len); }
 /* NTFS has no durable directory-entry fsync API exposed here; rename is
  * effectively durable once the file data is committed, so this is a no-op. */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)  { (void)dir; return 0; }
@@ -39,6 +42,7 @@ static APX_UNUSED void apx_mutex_lock(apx_mutex *m)    { pthread_mutex_lock(m); 
 static APX_UNUSED void apx_mutex_unlock(apx_mutex *m)  { pthread_mutex_unlock(m); }
 static APX_UNUSED void apx_mutex_destroy(apx_mutex *m) { pthread_mutex_destroy(m); }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return fsync(fileno(f)); }
+static APX_UNUSED int  apx_truncate(FILE *f, long len) { return ftruncate(fileno(f), (off_t)len); }
 /* fsync the directory so a rename of a journal file is durable across a crash
  * (the rename's directory-entry update must itself be flushed). */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)
