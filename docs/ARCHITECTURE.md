@@ -16,7 +16,7 @@ for the *API contract*, see [`include/gptps.h`](../include/gptps.h).
 | Goal | Consequence in the codebase |
 |---|---|
 | **Portability** — one task, any hardware | Strict C99 core; every OS primitive is behind the HAL (`gptps_hal.h`). No `_Atomic` in the core. |
-| **Modularity** — handle all outcomes | Mechanism-only core + four add-on *seams* (task / constraint / transport / observer). Domain policy lives in add-ons, not the core. |
+| **Modularity** — handle all outcomes | Mechanism-only core + five add-on *seams* (task / constraint / scheduler / transport / observer). Domain policy lives in add-ons, not the core. |
 | **Embeddability** | No mandatory third-party dependency. Single-file amalgamation (`gptps.c` + `gptps.h`). Stable, versioned ABI. |
 | **General purpose** | Tasks are opaque (`payload` bytes → `result` bytes). Three executors cover in-process, isolated, and any-language work. |
 
@@ -117,7 +117,10 @@ without deadlock or re-entrancy under the lock.
 4. **Admit** — priority-ordered, skip-to-fit, with reservation (see §5).
 5. **Emit** buffered events with the lock released, then `continue` (re-runs the
    loop so a signal arriving during the emit window can't be lost).
-6. **Shutdown** check — when fully drained, wake workers to exit and break.
+6. **Shutdown** check — when fully drained, wake workers to exit and break. The
+   drain is BOUNDED: `gptps_shutdown` arms a deadline (`limits.shutdown_grace_ms`,
+   default 30s, `0` = wait forever), and once it passes, step 3b raises every
+   in-flight item's cancel flag so one stuck child cannot hang the host's exit.
 7. **Sleep** — `cond_timedwait` until the nearest deadline/backoff, or `cond_wait`
    until signalled. (Steps 1–7 hold the lock continuously when no events were
    emitted, so no wakeup can be lost.)
@@ -221,8 +224,12 @@ Per-task `gptps_failure_policy`: `timeout_seconds`, `max_retries`,
   re-admitted after `retry_backoff_seconds` (emitting `RETRIED`).
 - **`on_failure`** when retries are exhausted:
   - `dead_letter` (default, safe) — retained in the in-memory dead-letter list,
-    emits `DEAD_LETTERED`;
-  - `drop` — discarded (no event);
+    emits `DEAD_LETTERED`. The list is CAPPED (`limits.max_dead_letters`, default
+    1024, `0` = unbounded), evicting oldest-first and counting evictions in
+    `stats.dead_letters_evicted` — it is the only queue the host need not drain,
+    so an unbounded one was a leak in an engine built on bounded admission;
+  - `drop` — discarded, emits `DROPPED` (v1.9) so an observer can still reconcile
+    the handle;
   - `requeue` — re-enqueued for another cycle (bodies MUST be idempotent; never
     re-admitted during shutdown, to avoid an always-failing task hanging the drain).
 - **Dead-letter drain** — `gptps_dead_letter_drain()` detaches the retained list
@@ -427,8 +434,11 @@ sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
 **self-skip** where the facility is absent rather than failing (cgroup delegation, a
-wasm runtime CLI). CI runs six jobs:
-`build-test` (Linux + macOS), `windows` (mingw-w64), `amalgamation`, `asan`, and `tsan`.
+wasm runtime CLI). CI runs nine jobs: `build-test` (Linux + macOS), `windows` (mingw-w64), `msvc`
+(cl.exe), `amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan),
+`tsan`, `hal_fast`, `cross` (i386 + big-endian s390x under QEMU), and
+`freestanding`. The `tsan` and `cross` jobs select tests with an EXCLUDE list, so
+a newly added test is covered by default rather than silently skipped.
 
 ---
 

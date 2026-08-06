@@ -25,6 +25,18 @@ max_concurrent_tasks = 0
 # 0 / omitted => ~0.75 x detected RAM.
 max_memory_gb = 0.0
 # max_memory_bytes = 0
+# Max queued (un-admitted) items before gptps_submit returns E_FULL.
+# 0 / omitted => unbounded intake.
+# max_intake_depth = 0
+# How long gptps_shutdown lets in-flight work drain before cancelling it. Past
+# this, every running item's cancel flag is raised and the enforced executors
+# hard-kill their child - so one stuck external child cannot hang your process's
+# exit path forever. 0 => wait forever.
+shutdown_grace_ms = 30000
+# Cap on RETAINED dead-lettered items (the default on_failure). This is the one
+# queue you are not required to drain, so past the cap the oldest is evicted and
+# counted in the stats.dead_letters_evicted setting. 0 => unbounded.
+max_dead_letters = 1024
 
 # Scheduler tuning.
 [scheduler]

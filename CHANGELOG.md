@@ -6,6 +6,141 @@ versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Fixed — teardown always terminates
+
+Four separate ways `gptps_shutdown` could stop returning. All are reachable from the
+`memset`-zeroed `gptps_task_def` the quick start teaches, and because GPTPS is an
+in-process library, a hung shutdown hangs the **host's** exit path — the supervisor
+SIGKILLs the process and any external children survive as orphans.
+
+- **The shutdown drain is now bounded.** In-flight work gets `limits.shutdown_grace_ms`
+  (default 30000, live-settable, `0` = the old wait-forever) to finish, after which
+  every running item's cancel flag is raised; the enforced executors then hard-kill
+  their child within ~200ms. Previously `stop_services` raised the flag *only* for
+  service items, so a `GPTPS_EXEC_PROGRAM` task with the default `timeout_seconds == 0`
+  whose child never exited hung teardown forever.
+- **`gptps_shutdown` and `gptps_step` are no longer re-entrant.** Called from a task
+  body or an event callback they now return `GPTPS_E_BUSY` instead of joining the very
+  thread making the call (a deadlock in THREADED mode) or freeing the engine that
+  `gptps_step` is standing on (a use-after-free in MANUAL mode). The header explicitly
+  promised callbacks may re-enter the engine; these two are now documented exceptions.
+- **The external-program executor no longer blocks forever in `waitpid`.** Its pump
+  breaks on *stdout EOF*, which says the child closed its output — not that it exited.
+  A child that closes stdout and keeps running pinned the worker with no deadline to
+  rescue it. Reaping is now bounded (`WNOHANG` + a grace period, then `SIGKILL`).
+- **A zero-backoff service no longer spins a core.** The `REQUEUE` / service-restart
+  paths reset `attempt`, so unlike a bounded retry nothing stops them; with
+  `retry_backoff_seconds` at its zero default an immediately-failing body was
+  re-admitted as fast as the dispatcher could loop. Re-admission is now floored at
+  ~100ms. Bounded retries are deliberately unchanged.
+
+### Fixed — unbounded growth
+
+- **The dead-letter list is capped** at `limits.max_dead_letters` (default 1024,
+  live-settable, `0` = unbounded), evicting oldest-first. It is the only queue a host
+  is not required to drain and `DEAD_LETTER` is the default `on_failure`, so an
+  undrained one grew forever, each entry pinning its original payload — an unbounded
+  queue inside an engine whose entire contract is bounded admission. The truncation is
+  never silent: `stats.dead_letters_evicted` counts what was dropped.
+- **The OOP executor caps the result it will buffer** at 16 MiB, matching the sibling
+  PROGRAM executor. The parent previously allocated whatever length the child declared,
+  and on a 32-bit host `(size_t)len64` truncated — allocating a short buffer and then
+  reading the rest of the record as if it were the next one.
+
+### Fixed — a failed add-on load left dangling pointers
+
+`gptps_load_addon` called `dlclose` when `setup()` failed, without unwinding anything
+that partial setup had already registered — so an observer or constraint function
+pointer into the now-unmapped library stayed on a list the engine walks on the next
+event. `GPTPS_E_DUP` (a name collision) and `GPTPS_E_NOMEM` are exactly the statuses a
+host logs and continues past, which turned a soft, recoverable failure into memory
+corruption. A failed `setup()` is now unwound (observers, constraints, tasks, the
+scheduler hook restored to their pre-`setup` state) and the mapping is deliberately
+**not** unloaded, since a partial setup can leave pointers the unwind cannot reach.
+Relatedly, config-file `addons = [...]` auto-load failures are now reported through the
+log sink instead of being discarded.
+
+### Fixed — the terminal-event contract observers depend on
+
+Observers are the only completion channel in this design (the core never aggregates),
+so an item that vanishes with no terminal event makes every add-on built on that seam
+quietly wrong — `gpu_quota` releases its reservation only when it sees one, so a
+silently-freed item leaked its GPU budget permanently.
+
+- `gptps_unregister_task(…, GPTPS_REMOVE_CANCEL)` destroyed its queued backlog with **no
+  event at all**. Every cancelled item now emits `GPTPS_EV_FAILED` / `GPTPS_E_CANCELLED`.
+- An item cancelled while *running* is not double-reported: it already got its terminal
+  event from the executor.
+- **`gptps_cancel` no longer reports `GPTPS_E_TIMEOUT`.** A cancelled in-flight task now
+  ends with `GPTPS_E_CANCELLED`, so an operator's cancel is distinguishable from a
+  deadline breach. A real deadline still reports `GPTPS_E_TIMEOUT`. The same distinction
+  is now made by all three executors (in-process, POSIX OOP/PROGRAM, Win32 PROGRAM),
+  which additionally report a pump I/O failure as `GPTPS_E_IO` rather than a timeout.
+
+### Fixed — fork and allocator safety
+
+- **The OOP child no longer calls the allocator.** `gptps_run_capture` duplicated the
+  task's result with `gptps_malloc` inside the forked child; if the host installed a
+  lock-guarded allocator via `gptps_set_allocator`, that lock could have been held by a
+  thread that did not survive the fork. It now hands out the buffer directly (the child
+  `_exit`s straight after writing, so nothing leaks).
+- **A host `fork()` is detected.** An engine created *before* a fork now returns
+  `GPTPS_E_SHUTDOWN` from every entry point in the child rather than deadlocking on a
+  mutex a vanished thread may hold. An engine opened fresh in the child is unaffected —
+  the fork-a-worker-process pattern (`gptps_xport`) keeps working. New HAL entry points:
+  `gptps_hal_thread_id`, `gptps_hal_fork_guard_install`, `gptps_hal_fork_generation`.
+
+### Fixed — durable_queue survived one full disk and then bricked
+
+A short write left a **partial record in the middle of the journal**, and replay stops
+at the first record it cannot verify — so every valid record after it was silently
+discarded. stdio also latches its error flag, so the queue refused every subsequent
+write for the life of the process even after space was freed. Failed appends now roll
+the journal back to its previous length and clear the error.
+
+### Changed — CI can now actually fail
+
+- The **ThreadSanitizer job** hand-listed ten test binaries and six `.c` files, so every
+  test and add-on added after it was written was silently not covered — including
+  `test_stress`, written specifically for TSan, and all seven add-ons. It now builds
+  with CMake and runs the whole suite (excluding only `bench_pool`, for runtime).
+- The **s390x big-endian job** used an include-list that skipped `abi` — the
+  struct-layout gate, which is precisely what a big-endian job is for — while its own
+  comment claimed serialization was covered. Both selectors are now EXCLUDE lists, so a
+  new test is covered by default: 24 tests there now, up from 17.
+- The **freestanding job's** `ldd | grep pthread` assertion was vacuous: glibc ≥ 2.34
+  merges libpthread and libdl into `libc.so.6`, so it passed even for a program calling
+  `pthread_create`. It now asserts on undefined symbols (`nm -u`), which is real evidence.
+- Added a **weekly scheduled run**, so a dormant repo's green badge stays a statement
+  about today.
+- Two data races fixed in test/example code that the hand-rolled TSan job never
+  compiled: `examples/task_control.c` published a result across threads with a plain
+  store, and it is a file people copy.
+
+### Added — regression tests for all of the above
+
+- `tests/test_hang.c` — re-entrant shutdown/step, a no-timeout external child that never
+  exits (both the never-writes and the closes-stdout-then-lives-on shapes), zero-backoff
+  service restart, and the dead-letter cap. The failure mode of every check is a hang or
+  unbounded growth, so the CTest `TIMEOUT` is part of the assertion. Verified to **hang**
+  against the pre-fix tree.
+- `tests/test_reconcile.c` — every submitted handle reaches exactly one terminal event
+  across `REMOVE_CANCEL`, the `DROP` policy, and cancel-while-running, plus the
+  cancel-vs-timeout distinction. Verified to **fail 4 checks** against the pre-fix tree.
+- `tests/prog_helper.c` gained an `eofhang` mode (write, close stdout, keep running).
+- `tests/test_settings.c` no longer pins an absolute setting count — it asserts the
+  documented keys plus the per-task delta, so a new core knob is not a false regression.
+
+### Added — the licence travels with the code
+
+Every file under `src/`, `include/`, `addons/`, `freestanding/`, `examples/` and
+`tests/` now carries an `SPDX-License-Identifier: MIT` header, and
+`tools/amalgamate.sh` emits the full MIT text into **both** generated files. The
+single-file drop-in is the distributed form for anyone who vendors GPTPS, and `LICENSE`
+requires its notice "in all copies or substantial portions of the Software" — so the
+artifact the architecture exists to enable was shipping without it. A CI step now
+asserts the notice is present.
+
 ### Changed — append-safe ABI guards for all input structs
 - The remaining caller-supplied input structs — `gptps_config`, `gptps_submit_options`,
   `gptps_allocator`, `gptps_addon` — now validate `struct_size` against a **frozen

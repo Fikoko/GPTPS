@@ -39,9 +39,12 @@ static gptps_status sum(gptps_ctx *ctx, void *ud) {
 }
 
 static void on_event(const gptps_event *ev, void *ud) {
-    (void)ud;
-    if (ev->kind == GPTPS_EV_FINISHED)
-        printf("task %s done: %lu\n", ev->task_name, *(const unsigned long*)ev->result);
+    (void)ud;   /* ev->result may be NULL: a task need not set one */
+    if (ev->kind == GPTPS_EV_FINISHED && ev->result_len == sizeof(unsigned long)) {
+        unsigned long s;
+        memcpy(&s, ev->result, sizeof s);   /* copy: valid only for this call */
+        printf("task %s done: %lu\n", ev->task_name, s);
+    }
 }
 
 int main(void) {
@@ -58,7 +61,7 @@ int main(void) {
     gptps_register_task(e, &d);
 
     gptps_submit(e, "sum", "hello", 5, &h);     /* runs on the pool           */
-    gptps_shutdown(e);                          /* drains, then returns       */
+    gptps_shutdown(e);                          /* drains (bounded), returns  */
     return 0;
 }
 ```
@@ -107,7 +110,7 @@ TTY; with no TTY it just prints a line and exits, which is how CI runs it headle
 ./build/example_dashboard    # keys: w/f submit · t tasks · l dead-letter · s settings · m KPI · p pause · ? help · q quit
 ```
 
-It looks like [this](#live-terminal-dashboard) (screenshot below).
+See [Live terminal dashboard](#live-terminal-dashboard) for what it shows and how to drive it.
 
 **3. Run the other examples + the tests.**
 
@@ -165,7 +168,7 @@ either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --
 | `gptps_load_addon(e, path)` | load a shared-library add-on over the stable ABI |
 | `gptps_step(e, &ran)` | MANUAL mode: pump the engine on the calling thread (no worker threads) |
 | `gptps_set_allocator(&a)` | redirect all core allocation to a custom `malloc`/`realloc`/`free` |
-| `gptps_shutdown(e)` | drain in-flight + queued work, then free |
+| `gptps_shutdown(e)` | drain in-flight + queued work (bounded by `limits.shutdown_grace_ms`), then free |
 
 Inside a task you get a `gptps_ctx *`: `gptps_payload()`, `gptps_is_cancelled()` (poll it
 for cooperative timeout), `gptps_result_set()` / `gptps_result_set_nocopy()`.
@@ -461,11 +464,17 @@ Run it live in a terminal: `./build/example_dashboard` (source:
 
 ## Executor kinds (per task, via `def.exec`)
 
-| Kind | Runs as | Enforcement | Platforms |
-|---|---|---|---|
-| `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | all |
-| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout **or cancel** | POSIX only (needs `fork`) |
-| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout **or cancel** | all (POSIX `fork`+exec; Windows `CreateProcess` + Job Object) |
+| Kind | Runs as | Enforcement | **If the task crashes** | Platforms |
+|---|---|---|---|---|
+| `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | **kills your whole process** — the engine, the dispatcher, and every other in-flight item | all |
+| `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout **or cancel** | kills only the child; reported as `GPTPS_E_TASK` (`E_NOMEM` if it blew the memory cap) | POSIX only (needs `fork`) |
+| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout **or cancel** | kills only the child; reported as `GPTPS_E_TASK` (`E_NOMEM` if it blew the memory cap) | all (POSIX `fork`+exec; Windows `CreateProcess` + Job Object) |
+
+**Read the blast-radius column before you pick.** `GPTPS_EXEC_INPROC` is `0`, so it is
+what a `memset`-zeroed `gptps_task_def` gives you — the fast path, and the right default
+for code you trust. For anything that can segfault, leak, or run away, `OOP`/`PROGRAM`
+buy you a real fault boundary: a memory cap the OS enforces, a guaranteed kill, and a
+`child_setup` hook to drop privileges or install seccomp before the work starts.
 
 The out-of-process executors are fully **cancellable**: `gptps_cancel` (and
 `gptps_unregister_task(…, CANCEL)`) hard-kill a running child in bounded time — even one
@@ -533,6 +542,9 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
 - **Dead letter:** tasks that exhaust retries (or that a constraint denies) are retained.
   `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
+  The list is capped at `limits.max_dead_letters` (default 1024, oldest evicted, `0` =
+  unbounded); `stats.dead_letters_evicted` counts anything the cap dropped, so a host
+  that never drains gets bounded memory instead of silent growth.
 - **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
 - **Runtime task management:** enumerate, pause/resume, clone, and unregister task types
@@ -587,6 +599,23 @@ shards) and **scale-out** (`gptps_xport` worker processes) add-ons, the optional
 platform-optimized HAL (`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the
 settings editor), the crash-durable queue, GPU-quota, and WASM-executor add-ons, the
 examples + benchmark, CMake + CI + single-file amalgamation.
+
+**Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
+hang it hangs your host's exit path — so these are contractual, and
+[`tests/test_hang.c`](tests/test_hang.c) enforces them with a hard test timeout:
+
+- `gptps_shutdown` always returns. In-flight work drains for at most
+  `limits.shutdown_grace_ms` (default 30s; `0` opts back into waiting forever), then
+  gets cancelled — an external child with no timeout of its own cannot wedge teardown.
+- `gptps_shutdown` / `gptps_step` return `GPTPS_E_BUSY` rather than deadlocking when
+  called from a task body or an event callback.
+- Nothing in the engine grows without bound: the intake queue
+  (`limits.max_intake_depth`), the dead-letter list (`limits.max_dead_letters`), and
+  the bytes an out-of-process child can make the parent buffer (16 MiB) are all capped,
+  and truncation is always counted rather than silent.
+- Every submitted handle reaches exactly one terminal event — the invariant the
+  observer seam, and every add-on built on it, depends on
+  ([`tests/test_reconcile.c`](tests/test_reconcile.c)).
 
 Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** (Win32 HAL
 via `src/hal_win.c`) runs the engine, scheduler, config, the in-process and
