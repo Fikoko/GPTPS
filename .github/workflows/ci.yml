@@ -8,6 +8,13 @@ on:
   # weekly run keeps the badge a statement about TODAY.
   schedule:
     - cron: '0 6 * * 1'
+  # Manual trigger. Added after the 2026-08-06 Actions outage, during which
+  # push-triggered run CREATION was down for hours: commits landed on main and no
+  # run was ever created for them, and GitHub does not create those retroactively.
+  # Without this the only way to ask for a run was to push another commit - which
+  # was the very thing not working. workflow_dispatch reaches the API by a
+  # different path, and costs nothing when everything is healthy.
+  workflow_dispatch:
 
 # Two conventions every job below follows, both of which exist so a green run means
 # what it says:
