@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * task_control.c - the runtime CONTROL PLANE end to end: declare generic
  * settings, enumerate the registry, read a per-task setting from inside a task,
@@ -17,12 +19,19 @@ static gptps_status resize(gptps_ctx *ctx, void *ud)
     return gptps_result_set(ctx, &q, sizeof q);
 }
 
-static long last_quality = -1;
+/* Written on a WORKER thread (the FINISHED event fires there) and read on main,
+ * so it must be published atomically - a plain store/load pair here is a data
+ * race, and this file is a template people copy. `int` keeps the shim in
+ * tests/test_atomic_compat.h applicable on MSVC. */
+static int last_quality = -1;
 static void on_event(const gptps_event *ev, void *ud)
 {
     (void)ud;
-    if (ev->kind == GPTPS_EV_FINISHED && ev->result && ev->result_len == sizeof(long))
-        memcpy(&last_quality, ev->result, sizeof last_quality);
+    if (ev->kind == GPTPS_EV_FINISHED && ev->result && ev->result_len == sizeof(long)) {
+        long q;
+        memcpy(&q, ev->result, sizeof q);
+        __atomic_store_n(&last_quality, (int)q, __ATOMIC_SEQ_CST);
+    }
 }
 
 static void reg(gptps *e, const char *name)
@@ -69,7 +78,7 @@ int main(void)
     gptps_submit(e, "resize", NULL, 0, &h);
     { uint64_t s = gptps_now_ms(NULL);
       while (__atomic_load_n(&last_quality, __ATOMIC_SEQ_CST) < 0 && gptps_now_ms(NULL) - s < 2000) {} }
-    printf("resize run() read quality = %ld\n", last_quality);
+    printf("resize run() read quality = %d\n", __atomic_load_n(&last_quality, __ATOMIC_SEQ_CST));
 
     /* 5) clone, retune the copy, pause + resume, then remove a type cleanly */
     gptps_clone_task(e, "resize", "resize_hi");

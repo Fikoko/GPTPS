@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_step.c - MANUAL (single-threaded) mode: the engine runs with NO worker or
  * dispatcher threads; the caller drives it via gptps_step(). Verifies the full
@@ -31,6 +33,8 @@ static void on_event(const gptps_event *ev, void *ud)
         case GPTPS_EV_FAILED:        ev_failed++;     break;
         case GPTPS_EV_RETRIED:       ev_retried++;    break;
         case GPTPS_EV_DEAD_LETTERED: ev_deadletter++; break;
+        case GPTPS_EV_DROPPED:       break;   /* not exercised here; named so -Wswitch
+                                               * keeps flagging the NEXT event kind added */
     }
 }
 

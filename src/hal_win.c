@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * hal_win.c - GPTPS Hardware Abstraction Layer, Win32 backend.
  *
@@ -117,6 +119,12 @@ void gptps_thread_join(gptps_thread *t)
     CloseHandle(t->h);
     free(t);
 }
+
+uint64_t gptps_hal_thread_id(void) { return (uint64_t)GetCurrentThreadId(); }
+
+/* Windows has no fork(), so there is no forked-child hazard to guard against. */
+void     gptps_hal_fork_guard_install(void) { }
+uint64_t gptps_hal_fork_generation(void) { return 0; }
 
 /* --- dynamic loading ----------------------------------------------------- */
 gptps_dl *gptps_dl_open(const char *path) { return (gptps_dl *)LoadLibraryA(path); }

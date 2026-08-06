@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_cgroup.c - accurate memory enforcement via cgroup v2 (Linux).
  *
@@ -78,13 +80,15 @@ static int setup_parent(char *parent, size_t pn)
     svc = strstr(at, ".service");
     if (!svc) return 0;
     svc[8] = 0;                                  /* cut just after ".service" */
-    snprintf(base, sizeof base, "/sys/fs/cgroup%s", line + 3);
+    if ((size_t)snprintf(base, sizeof base, "/sys/fs/cgroup%s", line + 3) >= sizeof base)
+        return 0;                                /* path too long -> skip, never truncate */
 
-    snprintf(parent, pn, "%s/gptps_test_%ld", base, (long)getpid());
+    if ((size_t)snprintf(parent, pn, "%s/gptps_test_%ld", base, (long)getpid()) >= pn)
+        return 0;
     if (mkdir(parent, 0700) != 0) return 0;      /* no delegation here -> skip */
     if (cg_write(parent, "cgroup.subtree_control", "+memory") != 0) { rmdir(parent); return 0; }
     /* verify a child can actually take a memory cap */
-    snprintf(probe, sizeof probe, "%s/_probe", parent);
+    if ((size_t)snprintf(probe, sizeof probe, "%s/_probe", parent) >= sizeof probe) { rmdir(parent); return 0; }
     if (mkdir(probe, 0700) != 0) { rmdir(parent); return 0; }
     if (cg_write(probe, "memory.max", "33554432") != 0) { rmdir(probe); rmdir(parent); return 0; }
     rmdir(probe);

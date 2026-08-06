@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * hal_stub.c - a freestanding/MANUAL-mode reference HAL backend.
  *
@@ -65,6 +67,11 @@ void gptps_cond_broadcast(gptps_cond *c) { (void)c; }
 /* --- threads: never started in MANUAL mode; present only to link ---------- */
 gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg) { (void)fn; (void)arg; return 0; }
 void gptps_thread_join(gptps_thread *t) { (void)t; }
+
+/* Single-threaded, no fork: one constant id, and nothing to guard. */
+uint64_t gptps_hal_thread_id(void) { return 1u; }
+void     gptps_hal_fork_guard_install(void) { }
+uint64_t gptps_hal_fork_generation(void) { return 0; }
 
 /* --- dynamic loading: no add-ons on bare metal ---------------------------- */
 gptps_dl *gptps_dl_open(const char *path) { (void)path; return 0; }

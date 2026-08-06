@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gptps.h - GPTPS: General Purpose Task Processing System
  *
@@ -307,6 +309,15 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *    cooperative for INPROC; OOP/PROGRAM are hard-killed at their deadline).
  *  - Settings write callbacks take their own lock; the fixed lock order is
  *    settings-lock -> engine-lock -> add-on lock.
+ *  - gptps_shutdown() and gptps_step() are the exceptions to "callbacks may
+ *    re-enter": both return GPTPS_E_BUSY when called from a task body or a
+ *    callback, since either would tear down / recurse into the caller's own
+ *    thread. Signal your main thread instead.
+ *  - FORK: an engine must not be used in a child of fork(). Its mutex may be held
+ *    by a thread that did not survive, so the child would deadlock; every entry
+ *    point therefore returns GPTPS_E_SHUTDOWN on an engine created before the
+ *    fork. A child that opens its OWN engine after forking is fully supported
+ *    (that is how the gptps_xport worker-process add-on works).
  * ==========================================================================*/
 
 /* ============================================================================
@@ -491,8 +502,10 @@ GPTPS_API gptps_status gptps_submit_ex(gptps *e, const char *task_name,
 /* Cancel one submitted work item by its handle. A still-queued item is removed
  * before it runs; an in-flight or admitted item gets the cooperative cancel flag
  * (in-process tasks MUST poll gptps_is_cancelled() to stop; OOP/PROGRAM children
- * stop at their deadline). The item ends terminal (a FAILED event, never a retry
- * or dead-letter). Returns GPTPS_OK if a matching item was found and cancelled,
+ * are hard-killed within ~200ms even with no deadline set). The item ends terminal:
+ * exactly one GPTPS_EV_FAILED carrying GPTPS_E_CANCELLED - never a retry or a
+ * dead-letter, and never GPTPS_E_TIMEOUT, so an operator's cancel stays
+ * distinguishable from a deadline breach. Returns GPTPS_OK if a matching item was found and cancelled,
  * GPTPS_E_NOTFOUND if the handle is unknown or already terminal (cancel-after-
  * completion is a harmless no-op), GPTPS_E_SHUTDOWN during teardown. Safe to call
  * from any thread, including from inside an event callback. */
@@ -509,7 +522,21 @@ GPTPS_API gptps_status gptps_cancel(gptps *e, gptps_handle h);
  * tasks should poll gptps_is_cancelled() / gptps_deadline_ms(). */
 GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
 
-GPTPS_API gptps_status gptps_shutdown(gptps *e); /* drain in-flight, join, free */
+/* Drain in-flight + queued work, join the threads, free the engine.
+ *
+ * BOUNDED: in-flight work gets `limits.shutdown_grace_ms` (default 30000, live-
+ * settable, 0 = wait forever) to finish on its own, after which every running
+ * item's cancel flag is raised - the enforced executors then hard-kill their child
+ * within ~200ms. Without that bound a single external child that ignores its
+ * (absent) deadline would hang the HOST's exit path forever and be orphaned when
+ * the supervisor gave up. An in-process body that never polls
+ * gptps_is_cancelled() still cannot be preempted - nothing in-process can be.
+ *
+ * NOT RE-ENTRANT: returns GPTPS_E_BUSY if called from a task body or an event
+ * callback, because it would join the very thread making the call (THREADED) or
+ * free the engine that gptps_step is standing on (MANUAL). Signal your main
+ * thread and shut down from there. */
+GPTPS_API gptps_status gptps_shutdown(gptps *e);
 
 /* ============================================================================
  * EVENTS (observer surface; the core never aggregates - that's an add-on)
@@ -552,6 +579,13 @@ GPTPS_API gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *use
  * Tasks that exhaust retries under the dead_letter policy, and tasks a
  * constraint DENYs, are retained in-memory. Pull them back out to log, audit,
  * or re-submit them. gptps_shutdown() frees any that were never drained.
+ *
+ * BOUNDED: this is the one queue a host is not required to drain, so it is capped
+ * at `limits.max_dead_letters` (default 1024, live-settable, 0 = unbounded) and
+ * the OLDEST entry is evicted past the cap - otherwise a long-running host with a
+ * persistently failing task grew forever, each entry pinning its original payload.
+ * The truncation is never silent: the `stats.dead_letters_evicted` setting counts
+ * what was dropped (write to it to reset the counter).
  * ==========================================================================*/
 typedef struct {
     size_t       struct_size;   /* = sizeof(gptps_dead_letter) */

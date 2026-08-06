@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * exec_oop_posix.c - out-of-process executor (T13, POSIX).
  *
@@ -13,7 +15,9 @@
  *  - RLIMIT_AS caps VIRTUAL address space, not RSS - a blunt approximation. The
  *    accurate answer (cgroups v2 memory.max) is a later increment; only applied
  *    when mem_cap is large enough (>= floor) to leave room for the base image.
- *  - timeout_s==0 => no deadline; a task that never returns blocks its worker.
+ *  - timeout_s==0 => no deadline of its own, but NOT unstoppable: the parent polls
+ *    the cancel flag in bounded slices, so gptps_cancel / task removal / the
+ *    shutdown grace still hard-kill the child. Nothing here waits forever.
  */
 
 /* feature-test macros before any system header (see hal_posix.c) */
@@ -44,6 +48,47 @@
 #include <sys/stat.h>
 
 #define GPTPS_OOP_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, a mem cap is meaningless */
+
+/* Max bytes either enforced executor will buffer from a child. The OOP child runs
+ * our own code, but a torn or corrupted record can still declare an arbitrary
+ * length - and on a 32-bit host `(size_t)len64` would silently TRUNCATE, so the
+ * parent would allocate a short buffer and then read the rest of the record as if
+ * it were the next one. Both executors share one bound. */
+#define GPTPS_EXEC_RESULT_CAP (16u * 1024u * 1024u)
+
+/* How long a child that has finished talking to us gets to exit on its own before
+ * we escalate to SIGKILL (see reap_bounded). */
+#define GPTPS_EXEC_EXIT_GRACE_MS 2000
+
+/* Reap `pid` WITHOUT blocking forever. A child that closes its stdout but keeps
+ * running - or ignores every signal short of SIGKILL - would otherwise pin this
+ * worker inside waitpid(), which is exactly the hang these executors promise never
+ * to have. Polls with WNOHANG in short slices, honouring the deadline and the
+ * cancel flag, then escalates to SIGKILL (unblockable, so the loop terminates).
+ * `group` selects kill(-pid) for a child that leads its own process group.
+ * Returns GPTPS_OK if the child exited on its own, else why it had to be killed. */
+static gptps_status reap_bounded(pid_t pid, int *wstatus, int group,
+                                 uint64_t deadline, gptps_flag *cancel)
+{
+    gptps_status why = GPTPS_OK;
+    int waited = 0;
+    for (;;) {
+        struct timespec ts;
+        pid_t r = waitpid(pid, wstatus, WNOHANG);
+        if (r == pid) return why;
+        if (r < 0 && errno != EINTR) return why;     /* already reaped / no such child */
+        if (why == GPTPS_OK) {
+            uint64_t now = gptps_hal_monotonic_ms();
+            if (deadline && now >= deadline)              why = GPTPS_E_TIMEOUT;
+            else if (cancel && gptps_flag_get(cancel))    why = GPTPS_E_CANCELLED;
+            else if (waited >= GPTPS_EXEC_EXIT_GRACE_MS)  why = GPTPS_E_TIMEOUT;
+            if (why != GPTPS_OK) { if (group) kill(-pid, SIGKILL); else kill(pid, SIGKILL); }
+        }
+        ts.tv_sec = 0; ts.tv_nsec = 5L * 1000000L;   /* 5ms */
+        nanosleep(&ts, NULL);
+        waited += 5;
+    }
+}
 
 /* Create a pipe with both ends close-on-exec so a concurrently-forked child
  * (especially a PROGRAM child that exec()s) cannot inherit and pin open another
@@ -93,9 +138,12 @@ static int cg_write_file(const char *dir, const char *file, const char *val)
     char path[512];   /* stack, not malloc: cgroup_self_join() calls this in the CHILD
                        * between fork and work/exec, where allocating in a threaded
                        * process can deadlock. Cgroup paths are short; bail if not. */
-    int fd; ssize_t w;
-    if (strlen(dir) + 1 + strlen(file) + 1 > sizeof path) return -1;
-    snprintf(path, sizeof path, "%s/%s", dir, file);
+    int fd, n; ssize_t w;
+    /* Bound via snprintf's return value rather than a separate strlen sum: same
+     * guarantee, but it is the form the compiler can actually verify (the sum
+     * version trips -Wformat-truncation at -O2, which blocks a -Werror build). */
+    n = snprintf(path, sizeof path, "%s/%s", dir, file);
+    if (n < 0 || (size_t)n >= sizeof path) return -1;   /* would truncate: refuse */
     fd = open(path, O_WRONLY);
     if (fd < 0) return -1;
     w = write(fd, val, strlen(val));
@@ -221,11 +269,18 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
         if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook */
         st = gptps_run_capture(def, payload, plen, &res, &rlen);
-        st32 = (int32_t)st; len64 = (uint64_t)rlen;
+        st32 = (int32_t)st;
+        /* Never let a child declare more than the parent will accept - the parent
+         * rejects an oversize record, so sending it would just desynchronise. */
+        len64 = (rlen > GPTPS_EXEC_RESULT_CAP) ? 0 : (uint64_t)rlen;
+        if (rlen > GPTPS_EXEC_RESULT_CAP) st32 = (int32_t)GPTPS_E_IO;
         write_all(p[1], &st32, sizeof st32);
         write_all(p[1], &len64, sizeof len64);
-        if (rlen) write_all(p[1], res, rlen);
-        gptps_free(res);
+        if (len64) write_all(p[1], res, (size_t)len64);
+        /* Deliberately no free() and no allocator call on this path: we are in a
+         * forked child of a threaded process, so a host allocator installed via
+         * gptps_set_allocator may hold a mutex locked by a thread that did not
+         * survive the fork. _exit() reclaims everything. */
         close(p[1]);
         _exit(0);
     }
@@ -238,6 +293,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         uint64_t len64 = 0;
         void *res = NULL;
         gptps_status eff;
+        gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
 
         close(p[1]);
@@ -250,14 +306,16 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             int slice = 200;
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
-                if (now >= deadline) { kill(pid, SIGKILL); killed = 1; break; }    /* deadline */
+                if (now >= deadline) { kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_TIMEOUT; break; }
                 if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
             pr = poll(&pfd, 1, slice);
-            if (cancel && gptps_flag_get(cancel)) { kill(pid, SIGKILL); killed = 1; break; } /* cancelled */
+            /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
+             * breach - report the two apart so an operator can tell which happened. */
+            if (cancel && gptps_flag_get(cancel)) { kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
             /* a genuine poll error must kill (killed=1 skips the blocking read_all below,
              * which would otherwise hang this worker on a still-live child). */
-            if (pr < 0) { if (errno == EINTR) continue; kill(pid, SIGKILL); killed = 1; break; }
+            if (pr < 0) { if (errno == EINTR) continue; kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_IO; break; }
             if (pr == 0) continue;                            /* slice elapsed: re-check */
             break;                                            /* readable: read the record */
         }
@@ -265,7 +323,12 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         if (!killed) {
             if (read_all(p[0], &st32, sizeof st32) == 0 &&
                 read_all(p[0], &len64, sizeof len64) == 0) {
-                if (len64) {
+                if (len64 > (uint64_t)GPTPS_EXEC_RESULT_CAP) {
+                    /* Torn or corrupted record. Do not allocate what it asks for and
+                     * do not trust the rest of the stream (on 32-bit, (size_t)len64
+                     * would truncate and desynchronise the read). */
+                    len64 = 0; st32 = (int32_t)GPTPS_E_IO;
+                } else if (len64) {
                     res = gptps_malloc((size_t)len64);
                     if (!res || read_all(p[0], res, (size_t)len64) != 0) {
                         gptps_free(res); res = NULL; len64 = 0; st32 = (int32_t)GPTPS_E_IO;
@@ -276,10 +339,16 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             }
         }
         close(p[0]);
-        while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { /* reap */ }
+        if (killed) {
+            while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
+        } else {
+            /* The child owes us nothing more, but it has not necessarily exited. */
+            gptps_status why = reap_bounded(pid, &wstatus, 0, deadline, cancel);
+            if (why != GPTPS_OK) { killed = 1; kill_st = why; }
+        }
 
         if (killed) {
-            eff = GPTPS_E_TIMEOUT;
+            eff = kill_st;
         } else if (WIFSIGNALED(wstatus)) {
             gptps_free(res); res = NULL; len64 = 0;   /* crash / OOM-kill */
             eff = GPTPS_E_TASK;
@@ -297,7 +366,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
     }
 }
 
-#define GPTPS_PROG_RESULT_CAP (16u * 1024u * 1024u) /* max captured stdout */
+#define GPTPS_PROG_RESULT_CAP GPTPS_EXEC_RESULT_CAP /* max captured stdout */
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
@@ -364,6 +433,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     {
         gptps_status eff = GPTPS_OK;
         int killed = 0, oversize = 0, nomem = 0, wstatus = 0;
+        gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
         char *buf = NULL; size_t cap = 0, len = 0;
         const char *wp = (const char *)payload;   /* unwritten payload cursor */
         size_t wleft = plen;
@@ -399,15 +469,17 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
-                if (now >= deadline) { killed = 1; kill(-pid, SIGKILL); break; }
+                if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; kill(-pid, SIGKILL); break; }
                 if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
             pr = poll(pfd, (nfds_t)nfd, slice);
-            if (cancel && gptps_flag_get(cancel)) { killed = 1; kill(-pid, SIGKILL); break; }
+            /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
+             * breach - report the two apart so an operator can tell which happened. */
+            if (cancel && gptps_flag_get(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; kill(-pid, SIGKILL); break; }
             /* a genuine poll error (e.g. ENOMEM) must still kill the child, or the
              * blocking waitpid below would hang this worker on a still-live child -
              * the very thing this executor promises never to do. */
-            if (pr < 0) { if (errno == EINTR) continue; kill(-pid, SIGKILL); break; }
+            if (pr < 0) { if (errno == EINTR) continue; killed = 1; kill_st = GPTPS_E_IO; kill(-pid, SIGKILL); break; }
             if (pr == 0) continue;                 /* slice elapsed: re-check deadline/cancel */
 
             /* drain stdout */
@@ -425,7 +497,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
                 r = read(outp[0], buf + len, cap - len);
                 if (r > 0) len += (size_t)r;
                 else if (r == 0) break;            /* stdout EOF: child is done */
-                else if (errno != EINTR && errno != EAGAIN) { kill(-pid, SIGKILL); break; } /* I/O error: kill so waitpid can't hang */
+                else if (errno != EINTR && errno != EAGAIN) { killed = 1; kill_st = GPTPS_E_IO; kill(-pid, SIGKILL); break; } /* I/O error: kill so waitpid can't hang */
             }
             /* feed stdin */
             if (in_open && (pfd[iidx].revents & (POLLOUT | POLLERR | POLLHUP))) {
@@ -451,9 +523,18 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             pthread_sigmask(SIG_SETMASK, &sp_old, NULL);
         }
 #endif
-        while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { }
+        if (killed || oversize || nomem) {
+            while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
+        } else {
+            /* Loop exited on stdout EOF - which says the child closed its stdout, NOT
+             * that it exited. A program that keeps running (or ignores signals) would
+             * otherwise pin this worker in waitpid() forever, orphaning the child at
+             * shutdown. Give it a bounded grace period, then SIGKILL. */
+            gptps_status why = reap_bounded(pid, &wstatus, 1, deadline, cancel);
+            if (why != GPTPS_OK) { killed = 1; kill_st = why; }
+        }
 
-        if (killed)                  eff = GPTPS_E_TIMEOUT;
+        if (killed)                  eff = kill_st;
         else if (oversize)           eff = GPTPS_E_IO;
         else if (nomem)              eff = GPTPS_E_NOMEM;
         else if (WIFEXITED(wstatus)) eff = (WEXITSTATUS(wstatus) == 0) ? GPTPS_OK : GPTPS_E_TASK;

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_foundation.c - tests for the HAL (T3) + config auto-tune (T6).
  * Zero-dependency: a CHECK macro + nonzero exit on failure, run by CTest.
@@ -8,6 +10,7 @@
 #include "gptps_hal.h"
 #include "gptps_internal.h"
 #include <stdio.h>
+#include <string.h>
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -42,8 +45,13 @@ int main(void)
 
     /* --- config auto-tune: zeros resolve from hardware --- */
     {
-        gptps_limits zero = { sizeof(gptps_limits), 0, 0 };
-        gptps_limits r;
+        /* memset + explicit struct_size rather than a positional initializer list:
+         * the list stops naming fields as soon as gptps_limits grows, which is a
+         * -Wmissing-field-initializers error under -Werror and, worse, leaves any
+         * appended field indeterminate in a test about DEFAULTS. */
+        gptps_limits zero, r;
+        memset(&zero, 0, sizeof zero);
+        zero.struct_size = sizeof zero;
         CHECK(gptps_config_resolve(&zero, &r) == GPTPS_OK);
         CHECK(r.max_concurrent_tasks == hw.cpu_count);
         CHECK(r.max_memory_bytes > 0);
@@ -52,8 +60,11 @@ int main(void)
 
     /* --- explicit values win over auto-tune --- */
     {
-        gptps_limits ex = { sizeof(gptps_limits), 3, 123456789ull };
-        gptps_limits r;
+        gptps_limits ex, r;
+        memset(&ex, 0, sizeof ex);
+        ex.struct_size = sizeof ex;
+        ex.max_concurrent_tasks = 3;
+        ex.max_memory_bytes = 123456789ull;
         CHECK(gptps_config_resolve(&ex, &r) == GPTPS_OK);
         CHECK(r.max_concurrent_tasks == 3u);
         CHECK(r.max_memory_bytes == 123456789ull);

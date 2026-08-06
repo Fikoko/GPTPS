@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_settings.c - the unified settings registry (Phase 1): registration,
  * introspection, typed get/set with validation, and hot-apply (observed by
@@ -46,25 +48,32 @@ int main(void)
 {
     gptps *e = NULL;
     char buf[GPTPS_SETTINGS_VALUE_MAX];
-    size_t i, n;
+    size_t i, n, core_n;
 
     CHECK(gptps_open(NULL, &e) == GPTPS_OK);
     if (!e) return 1;
 
-    /* core settings present before any task */
-    CHECK(gptps_settings_count(e) == 4);
+    /* Core settings present before any task. Asserted by KEY plus a per-task DELTA
+     * rather than an absolute total: the total is not a contract, so pinning it made
+     * every new core knob look like a regression here. What must hold is that the
+     * documented keys exist and that each task contributes exactly six. */
+    core_n = gptps_settings_count(e);
+    CHECK(core_n >= 4);
     CHECK(has_key(e, "limits.max_memory_bytes"));
     CHECK(has_key(e, "limits.max_concurrent_tasks"));
     CHECK(has_key(e, "limits.max_intake_depth"));
+    CHECK(has_key(e, "limits.shutdown_grace_ms"));
+    CHECK(has_key(e, "limits.max_dead_letters"));
+    CHECK(has_key(e, "stats.dead_letters_evicted"));
     CHECK(has_key(e, "scheduler.reserve_after_skips"));
 
     /* a task adds its six knobs */
     reg(e, "work");
-    CHECK(gptps_settings_count(e) == 10);
+    CHECK(gptps_settings_count(e) == core_n + 6);
     CHECK(has_key(e, "tasks.work.timeout_seconds"));
     CHECK(has_key(e, "tasks.work.on_failure"));
     reg(e, "bulk");
-    CHECK(gptps_settings_count(e) == 16);
+    CHECK(gptps_settings_count(e) == core_n + 12);
 
     /* get a default */
     CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", buf, sizeof buf) == GPTPS_OK);

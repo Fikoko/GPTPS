@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_sched_seam.c - the pluggable scheduler seam (gptps_set_scheduler). Proves a
  * custom ordering hook replaces the built-in priority/FIFO admission order WITHOUT
@@ -12,7 +14,6 @@
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
 
 static int  g_release, g_block_running, g_n;

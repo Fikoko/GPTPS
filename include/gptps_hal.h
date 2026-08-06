@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gptps_hal.h - GPTPS Hardware Abstraction Layer (INTERNAL, not a public API).
  *
@@ -73,6 +75,30 @@ void        gptps_cond_broadcast(gptps_cond *c);
 
 gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg); /* NULL on failure */
 void          gptps_thread_join(gptps_thread *t);               /* joins, then frees */
+
+/* An opaque, comparable id for the CALLING thread, stable for its lifetime and
+ * distinct from every other live thread's. The core uses it for ONE purpose:
+ * detecting re-entrancy - gptps_shutdown() or gptps_step() called from inside a
+ * task body or an event callback, which would otherwise join (or free) the very
+ * thread making the call. Never used for scheduling, indexing, or storage.
+ * A single-threaded HAL may return any constant. */
+uint64_t gptps_hal_thread_id(void);
+
+/* --- fork safety (POSIX; a no-op elsewhere) ------------------------------ *
+ * A host that fork()s while worker threads are live gets a child where only the
+ * calling thread exists but the engine mutex may still be LOCKED by a thread that
+ * did not survive - so the child deadlocks on its first call into that engine.
+ * POSIX allows only async-signal-safe calls in such a child anyway, so the
+ * contract is: an engine created BEFORE a fork must not be used after it.
+ *
+ * The generation counter makes exactly that distinguishable. It increments in the
+ * child on every fork; an engine stamps it at creation and compares on entry, so
+ * an INHERITED engine is refused (GPTPS_E_SHUTDOWN) while an engine created fresh
+ * in the child - the fork-a-worker-process pattern, e.g. addons/gptps_xport - is
+ * untouched. Install is idempotent. A HAL with no fork (Win32, freestanding)
+ * installs nothing and returns a constant, compiling the check away. */
+void     gptps_hal_fork_guard_install(void);
+uint64_t gptps_hal_fork_generation(void);
 
 /* --- dynamic loading (add-on loader) ------------------------------------ */
 typedef struct gptps_dl gptps_dl;

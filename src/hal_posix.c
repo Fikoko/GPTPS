@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * hal_posix.c - POSIX implementation of the GPTPS HAL (T3, first slice).
  *
@@ -28,6 +30,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <signal.h>   /* sig_atomic_t: the pthread_atfork child flag */
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
 #  include <sched.h>   /* sched_getaffinity / CPU_COUNT (container CPU bound) */
@@ -278,6 +281,44 @@ void gptps_thread_join(gptps_thread *t)
     if (!t) return;
     pthread_join(t->t, NULL);
     free(t);
+}
+
+uint64_t gptps_hal_thread_id(void)
+{
+    /* pthread_t is opaque and NOT required to be an integer, so it cannot be cast.
+     * Copying its bytes is the portable way to get a comparable value: it is an
+     * unsigned long on glibc/musl and a pointer on macOS/BSD, so 8 bytes capture it
+     * exactly on every target this HAL builds for. Wider (or struct) pthread_t
+     * implementations keep only the leading bytes, which is still sound for the one
+     * thing the core does with this - comparing it against a thread's own id. */
+    pthread_t self = pthread_self();
+    uint64_t id = 0;
+    memcpy(&id, &self, (sizeof self < sizeof id) ? sizeof self : sizeof id);
+    return id;
+}
+
+/* --- fork safety ---------------------------------------------------------
+ * A host that fork()s while GPTPS worker threads are live gets a child in which
+ * only the calling thread exists, but the engine mutex may have been LOCKED by a
+ * thread that did not survive - so the child's first gptps_submit() blocks
+ * forever on a lock nobody will ever release. POSIX says a child of a
+ * multithreaded parent may only call async-signal-safe functions before exec(),
+ * so the honest contract is: a forked child must exec() or _exit(), never keep
+ * using the engine. These handlers make violating it FAIL rather than hang -
+ * gptps_hal_forked_child() reports true in the child, and the engine turns every
+ * subsequent entry point into GPTPS_E_SHUTDOWN.
+ * (The engine's own OOP executor is unaffected: its child execs or _exit()s and
+ * never re-enters the engine - see gptps_run_capture.) */
+static volatile sig_atomic_t g_fork_gen = 0;
+static void gptps__atfork_child(void) { g_fork_gen = (sig_atomic_t)(g_fork_gen + 1); }
+static void gptps__install_atfork(void) { pthread_atfork(NULL, NULL, gptps__atfork_child); }
+
+uint64_t gptps_hal_fork_generation(void) { return (uint64_t)g_fork_gen; }
+
+void gptps_hal_fork_guard_install(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, gptps__install_atfork);
 }
 
 /* ------------------------------------------------------------------------- */

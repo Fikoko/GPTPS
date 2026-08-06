@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * engine.c - GPTPS engine: lifecycle, registry, queue, single-writer
  * dispatcher + worker pool, in-process executor, failure engine
@@ -74,6 +76,12 @@ typedef struct gptps_item {
     gptps_flag           *cancel;
     gptps_status          outcome;   /* effective status of the last attempt */
     int                   cancelled; /* gptps_cancel(handle) requested: never retry/dead-letter */
+    int                   started;   /* 1 once execute() ran for this item, so a STARTED and a
+                                      * FINISHED/FAILED event have already been emitted for the
+                                      * current attempt. The done-drain uses this to decide whether
+                                      * a terminal event still owes the observer, instead of
+                                      * inferring it from `outcome` (which no longer distinguishes
+                                      * never-ran from cancelled-while-running). */
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
     uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed+NULLed at release (done-drain), else at item_free */
     size_t                res_n;
@@ -150,6 +158,12 @@ typedef struct { gptps_item *head, *tail; size_t count; } gptps_fifo;
  * (not a borrowed pointer): a task type can be unregistered and freed during the
  * lock-released emit window, so the buffered event must not alias reg/def memory. */
 #define GPTPS_EV_NAME_MAX 128
+
+/* Max task types a failed add-on setup() is unwound across (see addon_unwind).
+ * An add-on registering more than this before failing keeps the surplus types -
+ * they are inert (nothing has been submitted) and the mapping is deliberately
+ * never unloaded on that path, so their function pointers stay valid. */
+#define GPTPS_ADDON_UNWIND_MAX 16
 typedef struct {
     gptps_event_kind kind;
     gptps_handle     handle;
@@ -188,6 +202,15 @@ struct gptps {
     gptps_fifo     running_items;  /* in-flight, scanned for deadlines */
     gptps_fifo     dead_letter;    /* terminal failures retained */
     uint32_t       dead_letter_count;
+    /* Cap on the retained list. It is the ONLY queue the host is not required to
+     * drain, so an undrained one grew without bound - each entry pinning its
+     * original payload - which is a memory leak with extra steps in an engine whose
+     * entire contract is bounded admission (and DEAD_LETTER is the default policy).
+     * Past the cap the OLDEST entry is evicted; `dead_evicted` counts how many, so
+     * the truncation is never silent (settings key stats.dead_letters_evicted).
+     * 0 => unbounded (the pre-1.0 behaviour, now opt-in). */
+    uint32_t       max_dead_letters;
+    uint64_t       dead_evicted;
 
     uint64_t       reserved_mem;   /* DISPATCHER-ONLY */
     uint32_t       running;        /* DISPATCHER-ONLY */
@@ -200,8 +223,33 @@ struct gptps {
     unsigned       nworkers;
 
     bool           stopping;
+    /* Shutdown drain bound. gptps_shutdown waits for in-flight work to finish; an
+     * OOP/PROGRAM task with no timeout whose child never exits, or a cooperative
+     * in-process body that ignores its deadline, would otherwise hang teardown
+     * FOREVER - and since this is an in-process library, that hangs the host's exit
+     * path and leaves external children orphaned when the supervisor kills it. Once
+     * the grace elapses the dispatcher raises every in-flight item's cancel flag.
+     * 0 => wait forever (the pre-1.0 behaviour, now opt-in). */
+    uint32_t       shutdown_grace_ms;
+    uint64_t       stop_deadline_ms;   /* monotonic; 0 = not shutting down / no bound */
     bool           workers_exit;
     bool           manual;         /* MANUAL mode: no threads; driven by gptps_step() */
+
+    /* Re-entrancy detection. gptps_shutdown joins the dispatcher + every worker, so
+     * calling it from a task body or an event callback makes a thread join ITSELF -
+     * a deadlock in THREADED mode, and in MANUAL mode a free of the engine that
+     * gptps_step is still standing on. Each owned thread records its id here at
+     * startup, and gptps_step publishes the id of whoever is pumping it, so those
+     * calls can be refused with GPTPS_E_BUSY instead. */
+    uint64_t      *owned_tids;     /* dispatcher + workers; NULL in MANUAL mode */
+    unsigned       n_owned_tids, cap_owned_tids;
+    uint64_t       step_tid;       /* thread currently inside gptps_step (0 = none) */
+    /* Fork generation this engine was CREATED in. If the process forks, the child's
+     * generation advances, so an engine carried across the fork no longer matches and
+     * every entry point refuses it - the mutex it holds may be locked by a thread that
+     * did not survive. An engine opened fresh in the child matches and works normally,
+     * which is what the fork-a-worker-process pattern (addons/gptps_xport) needs. */
+    uint64_t       fork_gen;
 
     gptps_handle   next_handle;
     gptps_event_cb ev_cb;
@@ -380,11 +428,14 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
     ctx.cancel = NULL; /* OOP enforcement is hard-kill, not the cooperative flag */
 
     st = def->run(&ctx, def->user_data);
-    if (ctx.result_set && ctx.result_len) {
-        void *copy = gptps_malloc(ctx.result_len);
-        if (copy) { memcpy(copy, ctx.result, ctx.result_len); *out_result = copy; *out_len = ctx.result_len; }
-    }
-    ctx_clear_result(&ctx);
+    /* Hand the task's own result buffer straight out instead of duplicating it, and
+     * do NOT clear the ctx. This runs in a FORKED CHILD of a threaded process: if the
+     * host installed a lock-guarded allocator via gptps_set_allocator, its mutex may
+     * have been held by a thread that did not survive the fork, so any malloc/free
+     * here can deadlock the child (and hang its parent's worker). The caller writes
+     * these bytes to the pipe and then _exit()s, which reclaims everything - so the
+     * skipped free is not a leak. Callers must therefore NOT free *out_result. */
+    if (ctx.result_set && ctx.result_len) { *out_result = ctx.result; *out_len = ctx.result_len; }
     return st;
 }
 
@@ -414,7 +465,16 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         ctx.payload = it->payload; ctx.payload_len = it->payload_len;
         ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
         st = it->def->run(&ctx, it->def->user_data);
-        if (gptps_flag_get(it->cancel)) st = GPTPS_E_TIMEOUT;
+        if (gptps_flag_get(it->cancel)) {
+            /* Tell a deadline breach apart from an explicit stop. The dispatcher's
+             * watchdog raises this flag only once the deadline has passed, so a flag
+             * raised with no deadline at all - or before it - came from gptps_cancel,
+             * shutdown, or task removal. Inferred from the deadline rather than read
+             * from it->cancelled, which the engine writes under e->m while this runs
+             * with the lock RELEASED (reading it here would be a data race). */
+            st = (ctx.deadline_ms && gptps_hal_monotonic_ms() >= ctx.deadline_ms)
+               ? GPTPS_E_TIMEOUT : GPTPS_E_CANCELLED;
+        }
     } else if (it->def->exec == GPTPS_EXEC_OOP) {
         /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed.
          * it->cancel lets gptps_cancel / shutdown / removal hard-kill the child. */
@@ -439,9 +499,32 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     return st;
 }
 
+/* Record the calling thread as one this engine owns, so a re-entrant
+ * gptps_shutdown from a task body / event callback can be refused instead of
+ * joining the caller's own thread. Caller must NOT hold e->m. */
+static void engine_note_own_thread(gptps *e)
+{
+    gptps_mutex_lock(e->m);
+    if (e->owned_tids && e->n_owned_tids < e->cap_owned_tids)
+        e->owned_tids[e->n_owned_tids++] = gptps_hal_thread_id();
+    gptps_mutex_unlock(e->m);
+}
+
+/* Is `tid` one of this engine's own threads, or the one pumping gptps_step?
+ * Caller holds e->m. */
+static int engine_is_reentrant(const gptps *e, uint64_t tid)
+{
+    unsigned i;
+    if (e->step_tid == tid) return 1;
+    for (i = 0; i < e->n_owned_tids; ++i)
+        if (e->owned_tids[i] == tid) return 1;
+    return 0;
+}
+
 static void *worker_main(void *arg)
 {
     gptps *e = (gptps *)arg;
+    engine_note_own_thread(e);
     gptps_mutex_lock(e->m);
     for (;;) {
         gptps_item *it;
@@ -477,6 +560,7 @@ static void *worker_main(void *arg)
             it->deadline_ms = it->policy.timeout_seconds
                 ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
         gptps_flag_set(it->cancel, false);
+        it->started = 1;                   /* execute() will emit STARTED + a terminal event */
         fifo_push(&e->running_items, it);
         gptps_cond_signal(e->cv_disp);     /* let dispatcher track the new deadline */
         gptps_mutex_unlock(e->m);
@@ -508,6 +592,47 @@ static void *worker_main(void *arg)
  * (suspends backfill and drains running tasks until it fits). Override per engine
  * via the config file's [scheduler] reserve_after_skips. */
 #define GPTPS_RESERVE_AFTER 8u
+
+/* Minimum delay before re-admitting an item under a policy that re-enqueues
+ * INDEFINITELY - a service restart, or GPTPS_ON_FAILURE_REQUEUE. Both reset
+ * `attempt`, so unlike a bounded retry there is no max_retries ceiling to stop
+ * them: with retry_backoff_seconds left at its zero default (what a memset-zero
+ * task_def gives you), a body that fails immediately would be re-admitted as fast
+ * as the dispatcher can loop and peg a core. A BOUNDED retry is deliberately not
+ * floored - a zero backoff there means "retry now" and max_retries ends it. */
+#define GPTPS_REQUEUE_MIN_BACKOFF_MS 100u
+
+/* Default shutdown drain bound (see gptps.shutdown_grace_ms). Long enough that a
+ * normal drain finishes untouched, short enough that a stuck child cannot wedge the
+ * host's exit path. Tunable live via the "limits.shutdown_grace_ms" setting or the
+ * config file's [limits] shutdown_grace_ms. */
+#define GPTPS_SHUTDOWN_GRACE_MS_DEFAULT 30000u
+
+/* Default cap on retained dead-lettered items (see gptps.max_dead_letters). */
+#define GPTPS_MAX_DEAD_LETTERS_DEFAULT 1024u
+
+/* Retain a terminal failure, evicting the OLDEST first if the list is at its cap.
+ * Caller holds e->m. An evicted item holds no admission budget (it was released by
+ * the done-drain before it got here), so freeing it needs no ledger bookkeeping. */
+static void dead_letter_push(gptps *e, gptps_item *it)
+{
+    while (e->max_dead_letters && e->dead_letter_count >= e->max_dead_letters) {
+        gptps_item *old = fifo_pop(&e->dead_letter);
+        if (!old) break;
+        e->dead_letter_count -= 1;
+        e->dead_evicted += 1;
+        item_free(old);
+    }
+    fifo_push(&e->dead_letter, it);
+    e->dead_letter_count += 1;
+}
+
+static uint64_t requeue_at(uint64_t now, uint32_t backoff_seconds)
+{
+    uint64_t ms = (uint64_t)backoff_seconds * 1000u;
+    if (ms < GPTPS_REQUEUE_MIN_BACKOFF_MS) ms = GPTPS_REQUEUE_MIN_BACKOFF_MS;
+    return now + ms;
+}
 
 static uint64_t min_nonzero(uint64_t a, uint64_t b)
 {
@@ -595,7 +720,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                 if (it->reg && it->reg->service && !it->reg->retire_on_ok &&
                     !it->cancelled && !it->reg->removed && !e->stopping) {
                     it->attempt = 1;
-                    it->not_before_ms = now + (uint64_t)it->policy.retry_backoff_seconds * 1000u;
+                    it->not_before_ms = requeue_at(now, it->policy.retry_backoff_seconds);
                     fifo_push(&e->delayed, it);
                 } else {
                     item_free(it);
@@ -604,10 +729,10 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
             }
             if (it->cancelled) {
                 /* per-handle gptps_cancel: terminal, never retried or dead-lettered.
-                 * outcome==E_CANCELLED means it was discarded before running, so no
-                 * STARTED/terminal event fired yet - emit one so observers reconcile.
-                 * If it actually ran, execute() already emitted its FAILED event. */
-                if (it->outcome == GPTPS_E_CANCELLED && npend < GPTPS_PENDING_CAP) {
+                 * An item that never started has had NO event at all, so it still owes
+                 * the observer a terminal one. One that ran already got its FAILED
+                 * event from execute() - emitting here too would double-count. */
+                if (!it->started && npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
                     ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
@@ -621,6 +746,26 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                  * CANCEL discards in-flight work; DROP frees; otherwise (DRAIN) a
                  * genuine failure is preserved in the dead-letter list. */
                 if (it->reg->cancelling || it->policy.on_failure == GPTPS_ON_FAILURE_DROP) {
+                    /* Still terminal - so it still owes a terminal event. Freeing these
+                     * silently used to make a REMOVE_CANCEL destroy submitted items with
+                     * no event at all, which breaks the reconciliation contract every
+                     * observer-seam add-on is built on (gpu_quota, for one, releases its
+                     * reservation only when it sees a terminal event, so a silent free
+                     * leaked its budget permanently).
+                     *   CANCEL: FAILED/E_CANCELLED is itself the terminal event, so it is
+                     *     emitted only for an item that never started - one that ran
+                     *     already got exactly that event from execute().
+                     *   DROP:   EV_DROPPED after the attempt's FAILED, matching the
+                     *     ordinary (non-removal) DROP path. */
+                    int owes = it->reg->cancelling ? !it->started : 1;
+                    if (owes && npend < GPTPS_PENDING_CAP) {
+                        pend[npend].kind = it->reg->cancelling ? GPTPS_EV_FAILED : GPTPS_EV_DROPPED;
+                        pend[npend].handle = it->handle;
+                        ev_set_name(pend[npend].name, item_name(it));
+                        pend[npend].status = it->reg->cancelling ? GPTPS_E_CANCELLED : it->outcome;
+                        pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    }
                     item_free(it);
                 } else {
                     if (npend < GPTPS_PENDING_CAP) {
@@ -629,8 +774,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                         pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                     }
-                    fifo_push(&e->dead_letter, it);
-                    e->dead_letter_count += 1;
+                    dead_letter_push(e, it);
                 }
                 continue;
             }
@@ -651,13 +795,12 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                         if (e->stopping) {
                             /* never re-admit during drain: an always-failing
                              * REQUEUE task would otherwise hang shutdown forever */
-                            fifo_push(&e->dead_letter, it);
-                            e->dead_letter_count += 1;
+                            dead_letter_push(e, it);
                         } else {
-                            /* re-enqueue via delayed so retry_backoff is honored
-                             * (avoids a zero-backoff busy loop pegging a core) */
+                            /* re-enqueue via delayed so retry_backoff is honored,
+                             * floored so a zero backoff cannot busy-loop a core */
                             it->attempt = 1;
-                            it->not_before_ms = now + (uint64_t)it->policy.retry_backoff_seconds * 1000u;
+                            it->not_before_ms = requeue_at(now, it->policy.retry_backoff_seconds);
                             fifo_push(&e->delayed, it);
                         }
                         break;
@@ -681,8 +824,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                         }
-                        fifo_push(&e->dead_letter, it);
-                        e->dead_letter_count += 1;
+                        dead_letter_push(e, it);
                         break;
                 }
             }
@@ -715,6 +857,23 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
             if (it->deadline_ms) {
                 if (now >= it->deadline_ms) gptps_flag_set(it->cancel, true);
                 else next_wake = min_nonzero(next_wake, it->deadline_ms);
+            }
+        }
+
+        /* 3b) bound the shutdown drain. Without this, one in-flight item that never
+         * ends - a PROGRAM child ignoring its (absent) deadline, or a cooperative
+         * body that never polls - keeps running_items non-empty and gptps_shutdown
+         * never returns. Once the grace expires, ask everything still in flight to
+         * stop: the enforced executors poll this flag and SIGKILL their child within
+         * a 200ms slice, and a cooperative in-process body sees gptps_is_cancelled().
+         * A body that ignores the flag entirely is unchanged - nothing can preempt
+         * it in-process - but it is no longer the common case that hangs teardown. */
+        if (e->stopping && e->stop_deadline_ms) {
+            if (now >= e->stop_deadline_ms) {
+                for (it = e->running_items.head; it; it = it->next)
+                    gptps_flag_set(it->cancel, true);
+            } else {
+                next_wake = min_nonzero(next_wake, e->stop_deadline_ms);
             }
         }
 
@@ -778,8 +937,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend, uint64
                     pend[npend].attempt = best->attempt; pend[npend].mem = best->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
-                fifo_push(&e->dead_letter, best);        /* denied -> retained */
-                e->dead_letter_count += 1;
+                dead_letter_push(e, best);               /* denied -> retained */
                 continue;
             }
 
@@ -818,6 +976,7 @@ static void *dispatcher_main(void *arg)
     int npend, i;
     uint64_t next_wake;
 
+    engine_note_own_thread(e);
     gptps_mutex_lock(e->m);
     for (;;) {
         engine_pass(e, pend, &npend, &next_wake);
@@ -899,6 +1058,14 @@ static size_t       sc_rd_conc(void *t, char *b, size_t c) { gptps *e = (gptps *
 static gptps_status sc_wr_conc(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->limits.max_concurrent_tasks = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; } /* restart-only: pool not resized live */
 static size_t       sc_rd_intake(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->limits.max_intake_depth); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_intake(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->limits.max_intake_depth = (uint32_t)strtoul(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+static size_t       sc_rd_grace(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->shutdown_grace_ms); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sc_wr_grace(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->shutdown_grace_ms = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+static size_t       sc_rd_dlcap(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->max_dead_letters); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sc_wr_dlcap(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->max_dead_letters = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+/* Count of dead-letter entries evicted by the cap. Writable so an operator can zero
+ * it after acting on it; the point is that a capped list never truncates silently. */
+static size_t       sc_rd_devict(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u64(b, c, e->dead_evicted); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sc_wr_devict(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->dead_evicted = (uint64_t)strtoull(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
 static size_t       sc_rd_resv(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->reserve_after_skips); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_resv(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->reserve_after_skips = (uint32_t)strtoul(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
 
@@ -1137,14 +1304,21 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     if (cfg && cfg->struct_size < GPTPS_CONFIG_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: append-safe floor */
     *out_engine = NULL;
 
+    /* Idempotent; makes a host fork() detectable so the child fails loudly rather
+     * than deadlocking on a mutex its parent's threads left locked. */
+    gptps_hal_fork_guard_install();
+
     e = (gptps *)gptps_calloc(1, sizeof *e);
     if (!e) return GPTPS_E_NOMEM;
+    e->fork_gen = gptps_hal_fork_generation();   /* refuse this engine after a fork */
 
     s = gptps_config_resolve(in, &e->limits);
     if (s != GPTPS_OK) { gptps_free(e); return s; }
 
     e->next_handle = 1;
     e->reserve_after_skips = GPTPS_RESERVE_AFTER;
+    e->shutdown_grace_ms   = GPTPS_SHUTDOWN_GRACE_MS_DEFAULT;
+    e->max_dead_letters    = GPTPS_MAX_DEAD_LETTERS_DEFAULT;
     e->m = gptps_mutex_create();
     e->cv_disp = gptps_cond_create();
     e->cv_work = gptps_cond_create();
@@ -1159,6 +1333,12 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
                      "worker pool size (restart to apply)", sc_rd_conc, sc_wr_conc);
     reg_core_setting(e, "limits.max_intake_depth", GPTPS_SETTING_UINT, 1, 0, 0, 0,
                      "max queued (un-admitted) items before submit returns E_FULL (0 = unbounded)", sc_rd_intake, sc_wr_intake);
+    reg_core_setting(e, "limits.shutdown_grace_ms", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+                     "ms gptps_shutdown lets in-flight work drain before cancelling it (0 = wait forever)", sc_rd_grace, sc_wr_grace);
+    reg_core_setting(e, "limits.max_dead_letters", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+                     "max retained dead-lettered items; oldest is evicted past this (0 = unbounded)", sc_rd_dlcap, sc_wr_dlcap);
+    reg_core_setting(e, "stats.dead_letters_evicted", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+                     "dead-letter entries dropped by limits.max_dead_letters (write to reset)", sc_rd_devict, sc_wr_devict);
     reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 0, 0, 0,
                      "scheduler starvation guard (backfill skips before reserving)", sc_rd_resv, sc_wr_resv);
 
@@ -1178,6 +1358,12 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
         e->nworkers = e->limits.max_concurrent_tasks;
         e->workers = (gptps_thread **)gptps_calloc(e->nworkers, sizeof *e->workers);
         if (!e->workers) { s = GPTPS_E_NOMEM; goto fail; }
+
+        /* Room for every thread this engine owns (dispatcher + workers) to record
+         * its own id, so gptps_shutdown can refuse a call made from one of them. */
+        e->cap_owned_tids = e->nworkers + 1;
+        e->owned_tids = (uint64_t *)gptps_calloc(e->cap_owned_tids, sizeof *e->owned_tids);
+        if (!e->owned_tids) { s = GPTPS_E_NOMEM; goto fail; }
 
         e->dispatcher = gptps_thread_start(dispatcher_main, e);
         if (!e->dispatcher) { s = GPTPS_E_NOMEM; goto fail; }
@@ -1200,6 +1386,7 @@ fail_threads:
 fail:
     if (e->settings) gptps_settings_destroy(e->settings);
     if (e->workers) gptps_free(e->workers);
+    if (e->owned_tids) gptps_free(e->owned_tids);
     if (e->cv_drain) gptps_cond_destroy(e->cv_drain);
     if (e->cv_work) gptps_cond_destroy(e->cv_work);
     if (e->cv_disp) gptps_cond_destroy(e->cv_disp);
@@ -1279,12 +1466,30 @@ gptps_status gptps_open(const char *config_path, gptps **out_engine)
         long long ll;
         int n, k;
         (*out_engine)->toml = t;            /* retained for register-time task overrides */
+        /* [limits]: knobs that live on the engine rather than in gptps_limits (which
+         * cannot grow - it sits BEFORE `mode` inside gptps_config, so appending to it
+         * would move `mode` and break the frozen GPTPS_CONFIG_MIN_SIZE). */
+        if (gptps_toml_int(t, "limits", "shutdown_grace_ms", &ll) && ll >= 0)
+            (*out_engine)->shutdown_grace_ms = (uint32_t)ll;
+        if (gptps_toml_int(t, "limits", "max_dead_letters", &ll) && ll >= 0)
+            (*out_engine)->max_dead_letters = (uint32_t)ll;
         /* [scheduler]: starvation-guard knob (0 => reserve immediately, no backfill) */
         if (gptps_toml_int(t, "scheduler", "reserve_after_skips", &ll) && ll >= 0)
             (*out_engine)->reserve_after_skips = (uint32_t)ll;
-        /* top-level addons = ["lib1.so", ...] : auto-load (best-effort) */
+        /* top-level addons = ["lib1.so", ...]. A failure here is NOT silent: the
+         * add-on is a policy carrier (a constraint that enforces a quota, say), and
+         * "ran without it" is exactly the outcome an operator must not discover from
+         * behaviour alone. Report it and keep going - the engine itself is valid. */
         n = gptps_toml_str_array(t, "", "addons", &addons);
-        for (k = 0; k < n; ++k) (void)gptps_load_addon(*out_engine, addons[k]);
+        for (k = 0; k < n; ++k) {
+            gptps_status as = gptps_load_addon(*out_engine, addons[k]);
+            if (as != GPTPS_OK) {
+                char msg[256];
+                snprintf(msg, sizeof msg, "add-on '%s' from %s failed to load: %s",
+                         addons[k], config_path, gptps_strerror(as));
+                gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+            }
+        }
     }
     return GPTPS_OK;
 }
@@ -1508,9 +1713,12 @@ static unsigned reg_live_refs(const gptps *e, const gptps_reg *r)
          + fifo_count_reg(&e->running_items, r);
 }
 
-/* remove + free every item in q referencing r (caller holds e->m). Only used on
- * queues whose items have NOT reserved admission budget (intake / delayed). */
-static unsigned fifo_drop_reg(gptps_fifo *q, const gptps_reg *r)
+/* Unlink every item in q referencing r and move it to `out` (caller holds e->m).
+ * The items are NOT freed here: they are still submitted handles that owe their
+ * observer a terminal event, and events must be emitted with the lock RELEASED.
+ * The caller drains `out` after unlocking (see gptps_unregister_task). Only used
+ * on queues whose items have NOT reserved admission budget (intake / delayed). */
+static unsigned fifo_detach_reg(gptps_fifo *q, const gptps_reg *r, gptps_fifo *out)
 {
     gptps_item *it = q->head, *prev = NULL; unsigned n = 0;
     while (it) {
@@ -1518,12 +1726,30 @@ static unsigned fifo_drop_reg(gptps_fifo *q, const gptps_reg *r)
         if (it->reg == r) {
             if (prev) prev->next = next; else q->head = next;
             if (q->tail == it) q->tail = prev;
-            it->next = NULL; item_free(it); ++n;
             q->count -= 1;
+            it->next = NULL;
+            fifo_push(out, it); ++n;
         } else prev = it;
         it = next;
     }
     return n;
+}
+
+/* Emit a terminal cancelled event for every item in `q` and free it. Caller must
+ * NOT hold e->m (observers may re-enter the engine), and must call this while the
+ * items' reg is still alive so item_name() stays valid. */
+static void drain_cancelled(gptps *e, gptps_fifo *q, gptps_event_cb cb, void *ud)
+{
+    gptps_item *it;
+    while ((it = fifo_pop(q)) != NULL) {
+        gptps_pending_ev p;
+        p.kind = GPTPS_EV_FAILED; p.handle = it->handle;
+        ev_set_name(p.name, item_name(it));
+        p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
+        p.result = NULL; p.result_len = 0;
+        emit_now(e, cb, ud, &p);
+        item_free(it);
+    }
 }
 
 /* free every SERVICE item in q (caller holds e->m). Only for queues whose items
@@ -1668,9 +1894,13 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
     gptps_reg *r;
     unsigned mode = flags & GPTPS_REMOVE_MODE_MASK;
     char prefix[320];
+    gptps_fifo dropped;              /* items cancelled by the removal, freed after unlock */
+    gptps_event_cb cb; void *ud;
 
     if (!e || !task_name) return GPTPS_E_INVAL;
     if (strlen(task_name) > sizeof prefix - 8) return GPTPS_E_INVAL;
+
+    dropped.head = dropped.tail = NULL; dropped.count = 0;
 
     gptps_mutex_lock(e->m);
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
@@ -1687,8 +1917,8 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
         /* MANUAL: no worker threads => nothing is in-flight between gptps_step calls. */
         if (mode == GPTPS_REMOVE_CANCEL) {
             r->removed = true; r->cancelling = true;
-            fifo_drop_reg(&e->intake, r);
-            fifo_drop_reg(&e->delayed, r);
+            fifo_detach_reg(&e->intake, r, &dropped);
+            fifo_detach_reg(&e->delayed, r, &dropped);
         } else if (reg_live_refs(e, r) > 0) {
             gptps_mutex_unlock(e->m);     /* DRAIN/REJECT: step the queue empty first, then remove */
             return GPTPS_E_BUSY;
@@ -1705,8 +1935,8 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
         if (mode == GPTPS_REMOVE_CANCEL) {
             gptps_item *it;
             r->cancelling = true;             /* in-flight items are discarded, not dead-lettered */
-            fifo_drop_reg(&e->intake, r);     /* drop the queued backlog (no budget reserved yet) */
-            fifo_drop_reg(&e->delayed, r);
+            fifo_detach_reg(&e->intake, r, &dropped);   /* queued backlog (no budget reserved yet) */
+            fifo_detach_reg(&e->delayed, r, &dropped);
             for (it = e->running_items.head; it; it = it->next)
                 if (it->reg == r) gptps_flag_set(it->cancel, true);   /* cooperative cancel in-flight */
             gptps_cond_broadcast(e->cv_work);
@@ -1726,7 +1956,13 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
      * then unlink the slot from the registry. */
     detach_dead_letter(e, r);
     registry_unlink(e, r);
+    cb = e->ev_cb; ud = e->ev_ud;         /* snapshot under the lock */
     gptps_mutex_unlock(e->m);
+
+    /* Terminal events for the backlog this removal cancelled. Emitted here, with
+     * e->m released (observers may re-enter) but BEFORE reg_destroy below, so
+     * item_name() still resolves against the live reg. */
+    drain_cancelled(e, &dropped, cb, ud);
 
     /* tear down its settings with e->m RELEASED (settings->m -> e->m order), then free */
     snprintf(prefix, sizeof prefix, "tasks.%s.", task_name);
@@ -1953,6 +2189,40 @@ static const gptps_api_routines G_API = {
     gptps_set_scheduler
 };
 
+/* Undo whatever a FAILED addon setup() managed to register before it gave up.
+ * Every list the host table can extend is prepend-only, so anything in front of
+ * the snapshot head belongs to this setup. Without this, a setup that registered
+ * an observer and then returned E_DUP on its second task left a live function
+ * pointer on a list the engine walks on the very next event. Matches
+ * gptps_unregister_observer's discipline: unlink under e->m, free after. */
+static void addon_unwind(gptps *e, gptps_observer *obs0, gptps_constraint *con0,
+                         gptps_reg *reg0, gptps_sched_fn sched0, void *schedud0)
+{
+    gptps_observer   *odead = NULL;
+    gptps_constraint *cdead = NULL;
+    char names[GPTPS_ADDON_UNWIND_MAX][GPTPS_EV_NAME_MAX];
+    size_t nnames = 0, i;
+    gptps_reg *r;
+
+    gptps_mutex_lock(e->m);
+    while (e->observers && e->observers != obs0) {
+        gptps_observer *o = e->observers; e->observers = o->next; o->next = odead; odead = o;
+    }
+    while (e->constraints && e->constraints != con0) {
+        gptps_constraint *c = e->constraints; e->constraints = c->next; c->next = cdead; cdead = c;
+    }
+    e->sched_fn = sched0; e->sched_ud = schedud0;
+    for (r = e->registry; r && r != reg0 && nnames < GPTPS_ADDON_UNWIND_MAX; r = r->next)
+        snprintf(names[nnames++], GPTPS_EV_NAME_MAX, "%s", r->name);
+    gptps_mutex_unlock(e->m);
+
+    while (odead) { gptps_observer   *n = odead->next; gptps_free(odead); odead = n; }
+    while (cdead) { gptps_constraint *n = cdead->next; gptps_free(cdead); cdead = n; }
+    /* takes e->m itself; nothing has been submitted to these types yet */
+    for (i = 0; i < nnames; ++i)
+        (void)gptps_unregister_task(e, names[i], GPTPS_REMOVE_CANCEL);
+}
+
 gptps_status gptps_load_addon(gptps *e, const char *path)
 {
     gptps_dl *dl;
@@ -1982,14 +2252,37 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
     }
 
     if (addon->setup) {
+        /* Snapshot every list setup() can prepend to, so a PARTIAL setup is undone
+         * rather than left live. A failed load is a status a host reasonably logs
+         * and continues past ("running without add-on X"), so it must leave the
+         * engine in a consistent state - not one event away from a wild jump. */
+        gptps_observer   *obs0;
+        gptps_constraint *con0;
+        gptps_reg        *reg0;
+        gptps_sched_fn    sched0;
+        void             *schedud0;
+
+        gptps_mutex_lock(e->m);
+        obs0 = e->observers; con0 = e->constraints; reg0 = e->registry;
+        sched0 = e->sched_fn; schedud0 = e->sched_ud;
+        gptps_mutex_unlock(e->m);
+
         s = addon->setup(e, &G_API, &err);
-        if (s != GPTPS_OK) { gptps_dl_close(dl); return s; }
+        if (s != GPTPS_OK) {
+            addon_unwind(e, obs0, con0, reg0, sched0, schedud0);
+            /* Deliberately NOT gptps_dl_close(dl). A partially-initialised add-on can
+             * still have left pointers the unwind cannot reach - a settings entry's
+             * read/write pair, a per-task setting schema, a named resource. Unmapping
+             * the library would turn every one of those into a wild jump; leaking a
+             * single mapping on a path that has already failed is the safer trade. */
+            return s;
+        }
     }
 
     node = (gptps_loaded *)gptps_calloc(1, sizeof *node);
     if (!node) {
         if (addon->teardown) addon->teardown(e);
-        gptps_dl_close(dl);
+        /* same reasoning as the setup-failure path above: do not unmap */
         return GPTPS_E_NOMEM;
     }
     node->dl = dl; node->addon = addon;
@@ -2011,6 +2304,11 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
 
     if (!e || !task_name) return GPTPS_E_INVAL;
     if (opts && opts->struct_size < GPTPS_SUBMIT_OPTIONS_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: append-safe floor */
+    /* An engine INHERITED across a fork may have its mutex held by a thread that
+     * did not survive, so taking it below would block forever. Fail instead of
+     * hang. An engine created fresh in the child stamps the new generation and is
+     * unaffected. */
+    if (e->fork_gen != gptps_hal_fork_generation()) return GPTPS_E_SHUTDOWN;
 
     /* Copy the payload + allocate the item + create the cancel flag OUTSIDE the
      * engine lock: none of it needs engine state, and keeping it off-lock shortens
@@ -2134,6 +2432,7 @@ gptps_status gptps_cancel(gptps *e, gptps_handle h)
     gptps_fifo *queues[2];
 
     if (!e || h == 0) return GPTPS_E_INVAL;
+    if (e->fork_gen != gptps_hal_fork_generation()) return GPTPS_E_SHUTDOWN; /* see submit_internal */
 
     gptps_mutex_lock(e->m);
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
@@ -2342,8 +2641,13 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
     if (out_ran) *out_ran = 0;
     if (!e) return GPTPS_E_INVAL;
     if (!e->manual) return GPTPS_E_INVAL;   /* threaded engines run themselves */
+    if (e->fork_gen != gptps_hal_fork_generation()) return GPTPS_E_SHUTDOWN; /* see submit_internal */
 
     gptps_mutex_lock(e->m);
+    /* Refuse a re-entrant pump: a task body or event callback calling gptps_step
+     * would recursively drain queues the outer step is still walking. */
+    if (e->step_tid != 0) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
+    e->step_tid = gptps_hal_thread_id();
 
     /* pass A: complete any prior work, promote backoff-ready retries, admit. */
     engine_pass(e, pend, &npend, &next_wake);
@@ -2353,9 +2657,19 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
     while ((it = fifo_pop(&e->ready)) != NULL) {
         gptps_status eff;
         gptps_event_cb cb = e->ev_cb; void *ud = e->ev_ud;  /* snapshot under lock */
+        /* Same guard as the threaded worker: an event callback may have re-entered
+         * and cancelled this admitted-but-unstarted item (or CANCELled its type)
+         * during the emit above - starting it anyway would reset its cancel flag
+         * and let a cooperative task spin forever. */
+        if (it->cancelled || (it->reg && it->reg->removed && it->reg->cancelling)) {
+            it->outcome = GPTPS_E_CANCELLED;
+            fifo_push(&e->done, it);
+            continue;
+        }
         it->deadline_ms = (it->policy.timeout_seconds && it->def->exec == GPTPS_EXEC_INPROC)
             ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
         gptps_flag_set(it->cancel, false);
+        it->started = 1;                   /* execute() will emit STARTED + a terminal event */
         fifo_push(&e->running_items, it);
         gptps_mutex_unlock(e->m);
 
@@ -2372,6 +2686,7 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
     engine_pass(e, pend, &npend, &next_wake);
     flush_pending(e, pend, &npend);
 
+    e->step_tid = 0;
     gptps_mutex_unlock(e->m);
     if (out_ran) *out_ran = ran;
     return GPTPS_OK;
@@ -2384,8 +2699,11 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
  * delayed queue non-empty. Running/ready instances (budget reserved) are marked
  * cancelled + flagged so they exit / are discarded through the normal `done` path
  * (which releases their budget); queued + backing-off instances (no budget) are
- * freed outright. Non-service in-flight work is untouched, so it still drains
- * gracefully. Caller holds e->m. */
+ * freed outright.
+ * Non-service in-flight work is left alone HERE so it drains gracefully - but it is
+ * no longer left alone forever: gptps_shutdown arms e->stop_deadline_ms, and once
+ * that grace elapses the dispatcher cancels whatever is still running (engine_pass
+ * step 3b). Caller holds e->m. */
 static void stop_services(gptps *e)
 {
     gptps_item *it;
@@ -2406,7 +2724,20 @@ gptps_status gptps_shutdown(gptps *e)
     if (!e) return GPTPS_E_INVAL;
 
     gptps_mutex_lock(e->m);
+    /* Refuse a re-entrant shutdown. Called from a task body or an event callback,
+     * this would join the very thread making the call (THREADED) or free the engine
+     * that gptps_step is still standing on (MANUAL) - a deadlock and a
+     * use-after-free respectively, both from a call that looks perfectly ordinary.
+     * The correct pattern is to signal your main thread and shut down from there. */
+    if (engine_is_reentrant(e, gptps_hal_thread_id())) {
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_BUSY;
+    }
     e->stopping = true;
+    /* Arm the drain bound before waking anyone: in-flight work gets until this
+     * instant to finish on its own, after which the dispatcher cancels it. */
+    e->stop_deadline_ms = e->shutdown_grace_ms
+        ? gptps_hal_monotonic_ms() + (uint64_t)e->shutdown_grace_ms : 0;
     stop_services(e);                   /* cooperatively stop long-running service instances */
     gptps_cond_signal(e->cv_disp);
     gptps_cond_broadcast(e->cv_work);   /* wake idle workers to discard cancelled service instances */
@@ -2459,6 +2790,7 @@ gptps_status gptps_shutdown(gptps *e)
     gptps_free(e->config_path);
 
     gptps_free(e->workers);
+    gptps_free(e->owned_tids);
     gptps_cond_destroy(e->cv_drain);
     gptps_cond_destroy(e->cv_work);
     gptps_cond_destroy(e->cv_disp);

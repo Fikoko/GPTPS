@@ -350,6 +350,25 @@ add_dependencies(test_program_helper prog_helper)
 add_test(NAME program_helper COMMAND test_program_helper)
 set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
 
+# --- teardown always terminates -------------------------------------------
+# The failure mode of every check in here is a HANG, so the TIMEOUT is part of
+# the assertion, not just a safety net. It uses prog_helper for the stuck-child
+# cases, so it lives next to program_helper.
+add_executable(test_hang tests/test_hang.c)
+target_include_directories(test_hang PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_hang PRIVATE gptps)
+target_compile_definitions(test_hang PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_hang prog_helper)
+add_test(NAME hang COMMAND test_hang)
+set_tests_properties(hang PROPERTIES TIMEOUT 60)
+
+# --- every submitted handle reaches exactly one terminal event -------------
+add_executable(test_reconcile tests/test_reconcile.c)
+target_include_directories(test_reconcile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_reconcile PRIVATE gptps)
+add_test(NAME reconcile COMMAND test_reconcile)
+set_tests_properties(reconcile PROPERTIES TIMEOUT 60)
+
 # real-time terminal dashboard add-on (portable; headless-tested)
 add_executable(test_tui tests/test_tui.c addons/tui.c)
 target_include_directories(test_tui

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gptps_internal.h - internal prototypes shared across core translation units.
  * Not installed; not part of the public ABI.
@@ -73,8 +75,11 @@ void  gptps_free(void *ptr);
  * `in` may be NULL (treated as "all auto"). */
 gptps_status gptps_config_resolve(const gptps_limits *in, gptps_limits *out);
 
-/* Build a ctx, run the task in THIS process, and return a malloc'd copy of its
- * result bytes (caller frees; NULL/0 if none). Used by the OOP child. */
+/* Build a ctx, run the task in THIS process, and hand out a BORROWED pointer to its
+ * result bytes (NULL/0 if none). The caller must NOT free them: this is called only
+ * in the forked OOP child, which must not touch the allocator (a host allocator's
+ * lock may have been held by a thread that did not survive fork()) and which _exit()s
+ * immediately after writing the bytes to its pipe. */
 gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, size_t plen,
                                void **out_result, size_t *out_len);
 
@@ -86,8 +91,12 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
  * memory-delegated cgroup; otherwise a coarse RLIMIT_AS fallback. mem_cap==0 or
  * below a floor => no cap. `cancel` (may be NULL) is the running item's cooperative
  * cancel flag: the parent waits in bounded slices and hard-kills the child when it is
- * raised (returns GPTPS_E_TIMEOUT), so a cancel / shutdown / task-removal stops even a
- * no-timeout (timeout_s==0) child instead of blocking its worker forever. */
+ * raised, so a cancel / shutdown / task-removal stops even a no-timeout (timeout_s==0)
+ * child instead of blocking its worker forever.
+ * The kill REASON is reported distinctly: GPTPS_E_CANCELLED for the flag,
+ * GPTPS_E_TIMEOUT for the deadline, GPTPS_E_IO for a pump failure - so an operator's
+ * cancel is never mistaken for a deadline breach. A child that stops talking without
+ * exiting is reaped with a bounded grace period, never an unbounded waitpid(). */
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                void **out_result, size_t *out_len);
@@ -126,7 +135,10 @@ size_t          gptps_settings_remove_prefix(gptps_settings *r, const char *pref
  * parent pumps stdin and stdout CONCURRENTLY (a single poll loop), so a large
  * payload through a streaming child does not deadlock. `cancel` (may be NULL) is
  * the item's cooperative cancel flag - the pump kills the child when it is raised,
- * so a no-timeout program can still be cancelled / shut down (returns E_TIMEOUT). */
+ * so a no-timeout program can still be cancelled / shut down (reported as
+ * GPTPS_E_CANCELLED, distinct from a deadline's GPTPS_E_TIMEOUT). Stdout EOF means the
+ * child closed its output, NOT that it exited, so the reap is bounded: a program that
+ * goes silent and keeps running is SIGKILLed after a grace period. */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
                                    void **out_result, size_t *out_len);

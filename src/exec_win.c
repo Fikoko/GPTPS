@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * exec_win.c - Windows executor backend (counterpart to exec_oop_posix.c).
  *
@@ -107,6 +109,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     DWORD code = 1, waited;
     int killed = 0, assigned = 0;
     gptps_status eff;
+    gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
 
     /* def->child_setup is a POSIX fork-time hook; Windows has no fork model, so
      * it does not apply to CreateProcess and is intentionally ignored here. */
@@ -174,13 +177,15 @@ return GPTPS_E_NOMEM; }
             DWORD slice = 200;
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
-                if (now >= deadline) { killed = 1; break; }
+                if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; break; }
                 if (deadline - now < (uint64_t)slice) slice = (DWORD)(deadline - now);
             }
             waited = WaitForSingleObject(pi.hProcess, slice);
             if (waited == WAIT_OBJECT_0) break;                       /* child exited */
-            if (cancel && gptps_flag_get(cancel)) { killed = 1; break; } /* cancelled */
-            if (waited == WAIT_FAILED) { killed = 1; break; }        /* defensive: never spin */
+            /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
+             * breach - report the two apart so an operator can tell which happened. */
+            if (cancel && gptps_flag_get(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
+            if (waited == WAIT_FAILED) { killed = 1; kill_st = GPTPS_E_IO; break; } /* defensive: never spin */
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }
         if (killed) {
@@ -196,7 +201,7 @@ return GPTPS_E_NOMEM; }
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     if (job) CloseHandle(job);
 
-    if      (killed)        eff = GPTPS_E_TIMEOUT;
+    if      (killed)        eff = kill_st;
     else if (rc.oversize)   eff = GPTPS_E_IO;
     else if (rc.nomem)      eff = GPTPS_E_NOMEM;
     else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
