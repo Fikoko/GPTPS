@@ -1,10 +1,58 @@
 # Changelog
 
 All notable changes to GPTPS are recorded here. Format follows
-[Keep a Changelog](https://keepachangelog.com/); the project aims for semantic
-versioning once it reaches 1.0.
+[Keep a Changelog](https://keepachangelog.com/). As of 1.0.0 the project follows
+semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
+the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.0.0] - 2026-08-06
+
+**First stable release.** The API and the add-on ABI are now under semantic
+versioning: structs grow by appending, never by reshaping, and a breaking change
+bumps MAJOR. Everything below this heading shipped in it.
+
+### Removed — the last breaking change (ABI 2.0)
+
+Two fields deleted from `gptps_cost`, in the only window the append-only rule
+leaves open — the one before 1.0:
+
+- **`gpu_units`** — a domain-specific field in a self-described mechanism-only core,
+  and one the core never enforced (its own comment said "via add-on"). ABI 1.10's
+  generic named-resource budgets subsume it exactly. `addons/gpu_quota` is now a thin
+  wrapper over `gptps_define_resource` / `gptps_set_task_resource_cost` — 159 lines
+  to 97, with no counter, no lock and no bookkeeping of its own, and it doubles as
+  the worked example for the named-resource API. Declare units with the new
+  `gptps_gpu_quota_set_task_units()`.
+  *Note its lifetime changed:* the quota is now a view onto the engine's ledger, so
+  every accessor except `_close()` requires a live engine.
+- **`est_duration_ms`** — declared a "scheduling hint" and read by no code anywhere.
+  Duration-aware ordering belongs in the scheduler seam (`gptps_set_scheduler`).
+
+### Added — a written NON-GOALS list
+
+"Mechanism-only" is not a constraint unless it can reject something. The README now
+states what the core will not grow into (distributed scheduling, queue persistence, a
+metrics format, futures in the engine, DAG semantics, a logging framework, more
+executor kinds, convenience wrappers) and where each belongs instead — plus the
+tie-break when nothing else decides it: *does a user with a name want this?*
+
+### Added — `docs/SECURITY.md`, and an honest trust boundary
+
+Three places told readers to route "**untrusted**" work to `GPTPS_EXEC_OOP`. What
+that actually does is fork a full copy of the host address space — every secret it
+holds — with descriptors and environment inherited. That is **resource** isolation
+and a guaranteed kill, not **privilege** isolation, and "untrusted" is the word that
+gets someone hurt. Reworded to "unbounded or crash-prone", with `SECURITY.md` naming
+the boundary, pointing at `child_setup` as the seam that fixes it, and listing the
+DoS bounds and the explicit non-guarantees.
+
+### Added — `GPTPS_BUILD_TESTS` / `GPTPS_BUILD_EXAMPLES`
+
+Default ON at top level, OFF when GPTPS is `add_subdirectory`'d or FetchContent'd. A
+consumer previously inherited all 43 CTest tests and had to build every test and
+example binary to get `libgptps.a`. The two generic target names `demo` and
+`bench_pool` are now `gptps_demo` and `gptps_bench_pool`, which would otherwise
+collide in any parent project.
 
 ### Fixed — teardown always terminates
 

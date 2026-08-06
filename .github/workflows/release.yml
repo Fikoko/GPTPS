@@ -1,0 +1,101 @@
+name: release
+
+# Publishes a GitHub Release when a version tag is pushed.
+#
+# The artifact is the single-file amalgamation, because that is the form most
+# people will actually consume GPTPS in: two files, no build system, no
+# dependencies. Cloning an unpinned HEAD was previously the ONLY way to obtain the
+# library, which meant no blog post, HN comment, vcpkg portfile or Dockerfile could
+# reference a stable, verifiable URL.
+#
+# The payload is built and RUN here before it is attached - a release artifact that
+# was never compiled is a promise, not a deliverable.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # required to create the Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + test at the tag
+        # Do not ship an artifact from a tree that does not pass its own suite.
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+      - name: Generate the amalgamation
+        run: sh tools/amalgamate.sh amalgamation
+
+      - name: Verify the artifact compiles, runs, and is licensed
+        run: |
+          cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
+             amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o amalg_check
+          ./amalg_check
+          for f in amalgamation/gptps.h amalgamation/gptps.c; do
+            grep -q 'Permission is hereby granted' "$f" \
+              || { echo "ERROR: $f ships with no MIT notice"; exit 1; }
+            grep -q 'SPDX-License-Identifier: MIT' "$f" \
+              || { echo "ERROR: $f has no SPDX tag"; exit 1; }
+          done
+
+      - name: Stage the release payload
+        id: stage
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp amalgamation/gptps.c amalgamation/gptps.h LICENSE dist/
+          cd dist
+          sha256sum gptps.c gptps.h LICENSE > SHA256SUMS
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cat SHA256SUMS
+
+      - name: Extract this version's changelog section
+        # Everything between this version's heading and the next one. Falls back to
+        # a pointer rather than failing the release if the heading is missing.
+        run: |
+          VERSION="${{ steps.stage.outputs.version }}"
+          awk -v v="## [$VERSION]" '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > NOTES.md
+          if [ ! -s NOTES.md ]; then
+            echo "See [CHANGELOG.md](CHANGELOG.md)." > NOTES.md
+          fi
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Getting it"
+            echo ""
+            echo 'Drop the two attached files into your project — no build system, no dependencies:'
+            echo ""
+            echo '```sh'
+            echo "cc -std=c99 myapp.c gptps.c -I. -lpthread -ldl   # Linux"
+            echo "cc -std=c99 myapp.c gptps.c -I. -lpthread        # macOS"
+            echo '```'
+            echo ""
+            echo 'Or build from source with CMake: `cmake -S . -B build && cmake --build build`.'
+            echo ""
+            echo 'Checksums are in `SHA256SUMS`.'
+          } >> NOTES.md
+
+      - name: Publish the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "GPTPS ${{ steps.stage.outputs.version }}"
+          body_path: NOTES.md
+          files: |
+            dist/gptps.c
+            dist/gptps.h
+            dist/LICENSE
+            dist/SHA256SUMS
