@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(gptps VERSION 0.2.0 LANGUAGES C)
+project(gptps VERSION 1.0.0 LANGUAGES C)
 
 # GPTPS - General Purpose Task Processing System.
 # Embeddable, in-process C99 task-processing library. Core is strict C99;
@@ -61,6 +61,20 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
+# --- what to build (a downstream consumer gets the LIBRARY only) -----------
+# Default ON at top level, OFF when GPTPS is add_subdirectory'd / FetchContent'd:
+# without this a consumer inherited all 43 CTest tests and had to build every test
+# and example binary to get libgptps.a. (PROJECT_IS_TOP_LEVEL needs CMake 3.21 and
+# this project supports 3.13, hence the explicit comparison.)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(GPTPS_IS_TOP_LEVEL ON)
+else()
+    set(GPTPS_IS_TOP_LEVEL OFF)
+endif()
+option(GPTPS_BUILD_TESTS    "Build the GPTPS test suite"  ${GPTPS_IS_TOP_LEVEL})
+option(GPTPS_BUILD_EXAMPLES "Build the GPTPS examples"    ${GPTPS_IS_TOP_LEVEL})
+
+
 # --- install / packaging (cmake --install; find_package(gptps); pkg-config) -
 include(CMakePackageConfigHelpers)
 install(TARGETS gptps EXPORT gptps-targets
@@ -85,8 +99,13 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/gptps.pc.in
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gptps.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
+# Examples register CTest tests too, so testing is enabled when EITHER is on.
+if(GPTPS_BUILD_TESTS OR GPTPS_BUILD_EXAMPLES)
+    enable_testing()
+endif()
+
+if(GPTPS_BUILD_TESTS)
 # --- tests (CTest) ---------------------------------------------------------
-enable_testing()
 add_executable(test_constraint tests/test_constraint.c)
 target_include_directories(test_constraint
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -289,11 +308,11 @@ if(UNIX)
     add_test(NAME stress COMMAND test_stress)
     set_tests_properties(stress PROPERTIES TIMEOUT 60)
 
-    add_executable(bench_pool examples/bench_pool.c addons/gptps_pool.c) # empirical scale-up proof (throughput vs shards)
-    target_include_directories(bench_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
-    target_link_libraries(bench_pool PRIVATE gptps)
-    add_test(NAME bench_pool COMMAND bench_pool)   # runs the CI-quick default; prints the scaling table
-    set_tests_properties(bench_pool PROPERTIES TIMEOUT 60)
+    add_executable(gptps_bench_pool examples/bench_pool.c addons/gptps_pool.c) # empirical scale-up proof (throughput vs shards)
+    target_include_directories(gptps_bench_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(gptps_bench_pool PRIVATE gptps)
+    add_test(NAME gptps_bench_pool COMMAND gptps_bench_pool)   # runs the CI-quick default; prints the scaling table
+    set_tests_properties(gptps_bench_pool PROPERTIES TIMEOUT 60)
 endif()
 
 # Portable add-on tests (all platforms): the add-on sources are portable
@@ -378,12 +397,15 @@ target_link_libraries(test_tui PRIVATE gptps)
 add_test(NAME tui COMMAND test_tui)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 
+endif() # GPTPS_BUILD_TESTS
+
+if(GPTPS_BUILD_EXAMPLES)
 # --- examples (runnable usage; double as smoke tests) ----------------------
-add_executable(demo examples/demo.c)
-target_include_directories(demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(demo PRIVATE gptps)
-add_test(NAME demo COMMAND demo)
-set_tests_properties(demo PROPERTIES TIMEOUT 20)
+add_executable(gptps_demo examples/demo.c)
+target_include_directories(gptps_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gptps_demo PRIVATE gptps)
+add_test(NAME gptps_demo COMMAND gptps_demo)
+set_tests_properties(gptps_demo PROPERTIES TIMEOUT 20)
 
 add_executable(example_config examples/config_file.c)
 target_include_directories(example_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -429,3 +451,5 @@ if(UNIX)
     add_test(NAME example_wasm COMMAND example_wasm)
     set_tests_properties(example_wasm PROPERTIES TIMEOUT 20)
 endif()
+
+endif() # GPTPS_BUILD_EXAMPLES
