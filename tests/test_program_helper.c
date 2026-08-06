@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_program_helper.c - GPTPS_EXEC_PROGRAM via a built helper binary, so the
  * external-program executor is verified on every platform (POSIX exec_oop_posix.c

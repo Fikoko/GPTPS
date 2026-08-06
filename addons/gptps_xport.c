@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gptps_xport.c - worker-process transport (scale-out) built on POSIX IPC.
  *

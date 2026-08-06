@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gptps_orch.c - run-after / fan-in orchestration (see gptps_orch.h).
  *

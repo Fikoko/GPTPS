@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * addon_demo.c - a valid GPTPS add-on built as a shared library, compiled
  * against the frozen header. It registers a task via the host-table ABI

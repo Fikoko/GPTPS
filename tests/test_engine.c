@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_engine.c - end-to-end engine: open -> register -> submit -> run ->
  * events -> shutdown, plus submit validation (unknown task, never-fit).

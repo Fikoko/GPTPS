@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_constraint.c - constraint hooks (admit/deny/defer) + observers.
  * Proves the modular admission/observer seams are wired into the dispatcher.

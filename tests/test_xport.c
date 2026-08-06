@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_xport.c - the worker-process transport (scale-out). Proves work submitted
  * here executes in a SEPARATE process (the result carries the worker's pid, which

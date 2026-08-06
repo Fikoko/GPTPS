@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gpu_quota.h - GPU-unit admission quota for GPTPS (optional add-on).
  *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_addon.c - add-on loader + ABI regression (T7). Loads a pre-compiled
  * plugin shared library via the host-table ABI, runs its task, and checks the

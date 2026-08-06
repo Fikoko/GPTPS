@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_resource.c - generic named-resource budgets. A resource (e.g. "gpu") with
  * a total budget gates admission independently of worker concurrency and the

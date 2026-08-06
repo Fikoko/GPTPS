@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_taskmgmt.c - runtime task management + generic settings (v1.8):
  *   - enumeration (count / get_info / exists)

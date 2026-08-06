@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * demo.c - the GPTPS headline use case: add a resource-aware, recoverable task
  * runner to your own program by linking libgptps. ~30 lines of real usage.

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_backpressure.c - bounded intake (max_intake_depth): gptps_submit returns
  * GPTPS_E_FULL once that many un-admitted items are queued, recovers as the queue

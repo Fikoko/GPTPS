@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_pool.c - the N-shard router (scale-up by composition). Proves work spreads
  * evenly round-robin across independent engine shards, that keyed routing pins a

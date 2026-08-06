@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * wasm_program.c - run a WebAssembly module as a GPTPS task, with NO new code in
  * the library: a wasm runtime CLI is just an external program, so a .wasm module

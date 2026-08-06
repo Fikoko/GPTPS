@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_cancel.c - gptps_cancel(handle): cancel a queued item before it runs,
  * cancel an in-flight item (cooperative), and no-op on unknown / already-terminal

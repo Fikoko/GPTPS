@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_abi.c - append-safe struct guards. A caller-supplied INPUT struct is
  * validated against a FROZEN minimum (the end of the last current field), not the

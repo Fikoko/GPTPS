@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_alloc.c - the process-wide allocator hook (gptps_set_allocator). Installs
  * a counting allocator, drives a MANUAL engine end-to-end (single-threaded, so the

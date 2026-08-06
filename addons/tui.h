@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * tui.h - a real-time terminal dashboard for GPTPS (optional, portable add-on).
  *

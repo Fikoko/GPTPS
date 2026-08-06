@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * settings.c - the generic, typed settings registry (Phase 1 of the settings
  * subsystem). It is SCHEMA + ACCESSOR BINDING only: each entry stores metadata

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_fuzz.c - robustness of the two hand-rolled parsers that consume
  * untrusted file bytes: the TOML-subset config parser and the durable-queue

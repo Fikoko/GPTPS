@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_durable.c - durable-queue add-on.
  *   A) happy path: dq_submit'd tasks run, and the journal marks them complete

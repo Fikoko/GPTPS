@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * dashboard.c - a live terminal dashboard over a running GPTPS engine, using the
  * tui add-on. On a real terminal it redraws continuously and takes hotkeys:

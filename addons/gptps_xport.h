@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * gptps_xport.h - scale-OUT by composition: a worker-PROCESS transport (add-on).
  *

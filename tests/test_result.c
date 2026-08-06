@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_result.c - result delivery: the FINISHED event carries the task's
  * result bytes, for both the in-process and out-of-process executors.

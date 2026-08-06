@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * addon_bad.c - an add-on with a wrong ABI magic. The loader must reject it
  * with GPTPS_E_ABI (proves the magic/version/size gate works).

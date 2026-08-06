@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_wasm.c - WASM executor add-on, exercised with a MOCK runtime so the
  * GPTPS-side integration (module-as-task: payload in, result out, INPROC + OOP,

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_program.c - generalized exec executor (GPTPS_EXEC_PROGRAM): run an
  * arbitrary external program as a task. Payload -> stdin, stdout -> result,

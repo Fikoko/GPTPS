@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_tui.c - terminal dashboard add-on, verified HEADLESSLY (no TTY): drive the
  * engine + the dashboard's key handling, then assert on the rendered frame string

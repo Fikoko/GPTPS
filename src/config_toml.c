@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * config_toml.c - a small, dependency-free TOML *subset* parser for GPTPS
  * config files. Supports:

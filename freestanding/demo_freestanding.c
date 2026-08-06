@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * demo_freestanding.c - proof that the GPTPS C99 core runs "on any hardware".
  *

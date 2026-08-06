@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_orch.c - orchestration add-on (run-after / fan-in). Proves task
  * dependencies are buildable purely on the public seams: a gated task does not

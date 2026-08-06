@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * wasm_exec.c - run WebAssembly modules as GPTPS tasks (see wasm_exec.h).
  *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * external_program.c - run an EXTERNAL PROGRAM as a GPTPS task.
  *

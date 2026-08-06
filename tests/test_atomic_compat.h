@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_atomic_compat.h - portability shim for the TEST/EXAMPLE suite only.
  *

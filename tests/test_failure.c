@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_failure.c - failure engine (T5): retries+backoff, on_failure
  * (dead_letter / drop / requeue), and the deadline watchdog (cooperative

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_deadletter.c - dead-letter drain API.
  *   1) inspect : failed tasks are retained; gptps_dead_letter_count + drain

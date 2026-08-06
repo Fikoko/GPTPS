@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_toml.c - config-file milestone. Two layers:
  *   (1) the TOML-subset parser in isolation (int/float/bool/string/array, dotted

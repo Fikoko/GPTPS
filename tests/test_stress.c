@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_stress.c - concurrent-producer stress on the submit path. Many threads
  * hammer gptps_submit at once with real payloads; every item must complete with

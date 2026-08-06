@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_oop.c - out-of-process executor (T13). Proves the enforced path:
  *  (B) a task that ignores everything (infinite loop) is HARD-KILLED on timeout

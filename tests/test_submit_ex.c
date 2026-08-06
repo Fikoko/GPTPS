@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
  * test_submit_ex.c - per-submit overrides (gptps_submit_ex): scheduling priority,
  * failure policy, and a sub-second deadline, all without cloning the task type.
