@@ -3,7 +3,7 @@
 /*
  * test_gpu_quota.c - GPU-unit admission quota add-on.
  *
- * Budget = 4 units; each "gpu" task declares gpu_units = 2 and blocks until
+ * Budget = 4 units; each "gpu" task costs 2 units and blocks until
  * released. With concurrency set high (8 workers), the GPU quota - not the
  * worker pool - is the limiter: at most 2 tasks (2 x 2 = 4) may run at once,
  * the rest deferred until units free. We submit 4, confirm exactly 2 run
@@ -68,7 +68,7 @@ int main(void)
     CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
     if (!e) return 1;
 
-    q = gptps_gpu_quota_install(e, 4, 20);        /* 4 units total, 2 per task => 2 concurrent */
+    q = gptps_gpu_quota_install(e, 4, 0);         /* 4 units total, 2 per task => 2 concurrent */
     CHECK(q != NULL);
     CHECK(gptps_gpu_quota_total(q) == 4);
 
@@ -84,9 +84,13 @@ int main(void)
     memset(&d, 0, sizeof d);
     d.struct_size = sizeof d; d.name = "gpu"; d.run = task_gpu; d.exec = GPTPS_EXEC_INPROC;
     d.default_cost.struct_size = sizeof d.default_cost;
-    d.default_cost.mem_bytes = 4096; d.default_cost.gpu_units = 2;
+    d.default_cost.mem_bytes = 4096;
     d.default_policy.struct_size = sizeof d.default_policy;
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    /* Units are declared against the NAMED RESOURCE, per task type, after
+     * registration - the gptps_cost.gpu_units field it replaced is gone. */
+    CHECK(gptps_gpu_quota_set_task_units(q, "gpu", 2) == GPTPS_OK);
+    CHECK(gptps_gpu_quota_set_task_units(q, "nope", 2) == GPTPS_E_NOTFOUND);
 
     for (i = 0; i < 4; ++i) CHECK(gptps_submit(e, "gpu", NULL, 0, &h) == GPTPS_OK);
 
@@ -98,13 +102,26 @@ int main(void)
     CHECK(gptps_gpu_quota_in_use(q) == 4);         /* both reservations held */
 
     __atomic_store_n(&g_release, 1, __ATOMIC_SEQ_CST);
-    gptps_shutdown(e);                             /* drains the rest */
+    CHECK(wait_until(&g_done, 4, 5000));           /* all four ran */
 
-    CHECK(get(&g_done) == 4);                      /* all four ran */
-    CHECK(get(&g_peak) == 2);                       /* never more than 2 at once */
+    /* The budget must come fully back. Checked while the engine is still ALIVE:
+     * since ABI 2.0 the quota is a view onto the engine's ledger rather than its
+     * own counter, so these accessors are a use-after-free once gptps_shutdown
+     * has freed the engine (see the LIFETIME note in gpu_quota.h). The engine
+     * releases each reservation in the dispatcher's done-drain, which can lag the
+     * task's own counter by a pass, hence the bounded wait. */
+    {
+        uint64_t t0 = gptps_now_ms(NULL);
+        while (gptps_gpu_quota_in_use(q) != 0 && gptps_now_ms(NULL) - t0 < 2000) { }
+    }
     CHECK(gptps_gpu_quota_in_use(q) == 0);         /* budget fully returned */
+    CHECK(gptps_gpu_quota_total(q) == 4);
 
-    gptps_gpu_quota_close(q);                        /* after shutdown */
+    gptps_shutdown(e);                             /* drains the rest */
+    CHECK(get(&g_done) == 4);
+    CHECK(get(&g_peak) == 2);                      /* never more than 2 at once */
+
+    gptps_gpu_quota_close(q);                      /* only legal call after shutdown */
     if (fails) { printf("%d gpu-quota check(s) FAILED\n", fails); return 1; }
     printf("all gpu-quota checks passed\n");
     return 0;

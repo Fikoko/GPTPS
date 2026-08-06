@@ -166,8 +166,11 @@ mode + a custom allocator is the bare-metal shape; see `examples/embedded.c`.
 
 ## 4. Admission: self-throttling budget
 
-Each task type declares a rough **cost** (`mem_bytes`, `gpu_units`,
-`est_duration_ms`). The engine resolves a budget at open time
+Each task type declares a rough **cost**: `mem_bytes`, plus any number of generic
+**named resources** (`gptps_define_resource` / `gptps_set_task_resource_cost`).
+`gpu_units` and `est_duration_ms` were removed in ABI 2.0 — the first *is* a named
+resource under a specific name, and the second was read by no code anywhere. The
+engine resolves a budget at open time
 (`max_concurrent_tasks`, `max_memory_bytes`) — explicit values win, else
 hardware auto-tune (cores; ~0.75× RAM).
 
@@ -260,8 +263,13 @@ Every step is best-effort and Linux-gated — anything missing falls back to the
 coarse `RLIMIT_AS` (VSZ) cap, so behavior degrades gracefully, never breaks.
 
 `fork()` in a multithreaded process keeps only the calling worker in the child,
-so OOP tasks must be fork-safe / self-contained (CPU/memory-bound work, or
-untrusted code you want isolated and killable).
+so OOP tasks must be fork-safe / self-contained (CPU/memory-bound work, or code
+you want isolated and killable because it may hang, leak, or crash).
+
+This is **resource** isolation, not **privilege** isolation: the child inherits a
+full copy of the host address space, its file descriptors, and its environment.
+See [SECURITY.md](SECURITY.md) for the trust boundary and what `child_setup` is
+for.
 
 ---
 

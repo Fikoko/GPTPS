@@ -35,26 +35,37 @@ cc -std=c99 gptps.c addons/durable_queue.c yourapp.c -lpthread -ldl
 
 ## gpu_quota — GPU-unit admission quota
 
-`gpu_quota.c` / `gpu_quota.h`. Caps total in-flight GPU usage by the `gpu_units`
-each task type declares in its cost. It composes two seams: a **constraint** gates
-admission (reserve units, or `DEFER` when the budget is full) and an **observer**
-releases units when a task run ends — so the engine never starts more GPU work
-than your budget allows.
+`gpu_quota.c` / `gpu_quota.h`. Caps total in-flight GPU usage so the engine never
+*starts* more GPU work than your budget allows.
+
+**Read this one first if you are learning the named-resource API.** It is a thin
+wrapper over `gptps_define_resource` / `gptps_set_task_resource_cost` /
+`gptps_resource_usage` and carries no counter, no lock, and no bookkeeping —
+about 90 lines, most of them comment. "GPU units" is not a mechanism, it is a
+*name* for one: swap the string and the same code caps licence seats, IO
+bandwidth, or a per-tenant quota. That is why the core has no idea what a GPU is.
 
 - **Scope:** admission-level *oversubscription prevention*, not driver-level VRAM
   enforcement (that needs vendor APIs / real hardware). Pair it with an OOP/cgroup
   memory cap for hard limits.
-- **Model:** `gpu_units` is treated as fixed per task type. Install as *the* GPU
-  constraint.
-- **Ordering:** call `gptps_gpu_quota_close()` after `gptps_shutdown()`.
-- **Portability:** Linux/macOS/Windows (via the `addon_compat` mutex shim).
+- **Model:** units are fixed per task TYPE, declared after registration.
+- **Ordering:** the engine owns the budget, so `gptps_gpu_quota_close()` only
+  releases the handle.
+- **Portability:** no platform code at all.
 
 ```c
-gptps_gpu_quota *q = gptps_gpu_quota_install(engine, /*total*/ 8, /*defer_ms*/ 25);
-/* tasks with def.default_cost.gpu_units = N are now budget-gated */
+gptps_gpu_quota *q = gptps_gpu_quota_install(engine, /*total*/ 8, /*unused*/ 0);
+gptps_register_task(engine, &def);
+gptps_gpu_quota_set_task_units(q, "infer", 2);   /* each item costs 2 units */
 gptps_shutdown(engine);
 gptps_gpu_quota_close(q);
 ```
+
+Before ABI 2.0 this was a constraint + observer pair with its own counter, keyed
+off a `gptps_cost.gpu_units` field. It had to infer releases from the event
+stream by task name, which leaked the budget on any terminal path the observer
+did not see — and there was one. Reserving through the core deletes the failure
+mode instead of patching it.
 
 ## wasm_exec — run WebAssembly modules as tasks (bring-your-own-runtime)
 

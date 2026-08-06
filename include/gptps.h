@@ -59,22 +59,35 @@
 extern "C" {
 #endif
 
-/* --- ABI version (semantic; loader refuses MAJOR mismatch) --------------- */
-#define GPTPS_ABI_VERSION_MAJOR 1u
-#define GPTPS_ABI_VERSION_MINOR 12u /* additive: result fields, argv/PROGRAM, constraints/observers, task priority, dead-letter drain, settings registry, settings change-watch, manual/single-threaded mode (gptps_step), allocator hook (gptps_set_allocator), generic task management (unregister/clone/enumerate/enable), generic global + per-task settings; v1.9: per-item constraint context (gptps_constraint_input: handle+payload), cancel-by-handle (gptps_cancel), bounded intake (max_intake_depth/E_FULL), submit_ex overrides, unregister constraint/observer, log sink, child_setup, EV_DROPPED; v1.10: generic named-resource budgets (define_resource/set_task_resource_cost/resource_usage); v1.11: long-running SERVICE tasks (gptps_task_def.flags + GPTPS_TASK_SERVICE + GPTPS_TASK_RETIRE_ON_OK); v1.12: pluggable scheduler seam (gptps_set_scheduler + gptps_sched_input): the admission ORDERING is a swappable policy over the core's fixed skip-to-fit/budget/starvation mechanism */
+/* --- ABI version (semantic; loader refuses MAJOR mismatch) ---------------
+ * 2.0 is the FIRST and, by design, the LAST breaking change: it removes two
+ * fields from gptps_cost (gpu_units, est_duration_ms - see the struct) in the
+ * only window the append-only rule below leaves open, the one before 1.0. From
+ * here the rule binds: structs grow by appending, never by reshaping, and MAJOR
+ * does not move again without a reason worth breaking every add-on for.
+ *
+ * 1.x history, for anyone porting: result fields, argv/PROGRAM, constraints and
+ * observers, task priority, dead-letter drain, the settings registry and its
+ * change-watch, MANUAL mode (gptps_step), the allocator hook, runtime task
+ * management, generic global + per-task settings; 1.9 added per-item constraint
+ * context, cancel-by-handle, bounded intake, submit_ex overrides, the log sink,
+ * child_setup and EV_DROPPED; 1.10 the generic named-resource budgets; 1.11
+ * SERVICE tasks; 1.12 the pluggable scheduler seam. */
+#define GPTPS_ABI_VERSION_MAJOR 2u
+#define GPTPS_ABI_VERSION_MINOR 0u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
  * GPTPS_VERSION_* track the project RELEASE; GPTPS_ABI_VERSION_* track the binary
  * add-on contract (host-table + structs) and bump only when that changes. They
- * move INDEPENDENTLY. Versioning policy: until 1.0 the release version may break
- * compatibility between minors; from 1.0 the project follows semantic versioning
- * (a breaking change bumps MAJOR) and deprecated API is kept for one MAJOR with a
- * documented replacement. */
-#define GPTPS_VERSION_MAJOR 0
-#define GPTPS_VERSION_MINOR 2
+ * move INDEPENDENTLY. Versioning policy: as of 1.0 this project follows semantic
+ * versioning - a breaking change bumps MAJOR, and deprecated API is kept for one
+ * MAJOR with a documented replacement. The pre-1.0 licence to break things
+ * between minors is spent; ABI 2.0 (see above) was the last use of it. */
+#define GPTPS_VERSION_MAJOR 1
+#define GPTPS_VERSION_MINOR 0
 #define GPTPS_VERSION_PATCH 0
-#define GPTPS_VERSION_STRING "0.2.0"
+#define GPTPS_VERSION_STRING "1.0.0"
 
 /* --- export / visibility ------------------------------------------------- */
 /* Default build is a STATIC library, so GPTPS_API is undecorated. Define
@@ -143,9 +156,20 @@ typedef enum {
 typedef struct {
     size_t   struct_size;     /* = sizeof(gptps_cost) */
     uint64_t mem_bytes;       /* peak memory the task expects to use */
-    uint32_t gpu_units;       /* abstract GPU units (0 = none); enforced via add-on */
-    uint64_t est_duration_ms; /* expected wall-clock; scheduling hint */
 } gptps_cost;
+/* Removed in ABI 2.0: `gpu_units` and `est_duration_ms`.
+ *   gpu_units      - a domain-specific field in a mechanism-only core, and one the
+ *                    core never enforced (its own comment said "via add-on").
+ *                    Superseded exactly by the generic NAMED RESOURCE budgets
+ *                    below: gptps_define_resource(e, "gpu", n) +
+ *                    gptps_set_task_resource_cost(e, task, "gpu", n). See
+ *                    addons/gpu_quota.h, which is now the worked example.
+ *   est_duration_ms - declared as a "scheduling hint" and read by nothing, ever.
+ *                    A field no code reads is not a hint, it is a promise the
+ *                    struct cannot keep; the scheduler seam (gptps_set_scheduler)
+ *                    is where duration-aware ordering actually belongs.
+ * Both were removed before 1.0 precisely because the append-only rule below makes
+ * that impossible afterwards. */
 
 /* --- per-task failure policy (overridable in config with the same keys) --- */
 typedef struct {
@@ -166,7 +190,9 @@ typedef enum { GPTPS_LOG_DEBUG, GPTPS_LOG_INFO, GPTPS_LOG_WARN, GPTPS_LOG_ERROR 
 
 /* True once the watchdog has signalled the deadline. In-process tasks MUST
  * poll this in long loops; a task that never polls cannot be stopped in-proc
- * (route untrusted/unbounded work to a GPTPS_EXEC_OOP executor). */
+ * (route UNBOUNDED or crash-prone work to a GPTPS_EXEC_OOP executor - that buys
+ * a hard kill and an OS memory cap, but NOT privilege isolation; see
+ * docs/SECURITY.md before running anything you actually distrust). */
 GPTPS_API bool        gptps_is_cancelled(const gptps_ctx *ctx);
 GPTPS_API uint64_t    gptps_deadline_ms(const gptps_ctx *ctx);  /* monotonic; 0 = none */
 GPTPS_API uint64_t    gptps_now_ms(const gptps_ctx *ctx);       /* monotonic */
