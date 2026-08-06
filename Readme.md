@@ -21,7 +21,7 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Configuration file](#configuration-file-optional) · [Settings](#settings-runtime-introspectable-persistable)
 - [Manage tasks at runtime](#manage-tasks-at-runtime-control-plane) · [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
-- [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
+- [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes) · [Security posture](docs/SECURITY.md)
 
 ## Quick start
 
@@ -115,7 +115,7 @@ See [Live terminal dashboard](#live-terminal-dashboard) for what it shows and ho
 **3. Run the other examples + the tests.**
 
 ```sh
-./build/demo                 # in-process tasks + events (prints results)
+./build/gptps_demo           # in-process tasks + events (prints results)
 ./build/example_config       # tune from a TOML file
 ./build/example_embedded     # no threads + a static memory pool (manual mode)
 ctest --test-dir build --output-on-failure   # full suite (should be 100%)
@@ -206,7 +206,7 @@ cfg.limits.max_memory_bytes     = 512u << 20; /* admission budget (declared) */
 gptps_open_ex(&cfg, &e);
 ```
 
-**4. Run heavy or untrusted work isolated and killable.** Set the executor kind on the
+**4. Run heavy or crash-prone work isolated and killable.** Set the executor kind on the
 task: `d.exec = GPTPS_EXEC_OOP` (forked child, memory-capped, hard-killed on timeout) or
 `GPTPS_EXEC_PROGRAM` to run any external binary — see [Executor kinds](#executor-kinds-per-task-via-defexec).
 
@@ -639,6 +639,33 @@ afford to start this task right now, given my own remaining budget?"
 
 For the full internals — concurrency model, dispatch loop, scheduler, executors, HAL, and the
 add-on ABI — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+### Non-goals
+
+"Mechanism-only" is not a constraint unless it can reject something, so here is what
+GPTPS will not grow into. These are **not** judgements about whether the ideas are good
+— several are good, and some belong in add-ons. They are statements about what does not
+go in the **core**, so that the answer is decided once instead of re-argued per feature.
+
+| Not in the core | Why, and where it belongs instead |
+|---|---|
+| **Distributed scheduling / cross-machine work stealing** | The novel thing here is *single-process* self-throttling admission. A cluster scheduler is a different product with a different failure model. `gptps_xport` shows the transport seam carrying work to other processes; take it to TCP in an add-on. |
+| **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/durable_queue` already does it on the public API. |
+| **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on; if one genuinely cannot be written, that is an argument for a specific *accessor*, not a format. |
+| **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` is ~150 lines on the observer seam and does not need to be in the mechanism — see the note below on what would change this. |
+| **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. |
+| **A logging framework** | `gptps_set_log_sink` is one function pointer. Anything more is your host's job. |
+| **More executor kinds** | Three (in-process, forked, external program) span the trust and isolation axes. A fourth is nearly always "an existing one plus a runtime" — which is what `addons/wasm_exec` is. |
+| **Convenience wrappers over the C API** | Bindings and sugar belong in their own repos where they can move at their own pace. |
+
+**The tie-break, when nothing above decides it:** *does a user with a name want this?*
+Not "would this be useful" — every proposal is useful to someone hypothetical. This
+project reached 50 public functions and 7 add-ons before it had a single user, which is
+the failure mode the rule exists to prevent.
+
+What would legitimately change the core: a capability that **cannot be built on the five
+seams at all**. That is a short list, and the honest way to discover an item on it is to
+try building the add-on first and report which accessor was missing.
 
 ## License
 
