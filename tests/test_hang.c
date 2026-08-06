@@ -210,17 +210,33 @@ static void test_dead_letter_is_capped(void)
 
     for (i = 0; i < 60; ++i) CHECK(gptps_submit(e, "bad", NULL, 0, NULL) == GPTPS_OK);
 
-    {   /* wait for the queue to drain into the dead-letter list */
+    /* Wait for EVERY submitted item to reach a terminal state - queued and running
+     * both drained - not merely for the cap to be reached. Waiting on
+     * "dead_letter_count >= 8" samples the eviction counter at the exact moment the
+     * 8th item filled the list, when nothing has been evicted yet: a race the fast
+     * Linux runners happened to win and the Windows runner did not. Draining fully
+     * also makes the numbers below EXACT rather than approximate. */
+    {
         uint64_t t0 = gptps_now_ms(NULL);
-        while (gptps_now_ms(NULL) - t0 < 3000 && gptps_dead_letter_count(e) < 8) { }
+        for (;;) {
+            size_t k, ntypes = gptps_task_count(e);
+            unsigned busy = 0;
+            for (k = 0; k < ntypes; ++k) {
+                gptps_task_info ti;
+                memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+                if (gptps_task_get_info(e, k, &ti) == GPTPS_OK) busy += ti.queued + ti.running;
+            }
+            if (busy == 0) break;
+            if (gptps_now_ms(NULL) - t0 > 10000) break;   /* safety net; the checks below decide */
+        }
     }
-    n = gptps_dead_letter_count(e);
-    CHECK(n <= 8);            /* bounded: it used to grow to 60, and forever in prod */
-    CHECK(n >= 1);
 
-    /* the truncation is reported, never silent */
+    n = gptps_dead_letter_count(e);
+    CHECK(n == 8);            /* exactly the cap - it used to grow to 60, and forever in prod */
+
+    /* 60 submitted, 8 retained => 52 evicted, and the truncation is never silent */
     CHECK(gptps_settings_get(e, "stats.dead_letters_evicted", buf, sizeof buf) == GPTPS_OK);
-    CHECK(strcmp(buf, "0") != 0);
+    CHECK(strcmp(buf, "52") == 0);
 
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
