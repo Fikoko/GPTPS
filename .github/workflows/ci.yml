@@ -3,11 +3,15 @@ name: ci
 on:
   push:
   pull_request:
+  # A dormant repo's green badge decays into fiction: toolchains, runner images and
+  # dependencies move underneath a tree that has not been pushed to in months. The
+  # weekly run keeps the badge a statement about TODAY.
+  schedule:
+    - cron: '0 6 * * 1'
 
 jobs:
-  # Build + test on the POSIX targets the HAL supports today.
-  # Windows is intentionally absent: the HAL (hal_posix.c / exec_oop_posix.c) is
-  # POSIX-only for M1; a Win32 HAL + out-of-process executor is a later increment.
+  # Build + test on the POSIX targets. Windows has its own jobs below (mingw-w64
+  # and MSVC), both running the same suite against the Win32 HAL.
   build-test:
     strategy:
       fail-fast: false
@@ -23,6 +27,23 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # Optimised build with warnings as errors. Every other job builds -O0, which
+  # makes the whole FLOW-SENSITIVE diagnostic family (-Wformat-truncation,
+  # -Wmaybe-uninitialized, -Wstringop-overflow) unreachable - they need the
+  # optimiser's value ranges to fire. This leg is where those land, and -Werror is
+  # what keeps them from accumulating as ignorable noise.
+  werror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (-O2, -Werror)
+        run: cmake -S . -B build-werror -DCMAKE_BUILD_TYPE=Release
+             -DCMAKE_C_FLAGS="-std=c99 -O2 -Wall -Wextra -Werror -Wno-unused-parameter"
+      - name: Build
+        run: cmake --build build-werror -j
+      - name: Test
+        run: ctest --test-dir build-werror --output-on-failure
+
   # Verify the single-file amalgamation compiles and runs (drop-in path).
   amalgamation:
     runs-on: ubuntu-latest
@@ -30,6 +51,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Generate amalgamation
         run: sh tools/amalgamate.sh amalgamation
+      - name: Assert the generated files carry the MIT notice
+        # The amalgamation is the DISTRIBUTED form for anyone who vendors GPTPS,
+        # and LICENSE requires its notice in "all copies or substantial portions".
+        # Unfixable retroactively once someone has vendored a copy without it.
+        run: |
+          for f in amalgamation/gptps.h amalgamation/gptps.c; do
+            grep -q 'Permission is hereby granted' "$f" \
+              || { echo "ERROR: $f ships with no MIT notice"; exit 1; }
+            grep -q 'SPDX-License-Identifier: MIT' "$f" \
+              || { echo "ERROR: $f has no SPDX tag"; exit 1; }
+          done
+          echo "OK: both generated files carry the licence"
       - name: Compile + run single-file build
         run: |
           cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
@@ -96,20 +129,27 @@ jobs:
       - name: Test
         run: ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build-asan --output-on-failure
 
-  # ThreadSanitizer on the concurrent paths (ASLR disabled for TSan in CI).
+  # ThreadSanitizer (ASLR disabled for TSan in CI).
+  #
+  # Driven by CMake and an EXCLUDE list, deliberately. This job used to hand-list
+  # ten test binaries and six .c files, which meant every test and every add-on
+  # added after it was written was silently NOT covered - including test_stress,
+  # the one written specifically for TSan, and every add-on (durable_queue,
+  # gptps_pool, gptps_xport, tui). A fail-closed allowlist in a race detector is
+  # the worst place to have one: it reports success for work it never ran.
   tsan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build + run under ThreadSanitizer
+      - name: Configure + build under ThreadSanitizer
         run: |
-          for t in test_engine test_failure test_scheduler test_settings test_step \
-                   test_taskmgmt test_constraint test_deadletter test_cancel test_backpressure; do
-            cc -fsanitize=thread -std=c99 -D_GNU_SOURCE -g -I include -I src \
-               src/alloc.c src/hal_posix.c src/config.c src/config_toml.c src/settings.c src/engine.c src/exec_oop_posix.c \
-               tests/$t.c -lpthread -ldl -o $t.tsan
-            setarch "$(uname -m)" -R ./$t.tsan
-          done
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="-fsanitize=thread -g"
+          cmake --build build-tsan -j
+      - name: Run the suite under ThreadSanitizer
+        # Only bench_pool is excluded, and only for runtime (~25s under TSan for a
+        # throughput benchmark that asserts nothing a race detector can use).
+        run: setarch "$(uname -m)" -R ctest --test-dir build-tsan --output-on-failure -E 'bench_pool'
 
   # Optional platform-optimized HAL (adaptive mutexes, glibc): build with the opt-in
   # scale knob ON and run the whole suite, so the fast path stays correct on CI. The
@@ -148,12 +188,19 @@ jobs:
           # qemu-user needs the guest sysroot to find the s390x dynamic loader + libs
           # (without this every test dies on '/lib/ld64.so.1: No such file').
           export QEMU_LD_PREFIX=/usr/s390x-linux-gnu
-          # Run the byte-order-critical, qemu-safe subset: serialization (toml /
-          # journal-parser fuzz / settings) + core logic + the new features. Skip
-          # fork/exec/dlopen/TTY tests (flaky under user-mode emulation; covered on
-          # the native x86_64/arm64 runners).
+          # EXCLUDE list, not an include list. The include list this replaced was
+          # fail-closed: it silently skipped every test added after it was written,
+          # including `abi` - the struct-layout regression gate, which is precisely
+          # what a big-endian job exists to run - and it skipped it while its own
+          # comment claimed serialization was covered.
+          # What is excluded and why: fork/exec (the OOP + external-program
+          # executors and anything driving them), dlopen (add-ons), and TTY work.
+          # All three are flaky under qemu user-mode emulation rather than wrong,
+          # and all three are covered on the native x86_64/arm64 + macOS runners.
+          # Everything else - byte-order-critical serialization, the scheduler, the
+          # failure engine, and every future pure-logic test - now runs by default.
           ctest --test-dir build-s390x --output-on-failure \
-            -R 'constraint|cancel|backpressure|submit_ex|foundation|engine|failure|toml|scheduler|deadletter|settings|taskmgmt|step|alloc|result|orch|fuzz'
+            -E 'oop|program|cgroup|addon|xport|wasm|tui|hang|durable|stress|bench_pool|demo|example_'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
   # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL
@@ -167,9 +214,17 @@ jobs:
         run: sh freestanding/build.sh ./gptps_freestanding_demo
       - name: Run the MANUAL-mode demo (exit 0 = ran via the HAL seam only)
         run: ./gptps_freestanding_demo
-      - name: Assert no pthread/dl linkage
+      - name: Assert no thread / dynamic-loader dependency
+        # Checked at the SYMBOL level, not with `ldd | grep pthread`. Since glibc
+        # 2.34 libpthread and libdl are merged into libc.so.6, so an ldd check
+        # passes even for a program that calls pthread_create - it proved nothing
+        # and would have kept passing if the HAL seam broke. Undefined symbols are
+        # the real evidence: if the core needed threads or dlopen, they would
+        # appear here.
         run: |
-          if ldd ./gptps_freestanding_demo | grep -Eiq 'pthread|libdl'; then
-            echo "ERROR: freestanding build pulled in pthread/dl"; exit 1
+          if nm -u ./gptps_freestanding_demo | grep -Eq ' (pthread_|dlopen|dlsym|dlclose)'; then
+            echo "ERROR: freestanding build references thread / loader symbols:"
+            nm -u ./gptps_freestanding_demo | grep -E ' (pthread_|dlopen|dlsym|dlclose)'
+            exit 1
           fi
-          echo "OK: no libpthread / libdl"
+          echo "OK: no pthread / dlopen symbols (still links a hosted libc, by design)"
