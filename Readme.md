@@ -21,6 +21,7 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Configuration file](#configuration-file-optional) · [Settings](#settings-runtime-introspectable-persistable)
 - [Manage tasks at runtime](#manage-tasks-at-runtime-control-plane) · [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
+- [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes) · [Security posture](docs/SECURITY.md)
 
 ## Quick start
@@ -79,10 +80,19 @@ cmake -S . -B build          # configure (once)
 cmake --build build -j       # libgptps.a + the examples + the test suite
 ```
 
-Scaling is opt-in and never in the default build — shard across engines, route across
-worker processes, or swap the scheduler (see [Scaling](#scaling-opt-in-by-composition)).
-The one build-time knob is `-DGPTPS_HAL_FAST=ON` for a platform-optimized HAL (adaptive
-mutexes on glibc; OFF by default keeps the portable pthread path).
+Scaling is never in the **core** — shard across engines, route across worker processes, or
+swap the scheduler, all as add-ons you link (see [Scaling](#scaling-opt-in-by-composition)).
+Build knobs, all optional:
+
+| Knob | Default | What it does |
+|---|---|---|
+| `-DGPTPS_ADDONS=` | `all` | which add-ons to build: `all`, `none`, or a `;`-list. A typo is a hard error, not an empty selection |
+| `-DGPTPS_BUILD_ADDONS=` | ON at top level | build the add-on libraries at all |
+| `-DGPTPS_BUILD_TESTS=` / `_EXAMPLES=` | ON at top level | the suite and the examples |
+| `-DGPTPS_HAL_FAST=ON` | OFF | platform-optimized HAL (adaptive mutexes on glibc); OFF keeps the portable pthread path |
+
+All four default **OFF** when GPTPS is `add_subdirectory`'d or `FetchContent`'d, so a
+consumer gets `libgptps.a` and nothing else — no CTest targets, no add-on builds.
 
 **Building on Windows with mingw-w64.** The core is pure C99 and the Win32 backend
 (`hal_win.c` + `exec_win.c`) is selected automatically; mingw-w64 gcc is a first-class,
@@ -138,8 +148,19 @@ To embed the **dashboard** too, also compile the add-on: add `addons/gptps_tui.c
 (`examples/demo.c` is a fuller starting template).
 
 **Install / consume (optional).** `cmake --install build --prefix <dir>` installs the header,
-static library, a CMake package config, and a pkg-config file. Downstream projects then use
-either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --libs gptps`.
+the static library, a CMake package config and a pkg-config file — plus **each add-on as its
+own library** (`gptps::pool`, …) with its header under `include/gptps/` and its own `.pc`,
+and the `gptps_conformance` tool in `bin/`. Downstream projects use either
+
+```cmake
+find_package(gptps 1.0 REQUIRED COMPONENTS durable_queue pool)   # COMPONENTS is optional
+target_link_libraries(myapp PRIVATE gptps::durable_queue gptps::pool)
+```
+
+or `pkg-config --cflags --libs gptps` (add `--static` if you link statically — the core
+calls `dlopen`, so it needs `-ldl`). Pick which add-ons get built with
+`-DGPTPS_ADDONS="pool;durable_queue"` (default `all`, or `none`). Full detail in
+[docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## API at a glance
 
@@ -165,7 +186,10 @@ either `find_package(gptps)` → link `gptps::gptps`, or `pkg-config --cflags --
 | `gptps_settings_get/set(e, key, …)` · `gptps_settings_count/get_info(e, …)` | read / change / introspect any setting at runtime |
 | `gptps_settings_save/reload(e, path)` | persist settings to / from a TOML file |
 | `gptps_register_setting(e, &def)` | add a custom setting (also a host-table routine for add-ons) |
-| `gptps_load_addon(e, path)` | load a shared-library add-on over the stable ABI |
+| `gptps_load_addon(e, path)` | load a binary plug-in over the stable ABI |
+| `gptps_addon_count/get_info(e, …)` | list what is loaded: name, namespace, path, enabled |
+| `gptps_addon_disable(e, ns_or_name)` | ask a plug-in to stop participating (it stays mapped — there is no unload) |
+| `gptps_set_scheduler_ex(e, fn, ud, owner, flags)` · `gptps_scheduler_owner(e)` | take the ordering seam **only if free**, and see who holds it |
 | `gptps_step(e, &ran)` | MANUAL mode: pump the engine on the calling thread (no worker threads) |
 | `gptps_set_allocator(&a)` | redirect all core allocation to a custom `malloc`/`realloc`/`free` |
 | `gptps_shutdown(e)` | drain in-flight + queued work (bounded by `limits.shutdown_grace_ms`), then free |
@@ -242,8 +266,14 @@ auto-tune. A subset of TOML is supported (tables, `int`/`float`/`bool`/`"string"
 single-line string arrays, `#` comments):
 
 ```toml
-# top level: shared-library add-ons to auto-load at open
-addons = ["./libmytasks.so"]
+# top level: binary plug-ins to dlopen at open, by explicit path. There is no search
+# path, deliberately - see docs/SECURITY.md: whoever can write this file can run code
+# in your process, so GPTPS makes you name the file rather than scanning a directory.
+# A plug-in that declares a namespace puts its own settings under it (below).
+addons = ["./libmytasks.so", "/usr/local/lib/gptps/gpu_quota_plugin.so"]
+
+[tasks.render]
+"gpuq.units" = 2               # a namespaced plug-in's per-task knob
 
 [limits]
 max_concurrent_tasks = 8       # 0 / omitted => detected cores
@@ -387,14 +417,25 @@ shard is a full engine. [`examples/bench_pool`](examples/bench_pool.c) measures 
 
 **Scale out — worker processes (`gptps_xport`).** Fork N persistent worker *processes* and
 ship each submit to one over IPC, marshalling the result back — work runs in a separate
-address space (crash-isolated), and swapping the local socketpair for a TCP socket reaches
-another machine (POSIX only, like `EXEC_OOP`):
+address space (crash-isolated). POSIX only, like `EXEC_OOP` (Windows has no `fork`):
 
 ```c
 gptps_xport *xp = gptps_xport_open(4, my_handler, ud);   /* 4 worker processes */
 gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);
 gptps_xport_close(xp);
 ```
+
+**Going cross-machine is not a socket swap, and `addons/gptps_remote` says why.** It is the
+wire *codec* — versioned header, fixed big-endian byte order, a request id, stable status
+codes, a 1 MiB cap — written down because `xport`'s framing is native-endian (silent
+corruption between a little- and a big-endian host), its `gptps_status` values are
+positional (so they would become wire-visible), it holds a lock across the whole round trip
+(one in-flight request per link), and its 256 MiB cap is a one-packet DoS from a peer you
+did not fork. There is deliberately **no transport yet** and the codec is **not published**
+as a release artifact: shipping it is what would create a permanent version-1 peer. Build a
+transport on it when you have a reason to, with
+[docs/SECURITY.md](docs/SECURITY.md) read first — the `task` field of a request is a
+dispatch key chosen by the peer.
 
 **Swap the scheduling discipline (`gptps_set_scheduler`).** The admission *mechanism*
 (skip-to-fit, budget, starvation guard) is fixed; the *ordering* is a hook. Return a score
@@ -555,9 +596,69 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
   per-task table, a scrollable event log, a settings editor, a **task manager** + dead-letter
   panes, and hotkeys — see [Live terminal dashboard](#live-terminal-dashboard) above.
 - **Add-ons** keep the core small. Task logic, transports, GPU quotas, rate limits,
-  priority, time-of-day windows, analytics sinks — all live in **add-ons** that attach over a
-  versioned host-table ABI, in-process (C ABI) or out-of-process (any language). See
-  `tests/addon_demo.c` for a minimal add-on.
+  priority, time-of-day windows, analytics sinks — all live in **add-ons**. See below.
+
+## Add-ons and plug-ins
+
+Everything domain-specific lives outside the core. **One question decides how you build it:**
+
+> **Does the host have to call *into* your module?**
+> **Yes → a compiled-in module.** It needs a header, so it needs your build. Links core
+> symbols directly; can own threads, own a whole engine, ship platform code.
+> **No → a binary plug-in.** It needs only the versioned host table, so it needs only your
+> *process*: named in a config file, `dlopen`'d at runtime, configured by an operator
+> through settings. It links **no** core symbols — which is what lets one `.so` work
+> against a static, shared or amalgamated host alike.
+
+A module is not the lesser thing: most of the bundled add-ons are modules *by necessity*,
+because their whole point is an API you call (`gptps_dq_submit()`, `gptps_orch_after()`,
+`gptps_tui_run()`). `gptps_gpu_quota` ships in **both** tiers, and the diff between
+`addons/gptps_gpu_quota.c` and `addons/gptps_gpu_quota_plugin.c` is the shortest honest
+description of the difference.
+
+**A plug-in declares a namespace and gets a guarantee.** With `GPTPS_ADDON_INIT_NS(…, "myns", …)`
+the loader *claims* that token — a second plug-in wanting it is refused — and in exchange
+everything you register during `setup()` must be `"myns."`-prefixed. That is what stops two
+unrelated plug-ins colliding on a task name, a settings key or a resource budget. An operator
+can list what is loaded (`gptps_addon_count` / `gptps_addon_get_info`) and turn one off
+without unloading it (`gptps_addon_disable`).
+
+**Prove it before you ship it:**
+
+```sh
+cmake -S templates/plugin -B build -DCMAKE_PREFIX_PATH=$(pkg-config --variable=prefix gptps)
+cmake --build build
+gptps_conformance build/myplugin.so        # installed to bin/
+```
+
+The interesting check is the **degradation ladder**: the harness synthesises the host table
+as each released core actually had it and runs your plug-in against every rung, so a routine
+you called without a `struct_size` guard is reported *by name, with the guard to add* —
+rather than segfaulting in a user's process a year from now. The engine cannot test this
+itself, because it always hands a plug-in the full table.
+
+Start from [`templates/plugin/`](templates/plugin) and read
+[docs/PLUGINS.md](docs/PLUGINS.md) for the full contract — the tier decision, the
+`struct_size` guard, threading per seam, seam ownership, and the security posture.
+
+### Getting one
+
+Each add-on is an installable library, so you can take a **subset** without cloning
+([docs/PACKAGING.md](docs/PACKAGING.md)):
+
+```cmake
+find_package(gptps 1.0 REQUIRED COMPONENTS durable_queue pool)
+target_link_libraries(myapp PRIVATE gptps::durable_queue gptps::pool)
+```
+```sh
+cc -std=c99 myapp.c $(pkg-config --cflags --libs --static gptps-durable_queue gptps-pool) -o myapp
+
+sh tools/amalgamate.sh out --addons durable_queue,pool   # no build system, no clone
+cc -std=c99 myapp.c out/gptps.c out/gptps_durable_queue.c out/gptps_pool.c -Iout -lpthread -ldl
+```
+
+`gptps.c` is byte-identical whichever add-ons you select, so its SHA256 stays pinnable.
+See [`addons/README.md`](addons/README.md) for what each one does.
 
 ## Project layout
 
@@ -572,16 +673,31 @@ gptps/
 │   ├── config.c         config model + hardware auto-tune;  config_toml.c  TOML parser
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection);  hal_win.c  Win32 backend
 │   └── exec_oop_posix.c out-of-process + external-program executors;  exec_win.c  Win32 executor
-├── addons/              ← optional modules on the public API: gptps_pool (scale-up), gptps_xport (scale-out),
-│                          gptps_orch (dependencies), durable_queue, gpu_quota, wasm_exec, tui
+├── addons/              ← optional modules, one installable library each (gptps::pool, …)
+│   ├── gptps_pool.c     scale-UP: N engine shards + a router;  gptps_xport.c  scale-OUT: worker processes
+│   ├── gptps_await.c    blocking wait(handle);  gptps_orch.c  run-after / fan-in dependencies
+│   ├── gptps_durable_queue.c  crash-durable journal;  gptps_gpu_quota.c  named-resource quota
+│   ├── gptps_wasm_exec.c  module-as-task;  gptps_tui.c  live terminal dashboard
+│   ├── gptps_remote.c   cross-host wire CODEC (built + tested; deliberately not distributed)
+│   ├── gptps_gpu_quota_plugin.c  the same quota policy as a dlopen BINARY plug-in
+│   └── CMakeLists.txt   one library + header + .pc per add-on
+├── templates/plugin/    ← a complete, copyable binary plug-in (built out-of-tree by CI)
 ├── examples/            ← runnable examples (demo, config_file, task_control, external_program, dashboard,
 │                          embedded, wasm_program, bench_pool)
 ├── gptps.example.toml   ← annotated sample config file
-├── docs/ARCHITECTURE.md ← how it works inside
-├── tests/               ← CTest suite (engine, failure, oop, program, constraint, ...)
-├── tools/amalgamate.sh  ← generates the single-file gptps.c + gptps.h
+├── docs/
+│   ├── ARCHITECTURE.md  how it works inside
+│   ├── PLUGINS.md       writing an add-on: which tier, the ABI contract, proving it
+│   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
+│   └── SECURITY.md      trust boundary and non-guarantees
+├── tests/               ← CTest suite (51 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tools/
+│   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
+│   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
+│   └── check_addon_coverage.sh  every add-on is built, obtainable and documented
 ├── CMakeLists.txt
-└── .github/workflows/ci.yml   Linux/macOS/Windows (mingw + MSVC), i386 + s390x + freestanding, ASan/UBSan + TSan
+└── .github/workflows/ci.yml   Linux/macOS/Windows (mingw + MSVC), i386 + s390x + freestanding,
+                               ASan/UBSan + TSan, and a `package` job that installs and consumes
 ```
 
 ## Status
@@ -594,11 +710,21 @@ fallback), the add-on loader + ABI, constraints + observers, TOML config-file lo
 registry (typed get/set + validation + round-trip persistence + add-on-extensible),
 **single-threaded MANUAL mode** (`gptps_step`) and a **custom-allocator hook** for
 embedded / bare-metal hosts, **supervised long-running services** (`GPTPS_TASK_SERVICE`),
-the **pluggable scheduler seam** (`gptps_set_scheduler`), **scale-up** (`gptps_pool`
-shards) and **scale-out** (`gptps_xport` worker processes) add-ons, the optional
-platform-optimized HAL (`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the
-settings editor), the crash-durable queue, GPU-quota, and WASM-executor add-ons, the
-examples + benchmark, CMake + CI + single-file amalgamation.
+the **pluggable scheduler seam** (`gptps_set_scheduler`, with declared ownership so two
+add-ons cannot silently fight over it), **scale-up** (`gptps_pool` shards) and
+**scale-out** (`gptps_xport` worker processes), the optional platform-optimized HAL
+(`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the settings editor), the
+crash-durable queue, a blocking `wait(handle)`, run-after/fan-in dependencies, GPU-quota
+and WASM-executor add-ons, the examples + benchmark, CMake + CI + single-file
+amalgamation.
+
+**Binary plug-ins work** as of ABI 2.1 — see [Add-ons and plug-ins](#add-ons-and-plug-ins).
+Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
+and an amalgamation pair, so you can take a subset without cloning.
+
+At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
+design, the last breaking change) · **9** add-on modules + 1 example binary plug-in ·
+**51** tests · **12** CI jobs, every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
 hang it hangs your host's exit path — so these are contractual, and
@@ -657,12 +783,12 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 | Not in the core | Why, and where it belongs instead |
 |---|---|
 | **Distributed *scheduling*** (which node runs what, work stealing, membership, failure detection, global fair-share, rebalancing) | Note the boundary, because the neighbouring thing IS permitted. **Transport** — route work to a *named* remote, marshal it, bring the result back, exclude a dead endpoint, retry elsewhere — is an add-on, and a welcome one: that is exactly the step `gptps_xport` describes as "swap the socketpair for a TCP socket". **Scheduling** is where it stops. The moment a module needs the global state of *other* nodes it needs consensus, and the failure model changes completely: the novel thing here is *single-process* self-throttling admission, and a cluster scheduler is a different product. Node selection is a router's business (`gptps_pool` already picks a shard); admission *ordering* is `gptps_set_scheduler`'s; neither is a cluster scheduler. |
-| **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/durable_queue` already does it on the public API. |
+| **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/gptps_durable_queue` already does it on the public API. |
 | **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on; if one genuinely cannot be written, that is an argument for a specific *accessor*, not a format. |
 | **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` does not need to be in the mechanism — and this row no longer asks you to take that on faith: `addons/gptps_await` **is** those lines, on the observer seam, with no core change. The core already supplies the one guarantee such a wait needs — every submitted handle reaches exactly one terminal event (`tests/test_reconcile`) — so nothing was missing. Chaining and dependencies are `addons/gptps_orch`'s job, not a future's. |
-| **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. |
+| **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. (Note what "terminal" means there: `GPTPS_EV_FAILED` is emitted per *attempt*, so a dependency that merely retries must not release a gate.) |
 | **A logging framework** | `gptps_set_log_sink` is one function pointer. Anything more is your host's job. |
-| **More executor kinds** | Three (in-process, forked, external program) span the trust and isolation axes. A fourth is nearly always "an existing one plus a runtime" — which is what `addons/wasm_exec` is. |
+| **More executor kinds** | Three (in-process, forked, external program) span the trust and isolation axes. A fourth is nearly always "an existing one plus a runtime" — which is what `addons/gptps_wasm_exec` is. The enum is also now *closed in code* - `gptps_register_task` rejects a kind it does not know, so an older core meeting a newer add-on refuses the work rather than silently running it as something else. |
 | **Convenience wrappers over the C API** | Bindings and sugar belong in their own repos where they can move at their own pace. |
 
 **The tie-break, when nothing above decides it:** *does a user with a name want this?*
