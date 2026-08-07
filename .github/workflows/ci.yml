@@ -100,6 +100,7 @@ jobs:
                    include/gptps/gptps_pool.h include/gptps/gptps_durable_queue.h \
                    lib/libgptps.a lib/libgptps_pool.a lib/libgptps_durable_queue.a \
                    lib/cmake/gptps/gptps-config.cmake \
+                   bin/gptps_conformance \
                    lib/pkgconfig/gptps.pc lib/pkgconfig/gptps-pool.pc; do
             test -f "stage/$f" || { echo "ERROR: install is missing $f"; exit 1; }
           done
@@ -139,6 +140,30 @@ jobs:
           sh tools/amalgamate.sh amalg-none --addons none
           cmp amalg/gptps.c amalg-none/gptps.c \
             || { echo "ERROR: gptps.c depends on the add-on selection"; exit 1; }
+
+      - name: A STRANGER builds a plug-in out-of-tree against the installed package
+        # templates/plugin is a standalone project - nothing in this tree
+        # add_subdirectory's it. Building it here is the only proof that the install
+        # tree is usable by someone who did not clone the repo.
+        run: |
+          cmake -S templates/plugin -B build-plugin -DCMAKE_PREFIX_PATH="$PWD/stage"
+          cmake --build build-plugin -j
+
+      - name: The INSTALLED conformance harness accepts it...
+        run: ./stage/bin/gptps_conformance build-plugin/myplugin.so
+
+      - name: ...and rejects a plug-in that reads past its declared table size
+        # A conformance harness that cannot fail certifies nothing. addon_greedy calls
+        # a v1.4 routine while declaring a v1.0 floor - which works fine against a
+        # current core and breaks only in an older host, i.e. exactly the mistake this
+        # tool exists to catch before a user does.
+        run: |
+          if ./stage/bin/gptps_conformance build-pkg/addon_greedy.so; then
+            echo "ERROR: conformance passed a plug-in that reads past its table"; exit 1
+          fi
+          if ./stage/bin/gptps_conformance build-pkg/addon_bad.so; then
+            echo "ERROR: conformance passed a plug-in with the wrong magic"; exit 1
+          fi
 
       - name: A typo in the add-on selector FAILS rather than selecting nothing
         run: |

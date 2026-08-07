@@ -7,6 +7,34 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — a plug-in author has documentation, a template, and a way to prove their work
+- **`tools/gptps_conformance`** — run it against your own `.so` before you ship it.
+  Installed to `bin/`, shipped in releases, no third-party dependencies.
+- The check that matters is the **degradation ladder**. The engine always hands a
+  plug-in its *full* host table, so the engine structurally cannot discover that a
+  plug-in reads past the table size it was given — yet that is the single most likely
+  way a plug-in breaks in the field: built against a newer GPTPS, dropped into an older
+  host, calls a routine that host's table does not contain, jumps through whatever lies
+  past the end. The harness links `libgptps`, so it can *synthesise* the table as each
+  released core actually had it and run your `setup()` against every rung. Slots past
+  the rung hold **poison stubs, not NULL** — a harness that proves your bug by crashing
+  cannot say which routine, cannot continue, and makes the CI leg look broken rather
+  than informative. You get the routine's name and the exact guard to add.
+- **`tests/addon_greedy.c`** exists so the harness has something it must reject: a
+  plug-in calling a v1.4 routine while declaring a v1.0 floor — which works fine against
+  a current core and breaks only in an older host. Wired as `WILL_FAIL`, so if the
+  harness ever goes soft it turns red instead of green. A conformance harness that
+  cannot fail certifies nothing.
+- **`templates/plugin/`** — a complete, standalone, copyable plug-in. Nothing in this
+  tree builds it; the `package` CI job builds it *out of tree* against a staged install,
+  which is the only real proof the install tree works for someone who did not clone.
+- **`docs/PLUGINS.md`** — the missing author guide: which tier you want and why a module
+  is not the lesser thing, the `struct_size` guard, why you must never call a core
+  symbol directly, namespaces, threading and re-entrancy per seam, seam ownership,
+  building on three platforms, proving it, shipping it, and the security posture.
+- **`docs/PACKAGING.md`** — the consumer side: four acquisition paths, the install tree,
+  every build option, and why add-on libraries are static on purpose.
+
 ### Added — add-ons are now OBTAINABLE
 - Until now an add-on was compiled as an extra *source* into whichever test binary
   referenced it. There was no library target, nothing for `install()` to ship, nothing

@@ -328,6 +328,32 @@ add_dependencies(test_plugin_tier gpu_quota_plugin)
 add_test(NAME plugin_tier COMMAND test_plugin_tier)
 set_tests_properties(plugin_tier PROPERTIES TIMEOUT 30)
 
+# --- plug-in conformance harness ------------------------------------------
+# Links libgptps so it can SYNTHESISE historical host-table shapes out of public
+# symbols - which is how it tests the one thing the engine structurally cannot: that
+# a plug-in does not read past the table size it was handed. Installed to bin/ so a
+# third-party author can run it against their own .so.
+add_executable(gptps_conformance tools/gptps_conformance.c)
+target_include_directories(gptps_conformance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gptps_conformance PRIVATE gptps)
+install(TARGETS gptps_conformance RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# A plug-in that calls a v1.4 routine while declaring a v1.0 floor. It exists so the
+# harness has something it MUST reject: a conformance harness that cannot fail
+# certifies nothing.
+add_library(addon_greedy MODULE tests/addon_greedy.c)
+target_include_directories(addon_greedy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_greedy PROPERTIES PREFIX "")
+
+add_test(NAME conformance_demo COMMAND gptps_conformance $<TARGET_FILE:addon_demo>)
+add_test(NAME conformance_bad  COMMAND gptps_conformance $<TARGET_FILE:addon_bad>)
+add_test(NAME conformance_greedy COMMAND gptps_conformance $<TARGET_FILE:addon_greedy>)
+set_tests_properties(conformance_demo PROPERTIES TIMEOUT 60)
+# addon_bad has the wrong magic; addon_greedy reads past its declared floor. Both MUST
+# be rejected - so if the harness ever goes soft, these turn red rather than green.
+set_tests_properties(conformance_bad conformance_greedy PROPERTIES WILL_FAIL TRUE TIMEOUT 60)
+add_dependencies(gptps_conformance addon_demo addon_bad addon_greedy)
+
 add_executable(test_addon_ns tests/test_addon_ns.c)
 target_include_directories(test_addon_ns PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_addon_ns PRIVATE gptps)
