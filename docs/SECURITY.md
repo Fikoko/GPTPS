@@ -89,9 +89,20 @@ work from elsewhere. If a submitter can outrun your workers, set it and handle
 
 Stated so nobody infers them:
 
-- No wire protocol, no authentication, no encryption — GPTPS has no network surface.
-  `addons/gptps_xport` uses a `socketpair` to its own forked children and its framing
-  is **not** authenticated; do not put it on a socket you do not control.
+- **No authentication, no encryption, and nothing GPTPS ships opens a socket.** The
+  core has no network code at all. `addons/gptps_xport` uses a `socketpair` to its own
+  forked children, and its framing is **not** authenticated; do not put it on a socket
+  you do not control.
+- `addons/gptps_remote` defines a cross-host **wire format** — and only that. It is a
+  codec: it encodes and decodes bytes and opens nothing. It is deliberately **not**
+  published as a release artifact, because shipping it is what would create a
+  version-1 peer in the world and make the format permanent.
+  If you build a transport on it, understand what you are taking on: the `task` field
+  of a request is a **dispatch key chosen by the peer**, so on a listening socket that
+  is remote code *selection* by anyone who can connect. Run it inside a trusted
+  boundary — loopback, WireGuard, a TLS terminator, an SSH tunnel — never on an open
+  port. GPTPS will not grow authentication or encryption of its own; that is a
+  different product with a different failure model.
 - Payloads and results are opaque bytes. Nothing is validated, sanitized, or
   size-checked beyond the caps above.
 - The dead-letter list holds original payloads in memory. If those are sensitive,

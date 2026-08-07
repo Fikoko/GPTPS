@@ -51,7 +51,7 @@ set(GPTPS_ADDONS "durable_queue;pool")     # or "all"
 ## 4. pkg-config
 
 ```sh
-cc -std=c99 myapp.c $(pkg-config --cflags --libs gptps-durable_queue gptps-pool) -o myapp
+cc -std=c99 myapp.c $(pkg-config --cflags --libs --static gptps-durable_queue gptps-pool) -o myapp
 pkg-config --variable=plugindir gptps      # where a binary plug-in should install
 ```
 

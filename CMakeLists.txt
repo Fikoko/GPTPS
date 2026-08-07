@@ -345,14 +345,22 @@ add_library(addon_greedy MODULE tests/addon_greedy.c)
 target_include_directories(addon_greedy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(addon_greedy PROPERTIES PREFIX "")
 
+# setup() is impeccable, run() reads past the table - the likelier real mistake, and
+# the one the harness missed entirely until it started executing tasks per rung.
+add_library(addon_greedy_run MODULE tests/addon_greedy_run.c)
+target_include_directories(addon_greedy_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_greedy_run PROPERTIES PREFIX "")
+
 add_test(NAME conformance_demo COMMAND gptps_conformance $<TARGET_FILE:addon_demo>)
+add_test(NAME conformance_greedy_run COMMAND gptps_conformance $<TARGET_FILE:addon_greedy_run>)
 add_test(NAME conformance_bad  COMMAND gptps_conformance $<TARGET_FILE:addon_bad>)
 add_test(NAME conformance_greedy COMMAND gptps_conformance $<TARGET_FILE:addon_greedy>)
 set_tests_properties(conformance_demo PROPERTIES TIMEOUT 60)
 # addon_bad has the wrong magic; addon_greedy reads past its declared floor. Both MUST
 # be rejected - so if the harness ever goes soft, these turn red rather than green.
-set_tests_properties(conformance_bad conformance_greedy PROPERTIES WILL_FAIL TRUE TIMEOUT 60)
-add_dependencies(gptps_conformance addon_demo addon_bad addon_greedy)
+set_tests_properties(conformance_bad conformance_greedy conformance_greedy_run
+                     PROPERTIES WILL_FAIL TRUE TIMEOUT 60)
+add_dependencies(gptps_conformance addon_demo addon_bad addon_greedy addon_greedy_run)
 
 add_executable(test_addon_ns tests/test_addon_ns.c)
 target_include_directories(test_addon_ns PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -415,11 +423,13 @@ if(UNIX)
     add_test(NAME cgroup COMMAND test_cgroup)
     set_tests_properties(cgroup PROPERTIES TIMEOUT 30)
 
+    if(TARGET gptps_xport)
     add_executable(test_xport tests/test_xport.c) # scale-out: worker-process transport (fork+socketpair)
     target_include_directories(test_xport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
     target_link_libraries(test_xport PRIVATE gptps_xport)
     add_test(NAME xport COMMAND test_xport)
     set_tests_properties(xport PROPERTIES TIMEOUT 30)
+    endif()
 
     add_executable(test_stress tests/test_stress.c) # concurrent-producer submit stress (off-lock copy under contention)
     target_include_directories(test_stress PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -427,50 +437,64 @@ if(UNIX)
     add_test(NAME stress COMMAND test_stress)
     set_tests_properties(stress PROPERTIES TIMEOUT 60)
 
+    if(TARGET gptps_pool AND TARGET gptps_await)
     add_executable(gptps_bench_pool examples/bench_pool.c) # empirical scale-up proof (throughput vs shards)
     target_include_directories(gptps_bench_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
     target_link_libraries(gptps_bench_pool PRIVATE gptps_pool gptps_await)
     add_test(NAME gptps_bench_pool COMMAND gptps_bench_pool)   # runs the CI-quick default; prints the scaling table
     set_tests_properties(gptps_bench_pool PROPERTIES TIMEOUT 60)
+    endif()
 endif()
 
 # Portable add-on tests (all platforms): the add-on sources are portable
 # (addon_compat shim); any fork-based PHASE inside a test is guarded for Windows.
+if(TARGET gptps_gpu_quota)
 add_executable(test_gpu_quota tests/test_gpu_quota.c)  # constraint + observer
 target_include_directories(test_gpu_quota PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_gpu_quota PRIVATE gptps_gpu_quota)
 add_test(NAME gpu_quota COMMAND test_gpu_quota)
 set_tests_properties(gpu_quota PROPERTIES TIMEOUT 30)
+endif()
 
+if(TARGET gptps_durable_queue)
 add_executable(test_durable tests/test_durable.c) # journal happy-path everywhere; recovery forks on POSIX
 target_include_directories(test_durable PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_durable PRIVATE gptps_durable_queue)
 add_test(NAME durable COMMAND test_durable)
 set_tests_properties(durable PROPERTIES TIMEOUT 30)
+endif()
 
+if(TARGET gptps_orch)
 add_executable(test_orch tests/test_orch.c)           # run-after / fan-in orchestration built on the public seams
 target_include_directories(test_orch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_orch PRIVATE gptps_orch)
 add_test(NAME orch COMMAND test_orch)
 set_tests_properties(orch PROPERTIES TIMEOUT 30)
+endif()
 
+if(TARGET gptps_remote)
 add_executable(test_remote_codec tests/test_remote_codec.c)          # the wire protocol, before any socket exists
 target_include_directories(test_remote_codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_remote_codec PRIVATE gptps_remote)
 add_test(NAME remote_codec COMMAND test_remote_codec)
 set_tests_properties(remote_codec PROPERTIES TIMEOUT 30)
+endif()
 
+if(TARGET gptps_await)
 add_executable(test_await tests/test_await.c)       # blocking wait(handle) on the observer seam
 target_include_directories(test_await PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_await PRIVATE gptps_await)
 add_test(NAME await COMMAND test_await)
 set_tests_properties(await PROPERTIES TIMEOUT 30)
+endif()
 
+if(TARGET gptps_wasm_exec)
 add_executable(test_wasm tests/test_wasm.c)            # module-as-task; OOP case POSIX-only
 target_include_directories(test_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_wasm PRIVATE gptps_wasm_exec)
 add_test(NAME wasm COMMAND test_wasm)
 set_tests_properties(wasm PROPERTIES TIMEOUT 30)
+endif()
 
 add_executable(test_sched_seam tests/test_sched_seam.c)                   # pluggable scheduler seam: swap the admission order
 target_include_directories(test_sched_seam PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -478,17 +502,21 @@ target_link_libraries(test_sched_seam PRIVATE gptps)
 add_test(NAME sched_seam COMMAND test_sched_seam)
 set_tests_properties(sched_seam PROPERTIES TIMEOUT 30)
 
+if(TARGET gptps_pool)
 add_executable(test_pool tests/test_pool.c)           # N-shard router: scale-up by composition
 target_include_directories(test_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_pool PRIVATE gptps_pool)
 add_test(NAME pool COMMAND test_pool)
 set_tests_properties(pool PROPERTIES TIMEOUT 30)
+endif()
 
+if(TARGET gptps_durable_queue)
 add_executable(test_fuzz tests/test_fuzz.c)        # TOML + journal parser robustness
 target_include_directories(test_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_fuzz PRIVATE gptps_durable_queue)
 add_test(NAME fuzz COMMAND test_fuzz)
 set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
+endif()
 
 # --- cross-platform external-program executor test (POSIX + Windows) -------
 add_executable(prog_helper tests/prog_helper.c)         # tiny portable test binary
@@ -520,6 +548,7 @@ add_test(NAME reconcile COMMAND test_reconcile)
 set_tests_properties(reconcile PROPERTIES TIMEOUT 60)
 
 # real-time terminal dashboard add-on (portable; headless-tested)
+if(TARGET gptps_tui)
 add_executable(test_tui tests/test_tui.c)
 target_include_directories(test_tui
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
@@ -527,6 +556,7 @@ target_include_directories(test_tui
 target_link_libraries(test_tui PRIVATE gptps_tui)
 add_test(NAME tui COMMAND test_tui)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
+endif()
 
 endif() # GPTPS_BUILD_TESTS
 
@@ -559,12 +589,14 @@ add_test(NAME example_embedded COMMAND example_embedded)
 set_tests_properties(example_embedded PROPERTIES TIMEOUT 20)
 
 # live terminal dashboard demo (self-skips the live loop without a TTY)
+if(TARGET gptps_tui)
 add_executable(example_dashboard examples/dashboard.c)
 target_include_directories(example_dashboard
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(example_dashboard PRIVATE gptps_tui)
 add_test(NAME example_dashboard COMMAND example_dashboard)
 set_tests_properties(example_dashboard PROPERTIES TIMEOUT 20)
+endif()
 
 if(UNIX)
     # external-program executor (forks + execs /bin/cat)

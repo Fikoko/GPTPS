@@ -485,7 +485,7 @@ developed in:
   paths: (1) `GPTPS_EXEC_PROGRAM` + a wasm runtime CLI — `argv = ["wasmtime",
   "run", "module.wasm"]`, argv[0] PATH-resolved — shown in
   `examples/wasm_program.c` (which embeds a hand-assembled, validated `.wasm` and
-  self-skips when no runtime is on PATH); (2) `addons/wasm_exec.c`, an in-process
+  self-skips when no runtime is on PATH); (2) `addons/gptps_wasm_exec.c`, an in-process
   binding that takes a pluggable `gptps_wasm_run_fn` hook (wasm3/wasmtime/WAMR),
   fully tested with a mock runtime. What's **not** bundled is an actual interpreter
   — left pluggable to keep the core dependency-free; a bundled default would need a

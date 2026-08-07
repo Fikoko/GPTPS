@@ -134,7 +134,7 @@ cc -std=c99 myapp.c out/gptps.c -Iout -lpthread        # macOS (dlopen is in lib
 ./myapp
 ```
 
-To embed the **dashboard** too, also compile the add-on: add `addons/tui.c -Iaddons`
+To embed the **dashboard** too, also compile the add-on: add `addons/gptps_tui.c -Iaddons`
 (`examples/demo.c` is a fuller starting template).
 
 **Install / consume (optional).** `cmake --install build --prefix <dir>` installs the header,
@@ -419,7 +419,7 @@ public API — the proof that scaling here needs no core change.
 
 ## Live terminal dashboard
 
-GPTPS ships an optional, dependency-free terminal dashboard (`addons/tui.c`) — link it,
+GPTPS ships an optional, dependency-free terminal dashboard (`addons/gptps_tui.c`) — link it,
 point it at your engine, and watch tasks flow in real time. Pure ANSI/VT (no ncurses),
 auto-enabled on a TTY, with the Windows console put into VT mode automatically.
 
@@ -545,7 +545,7 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
   The list is capped at `limits.max_dead_letters` (default 1024, oldest evicted, `0` =
   unbounded); `stats.dead_letters_evicted` counts anything the cap dropped, so a host
   that never drains gets bounded memory instead of silent growth.
-- **Durability (optional):** `addons/durable_queue.c` journals submissions to disk (fsync before
+- **Durability (optional):** `addons/gptps_durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
 - **Runtime task management:** enumerate, pause/resume, clone, and unregister task types
   live (`gptps_task_*`, `gptps_unregister_task` with reject-if-busy / drain / cancel) — the
@@ -670,9 +670,12 @@ Not "would this be useful" — every proposal is useful to someone hypothetical.
 project reached 50 public functions and 7 add-ons before it had a single user, which is
 the failure mode the rule exists to prevent.
 
-What would legitimately change the core: a capability that **cannot be built on the five
-seams at all**. That is a short list, and the honest way to discover an item on it is to
-try building the add-on first and report which accessor was missing.
+What would legitimately change the core: a capability that **cannot be built on the four
+called seams at all** (task / constraint / observer / scheduler — see Design notes). That
+is a short list, and the honest way to discover an item on it is to try building the
+add-on first and report which accessor was missing. ABI 2.1 is what that looks like when
+it happens: a binary plug-in could not poll for cancellation, so it could not honour a
+timeout or a cancel — not a preference, an impossibility.
 
 ## License
 

@@ -75,15 +75,25 @@ jobs:
           # with no tar, no clone and no build system does `curl -LO .../gptps_pool.c`,
           # which is exactly how the core is already consumed.
           cp amalgamation/gptps_*.c amalgamation/gptps_*.h dist/
-          # ...plus a tarball for people who want the set.
-          tar -czf "dist/gptps-$VERSION-addons.tar.gz" -C amalgamation \
+          # ...plus a tarball for people who want the set. FIXED name, no version in
+          # it: the files: block below is a literal list, so a name containing
+          # $VERSION could never be written there - which is why this tarball was
+          # built on every release and published on none of them. The tag already
+          # carries the version.
+          tar -czf "dist/gptps-addons.tar.gz" -C amalgamation \
               $(cd amalgamation && ls gptps_*.c gptps_*.h) -C "$PWD" LICENSE
-          # The `files:` block below is a literal list (no globs - see the comment
-          # there), so it cannot warn about an add-on it was never told about.
-          # Assert the staged set is the set the tool actually emitted.
-          want=$(sh tools/amalgamate.sh --list | wc -l)
-          have=$(ls dist/gptps_*.c | wc -l)
-          [ "$want" = "$have" ] || { echo "ERROR: staged $have add-on sources, expected $want"; exit 1; }
+          # Assert every emitted add-on is actually in the files: block below.
+          #
+          # The check this replaces compared `ls dist/gptps_*.c` to
+          # `amalgamate.sh --list` - but both sides derive from the same cp glob, so
+          # it was a tautology that could never fire while the real defect (an add-on
+          # missing from files:) sailed past it. Grep the WORKFLOW, which is the thing
+          # that can actually be out of date. tools/check_addon_coverage.sh runs the
+          # same check on every push, so this is the backstop, not the first line.
+          for a in $(sh tools/amalgamate.sh --list); do
+            grep -q "dist/gptps_$a\.c" "$GITHUB_WORKSPACE/.github/workflows/release.yml" \
+              || { echo "ERROR: gptps_$a.c is not in the files: block; it would not be published"; exit 1; }
+          done
           cd dist
           sha256sum * > SHA256SUMS
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -140,6 +150,7 @@ jobs:
             dist/gptps.h
             dist/LICENSE
             dist/SHA256SUMS
+            dist/gptps-addons.tar.gz
             dist/gptps_await.c
             dist/gptps_await.h
             dist/gptps_durable_queue.c

@@ -1009,7 +1009,13 @@ typedef struct {
      * It is reported verbatim by gptps_addon_get_info so an operator can see what
      * each loaded add-on claims to be, which is its whole job and a real one. */
     gptps_seam_kind seam;
-    /* Called once after load; register tasks/constraints/etc. via `api`. */
+    /* Called once after load; register tasks/constraints/etc. via `api`.
+     *
+     * err_out: OPTIONAL, and OWNERSHIP TRANSFERS. On failure you may set *err_out to
+     * a malloc'd NUL-terminated string saying why; the core logs it and frees it.
+     * Leave it NULL if you have nothing to add. It is the only way an add-on can
+     * explain itself to an operator who did not write it - "needs ABI 2.1 for
+     * is_cancelled" beats a bare GPTPS_E_ABI. */
     gptps_status  (*setup)(gptps *e, const gptps_api_routines *api, char **err_out);
     void          (*teardown)(gptps *e);
     /* --- ABI 2.1: appended. Read only when struct_size proves they are present;

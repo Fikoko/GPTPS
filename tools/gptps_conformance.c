@@ -211,9 +211,21 @@ int main(int argc, char **argv)
         if (a->abi_version_major != GPTPS_ABI_VERSION_MAJOR)
             { BAD("C3  abi_version_major is %u, this host is %u", a->abi_version_major, GPTPS_ABI_VERSION_MAJOR); FIX("a MAJOR mismatch is never loadable - rebuild against this core"); }
         else OK("C3  abi_version_major");
-        if (a->struct_size < offsetof(gptps_addon, teardown) + sizeof a->teardown)
-            { BAD("C3  struct_size %u is below the frozen floor", (unsigned)a->struct_size); }
-        else OK("C3  struct_size (%u bytes)", (unsigned)a->struct_size);
+        if (a->struct_size < offsetof(gptps_addon, teardown) + sizeof a->teardown) {
+            /* TERMINAL. Everything below reads further into the descriptor - name,
+             * setup, ns - and a struct_size below the floor means those fields may
+             * not be there. Reporting and continuing walked off the end of a
+             * truncated descriptor, which is the exact class of bug this tool
+             * exists to catch, committed by the tool. */
+            BAD("C3  struct_size %u is below the frozen floor (%u)",
+                (unsigned)a->struct_size,
+                (unsigned)(offsetof(gptps_addon, teardown) + sizeof a->teardown));
+            FIX("set struct_size = sizeof(gptps_addon); use GPTPS_ADDON_INIT/_NS");
+            dl_close(h);
+            printf("\nNOT CONFORMANT: %d check(s) failed\n", fails);
+            return fails;
+        }
+        OK("C3  struct_size (%u bytes)", (unsigned)a->struct_size);
         if (a->struct_size > sizeof(gptps_addon))
             NOTE("built against a NEWER minor than this host; trailing fields ignored");
         if (!a->name) { BAD("C3  name is NULL"); FIX("the loader rejects this, and introspection reports it"); }
@@ -276,19 +288,68 @@ int main(int argc, char **argv)
             gptps *e = NULL;
             const gptps_addon *ad;
             gptps_status st;
+            const char *where = "setup()";
             g_poisoned = NULL;
             build_table(&t, rungs[i].size);
             if (gptps_open(NULL, &e) != GPTPS_OK || !e) continue;
+            gptps_settings_set(e, "limits.shutdown_grace_ms", "500");
             ad = init(&t);
             st = (ad && ad->setup) ? ad->setup(e, &t, NULL) : GPTPS_OK;
+
+            /* RUN the tasks too, not just setup().
+             *
+             * A plug-in's task BODY is the likeliest place to call an unguarded
+             * routine - is_cancelled above all, which is exactly what a looping task
+             * needs and exactly what an older host does not have. Checking only
+             * setup() certified this tool's own reference template as conformant
+             * while its run() called is_cancelled unguarded. Submit one item to every
+             * task the add-on registered and drain, so run() executes against the
+             * degraded table before the verdict. */
+            if (!g_poisoned && st == GPTPS_OK) {
+                size_t k;
+                uint64_t t0;
+                for (k = 0; k < gptps_task_count(e); ++k) {
+                    gptps_task_info ti; gptps_handle hh = 0;
+                    memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+                    if (gptps_task_get_info(e, k, &ti) != GPTPS_OK || !ti.name) continue;
+                    (void)gptps_submit(e, ti.name, NULL, 0, &hh);
+                }
+                /* Wait for the work to finish HERE rather than letting shutdown do it,
+                 * because teardown() must run while the engine is still alive. */
+                t0 = gptps_now_ms(NULL);
+                for (;;) {
+                    size_t k2, busy = 0;
+                    for (k2 = 0; k2 < gptps_task_count(e); ++k2) {
+                        gptps_task_info ti;
+                        memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+                        if (gptps_task_get_info(e, k2, &ti) == GPTPS_OK) busy += ti.queued + ti.running;
+                    }
+                    if (!busy || gptps_now_ms(NULL) - t0 > 3000) break;
+                }
+                if (g_poisoned) where = "run()";
+            }
+
+            /* teardown() is part of the contract and may call the table too. It runs
+             * BEFORE gptps_shutdown, because shutdown frees the engine - and because
+             * this harness calls setup() directly rather than through
+             * gptps_load_addon, so the engine does not know to call teardown itself.
+             * Running it also stops this tool leaking an engine's worth of add-on
+             * state per rung and then telling the author to go run LeakSanitizer. */
+            if (ad && ad->teardown) {
+                const char *before = g_poisoned;
+                ad->teardown(e);
+                if (!before && g_poisoned) where = "teardown()";
+            }
+            gptps_shutdown(e);
+
             if (g_poisoned)
-                { BAD("C10 rung %-5s called api->%s past its declared table size", rungs[i].label, g_poisoned);
+                { BAD("C10 rung %-5s called api->%s from %s, past its declared table size",
+                      rungs[i].label, g_poisoned, where);
                   FIX("guard it: if (api->struct_size <= offsetof(gptps_api_routines, %s)) ...", g_poisoned); }
             else if (st == GPTPS_OK)
-                OK("C10 rung %-5s setup() succeeded within the table it was given", rungs[i].label);
+                OK("C10 rung %-5s setup + run + teardown stayed inside the table given", rungs[i].label);
             else
                 OK("C10 rung %-5s setup() declined cleanly (%s) - correct", rungs[i].label, gptps_strerror(st));
-            gptps_shutdown(e);
         }
     }
 

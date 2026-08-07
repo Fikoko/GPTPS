@@ -32,6 +32,11 @@ if(GPTPS_ADDONS STREQUAL "all")
     set(_want ${GPTPS_ADDON_ALL})
 elseif(GPTPS_ADDONS STREQUAL "none")
     set(_want "")
+elseif(GPTPS_ADDONS STREQUAL "")
+    # Empty is almost certainly a mistake - a variable that did not expand - and it
+    # would otherwise behave exactly like "none" while looking like a selection. Say
+    # "none" if you mean none; the same fail-closed rule as an unknown name below.
+    message(FATAL_ERROR "GPTPS_ADDONS is empty. Use \"none\" to build no add-ons, or name them explicitly.")
 else()
     set(_want ${GPTPS_ADDONS})
     # A typo must not silently give you nothing. This repo has twice rejected exactly

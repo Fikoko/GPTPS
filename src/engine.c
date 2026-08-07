@@ -258,16 +258,28 @@ struct gptps {
     void          *ev_ud;
     gptps_sched_fn sched_fn;      /* swappable admission ordering (NULL => built-in priority) */
     void          *sched_ud;
-    const char    *sched_owner;   /* who installed it (borrowed); NULL => seam free */
+    /* Who installed it. COPIED, not borrowed: an add-on passes its namespace token,
+     * which lives in the .so and outlives the engine - but a host can perfectly
+     * reasonably pass a stack buffer, and gptps_scheduler_owner would then hand back
+     * a dangling pointer. 32 bytes is enough by construction: the namespace grammar
+     * caps a token at 31 characters. NULL owner / released seam => empty string. */
+    char           sched_owner[32];
 
     /* Namespace enforcement window (ABI 2.1). Set under e->m immediately before an
      * add-on's setup() runs and cleared immediately after. The tid pin means only
      * the thread INSIDE setup() is policed, so a host thread registering
-     * concurrently is never caught by someone else's namespace - load is documented
-     * as setup-time, and the pin makes that assumption cost nothing if violated. */
+     * concurrently is never caught by someone else's namespace.
+     *
+     * There is exactly ONE window, so two concurrent loads would clobber each
+     * other's - the second's namespace would police the first, and enforcement
+     * would then FAIL OPEN when the window was cleared early. `loading` serialises
+     * the whole load, which closes that and the claim TOCTOU (two add-ons both
+     * passing the "is this token free?" scan before either is recorded) with one
+     * flag rather than two fixes. */
     const char    *cur_ns;
     size_t         cur_ns_len;
     uint64_t       cur_ns_tid;
+    int            loading;       /* a gptps_load_addon is in progress */
 
     gptps_loaded  *addons;        /* dlopen'd add-ons, torn down at shutdown */
     gptps_observer *observers;    /* extra event sinks (registered before submit) */
@@ -2349,7 +2361,8 @@ static const gptps_api_routines G_API = {
  * pointer on a list the engine walks on the very next event. Matches
  * gptps_unregister_observer's discipline: unlink under e->m, free after. */
 static void addon_unwind(gptps *e, gptps_observer *obs0, gptps_constraint *con0,
-                         gptps_reg *reg0, gptps_sched_fn sched0, void *schedud0)
+                         gptps_reg *reg0, gptps_sched_fn sched0, void *schedud0,
+                         const char *owner0)
 {
     gptps_observer   *odead = NULL;
     gptps_constraint *cdead = NULL;
@@ -2364,11 +2377,17 @@ static void addon_unwind(gptps *e, gptps_observer *obs0, gptps_constraint *con0,
     while (e->constraints && e->constraints != con0) {
         gptps_constraint *c = e->constraints; e->constraints = c->next; c->next = cdead; cdead = c;
     }
+    /* Restore the seam AND its owner label, UNCONDITIONALLY. Restoring only the
+     * function left a live mismatch whenever a scheduler already existed: the
+     * incumbent's fn came back under the FAILED add-on's label, so
+     * gptps_scheduler_owner named an add-on that is not installed, and the real
+     * owner could no longer release its own seam (gptps_set_scheduler_ex's `self`
+     * test compares owner strings, so it saw a stranger and returned E_BUSY). That
+     * is precisely the "two parties, both believe they hold it" failure this seam's
+     * ownership rules exist to eliminate - reintroduced through the failure path. */
     e->sched_fn = sched0; e->sched_ud = schedud0;
-    /* If the failed setup took the seam, the owner label must go back with it -
-     * otherwise the engine reports a scheduler owned by an add-on that is no
-     * longer installing anything. */
-    if (!sched0) e->sched_owner = NULL;
+    if (owner0) { memcpy(e->sched_owner, owner0, sizeof e->sched_owner); }
+    else        { e->sched_owner[0] = '\0'; }
     for (r = e->registry; r && r != reg0 && nnames < GPTPS_ADDON_UNWIND_MAX; r = r->next)
         snprintf(names[nnames++], GPTPS_EV_NAME_MAX, "%s", r->name);
     gptps_mutex_unlock(e->m);
@@ -2393,11 +2412,30 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
 
     if (!e || !path) return GPTPS_E_INVAL;
 
+    /* Claim the loader. Serialising the whole load is what makes the namespace
+     * window and the token claim actually hold: there is one window, so two
+     * concurrent loads would clobber it and enforcement would fail OPEN, and the
+     * "is this token taken?" scan is otherwise a check-then-act with a gap.
+     *
+     * Also fail fast on the two states every sibling entry point already refuses:
+     * a shutting-down engine (its threads are joining, and an add-on registering
+     * into that is a race with teardown), and an engine INHERITED across fork,
+     * whose mutex may be held by a thread that did not survive. */
+    gptps_mutex_lock(e->m);
+    if (e->stopping)                                  { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
+    if (e->fork_gen != gptps_hal_fork_generation())   { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
+    if (e->loading)                                   { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
+    e->loading = 1;
+    gptps_mutex_unlock(e->m);
+
+#define LOAD_RELEASE() do { gptps_mutex_lock(e->m); e->loading = 0; gptps_mutex_unlock(e->m); } while (0)
+#define LOAD_FAIL(st)  do { LOAD_RELEASE(); return (st); } while (0)
+
     dl = gptps_dl_open(path);
-    if (!dl) return GPTPS_E_IO;
+    if (!dl) LOAD_FAIL(GPTPS_E_IO);
 
     sym = gptps_dl_sym(dl, "gptps_addon_init");
-    if (!sym) { gptps_dl_close(dl); return GPTPS_E_ABI; }
+    if (!sym) { gptps_dl_close(dl); LOAD_FAIL(GPTPS_E_ABI); }
     memcpy(&init, &sym, sizeof init); /* portable object-ptr -> function-ptr */
 
     addon = init(&G_API);
@@ -2407,7 +2445,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         addon->struct_size < GPTPS_ADDON_MIN_SIZE ||   /* ABI: append-safe floor */
         !addon->name) {                                /* reported by introspection */
         gptps_dl_close(dl);
-        return GPTPS_E_ABI;
+        LOAD_FAIL(GPTPS_E_ABI);
     }
     /* Built against a NEWER minor than this core. Append-only means we can still use
      * it - we simply ignore the fields past our size - but that graceful degradation
@@ -2427,14 +2465,14 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
      * than silently shadowing the first. */
     if (GPTPS_STRUCT_HAS(gptps_addon, addon, ns) && addon->ns) {
         gptps_loaded *it;
-        if (!ns_token_valid(addon->ns)) { gptps_dl_close(dl); return GPTPS_E_ABI; }
+        if (!ns_token_valid(addon->ns)) { gptps_dl_close(dl); LOAD_FAIL(GPTPS_E_ABI); }
         gptps_mutex_lock(e->m);
         for (it = e->addons; it; it = it->next) {
             const gptps_addon *o = it->addon;
             if (GPTPS_STRUCT_HAS(gptps_addon, o, ns) && o->ns && strcmp(o->ns, addon->ns) == 0) {
                 gptps_mutex_unlock(e->m);
                 gptps_dl_close(dl);
-                return GPTPS_E_DUP;
+                LOAD_FAIL(GPTPS_E_DUP);
             }
         }
         gptps_mutex_unlock(e->m);
@@ -2451,10 +2489,12 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         gptps_reg        *reg0;
         gptps_sched_fn    sched0;
         void             *schedud0;
+        char              owner0[32];   /* copy: e->sched_owner is a buffer, not a pointer */
 
         gptps_mutex_lock(e->m);
         obs0 = e->observers; con0 = e->constraints; reg0 = e->registry;
         sched0 = e->sched_fn; schedud0 = e->sched_ud;
+        memcpy(owner0, e->sched_owner, sizeof owner0);
         /* Open the namespace window, pinned to this thread. */
         e->cur_ns = ns; e->cur_ns_len = ns ? strlen(ns) : 0;
         e->cur_ns_tid = gptps_hal_thread_id();
@@ -2467,7 +2507,18 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         gptps_mutex_unlock(e->m);
 
         if (s != GPTPS_OK) {
-            addon_unwind(e, obs0, con0, reg0, sched0, schedud0);
+            addon_unwind(e, obs0, con0, reg0, sched0, schedud0, owner0);
+            /* An add-on may report WHY it failed through err_out. Surface it - it is
+             * the only diagnostic channel a plug-in has, and the header promises it -
+             * then free it, since the contract is that the add-on hands ownership over. */
+            if (err) {
+                char msg[GPTPS_EV_NAME_MAX + 160];
+                snprintf(msg, sizeof msg, "add-on '%s' setup failed: %s",
+                         addon->name, err);
+                gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+                gptps_free(err);
+                err = NULL;
+            }
             /* Deliberately NOT gptps_dl_close(dl). A partially-initialised add-on can
              * still have left pointers the unwind cannot reach - a settings entry's
              * read/write pair, a per-task setting schema, a named resource. Unmapping
@@ -2478,7 +2529,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
              * nothing references once this returns. Releasing it keeps the deliberate
              * decision exact and this path leak-free. */
             gptps_dl_release(dl);
-            return s;
+            LOAD_FAIL(s);
         }
     }
 
@@ -2495,13 +2546,16 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         /* same reasoning as the setup-failure path above: keep the mapping, drop the
          * bookkeeping - setup() SUCCEEDED here, so its pointers are live */
         gptps_dl_release(dl);
-        return GPTPS_E_NOMEM;
+        LOAD_FAIL(GPTPS_E_NOMEM);
     }
     node->dl = dl; node->addon = addon; node->enabled = 1;
     gptps_mutex_lock(e->m);
     node->next = e->addons; e->addons = node;
+    e->loading = 0;                      /* published and released in one critical section */
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
+#undef LOAD_RELEASE
+#undef LOAD_FAIL
 }
 
 size_t gptps_addon_count(gptps *e)
@@ -2520,7 +2574,7 @@ gptps_status gptps_addon_get_info(gptps *e, size_t index, gptps_addon_info *out)
     gptps_loaded *a;
     size_t i = 0;
     if (!e || !out) return GPTPS_E_INVAL;
-    if (out->struct_size < sizeof *out) return GPTPS_E_INVAL;
+    if (out->struct_size < GPTPS_ADDON_INFO_MIN_SIZE) return GPTPS_E_INVAL; /* frozen floor, not sizeof */
     gptps_mutex_lock(e->m);
     for (a = e->addons; a; a = a->next, ++i) {
         if (i != index) continue;
@@ -2546,6 +2600,11 @@ gptps_status gptps_addon_disable(gptps *e, const char *ns_or_name)
     if (!e || !ns_or_name) return GPTPS_E_INVAL;
 
     gptps_mutex_lock(e->m);
+    /* Same two fail-fasts every sibling entry point has: a shutting-down engine is
+     * tearing add-ons down already, and an engine inherited across fork may have its
+     * mutex held by a thread that did not survive. */
+    if (e->stopping)                                { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
+    if (e->fork_gen != gptps_hal_fork_generation()) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
     /* namespace first (the unambiguous identity), then the self-declared name */
     for (a = e->addons; a && !hit; a = a->next) {
         const gptps_addon *ad = a->addon;
@@ -2556,22 +2615,37 @@ gptps_status gptps_addon_disable(gptps *e, const char *ns_or_name)
         if (a->addon->name && strcmp(a->addon->name, ns_or_name) == 0) hit = a;
 
     if (!hit)          { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
-    if (!hit->enabled) { gptps_mutex_unlock(e->m); return GPTPS_OK; }  /* idempotent */
+    if (!hit->enabled) { gptps_mutex_unlock(e->m); return GPTPS_OK; }  /* already disabled */
     if (!GPTPS_STRUCT_HAS(gptps_addon, hit->addon, disable) || !hit->addon->disable) {
         gptps_mutex_unlock(e->m);
         return GPTPS_E_INVAL;   /* matched, but it declares no disable hook */
     }
     fn = hit->addon->disable;
+    /* Claim the transition BEFORE releasing the lock. Setting enabled = 0 only after
+     * the hook returned made the documented idempotence false: two concurrent callers
+     * both saw enabled == 1 and both ran the hook, which for a well-written disable()
+     * means a double unregister. Claiming here makes the second caller take the
+     * already-disabled path above. On failure it is restored below, so a hook that
+     * declines leaves the add-on enabled, as it should. */
+    hit->enabled = 0;
     gptps_mutex_unlock(e->m);
 
     /* Call OUTSIDE the lock: disable() unregisters its own observers/constraints/
-     * tasks, every one of which takes e->m itself. */
+     * tasks, every one of which takes e->m itself.
+     *
+     * `hit` stays valid across this window by the same contract that makes the whole
+     * add-on model safe: an add-on's node and its mapping live for the engine's
+     * lifetime, and gptps_shutdown - the only thing that frees them - is refused
+     * re-entrantly and is a caller error to run concurrently with setup-time calls
+     * like this one. The e->stopping check above is the fail-fast for the honest
+     * mistake. */
     st = fn(e);
-    if (st != GPTPS_OK) return st;
-
-    gptps_mutex_lock(e->m);
-    hit->enabled = 0;
-    gptps_mutex_unlock(e->m);
+    if (st != GPTPS_OK) {
+        gptps_mutex_lock(e->m);
+        hit->enabled = 1;               /* the hook declined; it is still participating */
+        gptps_mutex_unlock(e->m);
+        return st;
+    }
     return GPTPS_OK;
 }
 
@@ -2790,11 +2864,19 @@ gptps_status gptps_set_scheduler_ex(gptps *e, gptps_sched_fn fn, void *user_data
      * the incumbent keeps ordering. Releasing (fn == NULL) is allowed to the current
      * owner without the flag, so an add-on's disable() can hand the seam back. */
     if (!(flags & GPTPS_SCHED_REPLACE) && e->sched_fn) {
-        int self = (fn == NULL && owner && e->sched_owner && strcmp(owner, e->sched_owner) == 0);
+        int self = (fn == NULL && owner && e->sched_owner[0] && strcmp(owner, e->sched_owner) == 0);
         if (!self) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
     }
     e->sched_fn = fn; e->sched_ud = user_data;
-    e->sched_owner = fn ? owner : NULL;
+    /* Copy, do not borrow - see the field's declaration. */
+    if (fn && owner) {
+        size_t n = strlen(owner);
+        if (n >= sizeof e->sched_owner) n = sizeof e->sched_owner - 1;
+        memcpy(e->sched_owner, owner, n);
+        e->sched_owner[n] = '\0';
+    } else {
+        e->sched_owner[0] = '\0';
+    }
     gptps_cond_signal(e->cv_disp);   /* re-evaluate ordering on the next pass */
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
@@ -2805,7 +2887,7 @@ const char *gptps_scheduler_owner(gptps *e)
     const char *o;
     if (!e) return NULL;
     gptps_mutex_lock(e->m);
-    o = e->sched_fn ? e->sched_owner : NULL;
+    o = (e->sched_fn && e->sched_owner[0]) ? e->sched_owner : NULL;
     gptps_mutex_unlock(e->m);
     return o;
 }

@@ -56,6 +56,13 @@ typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flag
 #define GPTPS_SUBMIT_OPTIONS_MIN_SIZE GPTPS_LAST_FIELD_END(gptps_submit_options, timeout_ms)
 #define GPTPS_ALLOCATOR_MIN_SIZE      GPTPS_LAST_FIELD_END(gptps_allocator, user_data)
 #define GPTPS_ADDON_MIN_SIZE          GPTPS_LAST_FIELD_END(gptps_addon, teardown)
+/* gptps_addon_info is an OUTPUT struct, but the same rule applies for the same
+ * reason: validating it with `< sizeof *out` would pin it to today's size, so the
+ * day a field is appended every already-compiled caller starts getting E_INVAL. That
+ * is exactly the trap this whole section exists to avoid, and it is free to avoid
+ * only while the struct is unreleased. (gptps_task_info and gptps_setting_info carry
+ * the older `< sizeof` check; those shipped in 1.0.0 and are frozen as they are.) */
+#define GPTPS_ADDON_INFO_MIN_SIZE     GPTPS_LAST_FIELD_END(gptps_addon_info, enabled)
 
 /* --- core allocator seam (alloc.c) ---
  * Every CORE allocation goes through these; they default to the C library and

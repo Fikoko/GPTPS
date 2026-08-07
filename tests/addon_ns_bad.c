@@ -17,6 +17,7 @@
 #include <stddef.h>
 
 static gptps_status work(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_OK; }
+static int64_t      score(const gptps_sched_input *in, void *ud) { (void)ud; return (int64_t)in->priority; }
 
 static gptps_status bad_setup(gptps *e, const gptps_api_routines *api, char **err)
 {
@@ -34,6 +35,13 @@ static gptps_status bad_setup(gptps *e, const gptps_api_routines *api, char **er
     d.name = "nsbad.fine";                    /* correctly prefixed: accepted */
     st = api->register_task(e, &d);
     if (st != GPTPS_OK) return st;
+
+    /* Take the scheduler seam BEFORE failing. Badly behaved on purpose - an add-on
+     * should pass flags == 0 and accept E_BUSY - but that is exactly the point: the
+     * unwind has to put the seam AND its owner label back however it was taken. A
+     * fixture that only registers tasks never exercises that path at all. */
+    if (api->struct_size > offsetof(gptps_api_routines, set_scheduler_ex) && api->set_scheduler_ex)
+        api->set_scheduler_ex(e, score, 0, "nsbad", GPTPS_SCHED_REPLACE);
 
     d.name = "unprefixed";                    /* violates our own namespace */
     st = api->register_task(e, &d);

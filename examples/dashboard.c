@@ -10,7 +10,7 @@
  * settings registry (navigate with j/k, Enter to edit, w to save). Run it headless
  * (no TTY) and gptps_tui_run() simply returns - the engine still drains the work.
  *
- *   cc dashboard.c gptps.c addons/tui.c -lpthread -ldl   (amalgamation; Win: drop -ldl)
+ *   cc dashboard.c gptps.c addons/gptps_tui.c -lpthread -ldl   (amalgamation; Win: drop -ldl)
  */
 #include "gptps.h"
 #include "gptps_tui.h"

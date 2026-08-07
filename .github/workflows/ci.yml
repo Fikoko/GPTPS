@@ -165,13 +165,32 @@ jobs:
             echo "ERROR: conformance passed a plug-in with the wrong magic"; exit 1
           fi
 
-      - name: A typo in the add-on selector FAILS rather than selecting nothing
+      - name: A SUBSET of add-ons actually builds
+        # -DGPTPS_ADDONS=<subset> is the documented distro knob, and it configured
+        # clean and then failed to LINK: the suite referenced add-on targets that the
+        # selector had not created. Nothing else in CI builds anything but the full
+        # set, so nothing else can catch this.
+        run: |
+          cmake -S . -B build-subset -DGPTPS_ADDONS="pool"
+          cmake --build build-subset -j
+          ctest --test-dir build-subset --output-on-failure --no-tests=error
+          cmake -S . -B build-none -DGPTPS_ADDONS="none" \
+                -DGPTPS_BUILD_TESTS=OFF -DGPTPS_BUILD_EXAMPLES=OFF
+          cmake --build build-none -j
+
+      - name: A typo or an empty selector FAILS rather than selecting nothing
         run: |
           if sh tools/amalgamate.sh amalg-bad --addons pool,nosuch 2>/dev/null; then
             echo "ERROR: amalgamate.sh accepted an unknown add-on"; exit 1
           fi
+          if sh tools/amalgamate.sh amalg-empty --addons "" 2>/dev/null; then
+            echo "ERROR: amalgamate.sh accepted an empty selector"; exit 1
+          fi
           if cmake -S . -B build-bad -DGPTPS_ADDONS="pool;nosuch" >/dev/null 2>&1; then
             echo "ERROR: CMake accepted an unknown add-on"; exit 1
+          fi
+          if cmake -S . -B build-empty -DGPTPS_ADDONS="" >/dev/null 2>&1; then
+            echo "ERROR: CMake accepted an empty selector"; exit 1
           fi
 
   # Verify the single-file amalgamation compiles and runs (drop-in path).

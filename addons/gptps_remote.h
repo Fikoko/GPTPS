@@ -59,8 +59,22 @@ extern "C" {
  * on its first frame instead of being interpreted as a length. */
 #define GPTPS_REMOTE_MAGIC    0x47505452u
 
-/* Bump ONLY for a change no version-1 peer could parse. Additive fields go in the
- * payload, behind their own length, never by widening the header. */
+/* Bump ONLY for a change no version-1 peer could parse.
+ *
+ * BE HONEST ABOUT WHAT v1 CAN AND CANNOT ABSORB. A request payload is
+ * [u32 task_len][task][item], where `item` is "everything remaining" - so nothing can
+ * ever follow it, and a reply payload has no internal framing at all. That means v1
+ * has NO extension slot: a deadline, a tenant id or a trace id cannot be added without
+ * a version bump, and this constant is the only lever.
+ *
+ * That is a deliberate v1 shape (simple, and impossible to get subtly wrong), not an
+ * oversight - but it must not be described as though additive fields were possible,
+ * because a wire format is a permanent contract and the one thing worse than a narrow
+ * format is a narrow format documented as extensible.
+ *
+ * A v2 that wanted headroom would frame the payload as
+ * [u32 n][n x (u16 tag, u32 len, bytes)] and put `task` and `item` in it as tags 1
+ * and 2. Do that when something actually needs it - not before. */
 #define GPTPS_REMOTE_VERSION  1u
 
 /* Fixed on-wire header size, in bytes. Deliberately a constant rather than a

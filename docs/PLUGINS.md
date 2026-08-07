@@ -37,10 +37,19 @@ half of them comment, and every ceremonial-looking line is load-bearing.
 
 - **Exactly one exported symbol**, `gptps_addon_init`, produced by `GPTPS_ADDON_INIT`
   or `GPTPS_ADDON_INIT_NS`. That is the entire ABI surface of a plug-in.
-- The core validates **magic**, **`abi_version_major`** and **`struct_size`** *before*
-  calling a line of your code. A rejected plug-in never runs.
+- Load order, precisely: `dlopen` maps you (so any static initializers run), then the
+  core calls **`gptps_addon_init`**, then it validates **magic**,
+  **`abi_version_major`**, **`struct_size`** and a non-NULL **`name`** on the descriptor
+  you returned — and only then calls `setup()`. So your init entry point *does* run
+  before validation; keep it to returning the descriptor and stashing `api`, which is
+  all `GPTPS_ADDON_INIT` does. A rejected plug-in never reaches `setup()`.
 - `setup(e, api, err_out)` runs once, at load. Register what you need and return
   `GPTPS_OK`. Returning anything else **fails the load**.
+- **`err_out` is a real channel, and you hand over ownership.** Set `*err_out` to a
+  `malloc`'d, NUL-terminated string explaining *why* you refused; the core logs it and
+  **frees it**. It is the only way a plug-in can explain itself to an operator who did
+  not write it — "add-on 'x' setup failed: needs ABI 2.1 for is_cancelled" beats a bare
+  `GPTPS_E_ABI`. Leave it NULL if you have nothing to say.
 - **If `setup()` fails, the core unwinds** what you already registered — observers,
   constraints, tasks, the scheduler — but **deliberately does not `dlclose` you**. A
   partial setup can leave pointers the unwind cannot reach (a settings entry's

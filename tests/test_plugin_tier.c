@@ -3,7 +3,7 @@
 /*
  * test_plugin_tier.c - the two-tier model, exercised rather than asserted.
  *
- * addons/gpu_quota.c and addons/gpu_quota_plugin.c carry the SAME policy in the two
+ * addons/gptps_gpu_quota.c and addons/gptps_gpu_quota_plugin.c carry the SAME policy in the two
  * tiers. This drives the Tier-B one the way its tier is meant to be driven: the host
  * calls nothing on it, loads it as a binary, and configures it purely through
  * settings - then checks the policy actually took effect.

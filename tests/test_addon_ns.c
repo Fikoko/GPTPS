@@ -11,6 +11,7 @@
 #include "gptps.h"
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 
 #ifndef ADDON_NS_PATH
 #define ADDON_NS_PATH     "./addon_ns.so"
@@ -104,6 +105,42 @@ int main(void)
     /* An add-on with no disable hook is refused, and stays enabled. */
     CHECK(gptps_load_addon(e, ADDON_DEMO_PATH) == GPTPS_OK);
     CHECK(gptps_addon_disable(e, "demo") == GPTPS_E_INVAL);
+
+    /* ===== 5b) a FAILED load must not steal the seam's owner label =====
+     * addon_unwind restores sched_fn, and used to leave sched_owner pointing at the
+     * add-on that just failed. The incumbent's function then ran under a stranger's
+     * name: gptps_scheduler_owner reported an add-on that is not installed, and the
+     * real owner could no longer release its own seam, because set_scheduler_ex's
+     * "am I the owner?" test compares owner strings and saw someone else. Exactly the
+     * "two parties both believe they hold it" failure the ownership rule exists to
+     * prevent, reintroduced through the failure path. */
+    {
+        /* host owns the seam... */
+        CHECK(gptps_set_scheduler_ex(e, host_score, NULL, "host", GPTPS_SCHED_REPLACE) == GPTPS_OK);
+        CHECK(gptps_scheduler_owner(e) && strcmp(gptps_scheduler_owner(e), "host") == 0);
+        /* ...a load fails after touching things (the ns-violating add-on) ... */
+        CHECK(gptps_load_addon(e, ADDON_NS_BAD_PATH) == GPTPS_E_INVAL);
+        /* ...and the host is still the owner, and can still release. */
+        CHECK(gptps_scheduler_owner(e) && strcmp(gptps_scheduler_owner(e), "host") == 0);
+        CHECK(gptps_set_scheduler_ex(e, NULL, NULL, "host", 0) == GPTPS_OK);
+        CHECK(gptps_scheduler_owner(e) == NULL);
+    }
+
+    /* ===== 5c) gptps_addon_info validates against a FROZEN FLOOR, not sizeof =====
+     * The distinction is the whole append-safe convention: at the floor a caller is
+     * served even though its struct is smaller than today's sizeof, which is what
+     * lets the struct grow later without invalidating every already-compiled caller.
+     * `< sizeof *out` would pin it to today's size forever. */
+    {
+        gptps_addon_info info;
+        const size_t floor = offsetof(gptps_addon_info, enabled)
+                           + sizeof(((gptps_addon_info *)0)->enabled);
+        memset(&info, 0, sizeof info);
+        info.struct_size = floor;
+        CHECK(gptps_addon_get_info(e, 0, &info) == GPTPS_OK);        /* at the floor: served */
+        info.struct_size = floor - 1;
+        CHECK(gptps_addon_get_info(e, 0, &info) == GPTPS_E_INVAL);   /* below it: refused */
+    }
 
     gptps_shutdown(e);
 

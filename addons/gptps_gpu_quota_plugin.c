@@ -1,16 +1,16 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
- * gpu_quota_plugin.c - the SAME policy as addons/gpu_quota.c, as a BINARY PLUG-IN.
+ * gpu_quota_plugin.c - the SAME policy as addons/gptps_gpu_quota.c, as a BINARY PLUG-IN.
  *
  * These two files ship side by side deliberately, and the diff between them is the
  * documentation of the two-tier model - more convincing than any prose about it:
  *
- *   addons/gpu_quota.c        TIER A, compiled-in module.
+ *   addons/gptps_gpu_quota.c   TIER A, compiled-in module.
  *     The host calls gptps_gpu_quota_install() and holds a gptps_gpu_quota*. It
  *     needs a header, therefore it needs your build. It links core symbols directly.
  *
- *   addons/gpu_quota_plugin.c TIER B, binary plug-in (this file).
+ *   addons/gptps_gpu_quota_plugin.c TIER B, binary plug-in (this file).
  *     The host calls NOTHING. It is named in a TOML `addons = [...]` line, and an
  *     operator configures it entirely through settings. It links NO core symbols -
  *     everything goes through the passed gptps_api_routines table, which is what

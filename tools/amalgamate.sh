@@ -30,12 +30,20 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 # name|source|header|description   (the table tools/check_addon_coverage.sh holds to
 # the directory listing, so a new add-on cannot silently miss the amalgamation)
+#
+# DELIBERATELY ABSENT: `remote`. It is the cross-host WIRE CODEC, and publishing it
+# is the act that creates a version-1 peer somewhere in the world - after which the
+# format is permanent, because there is no compiler to catch a violation and no way
+# to recall a deployed peer. Its own header argues it lands early "so it is reviewable
+# before any socket exists"; both cannot be true at once, so it stays in-tree and
+# buildable (addons/CMakeLists.txt builds it, and the suite tests it) but out of the
+# distributed set until a transport - and a user who wants one - exists.
+# tools/check_addon_coverage.sh has a matching exemption.
 ADDONS="await|gptps_await.c|gptps_await.h|blocking wait(handle) on the observer seam
 durable_queue|gptps_durable_queue.c|gptps_durable_queue.h|crash-durable submission journal
 gpu_quota|gptps_gpu_quota.c|gptps_gpu_quota.h|named-resource admission quota
 orch|gptps_orch.c|gptps_orch.h|run-after / fan-in orchestration
 pool|gptps_pool.c|gptps_pool.h|N-shard engine router (scale-up)
-remote|gptps_remote.c|gptps_remote.h|remote wire codec (cross-host transport)
 tui|gptps_tui.c|gptps_tui.h|real-time terminal dashboard
 wasm_exec|gptps_wasm_exec.c|gptps_wasm_exec.h|module-as-task, pluggable runtime
 xport|gptps_xport.c|gptps_xport.h|worker-process transport (scale-out; POSIX)"
@@ -60,6 +68,7 @@ ALL=$(printf '%s\n' "$ADDONS" | cut -d'|' -f1)
 case "$WANT" in
     all)  SEL="$ALL" ;;
     none) SEL="" ;;
+    "")   echo "amalgamate.sh: --addons is empty. Use 'none' to emit no add-ons." >&2; exit 2 ;;
     *)    SEL=$(printf '%s' "$WANT" | tr ',' ' ')
           for a in $SEL; do
               printf '%s\n' "$ALL" | grep -qx "$a" || {
