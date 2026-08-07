@@ -77,6 +77,7 @@ uint64_t gptps_hal_fork_generation(void) { return 0; }
 gptps_dl *gptps_dl_open(const char *path) { (void)path; return 0; }
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol) { (void)h; (void)symbol; return 0; }
 void      gptps_dl_close(gptps_dl *h) { (void)h; }
+void      gptps_dl_release(gptps_dl *h) { (void)h; }
 
 /* --- atomic file replace: no filesystem ----------------------------------- */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)

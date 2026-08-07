@@ -496,6 +496,36 @@ GPTPS_API gptps_status gptps_unregister_task(gptps *e, const char *task_name, un
  * before use and tears the add-on down at gptps_shutdown. */
 GPTPS_API gptps_status gptps_load_addon(gptps *e, const char *path);
 
+/* AN ADD-ON'S CODE STAYS MAPPED FOR THE ENGINE'S LIFETIME. That is a GUARANTEE,
+ * not a limitation - it is what makes every function pointer the engine holds valid
+ * without reference counting, a quiescence barrier, or a mapping check on the hot
+ * path. There is deliberately no gptps_unload_addon and there will not be one.
+ *
+ * Why not, concretely: a successful setup() can leave a settings entry holding a
+ * read/write function pair, and there is no gptps_unregister_setting. dlclose would
+ * leave the settings registry pointing into an unmapped library, so the next
+ * gptps_settings_save - from a TUI, an operator, anything - is a wild jump. That is
+ * the same reasoning the loader already applies when it refuses to dlclose after a
+ * FAILED setup: never create a pointer nothing can reach.
+ *
+ * What you can do instead is make an add-on STOP PARTICIPATING. `disable` asks it to
+ * unregister its own constraints / observers / tasks and release the scheduler seam
+ * if it holds it. Nothing is unmapped, so nothing can become a wild pointer.
+ * Settings it registered keep pointing at still-mapped code and keep working; that
+ * is the trade, and it is a good one.
+ *
+ * Match by namespace token first, then by add-on name. SETUP-TIME, like
+ * gptps_unregister_constraint/observer: the constraint list and event sinks are
+ * walked on the hot path, so disable while quiescent. Returns GPTPS_E_NOTFOUND if
+ * nothing matches, GPTPS_E_INVAL if the match declares no disable hook, and
+ * GPTPS_OK (idempotently) if it is already disabled. teardown() still runs once at
+ * gptps_shutdown, disabled or not. */
+GPTPS_API gptps_status gptps_addon_disable(gptps *e, const char *ns_or_name);
+
+/* Introspection (gptps_addon_info / count / get_info) is declared with the add-on
+ * descriptor itself, further down - it reports a gptps_seam_kind, which is defined
+ * in the HOST-TABLE ABI section below. */
+
 /* Enqueue work. Rejects with GPTPS_E_BUDGET at submit time if the task's
  * declared cost can NEVER fit max_memory_bytes (it would otherwise starve). */
 GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,
@@ -774,13 +804,46 @@ GPTPS_API gptps_status gptps_settings_watch(gptps *e, gptps_settings_cb cb, void
  * the host executable; -fvisibility=hidden/RTLD_LOCAL do NOT protect them, so
  * core symbols are namespaced (gptps_/gptps__) to avoid add-on capture.
  * ==========================================================================*/
+/* FOUR CALLED SEAMS and ONE COMPOSED PATTERN. The distinction is the first thing an
+ * add-on author needs, because it says which SIDE of the engine you are writing on:
+ * a called seam is a function the CORE invokes; a composed module calls the core.
+ * Everything here is ADVISORY metadata - see gptps_addon.seam. */
 typedef enum {
-    GPTPS_SEAM_TASK = 0,   /* frozen v1.0 */
-    GPTPS_SEAM_TRANSPORT,  /* EXPERIMENTAL until M2 (exec-bridge); frozen with first consumer */
+    GPTPS_SEAM_TASK = 0,   /* frozen v1.0: gptps_run_fn / gptps_cost_fn */
+
+    /* Value 1, spelled GPTPS_SEAM_TRANSPORT before ABI 2.1.
+     *
+     * It is NOT a core interface and never was: there is no transport struct, no
+     * function-pointer typedef, and no register call anywhere in this library. It
+     * names the COMPOSITION pattern in which a module moves work OUT of this engine
+     * entirely - addons/gptps_xport forks worker processes and marshals over a
+     * socketpair, and the core is not on that path at all.
+     *
+     * That is the point rather than a gap. A transport sits on the far side of the
+     * engine and calls IN, so an interface for it would be a vtable with no call
+     * site - and it would make the admission budget a lie, since the dispatcher
+     * reserves cost.mem_bytes for work that will not run in this address space.
+     * That the pattern needs nothing from the core is the strongest evidence for
+     * this library's "compose, don't extend" thesis, not a hole in it.
+     *
+     * The enumerator cannot be removed without renumbering the three below it - a
+     * MAJOR bump this project has declared it will not take - so it is renamed to
+     * what it actually is. Declare it if your module IS that pattern.
+     *
+     * What WOULD make this a real interface: a transport where the CORE must own
+     * the routing decision, handing an item out and taking a result back.
+     * gptps_xport proves the opposite case; until something proves the first, an
+     * interface here would be a promise the engine cannot keep. */
+    GPTPS_SEAM_COMPOSITION,
+
     GPTPS_SEAM_CONSTRAINT, /* frozen v1.9 (gptps_constraint_input): admit/deny/defer hook; MUST be non-blocking */
     GPTPS_SEAM_OBSERVER,   /* frozen v1.9: analytics / dead-letter sink */
     GPTPS_SEAM_SCHEDULER   /* frozen v1.12 (gptps_sched_input): the admission ordering key; MUST be non-blocking */
 } gptps_seam_kind;
+
+/* Pre-2.1 spelling of GPTPS_SEAM_COMPOSITION. Same value, so every add-on already
+ * compiled against it is binary-identical; source using it still compiles. */
+#define GPTPS_SEAM_TRANSPORT GPTPS_SEAM_COMPOSITION
 
 /* Constraint hook result (constraint seam, frozen v1.9). retry_after_ms is
  * honored on DEFER so the dispatcher schedules a wake at T (no busy-spin). */
@@ -908,6 +971,13 @@ typedef struct {
     const char  *(*strerror_fn)(gptps_status s);
     const char  *(*version)(void);
 
+    /* TRANCHE D - seam ownership. An add-on installing a scheduler MUST use this
+     * with flags == 0 and fail its setup() on GPTPS_E_BUSY, so a second add-on
+     * wanting the same seam produces a diagnosable conflict instead of silently
+     * replacing the first. See the SCHEDULER SEAM section. */
+    gptps_status (*set_scheduler_ex)(gptps *e, gptps_sched_fn fn, void *user_data,
+                                     const char *owner, unsigned flags);
+
     /* DELIBERATELY ABSENT, so the omissions read as decisions rather than oversights:
      *   open / open_ex / shutdown / step - engine LIFECYCLE is the host's. A module
      *     that wants to own an engine is a compiled-in module by definition (it has
@@ -929,11 +999,50 @@ typedef struct {
     size_t          struct_size;     /* = sizeof(gptps_addon) */
     uint32_t        magic;           /* == GPTPS_ABI_MAGIC */
     uint32_t        abi_version_major;
-    const char     *name;
+    const char     *name;            /* required; reported by gptps_addon_get_info */
+    /* What this add-on says it primarily is. ADVISORY: the loader does NOT inspect
+     * this field and never will. A useful add-on routinely spans seams (a quota is a
+     * resource plus settings; a dashboard is an observer plus settings) and this
+     * field is single-valued - so enforcing it would force add-ons to MISDECLARE
+     * themselves in order to work. It is also not a security boundary:
+     * docs/SECURITY.md is explicit that a loaded add-on is code you already trust.
+     * It is reported verbatim by gptps_addon_get_info so an operator can see what
+     * each loaded add-on claims to be, which is its whole job and a real one. */
     gptps_seam_kind seam;
     /* Called once after load; register tasks/constraints/etc. via `api`. */
     gptps_status  (*setup)(gptps *e, const gptps_api_routines *api, char **err_out);
     void          (*teardown)(gptps *e);
+    /* --- ABI 2.1: appended. Read only when struct_size proves they are present;
+     * GPTPS_ADDON_MIN_SIZE stays frozen at the end of `teardown`, so every add-on
+     * built against ABI 2.0 still loads here unchanged.
+     *
+     * BOTH are POINTER-WIDTH deliberately. Every member above is <= a pointer and
+     * this struct's alignment IS pointer alignment, so it carries no trailing
+     * padding on any supported ABI - meaning an appended POINTER lands exactly at
+     * the predecessor's padded sizeof and can never hide inside old padding, which
+     * would make a struct_size test give a false positive. That is the same hazard
+     * gptps_task_def.flags documents, and the same fix. Never append a uint32_t. */
+
+    /* Optional namespace token: [a-z][a-z0-9_]* , no dots, <= 31 chars. NULL means
+     * unnamespaced - the pre-2.1 behaviour, still fully supported.
+     *
+     * Declaring one buys a GUARANTEE and accepts a RULE:
+     *   guarantee - the loader CLAIMS this token. A second add-on declaring the same
+     *               one is refused with GPTPS_E_DUP at load, so nothing can shadow
+     *               you and an operator gets a diagnosable collision.
+     *   rule      - every task name, setting key, per-task setting leaf and resource
+     *               name you register during setup() must begin with "<ns>." or the
+     *               registration is refused and the reason logged.
+     *
+     * The enforcement window is setup() ONLY, and is pinned to the calling thread.
+     * An add-on that registers something later - from an observer, say - is not
+     * policed. This is ATTRIBUTION, not a sandbox: a check the core could not
+     * enforce everywhere would be worse than an honest partial one. */
+    const char   *ns;
+
+    /* Optional: asked to stop participating, without being unloaded. See
+     * gptps_addon_disable. NULL means this add-on cannot be disabled. */
+    gptps_status (*disable)(gptps *e);
 } gptps_addon;
 
 typedef const gptps_addon *(*gptps_addon_init_fn)(const gptps_api_routines *api);
@@ -941,16 +1050,44 @@ typedef const gptps_addon *(*gptps_addon_init_fn)(const gptps_api_routines *api)
 /* Ergonomic entry-point macro (EXTENSION_INIT-style): keeps the api table
  * stashed so call sites read normally. Use once per add-on translation unit. */
 #define GPTPS_ADDON_INIT(name_str, seam_kind, setup_fn, teardown_fn)            \
+    GPTPS_ADDON_INIT_NS(name_str, 0, seam_kind, setup_fn, teardown_fn, 0)
+
+/* Full form (ABI 2.1): declares a namespace and a disable hook as well. Prefer this
+ * for anything distributed out of tree - the namespace is what stops two unrelated
+ * plug-ins colliding on a task name or a settings key. Pass 0 for either to opt out;
+ * GPTPS_ADDON_INIT is exactly this with both zeroed. */
+#define GPTPS_ADDON_INIT_NS(name_str, ns_str, seam_kind, setup_fn, teardown_fn, disable_fn) \
     static const gptps_api_routines *gptps__api = 0;                            \
     GPTPS_ADDON_EXPORT const gptps_addon *                                      \
     gptps_addon_init(const gptps_api_routines *api) {                           \
         static const gptps_addon a = {                                          \
             sizeof(gptps_addon), GPTPS_ABI_MAGIC, GPTPS_ABI_VERSION_MAJOR,      \
-            (name_str), (seam_kind), (setup_fn), (teardown_fn)                  \
+            (name_str), (seam_kind), (setup_fn), (teardown_fn),                 \
+            (ns_str), (disable_fn)                                              \
         };                                                                      \
         gptps__api = api;                                                       \
         return &a;                                                              \
     }
+
+/* Introspection: what is loaded, what it claims to be, and whether it is still
+ * participating. Same shape as gptps_task_info - struct_size first, index-based,
+ * all pointers BORROWED and stable until the next gptps_load_addon. Declared here
+ * rather than beside gptps_load_addon because it reports a gptps_seam_kind. */
+typedef struct {
+    size_t          struct_size;       /* = sizeof(gptps_addon_info) */
+    const char     *name;              /* the add-on's self-declared name */
+    const char     *ns;                /* namespace token, or NULL if unnamespaced */
+    const char     *path;              /* the path it was loaded from */
+    gptps_seam_kind seam;              /* ADVISORY - never verified; see gptps_addon.seam */
+    uint32_t        abi_version_major; /* what it was built against */
+    int             enabled;           /* 0 once gptps_addon_disable has succeeded */
+} gptps_addon_info;
+
+/* Number of add-ons loaded into this engine. */
+GPTPS_API size_t gptps_addon_count(gptps *e);
+/* Snapshot add-on `index` (0-based, newest first). GPTPS_E_NOTFOUND if out of range,
+ * GPTPS_E_INVAL if out is NULL or its struct_size is below sizeof(gptps_addon_info). */
+GPTPS_API gptps_status gptps_addon_get_info(gptps *e, size_t index, gptps_addon_info *out);
 
 /* ============================================================================
  * CONSTRAINTS & OBSERVERS (extension points; also reachable by add-ons through
@@ -1003,8 +1140,49 @@ GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, vo
 
 /* Install (or, with fn == NULL, reset to the built-in priority ordering) the
  * scheduler. One per engine; a later call replaces the previous. A SETUP-time call
- * like the other seams - set it before submitting work / while quiescent. */
+ * like the other seams - set it before submitting work / while quiescent.
+ *
+ * Equivalent to gptps_set_scheduler_ex(e, fn, ud, "host", GPTPS_SCHED_REPLACE):
+ * unchanged behaviour, for a host that knows it is the only one installing. */
 GPTPS_API gptps_status gptps_set_scheduler(gptps *e, gptps_sched_fn fn, void *user_data);
+
+/* Take the seam regardless of who holds it (the pre-2.1 behaviour). */
+#define GPTPS_SCHED_REPLACE 0x1u
+
+/* Install the scheduler, declaring an OWNER (ABI 2.1).
+ *
+ * The seam is SINGLE-SLOT by design, and that is not a limitation to work around:
+ * an ordering key is a TOTAL ORDER, and a total order has one definition. Two
+ * independent scorers cannot be composed - gptps_sched_fn returns an int64 on no
+ * defined scale, so summing or chaining two of them produces an ordering neither
+ * author intended, silently. It would also weaken the starvation guard, which needs
+ * a stable top-of-order (see the NOTE above), and it would multiply an O(n)
+ * under-the-lock cost by the number of installed scorers.
+ *
+ * So two definitions is a CONFLICT, and the core reports it rather than picking:
+ *   flags == 0                   install only if the seam is FREE. GPTPS_E_BUSY if
+ *                                it is owned, and the incumbent is NOT replaced.
+ *   flags == GPTPS_SCHED_REPLACE take it regardless.
+ * fn == NULL releases the seam back to the built-in priority ordering.
+ *
+ * `owner` is a borrowed, human-readable id - an add-on should pass its namespace
+ * token - reported by gptps_scheduler_owner so an operator can see who holds it.
+ *
+ * AN ADD-ON MUST pass flags == 0 and fail its setup() on GPTPS_E_BUSY. The loader
+ * then unwinds it cleanly and the operator gets a diagnosable "seam already owned"
+ * instead of a policy that vanished without a word. Before 2.1 a second installer
+ * silently replaced the first and both believed they held it - fine for a single
+ * host, wrong for an ecosystem.
+ *
+ * If you want to INFLUENCE ordering without OWNING it, use the constraint seam:
+ * GPTPS_DEFER with retry_after_ms reorders in time, composes by construction, and
+ * is many-per-engine. That is the right answer for the second plug-in. */
+GPTPS_API gptps_status gptps_set_scheduler_ex(gptps *e, gptps_sched_fn fn, void *user_data,
+                                              const char *owner, unsigned flags);
+
+/* Who holds the scheduler seam, or NULL if the built-in priority ordering is in
+ * effect. Borrowed; stable until the seam is next installed or released. */
+GPTPS_API const char *gptps_scheduler_owner(gptps *e);
 
 #ifdef __cplusplus
 } /* extern "C" */

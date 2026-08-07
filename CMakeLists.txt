@@ -253,6 +253,26 @@ set_target_properties(addon_bad PROPERTIES PREFIX "")
 add_library(addon_cancel MODULE tests/addon_cancel.c)
 target_include_directories(addon_cancel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(addon_cancel PROPERTIES PREFIX "")
+# ABI 2.1 identity: a well-behaved namespaced plug-in, and one that violates its own
+# namespace (which must fail the load AND unwind what it already registered).
+add_library(addon_ns MODULE tests/addon_ns.c)
+target_include_directories(addon_ns PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_ns PROPERTIES PREFIX "")
+add_library(addon_ns_bad MODULE tests/addon_ns_bad.c)
+target_include_directories(addon_ns_bad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_ns_bad PROPERTIES PREFIX "")
+
+add_executable(test_addon_ns tests/test_addon_ns.c)
+target_include_directories(test_addon_ns PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_addon_ns PRIVATE gptps)
+target_compile_definitions(test_addon_ns PRIVATE
+    ADDON_NS_PATH="$<TARGET_FILE:addon_ns>"
+    ADDON_NS_BAD_PATH="$<TARGET_FILE:addon_ns_bad>"
+    ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
+)
+add_dependencies(test_addon_ns addon_ns addon_ns_bad addon_demo)
+add_test(NAME addon_ns COMMAND test_addon_ns)
+set_tests_properties(addon_ns PROPERTIES TIMEOUT 30)
 
 add_executable(test_addon tests/test_addon.c)
 target_include_directories(test_addon

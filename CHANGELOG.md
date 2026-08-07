@@ -7,6 +7,56 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — ABI 2.1: add-on IDENTITY, so an ecosystem can have more than one plug-in
+- **Namespaces.** An add-on may declare `ns` (e.g. `"gpuq"`). Declaring one buys a
+  guarantee — the loader **claims** the token, and a second add-on wanting it is
+  refused with `GPTPS_E_DUP` — and accepts a rule: every task name, setting key,
+  per-task leaf and resource name it registers during `setup()` must be `"<ns>."`
+  prefixed. Enforced inside `setup()` only and pinned to that thread: this is
+  **attribution, not a sandbox**, consistent with `docs/SECURITY.md`, and a violation
+  is logged with the required prefix rather than returning a bare error code.
+- The surface where this is load-bearing rather than tidy is `gptps_define_resource`:
+  a duplicate name is not an error there, it **silently re-budgets**. Two add-ons both
+  defining `"gpu"` each believed they owned the budget. A claimed namespace makes that
+  collision impossible instead of undetectable.
+- **`gptps_addon_disable`, and deliberately no `gptps_unload_addon`.** A successful
+  `setup()` can leave a settings entry holding a read/write function pair, and there is
+  no `gptps_unregister_setting` — so `dlclose` would leave the settings registry
+  pointing into an unmapped library and the next `gptps_settings_save` is a wild jump.
+  Disable asks an add-on to stop participating; nothing is unmapped, so nothing can
+  become a wild pointer. Same principle the loader already applied when refusing to
+  `dlclose` after a failed setup.
+- **`gptps_addon_count` / `gptps_addon_get_info`** — what is loaded, its namespace, its
+  path, what it claims to be, and whether it is still enabled.
+- **`gptps_set_scheduler_ex` + `gptps_scheduler_owner` + `GPTPS_SCHED_REPLACE`.** The
+  seam is single-slot by design — an ordering key is a total order, and two `int64`
+  scorers on no defined scale cannot be composed without silently producing an ordering
+  neither author intended. So two definitions is a conflict the core now *reports*: an
+  add-on passes `flags == 0` and fails its `setup()` on `GPTPS_E_BUSY`, instead of
+  silently replacing the incumbent as it did before. `gptps_set_scheduler` is unchanged.
+  The header names the right answer for a second plug-in: the **constraint** seam, whose
+  `GPTPS_DEFER` reorders in time, composes by construction, and is many-per-engine.
+
+### Changed — `GPTPS_SEAM_TRANSPORT` is now `GPTPS_SEAM_COMPOSITION`
+- Same enumerator value, and `GPTPS_SEAM_TRANSPORT` remains as a `#define`, so every
+  add-on already built is binary-identical and existing source still compiles. It is
+  renamed to what it actually is: not an interface (it has no struct, typedef or
+  register call) but the **composition pattern**, in which a module moves work out of
+  the engine entirely. A transport calls *into* the core rather than being called *by*
+  it, so an interface for it would be a vtable with no call site.
+- `gptps_addon.seam` is documented as **advisory** — the loader does not inspect it and
+  never will, because the field is single-valued while useful add-ons routinely span
+  seams. It now has its first real consumer instead: `gptps_addon_get_info` reports it.
+
+### Fixed — the add-on setup-failure path leaked its handle wrapper
+- Retaining the **mapping** when `setup()` fails is deliberate (a partial setup can
+  leave pointers the unwind cannot reach). Retaining the small handle *wrapper* was
+  not — nothing references it once the load has failed. New `gptps_dl_release` frees
+  the bookkeeping without unloading the library, which makes the deliberate decision
+  exact and the path leak-free under LeakSanitizer. Found by the first test to
+  exercise a failing `setup()`; every previous rejection failed earlier, at the magic
+  gate, which already unloaded.
+
 ### Added — ABI 2.1: a binary plug-in can finally write a working task
 - **The host table had no `is_cancelled`.** A `dlopen`'d task body therefore could not
   poll for cancellation, which means it could not honour a timeout, `gptps_cancel`,

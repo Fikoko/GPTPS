@@ -130,6 +130,9 @@ uint64_t gptps_hal_fork_generation(void) { return 0; }
 gptps_dl *gptps_dl_open(const char *path) { return (gptps_dl *)LoadLibraryA(path); }
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol) { return (void *)GetProcAddress((HMODULE)h, symbol); }
 void      gptps_dl_close(gptps_dl *h) { if (h) FreeLibrary((HMODULE)h); }
+/* The handle IS the HMODULE here - nothing was allocated to wrap it - so keeping
+ * the mapping and dropping the bookkeeping is simply doing nothing. */
+void      gptps_dl_release(gptps_dl *h) { (void)h; }
 
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
 { return MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING) ? GPTPS_OK : GPTPS_E_IO; }

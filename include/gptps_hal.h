@@ -105,6 +105,16 @@ typedef struct gptps_dl gptps_dl;
 gptps_dl *gptps_dl_open(const char *path);          /* RTLD_LOCAL; NULL on failure */
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol);
 void      gptps_dl_close(gptps_dl *h);
+/* Free the HANDLE's bookkeeping WITHOUT unloading the library.
+ *
+ * For the one case the add-on loader genuinely needs: a setup() that failed partway
+ * may have left pointers the unwind cannot reach (a settings entry's read/write
+ * pair, a per-task setting schema), so unmapping would turn each of those into a
+ * wild jump. Retaining the MAPPING is the deliberate trade there - but retaining
+ * this small wrapper too is not, since nothing references it once the load has
+ * failed. Separating the two makes the intent exact and keeps the failure path
+ * leak-free under LeakSanitizer. */
+void      gptps_dl_release(gptps_dl *h);
 
 /* --- atomic file replace (settings save: temp -> final) ------------------ *
  * Atomically replace `final_path` with `tmp_path` (rename on POSIX, MoveFileEx

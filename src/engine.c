@@ -137,6 +137,8 @@ typedef struct gptps_owned_setting {
 typedef struct gptps_loaded {
     gptps_dl            *dl;
     const gptps_addon   *addon;
+    char                *path;    /* owned copy, for gptps_addon_get_info */
+    int                  enabled; /* 0 once gptps_addon_disable succeeded */
     struct gptps_loaded *next;
 } gptps_loaded;
 
@@ -256,6 +258,16 @@ struct gptps {
     void          *ev_ud;
     gptps_sched_fn sched_fn;      /* swappable admission ordering (NULL => built-in priority) */
     void          *sched_ud;
+    const char    *sched_owner;   /* who installed it (borrowed); NULL => seam free */
+
+    /* Namespace enforcement window (ABI 2.1). Set under e->m immediately before an
+     * add-on's setup() runs and cleared immediately after. The tid pin means only
+     * the thread INSIDE setup() is policed, so a host thread registering
+     * concurrently is never caught by someone else's namespace - load is documented
+     * as setup-time, and the pin makes that assumption cost nothing if violated. */
+    const char    *cur_ns;
+    size_t         cur_ns_len;
+    uint64_t       cur_ns_tid;
 
     gptps_loaded  *addons;        /* dlopen'd add-ons, torn down at shutdown */
     gptps_observer *observers;    /* extra event sinks (registered before submit) */
@@ -1525,6 +1537,50 @@ static char **argv_dup(const char *const *argv)
     return out;
 }
 
+/* ------------------------------------------------------------------------- */
+/* add-on namespaces (ABI 2.1)                                               */
+/*                                                                            */
+/* A namespaced add-on must register everything under "<ns>.". Enforced only   */
+/* inside its own setup(), pinned to that thread - attribution, not a sandbox. */
+/* ------------------------------------------------------------------------- */
+
+/* Is `name` acceptable under the namespace window currently in force?
+ * Caller holds e->m. True when no window is active, when this is not the thread
+ * inside setup(), or when the name carries the "<ns>." prefix. */
+static bool ns_ok(const gptps *e, const char *name)
+{
+    if (!e->cur_ns || e->cur_ns_tid != gptps_hal_thread_id()) return true;
+    if (!name) return false;
+    return strncmp(name, e->cur_ns, e->cur_ns_len) == 0 && name[e->cur_ns_len] == '.';
+}
+
+/* Say WHY a registration was refused. A namespace violation is a mistake in an
+ * add-on the operator did not write, so an unexplained GPTPS_E_INVAL would be
+ * close to undiagnosable. Caller holds e->m (cur_ns is read here). */
+static void ns_reject(const gptps *e, const char *what, const char *name)
+{
+    char msg[GPTPS_EV_NAME_MAX * 2 + 96];
+    snprintf(msg, sizeof msg,
+             "add-on namespace '%s': %s \"%s\" must be prefixed \"%s.\" - rejected",
+             e->cur_ns, what, name ? name : "(null)", e->cur_ns);
+    gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+}
+
+/* A namespace token: [a-z][a-z0-9_]{0,30}. No dots - a dot would make the "<ns>."
+ * boundary ambiguous against the dotted settings-key grammar. */
+static bool ns_token_valid(const char *ns)
+{
+    size_t i;
+    if (!ns || !*ns) return false;
+    if (ns[0] < 'a' || ns[0] > 'z') return false;
+    for (i = 0; ns[i]; ++i) {
+        char c = ns[i];
+        if (i >= 31) return false;
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return false;
+    }
+    return true;
+}
+
 gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
 {
     gptps_reg *r;
@@ -1569,6 +1625,12 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     }
 
     gptps_mutex_lock(e->m);
+    if (!ns_ok(e, def->name)) {                    /* namespaced add-on, unprefixed name */
+        ns_reject(e, "task", def->name);
+        gptps_mutex_unlock(e->m);
+        if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
+        return GPTPS_E_INVAL;
+    }
     if (registry_find(e, def->name)) {
         gptps_mutex_unlock(e->m);
         if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
@@ -1652,6 +1714,16 @@ gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
     if (!e || !name || !*name) return GPTPS_E_INVAL;
     gptps_mutex_lock(e->m);
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
+    /* The one surface where namespacing is load-bearing rather than tidy: a
+     * duplicate resource name is NOT an error here, it silently RE-BUDGETS. So two
+     * add-ons both defining "gpu" would each believe they owned the budget, and the
+     * second would quietly resize the first's. A claimed namespace makes that
+     * collision impossible instead of undetectable. */
+    if (!ns_ok(e, name)) {
+        ns_reject(e, "resource", name);
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_INVAL;
+    }
     for (i = 0; i < e->nres; ++i)                       /* existing => just re-budget */
         if (strcmp(e->resources[i].name, name) == 0) {
             e->resources[i].budget = budget;
@@ -2006,6 +2078,14 @@ gptps_status gptps_define_global(gptps *e, const char *key, gptps_setting_type t
     size_t klen;
 
     if (!e || !key || !*key) return GPTPS_E_INVAL;
+    {   /* namespaced add-on: globals must live under "<ns>." too */
+        int bad;
+        gptps_mutex_lock(e->m);
+        bad = !ns_ok(e, key);
+        if (bad) ns_reject(e, "global setting", key);
+        gptps_mutex_unlock(e->m);
+        if (bad) return GPTPS_E_INVAL;
+    }
     if (type == GPTPS_SETTING_ENUM) {
         choices = parse_choices(constraint);
         if (!choices) return GPTPS_E_CONFIG;            /* enum needs a choice set */
@@ -2044,7 +2124,25 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
     gptps_reg **snap = NULL; size_t nsnap = 0, cap = 0, i;
     gptps_reg *r;
 
-    if (!e || !leaf || !*leaf || strchr(leaf, '.')) return GPTPS_E_INVAL;  /* leaf is a bare key */
+    if (!e || !leaf || !*leaf) return GPTPS_E_INVAL;
+    {   /* A leaf is normally a BARE key - no dots - because it is materialized as
+         * "tasks.<task>.<leaf>". A namespaced add-on is the one exception: it must
+         * prefix, so it gets exactly one dot, as "<ns>.<bare>". That round-trips
+         * cleanly because the settings layer splits a key at its LAST dot, so
+         * "tasks.resize.gpuq.units" yields section "tasks.resize.gpuq", leaf
+         * "units" - valid TOML, and read back by the add-on as "gpuq.units". */
+        int inside_ns, bad;
+        gptps_mutex_lock(e->m);
+        inside_ns = (e->cur_ns && e->cur_ns_tid == gptps_hal_thread_id());
+        if (inside_ns) {
+            bad = !ns_ok(e, leaf) || strchr(leaf + e->cur_ns_len + 1, '.') != NULL;
+            if (bad) ns_reject(e, "per-task setting leaf", leaf);
+        } else {
+            bad = (strchr(leaf, '.') != NULL);       /* unchanged rule for everyone else */
+        }
+        gptps_mutex_unlock(e->m);
+        if (bad) return GPTPS_E_INVAL;
+    }
     {   /* reject collisions with the six built-in per-task leaves (they are not in
          * task_schemas, so they would otherwise pass the dup check yet fail to materialize) */
         static const char *const BUILTIN[] = { "timeout_seconds", "max_retries", "retry_backoff_seconds",
@@ -2132,7 +2230,18 @@ gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out)
 
 /* --- settings: public forwarders onto the registry --- */
 gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def)
-{ return e ? gptps_settings_add(e->settings, def) : GPTPS_E_INVAL; }
+{
+    if (!e || !def) return GPTPS_E_INVAL;
+    {   /* namespaced add-on: its settings keys must live under "<ns>." */
+        int bad;
+        gptps_mutex_lock(e->m);
+        bad = !ns_ok(e, def->key);
+        if (bad) ns_reject(e, "setting", def->key);
+        gptps_mutex_unlock(e->m);
+        if (bad) return GPTPS_E_INVAL;
+    }
+    return gptps_settings_add(e->settings, def);
+}
 size_t gptps_settings_count(gptps *e)
 { return e ? gptps_settings_size(e->settings) : 0; }
 gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_setting_info *out)
@@ -2228,7 +2337,9 @@ static const gptps_api_routines G_API = {
     gptps_settings_watch,
     gptps_set_task_priority,
     gptps_strerror,
-    gptps_version
+    gptps_version,
+    /* seam ownership: an add-on must pass flags == 0 and fail setup() on E_BUSY */
+    gptps_set_scheduler_ex
 };
 
 /* Undo whatever a FAILED addon setup() managed to register before it gave up.
@@ -2254,6 +2365,10 @@ static void addon_unwind(gptps *e, gptps_observer *obs0, gptps_constraint *con0,
         gptps_constraint *c = e->constraints; e->constraints = c->next; c->next = cdead; cdead = c;
     }
     e->sched_fn = sched0; e->sched_ud = schedud0;
+    /* If the failed setup took the seam, the owner label must go back with it -
+     * otherwise the engine reports a scheduler owned by an add-on that is no
+     * longer installing anything. */
+    if (!sched0) e->sched_owner = NULL;
     for (r = e->registry; r && r != reg0 && nnames < GPTPS_ADDON_UNWIND_MAX; r = r->next)
         snprintf(names[nnames++], GPTPS_EV_NAME_MAX, "%s", r->name);
     gptps_mutex_unlock(e->m);
@@ -2274,6 +2389,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
     gptps_loaded *node;
     char *err = NULL;
     gptps_status s;
+    const char *ns = NULL;
 
     if (!e || !path) return GPTPS_E_INVAL;
 
@@ -2288,9 +2404,41 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
     if (!addon ||
         addon->magic != GPTPS_ABI_MAGIC ||
         addon->abi_version_major != GPTPS_ABI_VERSION_MAJOR ||
-        addon->struct_size < GPTPS_ADDON_MIN_SIZE) {   /* ABI: append-safe floor */
+        addon->struct_size < GPTPS_ADDON_MIN_SIZE ||   /* ABI: append-safe floor */
+        !addon->name) {                                /* reported by introspection */
         gptps_dl_close(dl);
         return GPTPS_E_ABI;
+    }
+    /* Built against a NEWER minor than this core. Append-only means we can still use
+     * it - we simply ignore the fields past our size - but that graceful degradation
+     * should not be invisible: an operator debugging "why is my add-on's new feature
+     * doing nothing" deserves the hint. */
+    if (addon->struct_size > sizeof(gptps_addon)) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "add-on '%s' was built against a newer ABI minor (descriptor %u bytes vs %u); "
+                 "fields past this core's size are ignored",
+                 addon->name, (unsigned)addon->struct_size, (unsigned)sizeof(gptps_addon));
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+
+    /* Claim the namespace token, if it declared one. Claiming is what makes the
+     * guarantee real: a second add-on wanting the same token is refused here rather
+     * than silently shadowing the first. */
+    if (GPTPS_STRUCT_HAS(gptps_addon, addon, ns) && addon->ns) {
+        gptps_loaded *it;
+        if (!ns_token_valid(addon->ns)) { gptps_dl_close(dl); return GPTPS_E_ABI; }
+        gptps_mutex_lock(e->m);
+        for (it = e->addons; it; it = it->next) {
+            const gptps_addon *o = it->addon;
+            if (GPTPS_STRUCT_HAS(gptps_addon, o, ns) && o->ns && strcmp(o->ns, addon->ns) == 0) {
+                gptps_mutex_unlock(e->m);
+                gptps_dl_close(dl);
+                return GPTPS_E_DUP;
+            }
+        }
+        gptps_mutex_unlock(e->m);
+        ns = addon->ns;
     }
 
     if (addon->setup) {
@@ -2307,29 +2455,122 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         gptps_mutex_lock(e->m);
         obs0 = e->observers; con0 = e->constraints; reg0 = e->registry;
         sched0 = e->sched_fn; schedud0 = e->sched_ud;
+        /* Open the namespace window, pinned to this thread. */
+        e->cur_ns = ns; e->cur_ns_len = ns ? strlen(ns) : 0;
+        e->cur_ns_tid = gptps_hal_thread_id();
         gptps_mutex_unlock(e->m);
 
         s = addon->setup(e, &G_API, &err);
+
+        gptps_mutex_lock(e->m);
+        e->cur_ns = NULL; e->cur_ns_len = 0; e->cur_ns_tid = 0;
+        gptps_mutex_unlock(e->m);
+
         if (s != GPTPS_OK) {
             addon_unwind(e, obs0, con0, reg0, sched0, schedud0);
             /* Deliberately NOT gptps_dl_close(dl). A partially-initialised add-on can
              * still have left pointers the unwind cannot reach - a settings entry's
              * read/write pair, a per-task setting schema, a named resource. Unmapping
-             * the library would turn every one of those into a wild jump; leaking a
-             * single mapping on a path that has already failed is the safer trade. */
+             * the library would turn every one of those into a wild jump; retaining a
+             * single mapping on a path that has already failed is the safer trade.
+             *
+             * The MAPPING is what must survive, though - not the handle wrapper, which
+             * nothing references once this returns. Releasing it keeps the deliberate
+             * decision exact and this path leak-free. */
+            gptps_dl_release(dl);
             return s;
         }
     }
 
     node = (gptps_loaded *)gptps_calloc(1, sizeof *node);
-    if (!node) {
+    if (node) {
+        size_t n = strlen(path) + 1;
+        node->path = (char *)gptps_malloc(n);
+        if (node->path) memcpy(node->path, path, n);
+    }
+    if (!node || !node->path) {
+        if (node) gptps_free(node->path);
+        gptps_free(node);
         if (addon->teardown) addon->teardown(e);
-        /* same reasoning as the setup-failure path above: do not unmap */
+        /* same reasoning as the setup-failure path above: keep the mapping, drop the
+         * bookkeeping - setup() SUCCEEDED here, so its pointers are live */
+        gptps_dl_release(dl);
         return GPTPS_E_NOMEM;
     }
-    node->dl = dl; node->addon = addon;
+    node->dl = dl; node->addon = addon; node->enabled = 1;
     gptps_mutex_lock(e->m);
     node->next = e->addons; e->addons = node;
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+size_t gptps_addon_count(gptps *e)
+{
+    size_t n = 0;
+    gptps_loaded *a;
+    if (!e) return 0;
+    gptps_mutex_lock(e->m);
+    for (a = e->addons; a; a = a->next) ++n;
+    gptps_mutex_unlock(e->m);
+    return n;
+}
+
+gptps_status gptps_addon_get_info(gptps *e, size_t index, gptps_addon_info *out)
+{
+    gptps_loaded *a;
+    size_t i = 0;
+    if (!e || !out) return GPTPS_E_INVAL;
+    if (out->struct_size < sizeof *out) return GPTPS_E_INVAL;
+    gptps_mutex_lock(e->m);
+    for (a = e->addons; a; a = a->next, ++i) {
+        if (i != index) continue;
+        out->name              = a->addon->name;
+        out->ns                = GPTPS_STRUCT_HAS(gptps_addon, a->addon, ns) ? a->addon->ns : NULL;
+        out->path              = a->path;
+        out->seam              = a->addon->seam;
+        out->abi_version_major = a->addon->abi_version_major;
+        out->enabled           = a->enabled;
+        gptps_mutex_unlock(e->m);
+        return GPTPS_OK;
+    }
+    gptps_mutex_unlock(e->m);
+    return GPTPS_E_NOTFOUND;
+}
+
+gptps_status gptps_addon_disable(gptps *e, const char *ns_or_name)
+{
+    gptps_loaded *a, *hit = NULL;
+    gptps_status (*fn)(gptps *) = NULL;
+    gptps_status st;
+
+    if (!e || !ns_or_name) return GPTPS_E_INVAL;
+
+    gptps_mutex_lock(e->m);
+    /* namespace first (the unambiguous identity), then the self-declared name */
+    for (a = e->addons; a && !hit; a = a->next) {
+        const gptps_addon *ad = a->addon;
+        if (GPTPS_STRUCT_HAS(gptps_addon, ad, ns) && ad->ns && strcmp(ad->ns, ns_or_name) == 0)
+            hit = a;
+    }
+    for (a = e->addons; a && !hit; a = a->next)
+        if (a->addon->name && strcmp(a->addon->name, ns_or_name) == 0) hit = a;
+
+    if (!hit)          { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+    if (!hit->enabled) { gptps_mutex_unlock(e->m); return GPTPS_OK; }  /* idempotent */
+    if (!GPTPS_STRUCT_HAS(gptps_addon, hit->addon, disable) || !hit->addon->disable) {
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_INVAL;   /* matched, but it declares no disable hook */
+    }
+    fn = hit->addon->disable;
+    gptps_mutex_unlock(e->m);
+
+    /* Call OUTSIDE the lock: disable() unregisters its own observers/constraints/
+     * tasks, every one of which takes e->m itself. */
+    st = fn(e);
+    if (st != GPTPS_OK) return st;
+
+    gptps_mutex_lock(e->m);
+    hit->enabled = 0;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
 }
@@ -2538,14 +2779,42 @@ gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data)
 /* Scheduler seam: swap the admission ORDERING key (fn == NULL resets to the
  * built-in priority ordering). Setup-time; the hook runs under e->m on the
  * dispatcher hot path (must be fast / non-reentrant). */
-gptps_status gptps_set_scheduler(gptps *e, gptps_sched_fn fn, void *user_data)
+gptps_status gptps_set_scheduler_ex(gptps *e, gptps_sched_fn fn, void *user_data,
+                                    const char *owner, unsigned flags)
 {
     if (!e) return GPTPS_E_INVAL;
     gptps_mutex_lock(e->m);
+    /* An ordering key is a total order, and a total order has one definition. Two
+     * independent scorers is a CONFLICT, not something to silently merge - so unless
+     * the caller explicitly asks to take it, an owned seam is reported as busy and
+     * the incumbent keeps ordering. Releasing (fn == NULL) is allowed to the current
+     * owner without the flag, so an add-on's disable() can hand the seam back. */
+    if (!(flags & GPTPS_SCHED_REPLACE) && e->sched_fn) {
+        int self = (fn == NULL && owner && e->sched_owner && strcmp(owner, e->sched_owner) == 0);
+        if (!self) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
+    }
     e->sched_fn = fn; e->sched_ud = user_data;
+    e->sched_owner = fn ? owner : NULL;
     gptps_cond_signal(e->cv_disp);   /* re-evaluate ordering on the next pass */
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
+}
+
+const char *gptps_scheduler_owner(gptps *e)
+{
+    const char *o;
+    if (!e) return NULL;
+    gptps_mutex_lock(e->m);
+    o = e->sched_fn ? e->sched_owner : NULL;
+    gptps_mutex_unlock(e->m);
+    return o;
+}
+
+gptps_status gptps_set_scheduler(gptps *e, gptps_sched_fn fn, void *user_data)
+{
+    /* Unchanged behaviour: the host takes the seam regardless. Every existing
+     * caller, and tests/test_sched_seam.c, keep working exactly as before. */
+    return gptps_set_scheduler_ex(e, fn, user_data, "host", GPTPS_SCHED_REPLACE);
 }
 
 gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_data)
@@ -2796,8 +3065,10 @@ gptps_status gptps_shutdown(gptps *e)
         gptps_loaded *a = e->addons;
         while (a) {
             gptps_loaded *n = a->next;
+            /* teardown runs once whether or not the add-on was disabled */
             if (a->addon->teardown) a->addon->teardown(e);
             gptps_dl_close(a->dl);
+            gptps_free(a->path);
             gptps_free(a);
             a = n;
         }
