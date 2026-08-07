@@ -262,6 +262,21 @@ add_library(addon_ns_bad MODULE tests/addon_ns_bad.c)
 target_include_directories(addon_ns_bad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(addon_ns_bad PROPERTIES PREFIX "")
 
+# The SAME policy as addons/gpu_quota.c, shipped as a binary plug-in. Built as a
+# MODULE precisely because that is its tier: the host never calls into it.
+add_library(gpu_quota_plugin MODULE addons/gpu_quota_plugin.c)
+target_include_directories(gpu_quota_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(gpu_quota_plugin PROPERTIES PREFIX "")
+
+add_executable(test_plugin_tier tests/test_plugin_tier.c)
+target_include_directories(test_plugin_tier PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_plugin_tier PRIVATE gptps)
+target_compile_definitions(test_plugin_tier PRIVATE
+    ADDON_GPUQ_PATH="$<TARGET_FILE:gpu_quota_plugin>")
+add_dependencies(test_plugin_tier gpu_quota_plugin)
+add_test(NAME plugin_tier COMMAND test_plugin_tier)
+set_tests_properties(plugin_tier PROPERTIES TIMEOUT 30)
+
 add_executable(test_addon_ns tests/test_addon_ns.c)
 target_include_directories(test_addon_ns PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_addon_ns PRIVATE gptps)
