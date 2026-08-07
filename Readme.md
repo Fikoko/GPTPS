@@ -22,7 +22,8 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Manage tasks at runtime](#manage-tasks-at-runtime-control-plane) · [Live terminal dashboard](#live-terminal-dashboard) · [Executor kinds](#executor-kinds-per-task-via-defexec)
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
-- [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes) · [Security posture](docs/SECURITY.md)
+- [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
+- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md)
 
 ## Quick start
 
@@ -77,7 +78,7 @@ mingw-w64; the build auto-selects the Win32 backend).
 
 ```sh
 cmake -S . -B build          # configure (once)
-cmake --build build -j       # libgptps.a + the examples + the test suite
+cmake --build build -j       # libgptps.a + the add-on libraries + examples + the test suite
 ```
 
 Scaling is never in the **core** — shard across engines, route across worker processes, or
@@ -134,8 +135,9 @@ ctest --test-dir build --output-on-failure   # full suite (should be 100%)
 More in [`examples/`](examples/): `external_program` (run any binary as a task) and
 `wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below).
 
-**4. Embed it in your own program.** Generate the single-file amalgamation (two files, zero
-build system), drop the [Quick start](#quick-start) program into `myapp.c`, and link:
+**4. Embed it in your own program.** Generate the amalgamation — two files for the core, plus
+a self-contained `.c`/`.h` pair for each add-on you ask for, and no build system — drop the
+[Quick start](#quick-start) program into `myapp.c`, and link:
 
 ```sh
 sh tools/amalgamate.sh out   # writes out/gptps.c and out/gptps.h
@@ -144,8 +146,15 @@ cc -std=c99 myapp.c out/gptps.c -Iout -lpthread        # macOS (dlopen is in lib
 ./myapp
 ```
 
-To embed the **dashboard** too, also compile the add-on: add `addons/gptps_tui.c -Iaddons`
-(`examples/demo.c` is a fuller starting template).
+To embed the **dashboard** too, ask for it when you amalgamate — no repo checkout needed:
+
+```sh
+sh tools/amalgamate.sh out --addons tui     # also writes out/gptps_tui.c + .h
+sh tools/amalgamate.sh --list               # everything available
+cc -std=c99 myapp.c out/gptps.c out/gptps_tui.c -Iout -lpthread -ldl
+```
+
+(`examples/demo.c` is a fuller starting template.)
 
 **Install / consume (optional).** `cmake --install build --prefix <dir>` installs the header,
 the static library, a CMake package config and a pkg-config file — plus **each add-on as its
@@ -412,8 +421,10 @@ gptps_pool_close(pool);
 
 The router's only shared state is a round-robin cursor (keyed routing is lock-free); each
 shard is a full engine. [`examples/bench_pool`](examples/bench_pool.c) measures it: on a
-32-core box, aggregate tiny-task throughput rose from ~15k/s at 1 shard to ~290k/s at 8
-(≈19×) — the single-writer ceiling, then composition breaking past it.
+32-core box at 400k items, aggregate tiny-task throughput rose from ~15k/s at 1 shard to
+~290k/s at 8 (≈19×) — the single-writer ceiling, then composition breaking past it. Use a
+large item count if you rerun it: the CI-quick default of 40k finishes in ~20ms and is
+noise-dominated.
 
 **Scale out — worker processes (`gptps_xport`).** Fork N persistent worker *processes* and
 ship each submit to one over IPC, marshalling the result back — work runs in a separate
@@ -724,7 +735,8 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
 design, the last breaking change) · **9** add-on modules + 1 example binary plug-in ·
-**51** tests · **12** CI jobs, every one required to pass.
+**51** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
+required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
 hang it hangs your host's exit path — so these are contractual, and
@@ -757,8 +769,8 @@ future work: a bundled default wasm runtime so neither a CLI nor an adapter is n
 
 The core is deliberately small and general: a mechanism-only engine with **four called seams**
 (task / constraint / observer / scheduler) — called because the core *invokes* them — and **one
-composed pattern** (transport), which is a shape a module takes rather than an interface the
-core offers. Anything specific — GPU quotas, rate limits, priority, time-of-day windows — is a
+composed pattern** (`GPTPS_SEAM_COMPOSITION` — spelled `GPTPS_SEAM_TRANSPORT` before ABI 2.1
+and still aliased), which is a shape a module takes rather than an interface the core offers. Anything specific — GPU quotas, rate limits, priority, time-of-day windows — is a
 **constraint add-on**; the admission *order* is a **scheduler** hook; scale-up (`gptps_pool`)
 and scale-out (`gptps_xport`) are **composition libraries** that sit above the engine and
 consume no seam at all. So the core stays minimal while the variety, and the scaling, live
@@ -782,7 +794,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 
 | Not in the core | Why, and where it belongs instead |
 |---|---|
-| **Distributed *scheduling*** (which node runs what, work stealing, membership, failure detection, global fair-share, rebalancing) | Note the boundary, because the neighbouring thing IS permitted. **Transport** — route work to a *named* remote, marshal it, bring the result back, exclude a dead endpoint, retry elsewhere — is an add-on, and a welcome one: that is exactly the step `gptps_xport` describes as "swap the socketpair for a TCP socket". **Scheduling** is where it stops. The moment a module needs the global state of *other* nodes it needs consensus, and the failure model changes completely: the novel thing here is *single-process* self-throttling admission, and a cluster scheduler is a different product. Node selection is a router's business (`gptps_pool` already picks a shard); admission *ordering* is `gptps_set_scheduler`'s; neither is a cluster scheduler. |
+| **Distributed *scheduling*** (which node runs what, work stealing, membership, failure detection, global fair-share, rebalancing) | Note the boundary, because the neighbouring thing IS permitted. **Transport** — route work to a *named* remote, marshal it, bring the result back, exclude a dead endpoint, retry elsewhere — is an add-on, and a welcome one: that is exactly the step `gptps_xport` gestures at — and `addons/gptps_remote` has already written down the wire format it would need, precisely so nobody mistakes it for a socket swap. **Scheduling** is where it stops. The moment a module needs the global state of *other* nodes it needs consensus, and the failure model changes completely: the novel thing here is *single-process* self-throttling admission, and a cluster scheduler is a different product. Node selection is a router's business (`gptps_pool` already picks a shard); admission *ordering* is `gptps_set_scheduler`'s; neither is a cluster scheduler. |
 | **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/gptps_durable_queue` already does it on the public API. |
 | **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on; if one genuinely cannot be written, that is an argument for a specific *accessor*, not a format. |
 | **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` does not need to be in the mechanism — and this row no longer asks you to take that on faith: `addons/gptps_await` **is** those lines, on the observer seam, with no core change. The core already supplies the one guarantee such a wait needs — every submitted handle reaches exactly one terminal event (`tests/test_reconcile`) — so nothing was missing. Chaining and dependencies are `addons/gptps_orch`'s job, not a future's. |
@@ -793,8 +805,10 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 
 **The tie-break, when nothing above decides it:** *does a user with a name want this?*
 Not "would this be useful" — every proposal is useful to someone hypothetical. This
-project reached 50 public functions and 7 add-ons before it had a single user, which is
-the failure mode the rule exists to prevent.
+project reached **55 public functions and 9 add-ons** before it had a single user, which
+is the failure mode the rule exists to prevent — and those numbers have only gone up
+since the rule was written, so it applies to the next proposal harder than it did to the
+last one.
 
 What would legitimately change the core: a capability that **cannot be built on the four
 called seams at all** (task / constraint / observer / scheduler — see Design notes). That

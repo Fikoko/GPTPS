@@ -22,7 +22,7 @@ set(GPTPS_ADDON_ALL await durable_queue gpu_quota orch pool remote tui wasm_exec
 # in with a plain `set(GPTPS_ADDONS "pool")` before add_subdirectory - but under
 # CMP0126's default (OLD) behaviour, which this project inherits by supporting CMake
 # 3.13, an unguarded `set(... CACHE ...)` here REMOVES that normal variable and the
-# cache default wins. The consumer asked for one add-on and silently got all eight.
+# cache default wins. The consumer asked for one add-on and silently got them all.
 if(NOT DEFINED GPTPS_ADDONS)
     set(GPTPS_ADDONS "all" CACHE STRING
         "Add-ons to build: all | none | a ;-list from: ${GPTPS_ADDON_ALL}")

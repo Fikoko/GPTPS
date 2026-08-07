@@ -18,7 +18,7 @@ One question decides it:
 | may | expose a C API, own threads, own an entire engine, use its own dependencies, ship platform code | register tasks / constraints / observers / a scheduler; define resources, globals and per-task settings; be configured entirely from TOML |
 | cannot | be added without a rebuild | be called by the host, own the engine lifecycle, repoint the allocator or log sink, load other plug-ins |
 
-**A module is not the lesser thing.** Six of the eight bundled add-ons are modules *by
+**A module is not the lesser thing.** Most of the bundled add-ons are modules *by
 necessity*, because their whole point is an API the host calls — `gptps_dq_submit()`,
 `gptps_orch_after()`, `gptps_tui_run()`. `gpu_quota` ships in **both** tiers, and the
 diff between `addons/gptps_gpu_quota.c` and `addons/gptps_gpu_quota_plugin.c` is the
