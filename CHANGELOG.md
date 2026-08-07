@@ -5,6 +5,35 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Fixed — an exec kind this core does not know is now refused at registration
+- `gptps_register_task` never range-checked `def->exec`. A value outside
+  `{INPROC, OOP, PROGRAM}` registered cleanly, and `execute()` then treated
+  "not INPROC and not OOP" as PROGRAM — so every item of that type ran with `argv`
+  NULL, failed, burned its whole retry budget and dead-lettered. A setup mistake was
+  diagnosed as a task failure. Both ends are now explicit: registration rejects the
+  value with `GPTPS_E_INVAL`, and `execute()`'s final branch is a hard stop rather
+  than a fallthrough. That second half is the forward-compatibility guard — if a
+  future ABI MINOR ever appends a fourth kind, an older core meeting a newer add-on
+  must REFUSE work it cannot run, never silently run it as something else.
+  (`test_engine`.)
+
+### Corrected — `GPTPS_SEAM_TRANSPORT` never had a consumer, or an interface
+- The 1.12 entry below calls `addons/gptps_xport` "the reference consumer of
+  `GPTPS_SEAM_TRANSPORT`", and `addons/gptps_xport.h` said the same. **Both were
+  false in code.** `gptps_xport` consumes no seam: it never calls into an engine,
+  registers nothing, and does not use the add-on host-table ABI at all. Nor is there
+  anything to consume — `GPTPS_SEAM_TRANSPORT` has no struct, no function-pointer
+  typedef and no register call anywhere in the library; it is an enumerator and
+  nothing else.
+- The history above is left as written; this entry is the correction. The distinction
+  the docs now draw: **four CALLED seams** (task / constraint / observer / scheduler —
+  real because the core invokes them) **and one COMPOSED pattern** (a transport sits on
+  the other side of the engine and calls IN, so an interface for it would be a vtable
+  with no call site). That the pattern needs nothing from the core is the strongest
+  evidence for the project's own thesis, not a gap in it.
+
 ## [1.0.0] - 2026-08-06
 
 **First stable release.** The API and the add-on ABI are now under semantic

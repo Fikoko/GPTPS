@@ -10,8 +10,16 @@
  * socketpair here is the only thing standing between this and cross-MACHINE
  * execution: swap it for a TCP socket and the same protocol reaches another host.
  *
- * It is the reference consumer of the transport seam (GPTPS_SEAM_TRANSPORT) and,
- * like the pool, needs NO core change - it is built on POSIX IPC plus a handler you
+ * It is the reference case for the COMPOSITION pattern, and the distinction is worth
+ * being exact about: this file consumes no seam at all. It never calls into an engine,
+ * registers no task, constraint, observer or scheduler, and does not use the add-on
+ * host-table ABI. The core is not on its path. That is the point rather than a gap -
+ * the pattern needs nothing from the core, which is why the core offers it nothing.
+ * (The four REAL seams are real because the core CALLS something: a task's run, a
+ * constraint, a scheduler score, an observer. A transport sits on the other side of
+ * the engine and calls IN, so an interface for it would be a vtable with no call site.)
+ *
+ * Like the pool, it needs NO core change - it is built on POSIX IPC plus a handler you
  * supply. The transport is the MECHANISM (route + marshal + supervise workers); how
  * a worker actually runs a task is your handler's business (dispatch on the name;
  * inside it you may drive a gptps engine, an executor, or plain C).

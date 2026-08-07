@@ -629,13 +629,20 @@ future work: a bundled default wasm runtime so neither a CLI nor an adapter is n
 
 ## Design notes
 
-The core is deliberately small and general: a mechanism-only engine with five add-on seams
-(task / constraint / scheduler / transport / observer). Anything specific — GPU quotas, rate
-limits, priority, time-of-day windows — is a **constraint add-on**; the admission *order* is
-a **scheduler** hook; scale-up (`gptps_pool`) and scale-out (`gptps_xport`) are **transport /
-composition** add-ons — so the core stays minimal while the variety, and the scaling, live on
-the seams. The novel piece is single-process *self-throttling* admission: "can my own process
+The core is deliberately small and general: a mechanism-only engine with **four called seams**
+(task / constraint / observer / scheduler) — called because the core *invokes* them — and **one
+composed pattern** (transport), which is a shape a module takes rather than an interface the
+core offers. Anything specific — GPU quotas, rate limits, priority, time-of-day windows — is a
+**constraint add-on**; the admission *order* is a **scheduler** hook; scale-up (`gptps_pool`)
+and scale-out (`gptps_xport`) are **composition libraries** that sit above the engine and
+consume no seam at all. So the core stays minimal while the variety, and the scaling, live
+outside it. The novel piece is single-process *self-throttling* admission: "can my own process
 afford to start this task right now, given my own remaining budget?"
+
+That last distinction is load-bearing rather than pedantic. `gptps_pool` and `gptps_xport`
+needed **zero** core changes because a transport calls *into* the engine rather than being
+called *by* it — which is precisely why the core gives it no interface, and the strongest
+evidence for the "compose, don't extend" thesis this project is built on.
 
 For the full internals — concurrency model, dispatch loop, scheduler, executors, HAL, and the
 add-on ABI — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -649,7 +656,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 
 | Not in the core | Why, and where it belongs instead |
 |---|---|
-| **Distributed scheduling / cross-machine work stealing** | The novel thing here is *single-process* self-throttling admission. A cluster scheduler is a different product with a different failure model. `gptps_xport` shows the transport seam carrying work to other processes; take it to TCP in an add-on. |
+| **Distributed *scheduling*** (which node runs what, work stealing, membership, failure detection, global fair-share, rebalancing) | Note the boundary, because the neighbouring thing IS permitted. **Transport** — route work to a *named* remote, marshal it, bring the result back, exclude a dead endpoint, retry elsewhere — is an add-on, and a welcome one: that is exactly the step `gptps_xport` describes as "swap the socketpair for a TCP socket". **Scheduling** is where it stops. The moment a module needs the global state of *other* nodes it needs consensus, and the failure model changes completely: the novel thing here is *single-process* self-throttling admission, and a cluster scheduler is a different product. Node selection is a router's business (`gptps_pool` already picks a shard); admission *ordering* is `gptps_set_scheduler`'s; neither is a cluster scheduler. |
 | **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/durable_queue` already does it on the public API. |
 | **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on; if one genuinely cannot be written, that is an argument for a specific *accessor*, not a format. |
 | **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` is ~150 lines on the observer seam and does not need to be in the mechanism — see the note below on what would change this. |

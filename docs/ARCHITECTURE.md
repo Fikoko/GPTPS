@@ -16,7 +16,7 @@ for the *API contract*, see [`include/gptps.h`](../include/gptps.h).
 | Goal | Consequence in the codebase |
 |---|---|
 | **Portability** — one task, any hardware | Strict C99 core; every OS primitive is behind the HAL (`gptps_hal.h`). No `_Atomic` in the core. |
-| **Modularity** — handle all outcomes | Mechanism-only core + five add-on *seams* (task / constraint / scheduler / transport / observer). Domain policy lives in add-ons, not the core. |
+| **Modularity** — handle all outcomes | Mechanism-only core + four *called* seams (task / constraint / observer / scheduler) and one *composed* pattern (transport). Domain policy lives in add-ons, not the core. |
 | **Embeddability** | No mandatory third-party dependency. Single-file amalgamation (`gptps.c` + `gptps.h`). Stable, versioned ABI. |
 | **General purpose** | Tasks are opaque (`payload` bytes → `result` bytes). Three executors cover in-process, isolated, and any-language work. |
 
@@ -309,14 +309,31 @@ static memory pool, that is the whole bare-metal dependency surface.
 
 ## 9. Add-ons and the host-table ABI
 
-The core is mechanism-only; variety lives in add-ons across four seams:
+The core is mechanism-only; variety lives in add-ons. There are **four called seams**
+— real extension interfaces, so called because the core *invokes* them:
 
 - **task** — register task types (frozen v1.0);
 - **constraint** — an admission hook (`ADMIT` / `DENY` / `DEFER`), consulted in
   the dispatcher so it MUST be non-blocking; used for rate limits, quotas,
   time-of-day windows, GPU caps;
-- **observer** — an extra event sink (analytics, durable queue, dead-letter sink);
-- **transport** — an exec bridge (experimental; frozen with its first consumer).
+- **observer** — an extra event sink (analytics, durable queue, dead-letter sink),
+  run with the engine lock RELEASED so it MAY call back into the engine;
+- **scheduler** — the admission *ordering* key (frozen v1.12), a single-slot hook
+  scored under the dispatcher lock.
+
+…and **one composed pattern**, which is not an interface at all:
+
+- **transport** (`GPTPS_SEAM_TRANSPORT`) — a module that carries work OUT of this
+  engine entirely. It has **no struct, no function-pointer typedef and no register
+  call**: the core never invokes a transport, because a transport sits on the *other
+  side* of the engine and calls *in*. `addons/gptps_xport` is the reference case and
+  it consumes no seam — it is built on POSIX IPC plus a handler you supply. That the
+  pattern needs nothing from the core is the point: an interface here would be a
+  vtable with no call site, and it would make the admission budget a lie, since the
+  dispatcher reserves `mem_bytes` for work that will not run in this address space.
+
+Which side you are writing on is the first thing to know as an add-on author, which
+is why the distinction is drawn here rather than smoothed over as "five seams".
 
 A dlopen'd add-on calls the core **only** through a passed, version-stamped
 `gptps_api_routines` table and links **no** core symbols (this also avoids symbol
@@ -326,11 +343,19 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams can simply be compiled into the host. Three ship
+and the observer/constraint seams can simply be compiled into the host. **Seven** ship
 in `addons/`: `durable_queue.c` (observer seam → crash-durable journal),
-`gpu_quota.c` (constraint + observer composed → GPU-unit admission quota), and
-`wasm_exec.c` (module-as-task with a pluggable wasm runtime). See
+`gpu_quota.c` (a thin wrapper over the core's named-resource budgets),
+`wasm_exec.c` (module-as-task with a pluggable wasm runtime), `tui.c` (observer +
+settings → live dashboard), `gptps_orch.c` (observer + submit → run-after/fan-in
+dependencies), and the two composition libraries `gptps_pool.c` (N engines in one
+process, scale-up) and `gptps_xport.c` (N worker processes, scale-out). See
 [`addons/README.md`](../addons/README.md).
+
+Note the last two are *composition libraries* rather than add-ons in the loader's
+sense: they register on no seam, use no host table, and sit above the engine instead
+of inside it. `gptps_pool` in fact owns N whole engines. Calling them add-ons is what
+makes the loader look unused; naming them accurately is more honest and more useful.
 
 ---
 

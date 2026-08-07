@@ -66,6 +66,24 @@ int main(void)
     CHECK(gptps_register_task(e, &big) == GPTPS_OK);
     CHECK(gptps_submit(e, "big", "x", 1, &h) == GPTPS_E_BUDGET);   /* never-fit reject */
 
+    /* An exec kind this build does not know must be refused HERE, where it can be
+     * named, rather than at run time. Before this check the value fell through
+     * execute()'s PROGRAM branch: the type registered fine, then every item failed
+     * with argv NULL, burned its retries and dead-lettered - a setup mistake
+     * reported as a task failure. Also the forward-compatibility guard: an older
+     * core meeting a newer add-on must reject work it cannot run, never run it as
+     * something else. */
+    {
+        gptps_task_def bad;
+        memset(&bad, 0, sizeof bad);
+        bad.struct_size = sizeof bad; bad.name = "badkind"; bad.run = task_ok;
+        bad.exec = (gptps_exec_kind)42;
+        bad.default_cost.struct_size = sizeof bad.default_cost;
+        bad.default_policy.struct_size = sizeof bad.default_policy;
+        CHECK(gptps_register_task(e, &bad) == GPTPS_E_INVAL);
+        CHECK(gptps_task_exists(e, "badkind") == 0);               /* nothing registered */
+    }
+
     for (i = 0; i < N; ++i)
         CHECK(gptps_submit(e, "ok", &i, sizeof i, &h) == GPTPS_OK);
 

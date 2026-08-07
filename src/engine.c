@@ -480,10 +480,24 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
          * it->cancel lets gptps_cancel / shutdown / removal hard-kill the child. */
         st = gptps_oop_execute(it->def, it->payload, it->payload_len,
                                it->cost.mem_bytes, it->policy.timeout_seconds, it->cancel, &oop_res, &oop_len);
-    } else {
+    } else if (it->def->exec == GPTPS_EXEC_PROGRAM) {
         /* enforced path: fork+exec an external program; payload->stdin, stdout->result */
         st = gptps_program_execute(it->def, it->payload, it->payload_len,
                                    it->cost.mem_bytes, it->policy.timeout_seconds, it->cancel, &oop_res, &oop_len);
+    } else {
+        /* Unreachable: gptps_register_task rejects an out-of-range exec kind. This is a
+         * hard stop rather than the fallthrough it replaces, and the difference matters
+         * for FORWARD compatibility, not for today's three kinds.
+         *
+         * The old code let the PROGRAM branch catch every value that was not INPROC or
+         * OOP. So a def carrying an unknown kind was RUN AS A PROGRAM - with argv NULL,
+         * which fails deep inside the executor and burns the item's whole retry budget
+         * before dead-lettering it. A misconfiguration was diagnosed as a task failure.
+         *
+         * If a future ABI MINOR ever appends a fourth kind, an older core loading a
+         * newer add-on MUST refuse work it cannot run, never silently run it as
+         * something else. Rejecting here is what makes appending a kind safe later. */
+        st = GPTPS_E_INVAL;
     }
 
     /* deliver the result on the FINISHED event (valid for the callback's duration) */
@@ -1520,6 +1534,14 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
 
     if (!e || !def || !def->name) return GPTPS_E_INVAL;
     if (def->struct_size < GPTPS_TASK_DEF_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: below the frozen minimum */
+    /* Reject an exec kind this core does not know, at REGISTRATION - the only place it
+     * can be reported as what it is. Without this the value flowed through to execute(),
+     * which used to treat "not INPROC and not OOP" as PROGRAM: a typo'd or
+     * newer-than-us kind registered cleanly, then failed once per attempt with argv
+     * NULL, consumed its retries and dead-lettered. That turns a setup mistake into a
+     * runtime mystery. Kept as an explicit range test (not a switch) so appending a
+     * fourth enumerator later is a one-line change here and in execute(). */
+    if ((unsigned)def->exec > (unsigned)GPTPS_EXEC_PROGRAM) return GPTPS_E_INVAL;
     if (def->exec == GPTPS_EXEC_PROGRAM) {
         if (!def->argv || !def->argv[0]) return GPTPS_E_INVAL; /* program needs an argv */
     } else if (!def->run) {
