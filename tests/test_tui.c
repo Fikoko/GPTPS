@@ -7,7 +7,7 @@
  * terminal I/O are exercised only on a real terminal and are not unit-tested here.
  */
 #include "gptps.h"
-#include "tui.h"
+#include "gptps_tui.h"
 #include <stdio.h>
 #include <string.h>
 

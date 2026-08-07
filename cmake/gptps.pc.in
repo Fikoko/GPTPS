@@ -1,11 +1,23 @@
-prefix=@CMAKE_INSTALL_PREFIX@
+# RELOCATABLE: the prefix is derived from where this .pc file actually sits, not
+# baked in at configure time. Baking it in is the usual way, and it is wrong the
+# moment anyone runs `cmake --install --prefix <other>` - CMake honours that at
+# install time while the .pc still claims the configure-time prefix, so every -I and
+# -L points somewhere that does not exist. Distro packagers hit this constantly
+# (DESTDIR staging), and it fails as a confusing "gptps.h: No such file".
+prefix=${pcfiledir}/@GPTPS_PC_PREFIX_REL@
 exec_prefix=${prefix}
 libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
 includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+# Where a binary PLUG-IN should install itself. GPTPS never SCANS this directory -
+# docs/SECURITY.md is explicit that add-on paths are code, so a host still names an
+# explicit path. It exists so plug-in authors have one canonical answer to "where do
+# I put it?" instead of seven. Read it with:
+#     pkg-config --variable=plugindir gptps
+plugindir=${libdir}/gptps
 
 Name: gptps
 Description: GPTPS - embeddable C99 general-purpose task processing system
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -lgptps
-Libs.private: -lpthread
+Libs.private: @GPTPS_PC_PRIVATE_LIBS@
 Cflags: -I${includedir}

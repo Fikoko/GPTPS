@@ -15,7 +15,7 @@
  * until the gate deferred everything forever. Reserving through the core removes
  * the failure mode rather than patching it.
  */
-#include "gpu_quota.h"
+#include "gptps_gpu_quota.h"
 
 #include <stdlib.h>
 #include <stdio.h>

@@ -37,15 +37,28 @@ jobs:
           cmake --build build -j
           ctest --test-dir build --output-on-failure --no-tests=error
 
-      - name: Generate the amalgamation
-        run: sh tools/amalgamate.sh amalgamation
+      - name: Generate the amalgamation (core + every add-on)
+        # Add-ons are separate .c/.h pairs, never folded into gptps.c - see the
+        # rationale at the top of tools/amalgamate.sh. gptps.c stays byte-identical
+        # regardless of this selection, which is what keeps its SHA256 pinnable.
+        run: sh tools/amalgamate.sh amalgamation --addons all
 
-      - name: Verify the artifact compiles, runs, and is licensed
+      - name: Verify the artifacts compile, run, and are licensed
         run: |
+          # The core, built exactly the way the release notes tell people to.
           cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
              amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o amalg_check
           ./amalg_check
-          for f in amalgamation/gptps.h amalgamation/gptps.c; do
+          # An ADD-ON artifact, likewise - and running its real test, so a broken
+          # amalgamated add-on cannot ship as "it compiled".
+          cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
+             amalgamation/gptps.c amalgamation/gptps_durable_queue.c \
+             tests/test_durable.c -lpthread -ldl -o amalg_addon_check
+          ./amalg_addon_check
+          # The licence loop now covers EVERY generated file, not just the core two.
+          # An add-on vendored without the MIT notice is as unfixable after the fact
+          # as a core file would be.
+          for f in amalgamation/*.c amalgamation/*.h; do
             grep -q 'Permission is hereby granted' "$f" \
               || { echo "ERROR: $f ships with no MIT notice"; exit 1; }
             grep -q 'SPDX-License-Identifier: MIT' "$f" \
@@ -58,8 +71,21 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
           cp amalgamation/gptps.c amalgamation/gptps.h LICENSE dist/
+          # One asset per add-on. The per-file URL is the requirement: a Dockerfile
+          # with no tar, no clone and no build system does `curl -LO .../gptps_pool.c`,
+          # which is exactly how the core is already consumed.
+          cp amalgamation/gptps_*.c amalgamation/gptps_*.h dist/
+          # ...plus a tarball for people who want the set.
+          tar -czf "dist/gptps-$VERSION-addons.tar.gz" -C amalgamation \
+              $(cd amalgamation && ls gptps_*.c gptps_*.h) -C "$PWD" LICENSE
+          # The `files:` block below is a literal list (no globs - see the comment
+          # there), so it cannot warn about an add-on it was never told about.
+          # Assert the staged set is the set the tool actually emitted.
+          want=$(sh tools/amalgamate.sh --list | wc -l)
+          have=$(ls dist/gptps_*.c | wc -l)
+          [ "$want" = "$have" ] || { echo "ERROR: staged $have add-on sources, expected $want"; exit 1; }
           cd dist
-          sha256sum gptps.c gptps.h LICENSE > SHA256SUMS
+          sha256sum * > SHA256SUMS
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           cat SHA256SUMS
 
@@ -104,8 +130,29 @@ jobs:
           # QUIETLY missing an asset. Every path below is literal, not a glob, so
           # this can only fire on a real staging bug.
           fail_on_unmatched_files: true
+          # Literal paths, not globs: a glob that matched nothing would publish a
+          # release quietly missing an asset, and fail_on_unmatched_files cannot see
+          # a file the list never mentioned. The staging step asserts this list is
+          # complete against `amalgamate.sh --list`, so adding an add-on without
+          # adding it here fails the release rather than shipping a partial one.
           files: |
             dist/gptps.c
             dist/gptps.h
             dist/LICENSE
             dist/SHA256SUMS
+            dist/gptps_await.c
+            dist/gptps_await.h
+            dist/gptps_durable_queue.c
+            dist/gptps_durable_queue.h
+            dist/gptps_gpu_quota.c
+            dist/gptps_gpu_quota.h
+            dist/gptps_orch.c
+            dist/gptps_orch.h
+            dist/gptps_pool.c
+            dist/gptps_pool.h
+            dist/gptps_tui.c
+            dist/gptps_tui.h
+            dist/gptps_wasm_exec.c
+            dist/gptps_wasm_exec.h
+            dist/gptps_xport.c
+            dist/gptps_xport.h

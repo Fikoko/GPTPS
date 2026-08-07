@@ -13,7 +13,7 @@
 #endif
 #include "gptps.h"
 #include "gptps_internal.h"   /* internal TOML parser */
-#include "durable_queue.h"
+#include "gptps_durable_queue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

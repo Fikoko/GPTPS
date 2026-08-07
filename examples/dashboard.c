@@ -13,7 +13,7 @@
  *   cc dashboard.c gptps.c addons/tui.c -lpthread -ldl   (amalgamation; Win: drop -ldl)
  */
 #include "gptps.h"
-#include "tui.h"
+#include "gptps_tui.h"
 #include <stdio.h>
 #include <string.h>
 

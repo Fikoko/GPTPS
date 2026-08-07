@@ -15,7 +15,7 @@
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
-#include "durable_queue.h"
+#include "gptps_durable_queue.h"
 #include "addon_compat.h"   /* portable mutex + fsync */
 
 #include <stdio.h>

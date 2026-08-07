@@ -11,7 +11,7 @@
  * budget fully returned.
  */
 #include "gptps.h"
-#include "gpu_quota.h"
+#include "gptps_gpu_quota.h"
 #include <stdio.h>
 #include <string.h>
 

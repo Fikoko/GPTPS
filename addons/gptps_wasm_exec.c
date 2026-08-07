@@ -9,7 +9,7 @@
  * ABI change - this is pure public-API glue.
  */
 #define _POSIX_C_SOURCE 200809L
-#include "wasm_exec.h"
+#include "gptps_wasm_exec.h"
 
 #include <stdlib.h>
 #include <string.h>

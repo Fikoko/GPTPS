@@ -70,6 +70,85 @@ jobs:
       - name: Test
         run: ctest --test-dir build-werror --output-on-failure --no-tests=error
 
+  # Does the PACKAGING work?
+  #
+  # Every other job builds INSIDE the tree, where every header is one -I away and
+  # every target already exists. Not one of them can catch a missing install(), a
+  # wrong INSTALL_INTERFACE include dir, a .pc with a prefix that only happens to be
+  # right, a components block that approves anything, or an add-on library that was
+  # never added to the export set. Those are the first things a stranger hits, and
+  # until this job existed nothing here could fail on any of them.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Every add-on is built, amalgamated and documented
+        run: sh tools/check_addon_coverage.sh
+
+      - name: Configure, build, test, install to a staging prefix
+        run: |
+          cmake -S . -B build-pkg -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-pkg -j
+          ctest --test-dir build-pkg --output-on-failure --no-tests=error
+          cmake --install build-pkg --prefix "$PWD/stage"
+
+      - name: The install tree contains what the docs promise
+        run: |
+          for f in include/gptps.h \
+                   include/gptps/gptps_pool.h include/gptps/gptps_durable_queue.h \
+                   lib/libgptps.a lib/libgptps_pool.a lib/libgptps_durable_queue.a \
+                   lib/cmake/gptps/gptps-config.cmake \
+                   lib/pkgconfig/gptps.pc lib/pkgconfig/gptps-pool.pc; do
+            test -f "stage/$f" || { echo "ERROR: install is missing $f"; exit 1; }
+          done
+          # The core calls dlopen; a static pkg-config link without -ldl fails on
+          # glibc < 2.34, and nothing in-tree would ever notice.
+          grep -q -- '-ldl' stage/lib/pkgconfig/gptps.pc \
+            || { echo "ERROR: gptps.pc omits -ldl, but the core calls dlopen"; exit 1; }
+          # Relocatable: `cmake --install --prefix` is honoured at INSTALL time while
+          # a baked-in prefix is fixed at CONFIGURE time. If those disagree every -I
+          # points somewhere that does not exist.
+          grep -q 'pcfiledir' stage/lib/pkgconfig/gptps.pc \
+            || { echo "ERROR: gptps.pc is not relocatable"; exit 1; }
+
+      - name: A stranger consumes a SUBSET via find_package COMPONENTS
+        run: |
+          cmake -S tests/consumer -B build-consumer -DCMAKE_PREFIX_PATH="$PWD/stage"
+          cmake --build build-consumer -j
+          ./build-consumer/consumer
+
+      - name: ...and via pkg-config alone
+        run: |
+          export PKG_CONFIG_PATH="$PWD/stage/lib/pkgconfig"
+          cc -std=c99 tests/consumer/main.c \
+             $(pkg-config --cflags --libs --static gptps-durable_queue gptps-pool) \
+             -o pkgconsumer
+          ./pkgconsumer
+
+      - name: ...and via the amalgamation, with an add-on
+        run: |
+          sh tools/amalgamate.sh amalg --addons durable_queue,pool
+          cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalg \
+             amalg/gptps.c amalg/gptps_durable_queue.c tests/test_durable.c \
+             -lpthread -ldl -o amalg_dq
+          ./amalg_dq
+          # gptps.c must be byte-identical whatever add-ons were asked for, or one
+          # release has N hashes for one filename and SHA256SUMS means nothing.
+          sh tools/amalgamate.sh amalg-none --addons none
+          cmp amalg/gptps.c amalg-none/gptps.c \
+            || { echo "ERROR: gptps.c depends on the add-on selection"; exit 1; }
+
+      - name: A typo in the add-on selector FAILS rather than selecting nothing
+        run: |
+          if sh tools/amalgamate.sh amalg-bad --addons pool,nosuch 2>/dev/null; then
+            echo "ERROR: amalgamate.sh accepted an unknown add-on"; exit 1
+          fi
+          if cmake -S . -B build-bad -DGPTPS_ADDONS="pool;nosuch" >/dev/null 2>&1; then
+            echo "ERROR: CMake accepted an unknown add-on"; exit 1
+          fi
+
   # Verify the single-file amalgamation compiles and runs (drop-in path).
   amalgamation:
     runs-on: ubuntu-latest

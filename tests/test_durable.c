@@ -15,7 +15,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "gptps.h"
-#include "durable_queue.h"
+#include "gptps_durable_queue.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

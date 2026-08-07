@@ -7,6 +7,60 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — add-ons are now OBTAINABLE
+- Until now an add-on was compiled as an extra *source* into whichever test binary
+  referenced it. There was no library target, nothing for `install()` to ship, nothing
+  in `find_package`/pkg-config, nothing in the amalgamation, and nothing in any
+  release. The only documented way to get one was to clone the repo and vendor the raw
+  `.c` at whatever commit you happened to have. **An add-on you cannot obtain is not a
+  module, it is a sample.**
+- Each add-on is now its own installable library — `gptps::pool`, `gptps::await`, … —
+  with an installed header under `include/gptps/`, an exported CMake target and a
+  generated `.pc`. Three supported ways to take a **subset**:
+  `find_package(gptps COMPONENTS durable_queue pool)`, `pkg-config gptps-durable_queue
+  gptps-pool`, or `amalgamate.sh --addons durable_queue,pool`. Asking for an add-on an
+  install does not have now says so in a sentence instead of failing three files later.
+- **The amalgamation emits one self-contained `.c`/`.h` pair per add-on, never appended
+  to `gptps.c`.** `gptps.c` stays byte-identical whatever selection you ask for — its
+  SHA256 is the thing a Dockerfile pins, and one release must not have N hashes for one
+  filename. Add-ons are not merged with each other either: each has file-`static`
+  helpers that could collide in a shared translation unit.
+- Releases now attach every add-on as an individual asset (so a Dockerfile can `curl`
+  exactly one) plus a tarball, and the MIT-notice check covers every generated file
+  rather than only the core two.
+- The four unprefixed add-on filenames (`durable_queue`, `gpu_quota`, `wasm_exec`,
+  `tui`) gained the `gptps_` prefix the other three already had. Their C symbols were
+  always namespaced; only the filenames had drifted. Done now because these have never
+  been installed or released, so the cost is exactly zero today and permanent tomorrow.
+- The suite links the real add-on libraries instead of compiling their sources in, so a
+  broken target fails the existing tests rather than surviving until a stranger tries
+  to link it. The downstream guarantee is unchanged: an `add_subdirectory`/`FetchContent`
+  consumer still gets zero CTest targets and zero add-on builds; opting in is two lines.
+
+### Fixed — three packaging defects nothing in-tree could have caught
+- **`gptps.pc` omitted `-ldl`.** The core calls `dlopen` for the add-on loader, so a
+  static `pkg-config --libs gptps` link failed with an undefined reference on
+  glibc < 2.34.
+- **The `.pc` files were not relocatable.** They baked in the *configure-time* prefix,
+  while `cmake --install --prefix` is honoured at *install* time. When those disagree —
+  routinely, for distro packagers and DESTDIR staging — every `-I` and `-L` points
+  somewhere that does not exist, surfacing as a baffling "gptps.h: No such file". Now
+  derived from `${pcfiledir}`, with the depth computed rather than hardcoded, since
+  libdir is `lib`, `lib64` or a multiarch triplet depending on the system.
+- **A consumer's add-on selection was silently ignored.** `set(GPTPS_ADDONS "pool")`
+  before `add_subdirectory` was clobbered by the subdirectory's own
+  `set(... CACHE ...)` under CMP0126's OLD behaviour (which supporting CMake 3.13
+  inherits): the consumer asked for one add-on and got all eight.
+- All three are now covered by a new **`package` CI job** — installs to a staging
+  prefix, asserts the install tree, then builds an out-of-tree consumer against it via
+  `find_package COMPONENTS`, via pkg-config, and via the amalgamation. Every other job
+  builds *inside* the tree, where every header is one `-I` away, so none of them could
+  ever fail on any of this.
+- `tools/check_addon_coverage.sh` holds the CMake table, the amalgamation table and
+  `addons/README.md` to the directory listing. It failed on the tree that introduced it
+  — six add-ons were undocumented, three of them (`pool`, `xport`, `orch`) having never
+  been in `addons/README.md` at all.
+
 ### Added — ABI 2.1: add-on IDENTITY, so an ecosystem can have more than one plug-in
 - **Namespaces.** An add-on may declare `ns` (e.g. `"gpuq"`). Declaring one buys a
   guarantee — the loader **claims** the token, and a second add-on wanting it is

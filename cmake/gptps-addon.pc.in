@@ -1,0 +1,16 @@
+# Relocatable, for the reason spelled out in gptps.pc.in.
+prefix=${pcfiledir}/@GPTPS_PC_PREFIX_REL@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: gptps-@GPTPS_ADDON_NAME@
+Description: GPTPS add-on: @GPTPS_ADDON_DESC@
+Version: @PROJECT_VERSION@
+# `Requires`, not `Requires.private`, so `pkg-config --libs gptps-pool` alone is
+# enough: it emits -lgptps_pool BEFORE -lgptps, which is the order a static link
+# needs. With Requires.private the core would land first and the add-on's
+# references into it would go unresolved.
+Requires: gptps
+Libs: -L${libdir} -lgptps_@GPTPS_ADDON_NAME@
+Cflags: -I${includedir}/gptps

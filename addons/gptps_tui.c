@@ -12,7 +12,7 @@
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
-#include "tui.h"
+#include "gptps_tui.h"
 
 #include <stdlib.h>
 #include <string.h>
