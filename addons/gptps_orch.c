@@ -41,6 +41,37 @@ struct gptps_orch {
 static char *dup_str(const char *s) { size_t n = strlen(s) + 1; char *o = (char *)malloc(n); if (o) memcpy(o, s, n); return o; }
 static void *dup_mem(const void *s, size_t n) { void *o; if (!n) return NULL; o = malloc(n); if (o) memcpy(o, s, n); return o; }
 
+/* Is this event the LAST one this handle will ever produce?
+ *
+ * This is the whole correctness of the add-on, and the obvious answer is wrong.
+ * GPTPS_EV_FAILED is NOT terminal: execute() emits it after EVERY failed attempt,
+ * and only afterwards does the dispatcher decide retry / drop / dead-letter. A gate
+ * that counted FAILED released as soon as a dependency FAILED TWICE - so "run C
+ * after A and B" would run C while B was still going, merely because A retried.
+ * With a single dep it is just as wrong: A fails once, C runs, A then retries and
+ * succeeds - C ran before its dependency finished.
+ *
+ * Derived from the dispatcher's own branches in src/engine.c:
+ *   retry              -> EV_RETRIED, then the item runs again
+ *   ON_FAILURE_DROP    -> EV_DROPPED        after the attempt's FAILED
+ *   ON_FAILURE_DEAD_.. -> EV_DEAD_LETTERED  after the attempt's FAILED
+ *   ON_FAILURE_REQUEUE -> re-admitted; NEVER terminal (see the header)
+ *   gptps_cancel       -> FAILED/E_CANCELLED, exactly once: emitted by execute() if
+ *                         the item ran, or by the dispatcher if it never started
+ * A FAILED carrying E_TIMEOUT is therefore not terminal either - a timed-out item
+ * still goes through retry and the on_failure policy like any other failure.
+ *
+ * This is the same predicate tests/test_reconcile.c uses to assert that every
+ * submitted handle reaches EXACTLY ONE terminal event, and the same one
+ * durable_queue.c already applies. */
+static int is_terminal(const gptps_event *ev)
+{
+    if (ev->kind == GPTPS_EV_FINISHED ||
+        ev->kind == GPTPS_EV_DROPPED  ||
+        ev->kind == GPTPS_EV_DEAD_LETTERED) return 1;
+    return ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED;
+}
+
 static int is_done(gptps_orch *o, gptps_handle h)
 {
     size_t i;
@@ -48,16 +79,24 @@ static int is_done(gptps_orch *o, gptps_handle h)
     return 0;
 }
 
-static void mark_done(gptps_orch *o, gptps_handle h)
+/* Record a terminal handle. Returns 1 if this handle is NEWLY terminal, 0 if it was
+ * already known. Callers advance gates only on a 1, which makes the decrement
+ * idempotent: even if a future engine ever emitted two terminal events for one
+ * handle, a gate could not be double-decremented into an early release. On an
+ * allocation failure we cannot remember the handle, so we return 1 and let the gate
+ * advance - best effort, matching the pre-existing choice to risk a lost hint rather
+ * than stall a gate forever. */
+static int mark_done(gptps_orch *o, gptps_handle h)
 {
-    if (is_done(o, h)) return;
+    if (is_done(o, h)) return 0;
     if (o->ndone == o->dcap) {
         size_t nc = o->dcap ? o->dcap * 2 : 16;
         gptps_handle *nd = (gptps_handle *)realloc(o->done, nc * sizeof *nd);
-        if (!nd) return;             /* drop the hint; a gate on this handle may stall */
+        if (!nd) return 1;           /* drop the hint; advance anyway (see above) */
         o->done = nd; o->dcap = nc;
     }
     o->done[o->ndone++] = h;
+    return 1;
 }
 
 /* release a gate: submit its task (caller holds o->mu; gptps_submit takes the
@@ -75,13 +114,14 @@ static void orch_obs(const gptps_event *ev, void *ud)
 {
     gptps_orch *o = (gptps_orch *)ud;
     size_t i, j;
-    /* only terminal events advance dependencies; ignore QUEUED/STARTED/RETRIED
-     * (and return before taking the lock so a re-entrant QUEUED can't deadlock). */
-    if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_FAILED &&
-        ev->kind != GPTPS_EV_DROPPED && ev->kind != GPTPS_EV_DEAD_LETTERED) return;
+    /* only terminal events advance dependencies; ignore QUEUED/STARTED/RETRIED and
+     * every non-final FAILED (see is_terminal). Returning before taking the lock also
+     * means a re-entrant QUEUED - emitted by the gptps_submit in release_gate, while
+     * we still hold o->mu - can't deadlock. */
+    if (!is_terminal(ev)) return;
 
     apx_mutex_lock(&o->mu);
-    mark_done(o, ev->handle);
+    if (!mark_done(o, ev->handle)) { apx_mutex_unlock(&o->mu); return; }  /* already counted */
     for (i = 0; i < o->ng; ++i) {
         gate *g = &o->gates[i];
         if (g->released) continue;

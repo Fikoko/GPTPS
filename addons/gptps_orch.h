@@ -20,6 +20,21 @@
  * terminate OR while the orchestrator is still tracking them (it remembers
  * completed handles for the process lifetime - prune in a long-running host).
  * Deps within one gate must be distinct.
+ *
+ * WHAT COUNTS AS "TERMINAL" - and what never gets there:
+ *   A dependency is satisfied by the LAST event its handle will ever produce:
+ *   FINISHED, DROPPED, DEAD_LETTERED, or FAILED carrying GPTPS_E_CANCELLED.
+ *   A plain FAILED is NOT terminal - it is emitted after every failed ATTEMPT, and
+ *   the engine then decides retry / drop / dead-letter. A dep that merely retries
+ *   must not release your gate, and a FAILED carrying GPTPS_E_TIMEOUT is a failed
+ *   attempt like any other.
+ *
+ *   Two dependency shapes NEVER reach a terminal state, so a gate on one waits
+ *   forever - correctly, but surprisingly:
+ *     - a task type with on_failure = GPTPS_ON_FAILURE_REQUEUE, which is
+ *       re-admitted instead of ending (until shutdown, which dead-letters it);
+ *     - a GPTPS_TASK_SERVICE instance, which is supervised to stay up by design.
+ *   Depend on those only if you will cancel them, which IS terminal.
  */
 #ifndef GPTPS_ORCH_H
 #define GPTPS_ORCH_H

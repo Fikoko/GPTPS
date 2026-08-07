@@ -308,7 +308,7 @@ if(UNIX)
     add_test(NAME stress COMMAND test_stress)
     set_tests_properties(stress PROPERTIES TIMEOUT 60)
 
-    add_executable(gptps_bench_pool examples/bench_pool.c addons/gptps_pool.c) # empirical scale-up proof (throughput vs shards)
+    add_executable(gptps_bench_pool examples/bench_pool.c addons/gptps_pool.c addons/gptps_await.c) # empirical scale-up proof (throughput vs shards)
     target_include_directories(gptps_bench_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
     target_link_libraries(gptps_bench_pool PRIVATE gptps)
     add_test(NAME gptps_bench_pool COMMAND gptps_bench_pool)   # runs the CI-quick default; prints the scaling table
@@ -334,6 +334,12 @@ target_include_directories(test_orch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(test_orch PRIVATE gptps)
 add_test(NAME orch COMMAND test_orch)
 set_tests_properties(orch PROPERTIES TIMEOUT 30)
+
+add_executable(test_await tests/test_await.c addons/gptps_await.c)       # blocking wait(handle) on the observer seam
+target_include_directories(test_await PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_await PRIVATE gptps)
+add_test(NAME await COMMAND test_await)
+set_tests_properties(await PROPERTIES TIMEOUT 30)
 
 add_executable(test_wasm tests/test_wasm.c addons/wasm_exec.c)            # module-as-task; OOP case POSIX-only
 target_include_directories(test_wasm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)

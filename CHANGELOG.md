@@ -7,6 +7,49 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — `addons/gptps_await`: the blocking wait the non-goals promised
+- The "futures / promises" non-goal argued a blocking `wait(handle)` is a small amount
+  of code on the observer seam and does not belong in the mechanism. That was true, but
+  **nobody had written it** — so the row asked readers to take it on faith, and
+  `examples/bench_pool` busy-spun on a shared atomic instead. `gptps_await_wait` now
+  blocks on a handle and returns the task's result and status; `gptps_await_quiesce`
+  covers "tell me when N things are done".
+- Two details that make it correct rather than merely present. **The submit/finish race
+  is closed**: in THREADED mode an item can finish before `gptps_submit` returns its
+  handle, so the observer is installed up front and unclaimed completions are retained.
+  **Retention is bounded** — a fixed-size ring that evicts oldest, rather than the
+  process-lifetime growth `addons/gptps_orch` documents in its own header. The limit is
+  stated in the header instead of being a surprise.
+- No core change. The one guarantee the wait needs — every submitted handle reaches
+  exactly one terminal event — is already contractual and already tested
+  (`tests/test_reconcile`).
+
+### Fixed — `addons/gptps_orch` released a gate while a dependency was still running
+- The orchestrator treated `GPTPS_EV_FAILED` as terminal. It is not: `execute()` emits it
+  after every failed ATTEMPT, and only then does the dispatcher choose retry / drop /
+  dead-letter. So a dependency with `max_retries >= 1` decremented the gate twice by
+  itself, and "run C after A and B" ran C **while B was still running** — because A
+  retried. With a single dependency it is just as wrong: A fails once, C runs, A retries
+  and succeeds, and C ran before its dependency finished.
+- The terminal predicate is now `{FINISHED, DROPPED, DEAD_LETTERED}` plus `FAILED`
+  carrying `GPTPS_E_CANCELLED` (a cancel is emitted exactly once — by `execute()` if the
+  item ran, by the dispatcher if it never started). This is what `tests/test_reconcile.c`
+  already uses to assert exactly-one-terminal-event-per-handle, and what
+  `addons/durable_queue.c` already did. Gate advancement is also idempotent now, so a
+  repeated terminal event could not double-decrement.
+- The header documents the two dependency shapes that never reach a terminal state at
+  all — `GPTPS_ON_FAILURE_REQUEUE` and `GPTPS_TASK_SERVICE` — because a gate on one waits
+  forever, correctly but surprisingly.
+
+### Changed — `examples/bench_pool` no longer busy-spins on a shared counter
+- The completion wait was `while (get(&g_done) < N) { }`: a spin, inside a throughput
+  benchmark, on a thread competing for CPU with the workers it was timing, incrementing
+  one atomic shared by every shard. It now uses `gptps_await` per shard — no shared cache
+  line, and the waiter sleeps. The documented ~15k/s → ~290k/s (≈19×) shape reproduces
+  unchanged; the mid-range (4 shards) improves, which is the shared counter no longer
+  throttling the harness. Note the CI-quick default of 40k items completes in ~20ms and
+  is noise-dominated — pass a larger count for a figure worth quoting.
+
 ### Fixed — an exec kind this core does not know is now refused at registration
 - `gptps_register_task` never range-checked `def->exec`. A value outside
   `{INPROC, OOP, PROGRAM}` registered cleanly, and `execute()` then treated
