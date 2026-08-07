@@ -13,7 +13,7 @@
 # two engines in one process. The dlopen tier is the supported way to get a binary
 # boundary, and it works precisely BECAUSE a plug-in links no core symbols at all.
 
-set(GPTPS_ADDON_ALL await durable_queue gpu_quota orch pool tui wasm_exec xport)
+set(GPTPS_ADDON_ALL await durable_queue gpu_quota orch pool remote tui wasm_exec xport)
 
 # GPTPS_ADDONS is the human knob; the per-add-on GPTPS_ADDON_<NAME> booleans are what
 # a distro packager scripts against. The list only sets their DEFAULTS.
@@ -107,6 +107,10 @@ gptps_addon(durable_queue SOURCE gptps_durable_queue.c HEADER gptps_durable_queu
 gptps_addon(gpu_quota     SOURCE gptps_gpu_quota.c     HEADER gptps_gpu_quota.h     DESC "named-resource admission quota")
 gptps_addon(orch          SOURCE gptps_orch.c          HEADER gptps_orch.h          DESC "run-after / fan-in orchestration")
 gptps_addon(pool          SOURCE gptps_pool.c          HEADER gptps_pool.h          DESC "N-shard engine router (scale-up)")
+# remote is the wire CODEC only - pure byte transformations, no sockets and no
+# platform calls, so it builds everywhere including Windows and the s390x leg that
+# actually exercises its byte order.
+gptps_addon(remote        SOURCE gptps_remote.c        HEADER gptps_remote.h        DESC "remote wire codec (cross-host transport)")
 # tui is TTY-dependent at RUNTIME only - gptps_tui_run self-skips without a TTY, and
 # render/press are headless and unit-tested. It compiles everywhere (POSIX termios and
 # the Windows console are both handled inside the add-on), so there is nothing to gate.

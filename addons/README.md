@@ -15,10 +15,11 @@ library — take only what you use.
 > exactly what lets one `.so` work against a static, shared or amalgamated host.
 
 That rule explains every module below without special-casing any of them, and it is
-not a ranking: six of the eight are compiled-in *by necessity*, because their whole
-point is an API the host calls. `addons/gptps_gpu_quota_plugin.c` ships the same
-policy as `gptps_gpu_quota.c` in the other tier — the diff between those two files is
-the clearest available description of the difference.
+not a ranking: most are compiled-in *by necessity*, because their whole point is an API
+the host calls — `gptps_dq_submit()`, `gptps_orch_after()`, `gptps_tui_run()`.
+`addons/gptps_gpu_quota_plugin.c` ships the same policy as `gptps_gpu_quota.c` in the
+other tier — the diff between those two files is the clearest available description of
+the difference.
 
 Two of them are not add-ons in the loader's sense at all: **`pool` and `xport` are
 composition libraries**. They register on no seam, use no host table, and sit *above*
@@ -33,6 +34,7 @@ more useful than calling everything an add-on.
 | `gpu_quota_plugin` | **plug-in** | *(named resources + settings)* | all | *(MODULE, `.so`)* | — |
 | `orch` | module | observer | all | `gptps::orch` | `gptps-orch` |
 | `pool` | *composition* | none — public API only | all | `gptps::pool` | `gptps-pool` |
+| `remote` | module | none — wire codec | all | `gptps::remote` | `gptps-remote` |
 | `tui` | module | observer + settings | all | `gptps::tui` | `gptps-tui` |
 | `wasm_exec` | module | task | all | `gptps::wasm_exec` | `gptps-wasm_exec` |
 | `xport` | *composition* | none — public API only | **POSIX** | `gptps::xport` | `gptps-xport` |
@@ -203,6 +205,44 @@ works.
 
 Measured on a 32-core box: aggregate tiny-task throughput ~15k/s at 1 shard to ~290k/s
 at 8 (see `examples/bench_pool.c`).
+
+## remote — the cross-host wire protocol (codec; transport pending)
+
+`gptps_remote.c` / `gptps_remote.h`. `xport` says the local socketpair "is the only
+thing standing between this and cross-MACHINE execution: swap it for a TCP socket and
+the same protocol reaches another host." That is true of the *shape* and false of the
+*details*, and this module exists to make the details honest.
+
+**Today it is the codec only, deliberately.** A wire format is a second
+forever-contract standing beside ABI 2.0 — once one peer anywhere speaks version 1,
+every future version must interoperate with it, and unlike a C ABI there is no
+compiler to catch a violation and no way to recall a deployed peer. So the bytes are
+defined, exhaustively tested and reviewable on their own, before a socket exists to
+hide bugs behind.
+
+What a network commits to that a socketpair does not, and what this fixes:
+
+- **Byte order.** `xport` writes raw native-endian integers — free on one machine,
+  silent corruption between a little-endian client and a big-endian server. Everything
+  here is explicitly big-endian, written byte by byte: never a `memcpy` of an integer,
+  never a cast of the buffer to a struct pointer (which is also an alignment fault on
+  strict targets). The tests assert the **actual bytes**, not a round trip — a round
+  trip passes just as happily on a native-endian codec.
+- **`gptps_status` values become wire-visible.** The enum fixes only `GPTPS_OK = 0`;
+  the rest are positional. The wire carries its own stable codes, and one from a newer
+  peer degrades to `GPTPS_E_IO` rather than being reinterpreted.
+- **A request id**, so a transport *can* multiplex. `xport` holds a lock across the
+  whole round trip, which caps a link at one in-flight request — fine at socketpair
+  latency, a hard ceiling of a few thousand/sec over a real network.
+- **A length cap that is a defence.** `xport` allows 256 MiB, reasonable against your
+  own forked child; from an unauthenticated peer it is one-packet memory exhaustion.
+  Default here is 1 MiB, per-link configurable, and checked *before* the caller is
+  told how many bytes to read.
+
+**Security, plainly:** the `task` field of a request is a dispatch key chosen by the
+peer. On a listening socket that is remote code *selection* by whoever can connect.
+There is no authentication and no encryption here by design — run it inside a trusted
+boundary (loopback, WireGuard, a TLS terminator, an SSH tunnel), never on an open port.
 
 ## tui — real-time terminal dashboard
 

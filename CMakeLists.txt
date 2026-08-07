@@ -454,6 +454,12 @@ target_link_libraries(test_orch PRIVATE gptps_orch)
 add_test(NAME orch COMMAND test_orch)
 set_tests_properties(orch PROPERTIES TIMEOUT 30)
 
+add_executable(test_remote_codec tests/test_remote_codec.c)          # the wire protocol, before any socket exists
+target_include_directories(test_remote_codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_remote_codec PRIVATE gptps_remote)
+add_test(NAME remote_codec COMMAND test_remote_codec)
+set_tests_properties(remote_codec PROPERTIES TIMEOUT 30)
+
 add_executable(test_await tests/test_await.c)       # blocking wait(handle) on the observer seam
 target_include_directories(test_await PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_await PRIVATE gptps_await)

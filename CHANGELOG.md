@@ -7,6 +7,39 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — `addons/gptps_remote`: the cross-host WIRE PROTOCOL (codec; transport pending)
+- `addons/gptps_xport` says the local socketpair "is the only thing standing between
+  this and cross-MACHINE execution: swap it for a TCP socket and the same protocol
+  reaches another host." That is true of the *shape* and false of the *details*. This
+  module makes the details honest.
+- **The codec ships and is reviewable before any socket exists, deliberately.** A wire
+  format is a second forever-contract standing beside ABI 2.0: once one peer anywhere
+  speaks version 1, every future version must interoperate with it — and unlike a C ABI
+  there is no compiler to catch a violation, no `struct_size` to check, and no way to
+  recall a deployed peer.
+- What a network commits to that a socketpair does not, each now handled:
+  **byte order** (`xport` writes raw native-endian integers — free on one machine,
+  silent corruption between a little-endian client and a big-endian server; everything
+  here is explicitly big-endian, byte by byte, never a `memcpy` of an integer and never
+  a cast of the buffer to a struct pointer, which would also be an alignment fault on
+  strict targets); **`gptps_status` becoming wire-visible** (the enum fixes only
+  `GPTPS_OK = 0`, so the wire carries its own stable codes and an unknown one from a
+  newer peer degrades to `GPTPS_E_IO` rather than being reinterpreted); **a request id**
+  so a transport can multiplex later (`xport` holds a lock across the whole round trip,
+  capping a link at one in-flight request — fine at socketpair latency, a hard ceiling
+  of a few thousand/sec over a network); and **a length cap that is a defence**
+  (`xport`'s 256 MiB is reasonable against your own forked child and is one-packet
+  memory exhaustion from an unauthenticated peer — 1 MiB here, per-link configurable,
+  checked before the caller is told how many bytes to read).
+- The tests assert the **actual bytes**, not a round trip — a round trip passes just as
+  happily on a native-endian codec, which is the bug being avoided. Plus every
+  rejection path: bad magic, unknown version, unknown kind, over-cap length, truncated
+  frames, and a `task_len` that overruns the payload.
+- Security, stated in the header rather than implied: the `task` field of a request is a
+  dispatch key chosen by the peer, so on a listening socket it is remote code
+  *selection* by whoever can connect. No authentication, no encryption, by design — run
+  it inside a trusted boundary.
+
 ### Added — a plug-in author has documentation, a template, and a way to prove their work
 - **`tools/gptps_conformance`** — run it against your own `.so` before you ship it.
   Installed to `bin/`, shipped in releases, no third-party dependencies.
