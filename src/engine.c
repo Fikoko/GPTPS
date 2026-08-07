@@ -2208,7 +2208,27 @@ static const gptps_api_routines G_API = {
     gptps_define_resource,
     gptps_set_task_resource_cost,
     gptps_resource_usage,
-    gptps_set_scheduler
+    gptps_set_scheduler,
+    /* --- ABI 2.1: the ctx surface a dlopen'd task body could not reach before.
+     * Without is_cancelled a binary plugin could not honour a timeout, a cancel or
+     * shutdown - i.e. could not meet the liveness guarantees the core makes
+     * contractual. See the rationale on gptps_api_routines in the public header. */
+    gptps_is_cancelled,
+    gptps_deadline_ms,
+    gptps_now_ms,
+    gptps_result_set_nocopy,
+    gptps_task_setting_int,
+    gptps_task_setting_str,
+    /* work flow: observers run with the lock released and MAY re-enter */
+    gptps_submit,
+    gptps_submit_ex,
+    /* configuration + diagnostics: what a purely config-driven add-on needs */
+    gptps_settings_get,
+    gptps_settings_set,
+    gptps_settings_watch,
+    gptps_set_task_priority,
+    gptps_strerror,
+    gptps_version
 };
 
 /* Undo whatever a FAILED addon setup() managed to register before it gave up.

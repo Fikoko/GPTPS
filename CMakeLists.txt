@@ -247,6 +247,12 @@ set_target_properties(addon_demo PROPERTIES PREFIX "")
 add_library(addon_bad MODULE tests/addon_bad.c)
 target_include_directories(addon_bad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(addon_bad PROPERTIES PREFIX "")
+# A plugin whose task LOOPS, so cancellation has to cross the host table to stop it.
+# addon_demo returns immediately, which is why the missing is_cancelled routine went
+# unnoticed until ABI 2.1 - this is the regression guard for that.
+add_library(addon_cancel MODULE tests/addon_cancel.c)
+target_include_directories(addon_cancel PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_cancel PROPERTIES PREFIX "")
 
 add_executable(test_addon tests/test_addon.c)
 target_include_directories(test_addon
@@ -256,8 +262,9 @@ target_link_libraries(test_addon PRIVATE gptps)
 target_compile_definitions(test_addon PRIVATE
     ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
     ADDON_BAD_PATH="$<TARGET_FILE:addon_bad>"
+    ADDON_CANCEL_PATH="$<TARGET_FILE:addon_cancel>"
 )
-add_dependencies(test_addon addon_demo addon_bad)
+add_dependencies(test_addon addon_demo addon_bad addon_cancel)
 add_test(NAME addon COMMAND test_addon)
 set_tests_properties(addon PROPERTIES TIMEOUT 30)
 

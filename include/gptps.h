@@ -74,7 +74,7 @@ extern "C" {
  * child_setup and EV_DROPPED; 1.10 the generic named-resource budgets; 1.11
  * SERVICE tasks; 1.12 the pluggable scheduler seam. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 0u
+#define GPTPS_ABI_VERSION_MINOR 1u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -860,6 +860,69 @@ typedef struct {
     gptps_status (*resource_usage)(gptps *e, const char *name, uint64_t *out_reserved, uint64_t *out_budget);
     /* --- v1.12 routines (append-only); guard with `struct_size` before calling --- */
     gptps_status (*set_scheduler)(gptps *e, gptps_sched_fn fn, void *user_data);
+
+    /* --- ABI 2.1 routines (append-only); guard with `struct_size` before calling ---
+     *
+     * TRANCHE A - the ctx surface. Until 2.1 this table had NO way to reach the
+     * running task's context beyond payload/result_set, and the omission was
+     * disqualifying rather than merely inconvenient: without is_cancelled a
+     * dlopen'd task body cannot poll for cancellation, so it cannot honour a
+     * timeout, gptps_cancel, GPTPS_REMOVE_CANCEL or limits.shutdown_grace_ms. That
+     * is not a missing convenience - it means a binary plugin could not meet the
+     * liveness guarantees this library makes contractual and tests/test_hang.c
+     * enforces. Nor could a plugin work around it by calling gptps_is_cancelled
+     * directly: the default build is a STATIC library, so core symbols live in the
+     * host executable behind the gptps_/gptps__ namespacing that exists precisely
+     * to stop add-on capture (see the note at the top of this section).
+     *
+     * This gap, not packaging, is why the host-table ABI shipped with real
+     * consumers numbering zero. It went unnoticed because the only plugin in the
+     * tree - tests/addon_demo.c - returns GPTPS_OK immediately, which is the one
+     * task shape that never needs to ask. */
+    bool         (*is_cancelled)(const gptps_ctx *ctx);
+    uint64_t     (*deadline_ms)(const gptps_ctx *ctx);
+    uint64_t     (*now_ms)(const gptps_ctx *ctx);
+    gptps_status (*result_set_nocopy)(gptps_ctx *ctx, void *bytes, size_t len,
+                                      void (*free_cb)(void *bytes));
+    gptps_status (*task_setting_int)(gptps_ctx *ctx, const char *key, long *out);
+    gptps_status (*task_setting_str)(gptps_ctx *ctx, const char *key, char *buf, size_t cap);
+
+    /* TRANCHE B - work flow. Observers deliberately run with the engine lock
+     * RELEASED so they MAY re-enter the engine (see THREADING & REENTRANCY) - that
+     * is exactly how addons/gptps_orch builds task dependencies. An add-on had no
+     * way to accept the invitation. */
+    gptps_status (*submit)(gptps *e, const char *task_name, const void *payload,
+                           size_t len, gptps_handle *out_handle);
+    gptps_status (*submit_ex)(gptps *e, const char *task_name, const void *payload,
+                              size_t len, const gptps_submit_options *opts,
+                              gptps_handle *out_handle);
+
+    /* TRANCHE C - configuration and diagnostics. settings_watch is what lets a
+     * purely CONFIG-DRIVEN add-on exist: one that a host never calls into, that is
+     * loaded from a TOML `addons` line and reconfigured by an operator editing a
+     * setting. That shape is the whole point of the binary tier. */
+    gptps_status (*settings_get)(gptps *e, const char *key, char *buf, size_t cap);
+    gptps_status (*settings_set)(gptps *e, const char *key, const char *value);
+    gptps_status (*settings_watch)(gptps *e, gptps_settings_cb cb, void *user_data);
+    gptps_status (*set_task_priority)(gptps *e, const char *task_name, int priority);
+    const char  *(*strerror_fn)(gptps_status s);
+    const char  *(*version)(void);
+
+    /* DELIBERATELY ABSENT, so the omissions read as decisions rather than oversights:
+     *   open / open_ex / shutdown / step - engine LIFECYCLE is the host's. A module
+     *     that wants to own an engine is a compiled-in module by definition (it has
+     *     to be called into); addons/gptps_pool and addons/gptps_xport are exactly
+     *     that, and neither is loadable nor needs to be.
+     *   set_allocator / set_log_sink    - process-wide, not per-engine. An add-on
+     *     must not repoint the host's heap or its diagnostics underneath it.
+     *   load_addon                      - docs/SECURITY.md is explicit that add-on
+     *     paths are code. The decision to load code stays with the host; a plugin
+     *     that can load plugins is a discovery mechanism nobody audited.
+     *   set_event_cb                    - single-slot and the HOST's. Add-ons use
+     *     register_observer, which is many-per-engine and already above.
+     *   dead_letter_count / drain       - draining is destructive and exactly-once.
+     *     Two consumers racing it is silent data loss. Observe
+     *     GPTPS_EV_DEAD_LETTERED and keep your own view instead. */
 } gptps_api_routines;
 
 typedef struct {

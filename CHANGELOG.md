@@ -7,6 +7,35 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — ABI 2.1: a binary plug-in can finally write a working task
+- **The host table had no `is_cancelled`.** A `dlopen`'d task body therefore could not
+  poll for cancellation, which means it could not honour a timeout, `gptps_cancel`,
+  `GPTPS_REMOVE_CANCEL` or `limits.shutdown_grace_ms` — it structurally could not meet
+  the liveness guarantees this library makes contractual and `tests/test_hang.c`
+  enforces. Nor could a plug-in reach the symbol directly: the default build is a
+  static library, so core symbols live in the host executable behind the
+  `gptps_`/`gptps__` namespacing that exists precisely to prevent add-on capture.
+- **This, not packaging, is why the frozen plug-in ABI shipped with zero real
+  consumers** and why all seven bundled add-ons are compiled-in. It went unnoticed
+  because the only plug-in in the tree, `tests/addon_demo.c`, returns `GPTPS_OK`
+  immediately — the one task shape that never has to ask.
+- Appended, each guarded by `struct_size` on the callee side: `is_cancelled`,
+  `deadline_ms`, `now_ms`, `result_set_nocopy`, `task_setting_int`, `task_setting_str`
+  (the ctx surface); `submit`, `submit_ex` (observers run with the lock released and
+  *may* re-enter — an add-on had no way to accept the invitation); `settings_get`,
+  `settings_set`, `settings_watch`, `set_task_priority`, `strerror`, `version` (what a
+  purely config-driven add-on needs to exist at all).
+- The header now also records what is **deliberately absent** and why —
+  `open`/`shutdown`/`step`, `set_allocator`/`set_log_sink`, `load_addon`,
+  `set_event_cb`, `dead_letter_drain` — so the omissions read as decisions.
+- `tests/addon_cancel.c` is the regression guard: a plug-in whose task *loops* and can
+  only be stopped through the table. If that routine is ever dropped the test hangs and
+  CTest reports it, instead of the suite passing on a lie.
+- Compatibility verified in **both** directions: an ABI-2.0-built `.so` still loads into
+  the 2.1 core unchanged, and a 2.1-built `.so` meeting a 2.0 core is cleanly refused
+  with `GPTPS_E_ABI` rather than calling past the end of a shorter table.
+  `MINOR` 0 → 1; **`MAJOR` stays 2** — ABI 2.0 remains the last breaking change.
+
 ### Added — `addons/gptps_await`: the blocking wait the non-goals promised
 - The "futures / promises" non-goal argued a blocking `wait(handle)` is a small amount
   of code on the observer seam and does not belong in the mechanism. That was true, but
