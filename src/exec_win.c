@@ -22,6 +22,16 @@
 
 #define GPTPS_WIN_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, a mem cap is meaningless */
 #define GPTPS_WIN_RESULT_CAP   (16u * 1024u * 1024u)        /* max captured stdout */
+#define GPTPS_WIN_JOIN_GRACE_MS 5000  /* how long a helper thread gets to notice EOF */
+
+/* CancelSynchronousIo is the only lever against a SYNCHRONOUS ReadFile/WriteFile
+ * issued by another thread (CancelIoEx cancels ASYNC I/O and does not apply). It is
+ * Vista+; on an older target there is simply no lever, so compile it out. */
+#if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600)
+#  define GPTPS_WIN_CANCEL_SYNC_IO(h) ((void)CancelSynchronousIo(h))
+#else
+#  define GPTPS_WIN_CANCEL_SYNC_IO(h) ((void)(h))
+#endif
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
@@ -72,7 +82,24 @@ static DWORD WINAPI writer_proc(LPVOID p)
     return 0;
 }
 
-typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize; } reader_ctx;
+typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize;
+                 HANDLE proc, job; int assigned; } reader_ctx;
+
+/* When the reader stops early it must also stop the child, because nothing else
+ * will: the parent never closes outR while the reader is alive, so a program that
+ * keeps writing past the 16 MiB cap blocks in WriteFile forever and the task can
+ * only end at its deadline - reporting GPTPS_E_TIMEOUT (or E_CANCELLED with
+ * timeout_s==0) and hiding the oversize/nomem cause behind it, since `killed` is
+ * tested first. POSIX already kills at the cap (exec_oop_posix.c: `oversize = 1;
+ * kill(-pid, SIGKILL);`); this makes the two backends agree on what the README
+ * sells as a hard cap. Do NOT close r->h instead: the parent closes outR
+ * unconditionally after the joins, so that would be a double close. */
+static void reader_stop_child(reader_ctx *r)
+{
+    if (r->assigned) TerminateJobObject(r->job, 1);
+    else             TerminateProcess(r->proc, 1);
+}
+
 static DWORD WINAPI reader_proc(LPVOID p)
 {
     reader_ctx *r = (reader_ctx *)p;
@@ -82,9 +109,9 @@ static DWORD WINAPI reader_proc(LPVOID p)
             size_t nc = r->cap ? r->cap * 2 : 65536;
             char *nb;
             if (nc > GPTPS_WIN_RESULT_CAP) nc = GPTPS_WIN_RESULT_CAP;
-            if (nc == r->cap) { r->oversize = 1; break; }
+            if (nc == r->cap) { r->oversize = 1; reader_stop_child(r); break; }
             nb = (char *)gptps_realloc(r->buf, nc);
-            if (!nb) { r->nomem = 1; break; }
+            if (!nb) { r->nomem = 1; reader_stop_child(r); break; }
             r->buf = nb; r->cap = nc;
         }
         if (!ReadFile(r->h, r->buf + r->len, (DWORD)(r->cap - r->len), &got, NULL)) break; /* pipe closed */
@@ -162,6 +189,7 @@ return GPTPS_E_NOMEM; }
 
     wc.h = inW; wc.data = (const char *)payload; wc.len = plen;
     rc.h = outR; rc.buf = NULL; rc.len = rc.cap = 0; rc.nomem = rc.oversize = 0;
+    rc.proc = pi.hProcess; rc.job = job; rc.assigned = assigned;
     wt = CreateThread(NULL, 0, writer_proc, &wc, 0, NULL);
     if (!wt) CloseHandle(inW);                 /* no writer => close stdin so the child sees EOF */
     rt = CreateThread(NULL, 0, reader_proc, &rc, 0, NULL);
@@ -188,13 +216,33 @@ return GPTPS_E_NOMEM; }
             if (waited == WAIT_FAILED) { killed = 1; kill_st = GPTPS_E_IO; break; } /* defensive: never spin */
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }
-        if (killed) {
-            if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
-        }
+        /* Tear the job down on EVERY path, not just the kill path, and do it BEFORE
+         * the joins. "child gone => its stdout closes => reader ends" is false: an
+         * anonymous pipe reports EOF only when the LAST write handle closes, so a
+         * grandchild that inherited outW (`cmd /c start worker.exe`, say) keeps
+         * reader_proc blocked in ReadFile long after the direct child exited - and
+         * the INFINITE joins below would then wedge this worker, and the
+         * gptps_shutdown that joins it, forever. JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+         * already kills exactly this set at CloseHandle(job); we only move that kill
+         * earlier, so nothing survives that used to. The direct child's exit code is
+         * already latched on pi.hProcess, so GetExitCodeProcess stays correct (and
+         * TerminateProcess on an exited process is a no-op). */
+        if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
     }
-    WaitForSingleObject(pi.hProcess, INFINITE); /* fully gone => its stdout closes => reader ends */
-    if (wt) { WaitForSingleObject(wt, INFINITE); CloseHandle(wt); }
-    if (rt) { WaitForSingleObject(rt, INFINITE); CloseHandle(rt); }
+    WaitForSingleObject(pi.hProcess, INFINITE); /* terminated above => bounded */
+    /* Without a job (assigned==0: CreateJobObject failed, or we are already inside a
+     * non-nestable job - common in CI containers) a descendant is unreachable, so
+     * give each helper a grace period and then cancel its blocking call. Unreliable
+     * on anonymous pipes, hence a last resort rather than the mechanism; and only
+     * after the grace period, so a task that is merely slow is never truncated. */
+    if (wt) {
+        if (WaitForSingleObject(wt, GPTPS_WIN_JOIN_GRACE_MS) == WAIT_TIMEOUT) GPTPS_WIN_CANCEL_SYNC_IO(wt);
+        WaitForSingleObject(wt, INFINITE); CloseHandle(wt);
+    }
+    if (rt) {
+        if (WaitForSingleObject(rt, GPTPS_WIN_JOIN_GRACE_MS) == WAIT_TIMEOUT) GPTPS_WIN_CANCEL_SYNC_IO(rt);
+        WaitForSingleObject(rt, INFINITE); CloseHandle(rt);
+    }
     GetExitCodeProcess(pi.hProcess, &code);
 
     CloseHandle(outR);

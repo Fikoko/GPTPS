@@ -168,7 +168,9 @@ Windows: build a `.dll`; `GPTPS_ADDON_EXPORT` already carries `__declspec(dllexp
 gptps_conformance build/myplugin.so
 ```
 
-Ships in the release and installs to `bin/`. The interesting check is the
+Installs to `bin/` from any build (`GPTPS_BUILD_CONFORMANCE`, on by default) — build
+it from source; the GitHub release publishes amalgamation **sources** only, no
+binaries. The interesting check is the
 **degradation ladder**: it synthesises the host table as each released core actually
 had it and runs your `setup()` against every rung, so a routine you called without a
 `struct_size` guard is reported by name, with the guard to add — instead of

@@ -71,6 +71,13 @@ uint32_t gptps_remote_status_to_wire(gptps_status s)
         case GPTPS_E_DENIED:     return GPTPS_RW_DENIED;
         case GPTPS_E_FULL:       return GPTPS_RW_FULL;
         case GPTPS_E_SHUTDOWN:   return GPTPS_RW_SHUTDOWN;
+        case GPTPS_E_TASK:       return GPTPS_RW_TASK;
+        case GPTPS_E_DUP:        return GPTPS_RW_DUP;
+        case GPTPS_E_ABI:        return GPTPS_RW_ABI;
+        case GPTPS_E_CONFIG:     return GPTPS_RW_CONFIG;
+        case GPTPS_E_BUSY:       return GPTPS_RW_BUSY;
+        /* Kept even though every enumerator above is now covered: the argument is a
+         * gptps_status, and nothing stops an out-of-range integer being cast to one. */
         default:                 return GPTPS_RW_UNKNOWN;
     }
 }
@@ -89,6 +96,11 @@ gptps_status gptps_remote_status_from_wire(uint32_t w)
         case GPTPS_RW_DENIED:    return GPTPS_E_DENIED;
         case GPTPS_RW_FULL:      return GPTPS_E_FULL;
         case GPTPS_RW_SHUTDOWN:  return GPTPS_E_SHUTDOWN;
+        case GPTPS_RW_TASK:      return GPTPS_E_TASK;
+        case GPTPS_RW_DUP:       return GPTPS_E_DUP;
+        case GPTPS_RW_ABI:       return GPTPS_E_ABI;
+        case GPTPS_RW_CONFIG:    return GPTPS_E_CONFIG;
+        case GPTPS_RW_BUSY:      return GPTPS_E_BUSY;
         /* A newer peer's code we have never heard of. Degrade to a plain I/O
          * failure: an unknown failure is still a failure, and reinterpreting the
          * number as whatever it happens to mean locally would be worse than useless. */
@@ -174,13 +186,21 @@ gptps_status gptps_remote_encode_request(const char *task,
                                          unsigned char *buf, size_t *len)
 {
     size_t tlen, need;
+    uint64_t total;
     if (!task || !buf || !len) return GPTPS_E_INVAL;
     if (item_len && !item)     return GPTPS_E_INVAL;
     tlen = strlen(task);
-    /* Bound both parts against uint32 before adding them, so the sum cannot wrap. */
-    if (tlen > 0xFFFFFFFFu || item_len > 0xFFFFFFFFu) return GPTPS_E_INVAL;
-    need = 4u + tlen + item_len;
-    if (need < tlen || need < item_len) return GPTPS_E_INVAL;   /* overflow guard */
+    /* The binding constraint is not size_t wraparound but the WIRE: payload_len is a
+     * u32, so a frame this codec accepts must fit in one. Bounding the two parts
+     * separately is not enough - each can be within a u32 while the sum is not, and
+     * the caller would then be handed a length it can only truncate into the header,
+     * leaving the peer reading a short payload and the stream desynchronised for every
+     * frame after it. Summed in uint64_t so the check itself cannot wrap where size_t
+     * is 32-bit, and checked BEFORE the size query so E_BUDGET can never report an
+     * unframeable length either. */
+    total = 4u + (uint64_t)tlen + (uint64_t)item_len;
+    if (total > 0xFFFFFFFFu) return GPTPS_E_INVAL;
+    need = (size_t)total;   /* <= 0xFFFFFFFF: representable in a 32-bit size_t */
     if (*len < need) { *len = need; return GPTPS_E_BUDGET; }
 
     put_u32(buf, (uint32_t)tlen);

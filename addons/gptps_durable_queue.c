@@ -91,20 +91,34 @@ static void write_file_header(FILE *f)
     fwrite(h, 1, sizeof h, f);
 }
 
-/* Append one record. Returns 0 on success. Does not flush/fsync. */
+/* Append one record. Returns 0 on success. Does not flush/fsync.
+ *
+ * The size bounds are enforced HERE, on the write side, because they are the
+ * reader's bounds: replay() treats nlen > DQ_MAX_NAME or plen > DQ_MAX_PAYLOAD as
+ * a torn record and stops, which would discard this record AND every valid record
+ * appended after it. Making the writer's contract the reader's contract by
+ * construction is what keeps the "a partial tail never corrupts state" invariant
+ * true; a caller-side check alone regresses the moment a new caller appears. */
 static int write_record(FILE *f, char type, uint64_t seq,
-                        const char *name, const void *payload, uint32_t plen)
+                        const char *name, const void *payload, size_t plen)
 {
-    uint16_t nlen = name ? (uint16_t)strlen(name) : 0;
-    size_t total = DQ_RHDR_LEN + nlen + plen + 4;
-    unsigned char *buf = (unsigned char *)malloc(total);
+    size_t nl = name ? strlen(name) : 0;
+    uint16_t nlen;
+    size_t total;
+    unsigned char *buf;
     uint32_t crc;
     size_t w;
+    if (!f) return -1;
+    if (nl > DQ_MAX_NAME || plen > DQ_MAX_PAYLOAD) return -1; /* replay would call it torn */
+    if (plen && !payload) return -1;   /* a failed dup_mem: would memcpy from NULL */
+    nlen = (uint16_t)nl;
+    total = DQ_RHDR_LEN + nlen + plen + 4;
+    buf = (unsigned char *)malloc(total);
     if (!buf) return -1;
     put32(buf, DQ_REC_MAGIC);
     buf[4] = (unsigned char)type; buf[5] = 0;
     put16(buf + 6, nlen);
-    put32(buf + 8, plen);
+    put32(buf + 8, (uint32_t)plen);
     put64(buf + 12, seq);
     if (nlen) memcpy(buf + DQ_RHDR_LEN, name, nlen);
     if (plen) memcpy(buf + DQ_RHDR_LEN + nlen, payload, plen);
@@ -122,11 +136,19 @@ static int write_record(FILE *f, char type, uint64_t seq,
  *     the MIDDLE of the journal silently discards every valid record after it.
  *  2. The error indicator itself, which stdio latches - without clearing it the
  *     stream keeps refusing writes even once the condition (a full disk, say) is
- *     gone, so one transient ENOSPC bricked the queue for the process's lifetime. */
+ *     gone, so one transient ENOSPC bricked the queue for the process's lifetime.
+ * The DQ_FHDR_LEN floor is a safety net, not an optimisation: every legitimate
+ * rollback point is at or past the file header (do_rewrite always writes it
+ * first), so an offset below it means ftell lied - an append-mode stream that has
+ * not been repositioned reports 0 on the Windows CRT, and ftell returns -1 past
+ * LONG_MAX on 32-bit builds. Truncating on such an offset would erase the whole
+ * journal; refusing leaves at worst a torn tail, which replay() already
+ * handles by stopping at it. */
 static void rollback_to(FILE *f, long start)
 {
+    if (!f) return;
     clearerr(f);
-    if (start < 0) return;
+    if (start < DQ_FHDR_LEN) return;
     fflush(f);
     clearerr(f);
     if (apx_truncate(f, start) == 0) fseek(f, start, SEEK_SET);
@@ -136,9 +158,17 @@ static void rollback_to(FILE *f, long start)
 /* Append one record and make it durable, rolling the journal back to its previous
  * length if either step fails. Returns 0 on success. */
 static int append_durable(FILE *f, char type, uint64_t seq,
-                          const char *name, const void *payload, uint32_t plen)
+                          const char *name, const void *payload, size_t plen)
 {
-    long start = ftell(f);
+    long start;
+    if (!f) return -1;   /* a compaction that could not reopen the journal */
+    /* Seek to EOF before sampling the rollback point. C99 leaves an append
+     * stream's initial position implementation-defined and the Windows CRT
+     * documents it as the START of the file until the first I/O, so the first
+     * append after open/compact would otherwise roll back to offset 0 - i.e.
+     * truncate every recovered record away on a transient ENOSPC. */
+    fseek(f, 0, SEEK_END);
+    start = ftell(f);
     if (write_record(f, type, seq, name, payload, plen) != 0) { rollback_to(f, start); return -1; }
     if (fflush(f) != 0 || apx_fsync(f) != 0)                  { rollback_to(f, start); return -1; }
     return 0;
@@ -149,7 +179,10 @@ static int append_durable(FILE *f, char type, uint64_t seq,
  * not - it would truncate the journal's tail at replay - so this rolls back too. */
 static void append_marker(FILE *f, char type, uint64_t seq)
 {
-    long start = ftell(f);
+    long start;
+    if (!f) return;   /* lost marker: harmless, replay just re-runs the record */
+    fseek(f, 0, SEEK_END);   /* see append_durable */
+    start = ftell(f);
     if (write_record(f, type, seq, "", NULL, 0) != 0 || fflush(f) != 0) rollback_to(f, start);
 }
 
@@ -166,10 +199,21 @@ static dq_rec *push_rec(gptps_dq *dq)
     return &dq->recs[dq->n++];
 }
 
+/* dq->recs is ASCENDING in seq by construction - gptps_dq_submit takes seq from a
+ * monotonic counter under dq->mu before appending, replay() pushes records in file
+ * order, and do_rewrite's compaction is stable - so this binary search is exact.
+ * It has to be a search, not a scan: replay() calls it once per 'D'/'Q' marker over
+ * an array that grows with every 'P' record, which made opening a long-lived
+ * journal quadratic (200k records took ~11s before this). */
 static dq_rec *find_by_seq(gptps_dq *dq, uint64_t seq)
 {
-    size_t i;
-    for (i = 0; i < dq->n; ++i) if (dq->recs[i].seq == seq) return &dq->recs[i];
+    size_t lo = 0, hi = dq->n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (dq->recs[mid].seq == seq) return &dq->recs[mid];
+        if (dq->recs[mid].seq < seq) lo = mid + 1;
+        else hi = mid;
+    }
     return NULL;
 }
 
@@ -205,15 +249,32 @@ static int replay(gptps_dq *dq)
         if (seq >= dq->next_seq) dq->next_seq = seq + 1;
         if (type == 'P') {
             dq_rec *rc = push_rec(dq);
-            if (rc) {
-                rc->seq = seq; rc->done = 0; rc->handle = 0; rc->len = plen;
-                rc->name = (char *)malloc(nlen + 1);
-                if (rc->name) { if (nlen) memcpy(rc->name, body, nlen); rc->name[nlen] = 0; }
-                rc->payload = dup_mem(body + nlen, plen);
+            if (!rc) { free(body); break; }            /* OOM: stop, as with a torn tail */
+            rc->seq = seq; rc->done = 0; rc->handle = 0; rc->len = plen;
+            rc->name = (char *)malloc((size_t)nlen + 1);
+            if (rc->name) { if (nlen) memcpy(rc->name, body, nlen); rc->name[nlen] = 0; }
+            rc->payload = dup_mem(body + nlen, plen);
+            if (!rc->name || (plen && !rc->payload)) {
+                /* A half-initialised record is worse than a missing one: the
+                 * do_rewrite below would persist it with an empty name (never
+                 * recoverable, never dropped - it leaks in the journal forever).
+                 * Pop it and stop, the same policy as a record we cannot trust. */
+                free(rc->name); free(rc->payload);
+                dq->n -= 1;
+                free(body);
+                break;
             }
         } else if (type == 'D') {
             dq_rec *rc = find_by_seq(dq, seq);
-            if (rc) rc->done = 1;
+            if (rc) {
+                rc->done = 1;
+                /* Release the completed record's buffers now instead of leaving
+                 * them to do_rewrite: replaying a journal of a million completed
+                 * records would otherwise hold every payload in RAM at once.
+                 * NULLing is mandatory - the cleanup paths free these again. */
+                free(rc->name); free(rc->payload);
+                rc->name = NULL; rc->payload = NULL; rc->len = 0;
+            }
         } else if (type == 'Q') {
             dq_rec *rc = find_by_seq(dq, seq);
             if (rc) rc->quarantined = 1;   /* dead-lettered: retained, not re-submitted */
@@ -222,6 +283,20 @@ static int replay(gptps_dq *dq)
     }
     fclose(f);
     return 0;
+}
+
+/* rename() over an EXISTING file is undefined in C99 and fails outright on
+ * Windows, where the CRT reports EEXIST - which would make every compaction fail
+ * there, and with it gptps_dq_open on any pre-existing journal (crash recovery,
+ * this add-on's whole point). MoveFileExA with MOVEFILE_REPLACE_EXISTING is the
+ * documented atomic replace. */
+static int dq_rename_replace(const char *from, const char *to)
+{
+#if defined(_WIN32)
+    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    return rename(from, to);
+#endif
 }
 
 /* Rewrite the journal to contain only still-pending records, then reopen the
@@ -241,20 +316,31 @@ static gptps_status do_rewrite(gptps_dq *dq)
         /* retain both still-pending and quarantined (dead-lettered) records; a
          * quarantined one is rewritten as P (to keep its poison payload) plus a Q
          * marker so replay reclassifies it without re-submitting it. */
-        if (write_record(t, 'P', dq->recs[i].seq, dq->recs[i].name, dq->recs[i].payload, (uint32_t)dq->recs[i].len) != 0 ||
+        if (write_record(t, 'P', dq->recs[i].seq, dq->recs[i].name, dq->recs[i].payload, dq->recs[i].len) != 0 ||
             (dq->recs[i].quarantined && write_record(t, 'Q', dq->recs[i].seq, "", NULL, 0) != 0)) {
-            fclose(t); free(tmp); return GPTPS_E_IO;
+            fclose(t); remove(tmp); free(tmp); return GPTPS_E_IO;
         }
     }
-    if (fflush(t) != 0 || apx_fsync(t) != 0) { fclose(t); free(tmp); return GPTPS_E_IO; }
+    if (fflush(t) != 0 || apx_fsync(t) != 0) { fclose(t); remove(tmp); free(tmp); return GPTPS_E_IO; }
     fclose(t);
 
     if (dq->fp) { fclose(dq->fp); dq->fp = NULL; }
-    if (rename(tmp, dq->path) != 0) { free(tmp); return GPTPS_E_IO; }
+    if (dq_rename_replace(tmp, dq->path) != 0) {
+        /* The original journal is untouched on disk (the rename never happened),
+         * so put the append handle back before reporting the error: this return
+         * is documented as an ordinary recoverable GPTPS_E_IO, and leaving
+         * dq->fp NULL would turn the caller's next submit - or the next terminal
+         * event, on an engine worker thread - into a NULL-FILE* crash. */
+        remove(tmp); free(tmp);
+        dq->fp = fopen(dq->path, "ab");
+        if (dq->fp) fseek(dq->fp, 0, SEEK_END);
+        return GPTPS_E_IO;
+    }
     fsync_parent_dir(dq->path);   /* make the rename's directory entry durable */
     free(tmp);
     dq->fp = fopen(dq->path, "ab");
-    if (!dq->fp) return GPTPS_E_IO;
+    if (!dq->fp) return GPTPS_E_IO;   /* last resort; append_* degrade to an error */
+    fseek(dq->fp, 0, SEEK_END);       /* an append stream's position is not portable */
 
     /* compact memory: drop done records, keep pending + quarantined */
     for (i = 0; i < dq->n; ++i) {
@@ -326,7 +412,25 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     gptps_handle h = 0;
     dq_rec *rc;
     uint64_t seq;
+    char *nm;
+    void *pl;
     if (!dq || !task_name) return GPTPS_E_INVAL;
+    /* Refuse anything the replayer would reject rather than writing it: a record
+     * past these bounds is classified as a torn tail on the next open, which
+     * discards it AND every record appended after it - while this call returned
+     * GPTPS_OK and its durability promise. The bounds are exactly replay()'s. */
+    if (len > DQ_MAX_PAYLOAD) return GPTPS_E_INVAL;
+    if (strlen(task_name) > DQ_MAX_NAME) return GPTPS_E_INVAL;
+    if (len && !payload) return GPTPS_E_INVAL;   /* would memcpy from NULL below */
+
+    /* Duplicate BEFORE journaling. The reverse order has no rollback: a failed
+     * dup_str leaves a persisted record whose in-memory name is NULL, and the
+     * next compaction rewrites it with an empty name - unrecoverable, undroppable,
+     * and counted as pending forever. dup_mem returns NULL for len == 0 by
+     * design, so only a non-zero len makes a NULL payload an error. */
+    nm = dup_str(task_name);
+    pl = dup_mem(payload, len);
+    if (!nm || (len && !pl)) { free(nm); free(pl); return GPTPS_E_NOMEM; }
 
     apx_mutex_lock(&dq->mu);
     seq = dq->next_seq;
@@ -334,17 +438,18 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
      * durability claim. On failure the journal is rolled back to its previous
      * length, so a transient full disk costs this one submit rather than every
      * submit for the rest of the process's life. */
-    if (append_durable(dq->fp, 'P', seq, task_name, payload, (uint32_t)len) != 0) {
+    if (append_durable(dq->fp, 'P', seq, task_name, payload, len) != 0) {
         apx_mutex_unlock(&dq->mu);
+        free(nm); free(pl);
         return GPTPS_E_IO;
     }
     dq->next_seq = seq + 1;
 
     rc = push_rec(dq);
-    if (!rc) { apx_mutex_unlock(&dq->mu); return GPTPS_E_NOMEM; }
+    if (!rc) { apx_mutex_unlock(&dq->mu); free(nm); free(pl); return GPTPS_E_NOMEM; }
     rc->seq = seq; rc->done = 0; rc->handle = 0; rc->len = len;
-    rc->name = dup_str(task_name);
-    rc->payload = dup_mem(payload, len);
+    rc->name = nm;
+    rc->payload = pl;
     dq->pending += 1;
 
     st = gptps_submit(dq->e, task_name, payload, len, &h);
@@ -367,7 +472,12 @@ size_t gptps_dq_recover(gptps_dq *dq)
     apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
         gptps_handle h = 0;
-        if (dq->recs[i].done || dq->recs[i].handle != 0) continue; /* completed or already live */
+        /* Quarantined records are TERMINAL-but-retained, not incomplete. Re-submitting
+         * one re-runs the exact poison payload dead-lettering exists to contain, and it
+         * never converges: dq_on_event skips an already-quarantined record, so no new Q
+         * marker is written and the same payload runs again on every restart. */
+        if (dq->recs[i].done || dq->recs[i].quarantined || dq->recs[i].handle != 0)
+            continue; /* completed, quarantined, or already live */
         if (gptps_submit(dq->e, dq->recs[i].name, dq->recs[i].payload, dq->recs[i].len, &h) == GPTPS_OK) {
             dq->recs[i].handle = h;
             ++count;
@@ -411,7 +521,12 @@ size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *
         dq->recs[i].done = 1;        /* drained => terminally gone */
         ++n;
     }
-    if (n) do_rewrite(dq);           /* compact the drained records out of the journal */
+    /* Compact the drained records out of the journal. A failure here is not a
+     * failed drain - cb has already seen every payload - and there is no channel
+     * to report it through, so it is deliberately dropped: the journal simply
+     * stays uncompacted and a restart re-quarantines these records for another
+     * drain, which is this add-on's at-least-once contract applied to cb. */
+    if (n) (void)do_rewrite(dq);
     apx_mutex_unlock(&dq->mu);
     return n;
 }

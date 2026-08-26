@@ -343,13 +343,16 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams can simply be compiled into the host. **Seven** ship
+and the observer/constraint seams can simply be compiled into the host. **Nine** ship
 in `addons/`: `durable_queue.c` (observer seam → crash-durable journal),
 `gpu_quota.c` (a thin wrapper over the core's named-resource budgets),
 `wasm_exec.c` (module-as-task with a pluggable wasm runtime), `tui.c` (observer +
 settings → live dashboard), `gptps_orch.c` (observer + submit → run-after/fan-in
-dependencies), and the two composition libraries `gptps_pool.c` (N engines in one
-process, scale-up) and `gptps_xport.c` (N worker processes, scale-out). See
+dependencies), `gptps_await.c` (observer seam → block until a handle is terminal),
+`gptps_remote.c` (the cross-host wire codec `gptps_xport` is specified against), and
+the two composition libraries `gptps_pool.c` (N engines in one process, scale-up) and
+`gptps_xport.c` (N worker processes, scale-out). `gpu_quota_plugin.c` builds
+separately as the example *binary* plug-in rather than a linkable module. See
 [`addons/README.md`](../addons/README.md).
 
 Note the last two are *composition libraries* rather than add-ons in the loader's
@@ -467,10 +470,11 @@ sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
 **self-skip** where the facility is absent rather than failing (cgroup delegation, a
-wasm runtime CLI). CI runs nine jobs: `build-test` (Linux + macOS), `windows` (mingw-w64), `msvc`
-(cl.exe), `amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan),
-`tsan`, `hal_fast`, `cross` (i386 + big-endian s390x under QEMU), and
-`freestanding`. The `tsan` and `cross` jobs select tests with an EXCLUDE list, so
+wasm runtime CLI). CI runs eleven jobs: `build-test` (Linux + macOS, a 2-way matrix),
+`werror` (`-O2 -Wall -Wextra -Werror`), `package` (installs, then builds a plug-in
+out-of-tree against the installed package), `windows` (mingw-w64), `msvc` (cl.exe),
+`amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan), `tsan`,
+`hal_fast`, `cross` (i386 + big-endian s390x under QEMU), and `freestanding`. The `tsan` and `cross` jobs select tests with an EXCLUDE list, so
 a newly added test is covered by default rather than silently skipped.
 
 ---

@@ -15,6 +15,7 @@
 #include "gptps_hal.h"
 #include "gptps_internal.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -150,8 +151,15 @@ static int valid_value(const gptps_setting_entry *e, const char *v)
     char *end;
     switch (e->type) {
         case GPTPS_SETTING_INT: {
-            long long x = strtoll(v, &end, 10);
+            long long x;
+            errno = 0;
+            x = strtoll(v, &end, 10);
             if (end == v) return 0;
+            /* strtoll SATURATES at LLONG_MIN/MAX instead of failing, so without the
+             * ERANGE check a nonsense value was accepted and silently clamped to a
+             * number the operator never asked for. A limit that cannot be honoured
+             * has to be refused, not guessed at. */
+            if (errno == ERANGE) return 0;
             while (*end == ' ' || *end == '\t') ++end;
             if (*end) return 0;
             if (e->has_range && ((double)x < e->min || (double)x > e->max)) return 0;
@@ -161,8 +169,10 @@ static int valid_value(const gptps_setting_entry *e, const char *v)
             unsigned long long x;
             const char *p = v; while (*p == ' ' || *p == '\t') ++p;
             if (*p == '-') return 0;
+            errno = 0;
             x = strtoull(v, &end, 10);
             if (end == v) return 0;
+            if (errno == ERANGE) return 0;   /* saturated to ULLONG_MAX; see above */
             while (*end == ' ' || *end == '\t') ++end;
             if (*end) return 0;
             if (e->has_range && ((double)x < e->min || (double)x > e->max)) return 0;

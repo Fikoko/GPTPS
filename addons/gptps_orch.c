@@ -27,14 +27,35 @@ typedef struct {
     size_t        ndeps;
     size_t        remaining;   /* deps not yet terminal */
     int           released;
+    unsigned      attempts;    /* rejected release_gate submits so far (see the cap) */
 } gate;
+
+/* How many times a gate whose dependencies are all satisfied may be re-submitted
+ * before the orchestrator gives up on it. A retry is not free: each one runs
+ * gptps_submit's pre-lock work - a malloc + memcpy of the whole payload - inside an
+ * observer callback on the engine's emit path, so an uncapped retry turns one stuck
+ * gate into a per-terminal-event tax on the entire engine. The cap is what makes
+ * gptps_orch_pending() converge to 0 and the cost bounded.
+ *
+ * 16 is chosen to ride out a BRIEF pause (the TUI's `a` key, a tasks.<t>.enabled
+ * flip) while capping the worst case at 16 payload copies. A type that stays paused
+ * longer than sixteen terminal events is a host-level condition the orchestrator
+ * cannot paper over, and retrying into it indefinitely only makes it everyone's
+ * problem. Note E_NOTFOUND cannot distinguish "paused" from "never registered", so a
+ * typo'd task name also costs this many attempts before the gate is abandoned. */
+#define GPTPS_ORCH_RELEASE_ATTEMPTS 16
 
 struct gptps_orch {
     gptps        *e;
     apx_mutex     mu;
     gate         *gates;
     size_t        ng, gcap;
-    gptps_handle *done;        /* terminal handles seen so far */
+    /* Terminal handles seen so far, as an OPEN-ADDRESSED SET: dcap is a power of two
+     * (or 0), an empty slot holds 0, and handle 0 is never stored because the engine
+     * numbers items from 1. It was a plain array scanned linearly, which made every
+     * terminal event cost O(handles completed so far) - quadratic over a run, paid on
+     * the engine's emit path, and paid even by a host that never gates anything. */
+    gptps_handle *done;
     size_t        ndone, dcap;
 };
 
@@ -72,11 +93,48 @@ static int is_terminal(const gptps_event *ev)
     return ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED;
 }
 
+/* Scatter the handle before probing. Handles are allocated sequentially, but only a
+ * SUBSET of them is ever recorded here (one task type of several, say), and a subset
+ * with a stride that shares factors with the table size would pile every entry into
+ * the same few slots under an identity hash. */
+static uint64_t done_hash(gptps_handle h)
+{
+    uint64_t x = (uint64_t)h;
+    x ^= x >> 33;
+    x *= (uint64_t)0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return x;
+}
+
+/* Slot for h: either the one holding it, or the first empty one after it. cap must be
+ * a non-zero power of two, and the table must never be full, both of which
+ * done_grow() guarantees (it keeps the load factor at or below 1/2). */
+static size_t done_slot(const gptps_handle *tab, size_t cap, gptps_handle h)
+{
+    size_t mask = cap - 1;
+    size_t i = (size_t)(done_hash(h) & (uint64_t)mask);
+    while (tab[i] && tab[i] != h) i = (i + 1) & mask;
+    return i;
+}
+
 static int is_done(gptps_orch *o, gptps_handle h)
 {
+    if (!o->dcap || !h) return 0;
+    return o->done[done_slot(o->done, o->dcap, h)] == h;
+}
+
+/* Double the table and rehash. Returns 0 on OOM, leaving the old table intact. */
+static int done_grow(gptps_orch *o)
+{
+    size_t nc = o->dcap ? o->dcap * 2 : 32;
     size_t i;
-    for (i = 0; i < o->ndone; ++i) if (o->done[i] == h) return 1;
-    return 0;
+    gptps_handle *nt = (gptps_handle *)calloc(nc, sizeof *nt);
+    if (!nt) return 0;
+    for (i = 0; i < o->dcap; ++i)
+        if (o->done[i]) nt[done_slot(nt, nc, o->done[i])] = o->done[i];
+    free(o->done);
+    o->done = nt; o->dcap = nc;
+    return 1;
 }
 
 /* Record a terminal handle. Returns 1 if this handle is NEWLY terminal, 0 if it was
@@ -88,24 +146,56 @@ static int is_done(gptps_orch *o, gptps_handle h)
  * than stall a gate forever. */
 static int mark_done(gptps_orch *o, gptps_handle h)
 {
+    if (!h) return 0;                /* 0 is the table's empty marker; the engine never
+                                      * issues it, so refuse to advance a gate on one */
     if (is_done(o, h)) return 0;
-    if (o->ndone == o->dcap) {
-        size_t nc = o->dcap ? o->dcap * 2 : 16;
-        gptps_handle *nd = (gptps_handle *)realloc(o->done, nc * sizeof *nd);
-        if (!nd) return 1;           /* drop the hint; advance anyway (see above) */
-        o->done = nd; o->dcap = nc;
+    /* keep the load factor at 1/2 so probe chains stay short */
+    if ((o->ndone + 1) * 2 > o->dcap) {
+        if (!done_grow(o)) return 1; /* drop the hint; advance anyway (see above) */
     }
-    o->done[o->ndone++] = h;
+    o->done[done_slot(o->done, o->dcap, h)] = h;
+    o->ndone += 1;
     return 1;
 }
 
 /* release a gate: submit its task (caller holds o->mu; gptps_submit takes the
- * engine lock, preserving the orch->engine lock order). */
+ * engine lock, preserving the orch->engine lock order).
+ *
+ * A rejected submit used to mark the gate released anyway, dropping the submission
+ * on the floor: the task never ran, no event was emitted, and gptps_orch_pending()
+ * fell to 0, so the host could not even observe the loss. Some rejections really are
+ * transient - the type is PAUSED (E_NOTFOUND, what the TUI's `a` key and
+ * tasks.<t>.enabled do) or the intake is at limits.max_intake_depth (E_FULL) - and
+ * those deserve a retry on the next terminal event.
+ *
+ * But most are NOT transient, and retrying them forever is worse than dropping them.
+ * gptps_submit rejects permanently for a cost that can never fit the budget
+ * (E_BUDGET, "never-fits: reject at submit"), for a status a task type's cost hook
+ * returns, and for a task name that was simply never registered - which is reachable
+ * here because gptps_orch_after does not validate the name on the held-gate path, so
+ * a typo surfaces only at release time. Holding those forever pins
+ * gptps_orch_pending() above 0 (a documented liveness predicate that hosts and
+ * tests/test_orch.c drain on) and re-submits the gate on EVERY subsequent terminal
+ * event, with no cap - a full payload malloc+memcpy per event, engine-wide.
+ *
+ * So: retry only the statuses that can plausibly clear, and only a bounded number of
+ * times. Anything else ends the gate immediately. Either way the gate always reaches
+ * `released`, so pending() always converges. */
 static void release_gate(gptps_orch *o, gate *g)
 {
     gptps_handle h = 0;
-    g->released = 1;
-    gptps_submit(o->e, g->task, g->payload, g->len, &h);
+    gptps_status st = gptps_submit(o->e, g->task, g->payload, g->len, &h);
+
+    if (st == GPTPS_OK) { g->released = 1; return; }
+
+    /* Transient: a paused type can be resumed, a full intake can drain, and memory
+     * can come back. Everything else - E_BUDGET, E_SHUTDOWN, E_INVAL, a cost hook's
+     * own status - will say the same thing next time, so stop now. */
+    if (st != GPTPS_E_NOTFOUND && st != GPTPS_E_FULL && st != GPTPS_E_NOMEM) {
+        g->released = 1;
+        return;
+    }
+    if (++g->attempts >= GPTPS_ORCH_RELEASE_ATTEMPTS) g->released = 1;  /* gave up */
     /* the released task is now a normal engine item; we don't track its handle
      * further (chaining onto a deferred gate is out of scope - see the header). */
 }

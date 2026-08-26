@@ -1,5 +1,12 @@
 name: ci
 
+# Least privilege by default. Without this block the token inherits the repository's
+# default permissions, which on an older repo is read/WRITE for every job here -
+# none of which needs to write anything. Jobs that need more must ask for it
+# explicitly (release.yml does).
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -44,7 +51,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
       - name: Build
@@ -61,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure (-O2, -Werror)
         run: cmake -S . -B build-werror -DCMAKE_BUILD_TYPE=Release
              -DCMAKE_C_FLAGS="-std=c99 -O2 -Wall -Wextra -Werror -Wno-unused-parameter"
@@ -82,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Every add-on is built, amalgamated and documented
         run: sh tools/check_addon_coverage.sh
@@ -198,7 +205,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Generate amalgamation
         run: sh tools/amalgamate.sh amalgamation
       - name: Assert the generated files carry the MIT notice
@@ -229,7 +236,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -259,7 +266,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure
         run: cmake -S . -B build
       - name: Build
@@ -273,7 +280,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure (ASan + UBSan)
         run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug
              -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g"
@@ -294,7 +301,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure + build under ThreadSanitizer
         run: |
           cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
@@ -312,7 +319,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Configure + build + test with GPTPS_HAL_FAST=ON
         run: |
           cmake -S . -B build-fast -DGPTPS_HAL_FAST=ON
@@ -327,7 +334,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: 32-bit (i386) build + full test
         run: |
           sudo apt-get update
@@ -355,8 +362,17 @@ jobs:
           # and all three are covered on the native x86_64/arm64 + macOS runners.
           # Everything else - byte-order-critical serialization, the scheduler, the
           # failure engine, and every future pure-logic test - now runs by default.
+          # ANCHORED names, not substrings. The substring form silently did the wrong
+          # thing: 'demo' also matched `conformance_demo`, the only POSITIVE control
+          # in the conformance set - so the three that remained are all WILL_FAIL,
+          # and WILL_FAIL passes on ANY non-zero exit. If the harness had failed to
+          # dlopen anything at all under qemu, this leg would have gone green while
+          # testing nothing. The conformance tests dlopen, so they belong with the
+          # other dlopen exclusions - as a group, explicitly.
+          # A test not named here RUNS: adding one and forgetting this list makes the
+          # job fail loudly, which is the right direction to be wrong in.
           ctest --test-dir build-s390x --output-on-failure --no-tests=error \
-            -E 'oop|program|cgroup|addon|xport|wasm|tui|hang|durable|stress|bench_pool|demo|example_'
+            -E '^(oop|program|program_helper|cgroup|addon|addon_ns|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|wasm|tui|hang|durable|stress|gptps_bench_pool|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm)$'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
   # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL
@@ -366,7 +382,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build core with the stub HAL (-ffreestanding, no pthread/dl)
         run: sh freestanding/build.sh ./gptps_freestanding_demo
       - name: Run the MANUAL-mode demo (exit 0 = ran via the HAL seam only)

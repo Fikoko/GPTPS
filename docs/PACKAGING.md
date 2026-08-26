@@ -86,6 +86,8 @@ bin/gptps_conformance               prove a plug-in before shipping it
 | `GPTPS_ADDONS` | `all` | `all`, `none`, or a `;`-list |
 | `GPTPS_ADDON_<NAME>` | from the list | per-add-on override, for packagers |
 | `GPTPS_HAL_FAST` | OFF | adaptive mutexes on glibc — a latency knob |
+| `GPTPS_HAL_SOURCE` | *(unset)* | replace the bundled HAL with your own implementation of `gptps_hal.h` |
+| `GPTPS_BUILD_CONFORMANCE` | ON | build + install `bin/gptps_conformance` |
 
 A typo in `GPTPS_ADDONS` is a **hard error**, not an empty selection. A selector that
 silently selects nothing reports success for work it never did.

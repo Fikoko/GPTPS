@@ -62,10 +62,17 @@ boundary a determined attacker respects.
 
 An engine created **before** a `fork()` must not be used in the child: its mutex may
 be held by a thread that did not survive, so the child would deadlock. GPTPS detects
-this and returns `GPTPS_E_SHUTDOWN` from every entry point rather than hanging. A
-child that opens its **own** engine after forking is fully supported — that is how
-`addons/gptps_xport` runs its worker processes. The POSIX rule stands regardless: a
-forked child of a threaded process should `exec()` or `_exit()`.
+this and returns `GPTPS_E_SHUTDOWN` from every entry point rather than hanging — and
+the check runs *before* the lock is taken, because taking it is itself the hang.
+`gptps_shutdown` is included, which matters most: it would otherwise go on to join
+dispatcher and worker `pthread_t`s that do not exist in the child.
+[`tests/test_fork.c`](../tests/test_fork.c) forks a live threaded engine and asserts
+the refusal across mutating, read-only, settings and teardown entry points.
+
+A child that opens its **own** engine after forking is fully supported. The POSIX rule
+stands regardless: a forked child of a threaded process should `exec()` or `_exit()`.
+(`addons/gptps_xport` forks worker processes, but they run the executor directly and
+never open an engine of their own, so it is not an example of this.)
 
 ## Denial of service
 

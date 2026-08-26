@@ -46,9 +46,19 @@ extern "C" {
 
 typedef struct gptps_xport gptps_xport;
 
+/* Cap on any single framed message (task name, payload, or result). A same-machine
+ * worker runs your own forked handler, so this is defense-in-depth against a buggy
+ * peer rather than a trust boundary - but it bounds a bad length field to a clean
+ * failure instead of a multi-GB malloc, and is what a cross-host TCP variant of this
+ * protocol would require anyway. It is public because submit() REJECTS an oversized
+ * task name or payload (GPTPS_E_INVAL), so a caller has to be able to test for it. */
+#define GPTPS_XPORT_MAX_MSG ((uint64_t)256u * 1024u * 1024u)
+
 /* Runs one unit of work IN THE WORKER PROCESS. Return GPTPS_OK (or an error) and,
  * on success, a malloc'd result in *out_result (*out_len bytes) that the transport
- * sends back and then frees on the worker side. NULL/0 result is allowed. */
+ * sends back and then frees on the worker side. NULL/0 result is allowed. A result
+ * larger than GPTPS_XPORT_MAX_MSG cannot be framed: the transport frees it and
+ * replies GPTPS_E_BUDGET with no result, rather than dropping the link. */
 typedef gptps_status (*gptps_xport_run_fn)(const char *task, const void *payload, size_t len,
                                            void **out_result, size_t *out_len, void *user_data);
 
@@ -56,7 +66,8 @@ typedef gptps_status (*gptps_xport_run_fn)(const char *task, const void *payload
  * bad argument or a fork/socket failure (any already-forked workers are reaped). */
 gptps_xport *gptps_xport_open(size_t nworkers, gptps_xport_run_fn run, void *user_data);
 
-/* Number of live workers. */
+/* Number of worker processes forked by open(). A worker whose link failed is retired
+ * rather than respawned, and stays counted here - see submit(). */
 size_t gptps_xport_count(gptps_xport *xp);
 
 /* Ship one unit of work to a worker (round-robin) and BLOCK until it replies.
@@ -64,7 +75,14 @@ size_t gptps_xport_count(gptps_xport *xp);
  * length. *out_task_status (may be NULL) receives the handler's own status. The return
  * value is the TRANSPORT status: GPTPS_OK if the round-trip completed (then check
  * out_task_status), GPTPS_E_IO if the worker died / the link failed, GPTPS_E_INVAL on
- * a bad argument. Thread-safe: concurrent callers fan out across the workers. */
+ * a bad argument - a NULL xp or task, a NULL payload with a nonzero len, or a task
+ * name or payload above GPTPS_XPORT_MAX_MSG. Thread-safe: concurrent callers fan out
+ * across the workers.
+ *
+ * A link that fails MID-FRAME cannot be resynchronised, so it is retired: that worker
+ * is not respawned and every later submit routed to it returns GPTPS_E_IO. That is the
+ * honest answer - the alternative is reading the abandoned frame's leftover bytes as
+ * the next reply and returning a result for work that never ran. */
 gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 const void *payload, size_t len,
                                 void **out_result, size_t *out_len,

@@ -54,8 +54,10 @@
  * task of the type, which is exactly the sort of thing a policy plug-in must not do. */
 #define GPUQ_UNLIMITED ((uint64_t)~(uint64_t)0)
 
+/* The host table is genuinely process-wide: the core hands out the address of one
+ * static G_API for every load, so caching it here is safe. The ENGINE is not -
+ * see on_setting for why it must arrive through the watcher cookie instead. */
 static const gptps_api_routines *g_api;
-static gptps *g_engine;
 
 static uint64_t gpuq_budget_of(const char *value)
 {
@@ -68,19 +70,26 @@ static uint64_t gpuq_budget_of(const char *value)
  *
  * Keys arrive as "tasks.<task>.gpuq.units". The task name is everything between the
  * first and the last "." of that shape, so it is extracted rather than assumed - a
- * task name may itself contain dots. */
+ * task name may itself contain dots.
+ *
+ * The engine arrives as the watcher cookie, NOT from a file-static. One process may
+ * load this .so into several engines (gptps_pool opens N engines from one config,
+ * and the duplicate-namespace check is per-engine), and setup() runs once per engine.
+ * A static would hold only the engine loaded LAST, so every quota write would land on
+ * that one - leaving the engine the operator meant to cap unconstrained - and a write
+ * arriving after that engine was shut down would be a use-after-free. */
 static void on_setting(const char *key, const char *value, void *ud)
 {
+    gptps *e = (gptps *)ud;
     const char *rest, *tail;
     char task[128];
     size_t n;
-    (void)ud;
 
-    if (!key || !value) return;
+    if (!e || !key || !value) return;
 
     /* the budget itself */
     if (strcmp(key, GPUQ_TOTAL) == 0) {
-        g_api->define_resource(g_engine, GPUQ_RESOURCE, gpuq_budget_of(value));
+        g_api->define_resource(e, GPUQ_RESOURCE, gpuq_budget_of(value));
         return;
     }
 
@@ -99,7 +108,7 @@ static void on_setting(const char *key, const char *value, void *ud)
     memcpy(task, rest, n);
     task[n] = '\0';
 
-    g_api->set_task_resource_cost(g_engine, task, GPUQ_RESOURCE,
+    g_api->set_task_resource_cost(e, task, GPUQ_RESOURCE,
                                   (uint64_t)strtoull(value, NULL, 10));
 }
 
@@ -108,7 +117,6 @@ static gptps_status gpuq_setup(gptps *e, const gptps_api_routines *api, char **e
     gptps_status st;
     (void)err;
     g_api = api;
-    g_engine = e;
 
     /* Guard the whole 2.1 tranche before using any of it. Against an older core we
      * refuse to load rather than half-installing: settings_watch is what makes this
@@ -136,7 +144,9 @@ static gptps_status gpuq_setup(gptps *e, const gptps_api_routines *api, char **e
     st = api->define_task_setting(e, GPUQ_LEAF, GPTPS_SETTING_UINT, "0", 0, 0);
     if (st != GPTPS_OK) return st;
 
-    return api->settings_watch(e, on_setting, 0);
+    /* the cookie carries the engine, so a second load into a second engine cannot
+     * steal the first engine's settings (see on_setting). */
+    return api->settings_watch(e, on_setting, e);
 }
 
 /* Stop participating: widen the budget until it constrains nothing.

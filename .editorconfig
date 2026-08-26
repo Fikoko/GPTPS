@@ -1,0 +1,44 @@
+# https://editorconfig.org — mechanical whitespace rules only.
+#
+# There is deliberately no .clang-format here. The code is hand-aligned: trailing
+# comments, consecutive declarations and related assignments are lined up to columns
+# a formatter cannot reproduce. Every clang-format configuration tried (with and
+# without AlignConsecutive*) rewrote 57-67% of the lines, so adding one would mean
+# reformatting the whole tree to a style nobody chose. Style is described in prose in
+# CONTRIBUTING.md instead; this file covers only what tools can get right.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{c,h}]
+indent_style = space
+indent_size = 4
+
+[*.{cmake,txt}]
+indent_style = space
+indent_size = 4
+
+[CMakeLists.txt]
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+indent_style = space
+indent_size = 2
+# hard line breaks in markdown are significant
+trim_trailing_whitespace = false
+
+[*.sh]
+indent_style = space
+indent_size = 4
+
+[Makefile]
+indent_style = tab

@@ -48,13 +48,17 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path);
 /* Durable submit: persist (task_name, payload) to the journal and fsync it
  * BEFORE enqueuing via gptps_submit. Returns gptps_submit's status (and its
  * handle via out_handle); on a journal write error returns GPTPS_E_IO and does
- * not enqueue. */
+ * not enqueue. Returns GPTPS_E_INVAL for a NULL dq/task_name, a task_name longer
+ * than 4096 bytes, or len above 256 MiB - the journal format's limits, which are
+ * rejected here rather than written as a record the replayer would discard. */
 gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
                              const void *payload, size_t len, gptps_handle *out_handle);
 
 /* Re-submit every record that survived from a previous run/crash (persisted but
- * never completed). Returns the count re-submitted. Idempotent task bodies
- * required (at-least-once). Safe to call once after open. */
+ * never completed). Quarantined (dead-lettered) records are terminal-but-retained,
+ * NOT incomplete: they are skipped here - recover them out-of-band via
+ * gptps_dq_drain_quarantine. Returns the count re-submitted. Idempotent task
+ * bodies required (at-least-once). Safe to call once after open. */
 size_t gptps_dq_recover(gptps_dq *dq);
 
 /* Number of records currently persisted-but-not-completed. */
@@ -73,7 +77,12 @@ typedef void (*gptps_dq_quarantine_cb)(const char *task_name, const void *payloa
 size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *user_data);
 
 /* Rewrite the journal to contain only still-pending records, bounding its growth
- * within a long-running process. Returns GPTPS_OK or GPTPS_E_IO. */
+ * within a long-running process. Returns GPTPS_OK or GPTPS_E_IO.
+ *
+ * Not optional at scale: nothing else bounds the journal, and both replay on open
+ * and the observer's per-completion lookup walk everything accumulated since the
+ * last compaction. A process that never compacts pays for it in gptps_dq_open,
+ * the one path that must be fast after a crash. */
 gptps_status gptps_dq_compact(gptps_dq *dq);
 
 /* Close the queue and free it. Call AFTER gptps_shutdown(e). */

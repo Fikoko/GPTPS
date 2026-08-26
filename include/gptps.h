@@ -87,7 +87,7 @@ extern "C" {
 #define GPTPS_VERSION_MAJOR 1
 #define GPTPS_VERSION_MINOR 0
 #define GPTPS_VERSION_PATCH 0
-#define GPTPS_VERSION_STRING "1.0.0"
+#define GPTPS_VERSION_STRING "1.1.0"
 
 /* --- export / visibility ------------------------------------------------- */
 /* Default build is a STATIC library, so GPTPS_API is undecorated. Define
@@ -245,6 +245,16 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * becomes unknown), while a non-OK return still restarts it. This is the
  * "Restart=on-failure" semantic; the default is "Restart=always". */
 #define GPTPS_TASK_RETIRE_ON_OK 0x2u
+
+/* Longest task-type name the engine accepts (excluding the terminator).
+ * It is 127 because an event record carries the name inline in a 128-byte field,
+ * so anything longer is already lossy on the observer seam. It is ENFORCED rather
+ * than merely documented because the internal "tasks.<name>.<leaf>" settings keys
+ * and gptps_unregister_task's own prefix buffer are fixed-size: a longer name used
+ * to register successfully and then be permanently unremovable, with five of its
+ * six per-task settings silently colliding into one truncated key.
+ * gptps_register_task returns GPTPS_E_INVAL past this. */
+#define GPTPS_TASK_NAME_MAX 127
 
 typedef struct {
     size_t                struct_size;   /* = sizeof(gptps_task_def) */

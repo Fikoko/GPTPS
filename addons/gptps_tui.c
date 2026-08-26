@@ -69,6 +69,13 @@ struct gptps_tui {
     tui_mutex        mu;
     uint64_t         start_ms;
     unsigned         q, s, fin, fail, retr, dead, peak;
+    /* In-flight is COUNTED, not derived as started - finished - failed. A cancel that
+     * lands while the item is still queued emits a terminal FAILED with no preceding
+     * STARTED, so the subtraction wrapped to 4294967295 on unsigned - and since peak
+     * is a running maximum, that wrap poisoned the gauge's divisor for the life of
+     * the process, leaving the bar empty forever. Counted with a floor, the unpaired
+     * terminal event is absorbed instead. */
+    unsigned         inflight;
     tui_task         tasks[TUI_MAX_TASKS];
     int              ntasks;
     tui_event       *recent;
@@ -124,19 +131,19 @@ static void tui_on_event(const gptps_event *ev, void *ud)
 {
     gptps_tui *t = (gptps_tui *)ud;
     tui_task *tk;
-    unsigned inflight;
     mu_lock(&t->mu);
     switch (ev->kind) {
         case GPTPS_EV_QUEUED:        t->q++;    break;
-        case GPTPS_EV_STARTED:       t->s++;    break;
-        case GPTPS_EV_FINISHED:      t->fin++;  break;
-        case GPTPS_EV_FAILED:        t->fail++; break;
+        case GPTPS_EV_STARTED:       t->s++;    t->inflight++; break;
+        /* the floor is what a terminal event with no matching STARTED hits - a cancel
+         * of a still-queued item, or a forced task removal (see the field comment) */
+        case GPTPS_EV_FINISHED:      t->fin++;  if (t->inflight) t->inflight--; break;
+        case GPTPS_EV_FAILED:        t->fail++; if (t->inflight) t->inflight--; break;
         case GPTPS_EV_RETRIED:       t->retr++; break;
         case GPTPS_EV_DEAD_LETTERED: t->dead++; break;
         default: break;
     }
-    inflight = t->s - t->fin - t->fail;          /* per-attempt: never underflows */
-    if (inflight > t->peak) t->peak = inflight;
+    if (t->inflight > t->peak) t->peak = t->inflight;
     t->dirty = 1;                                /* something changed (for ON_DEMAND repaint) */
 
     /* MINIMAL stops here - counts only, ~no per-event cost. NORMAL+ does the
@@ -484,7 +491,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     else pos = appendf(buf, cap, pos, "GPTPS \xc2\xb7 %s   up %.1fs   %.1f done/s\n", t->cfg.title, up, rate);
 
     {   /* in-flight gauge, scaled to the terminal width */
-        unsigned inflt = t->s - t->fin - t->fail, j, gw, w;
+        unsigned inflt = t->inflight, j, gw, w;   /* counted, not derived: see the field */
         const char *fillc = uni ? "\xe2\x96\x88" : "#";   /* full block / hash */
         const char *trakc = uni ? "\xe2\x96\x91" : ".";   /* light shade / dot  */
         const char *C = color ? "\x1b[36m" : "";          /* cyan bar */
@@ -1061,7 +1068,10 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
     t->start_ms = gptps_now_ms(NULL);
     if (gptps_register_observer(e, tui_on_event, t) != GPTPS_OK) {
-        free(t->recent); mu_destroy(&t->mu); free(t); return NULL;
+        /* t->lat too - it is 16 KB by default and up to 16 MB with cfg.latency_window
+         * at its cap, and the caller gets NULL back with no handle to reclaim it.
+         * Unconditional: t->lat is explicitly NULL below KPI FULL. Mirrors tui_close. */
+        free(t->lat); free(t->recent); mu_destroy(&t->mu); free(t); return NULL;
     }
     tui_register_settings(e, t);   /* expose tui.refresh_ms / tui.kpi / tui.mode */
     return t;

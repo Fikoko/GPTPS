@@ -48,7 +48,7 @@ logs/
 compile_commands.json
 
 # =====================
-# AI tooling (gstack)
+# AI tooling
 # =====================
-# Per-developer local overrides — keep personal permission grants out of git.
-.claude/settings.local.json
+# Assistant scratch/config, if a contributor uses one. Not required to build.
+.claude/

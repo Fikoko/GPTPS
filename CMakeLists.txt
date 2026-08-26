@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(gptps VERSION 1.0.0 LANGUAGES C)
+project(gptps VERSION 1.1.0 LANGUAGES C)
 
 # GPTPS - General Purpose Task Processing System.
 # Embeddable, in-process C99 task-processing library. Core is strict C99;
@@ -27,14 +27,46 @@ if(MSVC)
     add_compile_options(/FI${CMAKE_CURRENT_SOURCE_DIR}/tests/test_atomic_compat.h)
 endif()
 
+# The release version necessarily lives in two places: project(VERSION) drives
+# packaging (gptps.pc, gptps-config-version.cmake), while GPTPS_VERSION_STRING is what
+# a consumer compiles against - and it is the ONLY one that exists for the
+# amalgamation or a plain `cc -std=c99` build, where CMake never runs. Assert they
+# agree here, so drift is a configure error rather than a shipped inconsistency.
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/include/gptps.h _gptps_hdr)
+string(REGEX MATCH "#define[ \t]+GPTPS_VERSION_STRING[ \t]+\"([0-9]+\\.[0-9]+\\.[0-9]+)\"" _ "${_gptps_hdr}")
+if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR "could not read GPTPS_VERSION_STRING from include/gptps.h")
+elseif(NOT CMAKE_MATCH_1 STREQUAL PROJECT_VERSION)
+    message(FATAL_ERROR
+        "version drift: project(VERSION ${PROJECT_VERSION}) but include/gptps.h says "
+        "GPTPS_VERSION_STRING \"${CMAKE_MATCH_1}\". Update both.")
+endif()
+unset(_gptps_hdr)
+
 # --- library (grows as modules land) ---------------------------------------
 # Core is portable C99; the HAL + executor backend are selected per platform.
 set(GPTPS_SRC src/alloc.c src/config.c src/config_toml.c src/settings.c src/engine.c)
 if(WIN32)
-    list(APPEND GPTPS_SRC src/hal_win.c src/exec_win.c)        # Win32 HAL + CreateProcess/Job-Object program executor
+    set(_gptps_hal src/hal_win.c)
+    list(APPEND GPTPS_SRC src/exec_win.c)                       # CreateProcess/Job-Object program executor
 else()
-    list(APPEND GPTPS_SRC src/hal_posix.c src/exec_oop_posix.c) # POSIX HAL + out-of-process executor
+    set(_gptps_hal src/hal_posix.c)
+    list(APPEND GPTPS_SRC src/exec_oop_posix.c)                 # out-of-process executor
 endif()
+# The HAL is a real module boundary (freestanding/hal_stub.c proves it), so a
+# downstream on an unlisted platform can substitute its own implementation of
+# include/gptps_hal.h wholesale. This was documented below as supported but never
+# actually read, which meant setting it silently built the stock HAL anyway.
+set(GPTPS_HAL_SOURCE "" CACHE FILEPATH
+    "Replace the bundled HAL with this implementation of include/gptps_hal.h")
+if(GPTPS_HAL_SOURCE)
+    if(NOT EXISTS "${GPTPS_HAL_SOURCE}")
+        message(FATAL_ERROR "GPTPS_HAL_SOURCE does not exist: ${GPTPS_HAL_SOURCE}")
+    endif()
+    set(_gptps_hal "${GPTPS_HAL_SOURCE}")
+    message(STATUS "gptps: using custom HAL ${GPTPS_HAL_SOURCE}")
+endif()
+list(APPEND GPTPS_SRC ${_gptps_hal})
 add_library(gptps STATIC ${GPTPS_SRC})
 target_include_directories(gptps
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -50,7 +82,8 @@ endif()
 # Optional platform-optimized HAL: a build-time scale knob (adaptive/spin mutexes on
 # glibc) that stays OFF by default, so the portable C99 path is the untouched default.
 # The whole HAL is a module boundary, so scaling here needs no core change. A downstream
-# can also replace the HAL source wholesale via -DGPTPS_HAL_SOURCE=<file>.
+# can also replace the HAL source wholesale via -DGPTPS_HAL_SOURCE=<file> (declared
+# with the library sources above).
 option(GPTPS_HAL_FAST "Build the platform-optimized HAL (adaptive mutexes; glibc)" OFF)
 if(GPTPS_HAL_FAST)
     target_compile_definitions(gptps PRIVATE GPTPS_HAL_FAST)
@@ -149,6 +182,25 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/gptps.pc.in
                ${CMAKE_CURRENT_BINARY_DIR}/gptps.pc @ONLY)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/gptps.pc
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# --- plug-in conformance harness (a shipped tool, not a test artefact) ------
+# Links libgptps so it can SYNTHESISE historical host-table shapes out of public
+# symbols - which is how it tests the one thing the engine structurally cannot: that
+# a plug-in does not read past the table size it was handed. Installed to bin/ so a
+# third-party author can run it against their own .so.
+# It used to be built inside the GPTPS_BUILD_TESTS block, so `cmake --install` from a
+# default (tests-off) consumer build silently produced no bin/gptps_conformance at
+# all - while docs/PACKAGING.md listed it as part of the install tree and
+# docs/PLUGINS.md told authors to run it. Its own option, defaulting on, so the
+# documented install tree is what a packager actually gets.
+option(GPTPS_BUILD_CONFORMANCE
+       "Build and install the plug-in conformance harness (bin/gptps_conformance)" ON)
+if(GPTPS_BUILD_CONFORMANCE)
+    add_executable(gptps_conformance tools/gptps_conformance.c)
+    target_include_directories(gptps_conformance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(gptps_conformance PRIVATE gptps)
+    install(TARGETS gptps_conformance RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 
 # Examples register CTest tests too, so testing is enabled when EITHER is on.
 if(GPTPS_BUILD_TESTS OR GPTPS_BUILD_EXAMPLES)
@@ -251,6 +303,25 @@ target_link_libraries(test_scheduler PRIVATE gptps)
 add_test(NAME scheduler COMMAND test_scheduler)
 set_tests_properties(scheduler PROPERTIES TIMEOUT 30)
 
+add_executable(test_admission_order tests/test_admission_order.c) # admission ORDER contract
+target_include_directories(test_admission_order
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_admission_order PRIVATE gptps)
+add_test(NAME admission_order COMMAND test_admission_order)
+set_tests_properties(admission_order PROPERTIES TIMEOUT 60)
+
+# Complexity gate, not a benchmark: asserts admission stays LINEAR in queue depth.
+# It compares two runs on the same machine, so it carries over to a loaded runner in
+# a way an absolute throughput number would not.
+add_executable(test_admission_perf tests/test_admission_perf.c)
+target_include_directories(test_admission_perf
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_admission_perf PRIVATE gptps)
+add_test(NAME admission_perf COMMAND test_admission_perf)
+set_tests_properties(admission_perf PROPERTIES TIMEOUT 120)
+
 add_executable(test_deadletter tests/test_deadletter.c) # dead-letter drain API
 target_include_directories(test_deadletter
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -328,15 +399,13 @@ add_dependencies(test_plugin_tier gpu_quota_plugin)
 add_test(NAME plugin_tier COMMAND test_plugin_tier)
 set_tests_properties(plugin_tier PROPERTIES TIMEOUT 30)
 
-# --- plug-in conformance harness ------------------------------------------
-# Links libgptps so it can SYNTHESISE historical host-table shapes out of public
-# symbols - which is how it tests the one thing the engine structurally cannot: that
-# a plug-in does not read past the table size it was handed. Installed to bin/ so a
-# third-party author can run it against their own .so.
-add_executable(gptps_conformance tools/gptps_conformance.c)
-target_include_directories(gptps_conformance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(gptps_conformance PRIVATE gptps)
-install(TARGETS gptps_conformance RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# --- plug-in conformance harness: the fixtures it must accept and reject ----
+# (the harness itself is built above, outside this block - it ships to bin/)
+if(NOT GPTPS_BUILD_CONFORMANCE)
+    message(FATAL_ERROR
+        "GPTPS_BUILD_TESTS needs GPTPS_BUILD_CONFORMANCE=ON: the conformance tests "
+        "run the harness against fixture plug-ins.")
+endif()
 
 # A plug-in that calls a v1.4 routine while declaring a v1.0 floor. It exists so the
 # harness has something it MUST reject: a conformance harness that cannot fail
@@ -391,6 +460,15 @@ set_tests_properties(addon PROPERTIES TIMEOUT 30)
 add_dependencies(test_toml addon_demo) # test_toml writes the addon path into its config file
 
 if(UNIX)
+    # an engine inherited across fork() must refuse on every entry point (POSIX only)
+    add_executable(test_fork tests/test_fork.c)
+    target_include_directories(test_fork
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_fork PRIVATE gptps)
+    add_test(NAME fork COMMAND test_fork)
+    set_tests_properties(fork PROPERTIES TIMEOUT 30)
+
     add_executable(test_oop tests/test_oop.c)
     target_include_directories(test_oop
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

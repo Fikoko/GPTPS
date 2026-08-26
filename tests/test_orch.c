@@ -72,6 +72,49 @@ static gptps *open_engine(unsigned conc)
 static void wait_for(int *p, int target)
 { uint64_t s = gptps_now_ms(NULL); while (get(p) < target && gptps_now_ms(NULL) - s < 2000) { } }
 
+/* A gate the engine will NEVER accept must still stop being pending.
+ *
+ * gptps_orch_pending() is documented as a drain predicate and this test asserts the
+ * property that makes it one: it converges. A held gate is retried when the engine
+ * rejects its submit transiently (paused type, full intake) - but E_NOTFOUND cannot
+ * tell "paused" from "never registered", so without a cap a typo'd task name pinned
+ * pending() above 0 forever AND re-ran gptps_submit's payload copy on every terminal
+ * event in the engine. Here the name is never registered, so every retry fails; the
+ * gate must still be abandoned and pending() must reach 0. */
+static int check_unsatisfiable_gate(void)
+{
+    gptps *e = open_engine(1);
+    gptps_orch *o;
+    gptps_handle dep = 0;
+    int i, bad = 0;
+
+    if (!e) return 1;
+    o = gptps_orch_install(e);
+    if (!o) { gptps_shutdown(e); return 1; }
+    reg(e, "dep", task_mark);
+
+    if (gptps_submit(e, "dep", NULL, 0, &dep) != GPTPS_OK) ++bad;
+    /* payload is non-empty on purpose: a retry copies it, which is the cost being bounded */
+    if (gptps_orch_after(o, "no_such_task", "xxxx", 4, &dep, 1, NULL) != GPTPS_OK) ++bad;
+
+    /* drive terminal events until the orchestrator gives up (bounded by the retry
+     * cap); each unrelated completion is one retry opportunity */
+    for (i = 0; i < 200 && gptps_orch_pending(o) != 0; ++i) {
+        gptps_handle h = 0;
+        if (gptps_submit(e, "dep", NULL, 0, &h) != GPTPS_OK) break;
+        wait_for(&c_mark, i + 2);
+    }
+    if (gptps_orch_pending(o) != 0) {
+        printf("FAIL unsatisfiable gate never converged: pending=%u\n",
+               (unsigned)gptps_orch_pending(o));
+        ++bad;
+    }
+
+    gptps_shutdown(e);
+    gptps_orch_close(o);
+    return bad;
+}
+
 int main(void)
 {
     gptps *e;
@@ -181,6 +224,8 @@ int main(void)
 
     gptps_shutdown(e);
     gptps_orch_close(o);
+
+    fails += check_unsatisfiable_gate();
 
     if (fails) { printf("%d orch check(s) FAILED\n", fails); return 1; }
     printf("all orch checks passed\n");

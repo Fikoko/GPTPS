@@ -119,6 +119,20 @@ enum {
     GPTPS_RW_DENIED      = 8,
     GPTPS_RW_FULL        = 9,
     GPTPS_RW_SHUTDOWN    = 10,
+    /* Codes 11-15 complete the mapping: without them GPTPS_E_TASK - the one status a
+     * REPLY most exists to carry, "the handler ran and failed" - arrived as
+     * GPTPS_E_IO, i.e. as "the link broke", and a caller that reacts to a broken link
+     * by retrying would re-run a non-idempotent task that had already completed.
+     *
+     * Adding them did NOT need a GPTPS_REMOTE_VERSION bump, and a future addition
+     * will not either: a peer built before a code exists routes it through the
+     * default arm to GPTPS_E_IO, which is exactly what it did with that status
+     * beforehand. Assign the next free number; never renumber one. */
+    GPTPS_RW_TASK        = 11,
+    GPTPS_RW_DUP         = 12,
+    GPTPS_RW_ABI         = 13,
+    GPTPS_RW_CONFIG      = 14,
+    GPTPS_RW_BUSY        = 15,
     GPTPS_RW_UNKNOWN     = 65535
 };
 uint32_t     gptps_remote_status_to_wire(gptps_status s);
@@ -148,7 +162,10 @@ void gptps_remote_make_reply(gptps_remote_hdr *h, uint64_t req_id, gptps_status 
  * where our string ends.
  *
  * encode_request: needs *len set to the buffer size; sets it to the bytes written.
- *                 GPTPS_E_BUDGET if the buffer is too small.
+ *                 GPTPS_E_BUDGET if the buffer is too small (*len is then set to the
+ *                 size required). GPTPS_E_INVAL if the framed request would not fit
+ *                 the header's u32 payload_len, since such a frame could only be sent
+ *                 with a truncated length.
  * decode_request: returns BORROWED pointers into `buf`, valid as long as it is.
  *                 GPTPS_E_INVAL if the framing does not add up - which includes a
  *                 task_len that overruns the payload, the obvious attack. */

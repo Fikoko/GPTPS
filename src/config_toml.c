@@ -34,7 +34,14 @@ typedef struct {
 struct gptps_toml {
     toml_entry *e;
     size_t      n, cap;
+    int         oom;     /* an allocation failed mid-parse: the table is INCOMPLETE */
 };
+
+/* A settings file is kilobytes. The cap exists because fopen() on a DIRECTORY
+ * succeeds on POSIX and then reports ftell() == LONG_MAX - which used to become a
+ * ~8 EiB gptps_malloc: NULL on a plain build, a hard abort under a hardened
+ * allocator or ASan, for nothing worse than a mistyped path. */
+#define GPTPS_TOML_MAX_BYTES (16UL * 1024UL * 1024UL)
 
 /* ---- small helpers ---- */
 
@@ -101,17 +108,37 @@ static void strip_comment(char *v)
     int in_str = 0;
     char *p = v;
     for (; *p; ++p) {
+        /* Skip the escaped character, exactly as the value scanner below does.
+         * Without this a \" inside a string flipped in_str back to "outside", so
+         * `motd = "a\"b#c"` was cut at the '#' and the value silently lost its
+         * tail on every save->reload round trip. The `in_str &&` guard mirrors
+         * parse_value: a backslash outside a quoted body is not an escape and
+         * must not be able to swallow a comment marker. */
+        if (in_str && *p == '\\' && p[1]) { ++p; continue; }
         if (*p == '"') in_str = !in_str;
         else if (*p == '#' && !in_str) { *p = 0; break; }
     }
 }
 
-/* parse the value text into entry e (section/key already set) */
+/* parse the value text into entry e (section/key already set).
+ * Returns 0 on success and -1 when nothing was stored; on an allocation failure
+ * it also raises t->oom, because a config silently missing a [limits] key is not
+ * the same thing as a config with a line the subset grammar does not cover. */
 static int parse_value(struct gptps_toml *t, const char *section, const char *key, char *val)
 {
     toml_entry *e;
+    char *sec, *k;
     val = trim(val);
     if (!*val) return -1;
+
+    /* Name the row BEFORE push() publishes it. push() has already bumped t->n by
+     * the time it returns, so a dup that failed afterwards left a LIVE entry with
+     * section == NULL - and find() strcmp()s that field on the very next lookup.
+     * Under a pool allocator (examples/embedded.c runs on a 256 KiB arena) that
+     * is a startup SEGV, not a theoretical OOM. */
+    sec = dupn(section, strlen(section));
+    k   = dupn(key, strlen(key));
+    if (!sec || !k) { gptps_free(sec); gptps_free(k); t->oom = 1; return -1; }
 
     if (val[0] == '[') {
         /* single-line array of strings */
@@ -132,29 +159,45 @@ static int parse_value(struct gptps_toml *t, const char *section, const char *ke
                 str = dupn(p, (size_t)(q - p)); if (str) trim(str);
                 p = q;
             }
-            if (str) {
-                if (n == capn) { capn = capn ? capn * 2 : 4;
-                    arr = (char **)gptps_realloc(arr, (size_t)capn * sizeof *arr); }
-                if (arr) arr[n++] = str; else { gptps_free(str); }
+            if (!str) { t->oom = 1; goto arr_fail; }
+            if (n == capn) {
+                int nc = capn ? capn * 2 : 4;
+                /* Grow through a TEMPORARY. `arr = gptps_realloc(arr, ...)` drops
+                 * the only pointer to the old block on failure - leaking it and
+                 * every string in it - and the old code then carried on with
+                 * arr == NULL while n stayed put, publishing an (arr = NULL,
+                 * arrn = n) pair that gptps_toml_str_array hands to callers
+                 * verbatim: a NULL deref in gptps_open's addon loop. capn is
+                 * likewise raised only once the growth actually succeeded; bumping
+                 * it first is what stopped the `n == capn` retry from ever firing
+                 * again. */
+                char **na = (char **)gptps_realloc(arr, (size_t)nc * sizeof *arr);
+                if (!na) { gptps_free(str); t->oom = 1; goto arr_fail; }
+                arr = na; capn = nc;
             }
+            arr[n++] = str;
         }
         e = push(t);
-        if (!e) { int k; for (k = 0; k < n; ++k) gptps_free(arr[k]); gptps_free(arr); return -1; }
-        e->section = dupn(section, strlen(section));
-        e->key = dupn(key, strlen(key));
+        if (!e) { t->oom = 1; goto arr_fail; }
+        e->section = sec; e->key = k;
         e->type = TT_ARR; e->arr = arr; e->arrn = n;
         return 0;
+
+    arr_fail:
+        { int j; for (j = 0; j < n; ++j) gptps_free(arr[j]); }
+        gptps_free(arr); gptps_free(sec); gptps_free(k);
+        return -1;                 /* nothing published: the key is simply absent */
     }
 
     e = push(t);
-    if (!e) return -1;
-    e->section = dupn(section, strlen(section));
-    e->key = dupn(key, strlen(key));
+    if (!e) { gptps_free(sec); gptps_free(k); t->oom = 1; return -1; }
+    e->section = sec; e->key = k;
 
     if (val[0] == '"') {
         char *q = val + 1;
         while (*q && *q != '"') { if (*q == '\\' && q[1]) ++q; ++q; }
         e->type = TT_STR; e->s = unescape(val + 1, q);
+        if (!e->s) t->oom = 1;     /* the row exists but lost its value */
     } else if (strcmp(val, "true") == 0) {
         e->type = TT_BOOL; e->b = 1;
     } else if (strcmp(val, "false") == 0) {
@@ -173,6 +216,7 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
 {
     FILE *f;
     long sz;
+    size_t got;
     char *buf, *line, *save;
     struct gptps_toml *t;
     char section[256];
@@ -180,12 +224,25 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
     if (errbuf && errlen) errbuf[0] = 0;
     f = fopen(path, "rb");
     if (!f) { if (errbuf && errlen) snprintf(errbuf, errlen, "cannot open %s", path); return NULL; }
-    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz < 0) { fclose(f); return NULL; }
+    /* Each step below is checked AND fills errbuf. Unchecked, a mistyped path
+     * surfaced as gptps_open's E_CONFIG with a blank error string - and for the
+     * commonest typo of all, a directory, as an ~8 EiB allocation request (see
+     * GPTPS_TOML_MAX_BYTES). */
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); if (errbuf && errlen) snprintf(errbuf, errlen, "cannot size %s", path); return NULL; }
+    sz = ftell(f);
+    if (sz < 0 || (unsigned long)sz > GPTPS_TOML_MAX_BYTES) {
+        fclose(f);
+        if (errbuf && errlen) snprintf(errbuf, errlen, "%s is not a readable config file", path);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); if (errbuf && errlen) snprintf(errbuf, errlen, "cannot rewind %s", path); return NULL; }
     buf = (char *)gptps_malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { /* tolerate short read */ }
-    buf[sz] = 0;
+    if (!buf) { fclose(f); if (errbuf && errlen) snprintf(errbuf, errlen, "out of memory reading %s", path); return NULL; }
+    /* Terminate at what we actually read, not at what ftell promised: an editor
+     * that truncates-and-rewrites the file under a SIGHUP-driven reload would
+     * otherwise leave the tail of the buffer uninitialised - and parsed. */
+    got = fread(buf, 1, (size_t)sz, f);
+    buf[got] = 0;
     fclose(f);
 
     t = (struct gptps_toml *)gptps_calloc(1, sizeof *t);
@@ -224,6 +281,15 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
         }
     }
     gptps_free(buf);
+    /* An incomplete config is not a valid config: a dropped [limits] key would
+     * silently fall back to a compiled-in default the operator did not choose.
+     * Only a genuine allocation failure sets this - the "line I cannot parse"
+     * path leaves oom clear, so the subset grammar stays as tolerant as before. */
+    if (t->oom) {
+        gptps_toml_free(t);
+        if (errbuf && errlen) snprintf(errbuf, errlen, "out of memory parsing %s", path);
+        return NULL;
+    }
     return t;
 }
 
@@ -241,9 +307,13 @@ void gptps_toml_free(gptps_toml *t)
 static const toml_entry *find(const gptps_toml *t, const char *section, const char *key)
 {
     size_t k;
-    for (k = 0; k < t->n; ++k)
+    for (k = 0; k < t->n; ++k) {
+        /* Defence in depth: parse_value now only ever publishes a fully named
+         * row, but a NULL here is a strcmp() crash rather than a missed key. */
+        if (!t->e[k].section || !t->e[k].key) continue;
         if (strcmp(t->e[k].section, section) == 0 && strcmp(t->e[k].key, key) == 0)
             return &t->e[k];
+    }
     return NULL;
 }
 
@@ -277,7 +347,9 @@ const char *gptps_toml_str(const gptps_toml *t, const char *section, const char 
 int gptps_toml_str_array(const gptps_toml *t, const char *section, const char *key, const char *const **out)
 {
     const toml_entry *e = t ? find(t, section, key) : NULL;
-    if (!e || e->type != TT_ARR) { *out = NULL; return 0; }
+    /* !e->arr as well as the type: a caller loops out[0..n), so a non-zero count
+     * beside a NULL base is worse than reporting no array at all. */
+    if (!e || e->type != TT_ARR || !e->arr) { *out = NULL; return 0; }
     *out = (const char *const *)e->arr;
     return e->arrn;
 }

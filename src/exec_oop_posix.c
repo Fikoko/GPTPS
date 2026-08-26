@@ -66,17 +66,26 @@
  * to have. Polls with WNOHANG in short slices, honouring the deadline and the
  * cancel flag, then escalates to SIGKILL (unblockable, so the loop terminates).
  * `group` selects kill(-pid) for a child that leads its own process group.
+ * `*reaped` reports whether *wstatus was actually filled in: a host that runs
+ * `signal(SIGCHLD, SIG_IGN)` (or a wait-any reaper) auto-reaps our children, so
+ * waitpid() fails with ECHILD and wstatus keeps its initialiser. WIFEXITED(0) is
+ * then true with exit status 0 - i.e. the caller would read a FAILING program as a
+ * success. Callers must refuse to interpret wstatus when *reaped is 0.
  * Returns GPTPS_OK if the child exited on its own, else why it had to be killed. */
-static gptps_status reap_bounded(pid_t pid, int *wstatus, int group,
+static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group,
                                  uint64_t deadline, gptps_flag *cancel)
 {
     gptps_status why = GPTPS_OK;
     int waited = 0;
+    *reaped = 0;
     for (;;) {
         struct timespec ts;
         pid_t r = waitpid(pid, wstatus, WNOHANG);
-        if (r == pid) return why;
-        if (r < 0 && errno != EINTR) return why;     /* already reaped / no such child */
+        if (r == pid) { *reaped = 1; return why; }
+        /* Not an error we can act on (the host already reaped it): keep returning
+         * GPTPS_OK - both call sites map a non-OK return onto "we had to kill it",
+         * which would turn every successful task into a spurious failure. */
+        if (r < 0 && errno != EINTR) return why;
         if (why == GPTPS_OK) {
             uint64_t now = gptps_hal_monotonic_ms();
             if (deadline && now >= deadline)              why = GPTPS_E_TIMEOUT;
@@ -90,9 +99,11 @@ static gptps_status reap_bounded(pid_t pid, int *wstatus, int group,
     }
 }
 
-/* Create a pipe with both ends close-on-exec so a concurrently-forked child
- * (especially a PROGRAM child that exec()s) cannot inherit and pin open another
- * executor's pipe ends - which would hang that executor's parent waiting for EOF. */
+/* Create a pipe with both ends close-on-exec so a concurrently-forked child that
+ * goes on to exec() (a PROGRAM child) cannot inherit and pin open another
+ * executor's pipe ends - which would hang that executor's parent waiting for EOF.
+ * O_CLOEXEC only fires AT exec(), so it does nothing for the OOP child, which
+ * never execs; that case is handled by the fd registry below. */
 static int make_pipe_cloexec(int fds[2])
 {
 #if defined(__linux__) && defined(O_CLOEXEC)
@@ -103,6 +114,75 @@ static int make_pipe_cloexec(int fds[2])
     (void)fcntl(fds[0], F_SETFD, fcntl(fds[0], F_GETFD) | FD_CLOEXEC);
     (void)fcntl(fds[1], F_SETFD, fcntl(fds[1], F_GETFD) | FD_CLOEXEC);
     return 0;
+}
+
+/* ---- executor fd registry -------------------------------------------------
+ * The OOP child never exec()s - it runs the host's task function in-process - so
+ * FD_CLOEXEC cannot protect anyone from it. Every descriptor open at fork time
+ * stays open in that child for the WHOLE OOP task, including a concurrent PROGRAM
+ * executor's stdin write end: `cat` then never sees EOF and that executor pumps to
+ * its deadline, returning GPTPS_E_TIMEOUT with an empty result instead of the
+ * payload. (It equally swallows POLLHUP on another OOP executor's write end, which
+ * turns a child that crashed early into a full-timeout E_TIMEOUT and skips the
+ * cgroup OOM check.) A blanket "close everything above 2" is not an option:
+ * docs/SECURITY.md promises a forked child may keep using host-opened descriptors.
+ * So each executor publishes exactly the ends IT owns and the child closes only
+ * those. The lock is held across BOTH pipe creation and fork(), which is what
+ * removes the window where a pipe exists but is not yet published. */
+#define GPTPS_EXEC_MAX_FDS 256
+static pthread_mutex_t g_execfd_m = PTHREAD_MUTEX_INITIALIZER;
+static int             g_execfd[GPTPS_EXEC_MAX_FDS];
+static unsigned        g_execfd_n = 0;
+
+/* Create a pipe and publish both ends, atomically w.r.t. another executor's fork.
+ * On overflow the end simply goes unpublished - degraded to the old behaviour for
+ * that one descriptor rather than failing a task. */
+static int exec_pipe(int fds[2])
+{
+    int rc;
+    pthread_mutex_lock(&g_execfd_m);
+    rc = make_pipe_cloexec(fds);
+    if (rc == 0) {
+        if (g_execfd_n < GPTPS_EXEC_MAX_FDS) g_execfd[g_execfd_n++] = fds[0];
+        if (g_execfd_n < GPTPS_EXEC_MAX_FDS) g_execfd[g_execfd_n++] = fds[1];
+    }
+    pthread_mutex_unlock(&g_execfd_m);
+    return rc;
+}
+
+/* Unpublish and close as ONE step: closing first would free the fd number while it
+ * is still listed, and a concurrent thread could be handed it - after which the
+ * next OOP child would close a descriptor that is not ours. */
+static void exec_close(int fd)
+{
+    unsigned i;
+    pthread_mutex_lock(&g_execfd_m);
+    for (i = 0; i < g_execfd_n; ++i)
+        if (g_execfd[i] == fd) { g_execfd[i] = g_execfd[--g_execfd_n]; break; }
+    close(fd);
+    pthread_mutex_unlock(&g_execfd_m);
+}
+
+/* fork() with the registry locked; in the CHILD, close every published descriptor
+ * except this task's own `keep` ends, then drop the inherited list so a nested
+ * engine opened in the child starts clean. Only close() runs before the unlock,
+ * and unlocking a mutex this very thread holds is the standard pthread_atfork
+ * child-handler discipline. Returns as fork() does. */
+static pid_t exec_fork_sweep(const int *keep, unsigned nkeep)
+{
+    pid_t pid;
+    pthread_mutex_lock(&g_execfd_m);
+    pid = fork();
+    if (pid == 0) {
+        unsigned i, k;
+        for (i = 0; i < g_execfd_n; ++i) {
+            for (k = 0; k < nkeep; ++k) if (keep[k] == g_execfd[i]) break;
+            if (k == nkeep) close(g_execfd[i]);
+        }
+        g_execfd_n = 0;
+    }
+    pthread_mutex_unlock(&g_execfd_m);
+    return pid;
 }
 
 /* Coarse fallback cap: bound the child's virtual address space. Approximate
@@ -239,16 +319,16 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #endif
 
     *out_result = NULL; *out_len = 0;
-    if (make_pipe_cloexec(p) != 0) {
+    if (exec_pipe(p) != 0) {
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
         return GPTPS_E_IO;
     }
 
-    pid = fork();
+    pid = exec_fork_sweep(p, 2);   /* keep our own ends; shed every other executor's */
     if (pid < 0) {
-        close(p[0]); close(p[1]);
+        exec_close(p[0]); exec_close(p[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -288,7 +368,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
     /* ---- PARENT ---- */
     {
         struct pollfd pfd;
-        int killed = 0, pr, wstatus = 0;
+        int killed = 0, pr, wstatus = 0, reaped = 0;
         int32_t st32 = (int32_t)GPTPS_E_TASK;
         uint64_t len64 = 0;
         void *res = NULL;
@@ -296,7 +376,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
 
-        close(p[1]);
+        exec_close(p[1]);
         pfd.fd = p[0]; pfd.events = POLLIN; pfd.revents = 0;
 
         /* Wait for the child's result in bounded slices so a raised cancel flag (a
@@ -338,18 +418,21 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
                 st32 = (int32_t)GPTPS_E_TASK; /* child died before writing a record */
             }
         }
-        close(p[0]);
+        exec_close(p[0]);
         if (killed) {
             while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
         } else {
             /* The child owes us nothing more, but it has not necessarily exited. */
-            gptps_status why = reap_bounded(pid, &wstatus, 0, deadline, cancel);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
         if (killed) {
             eff = kill_st;
-        } else if (WIFSIGNALED(wstatus)) {
+        } else if (reaped && WIFSIGNALED(wstatus)) {
+            /* `reaped` gate: with an unreapable child wstatus is untouched, so the
+             * signal-death inference would be a guess. Fall through to st32, which
+             * the child reported over the pipe and is already authoritative. */
             gptps_free(res); res = NULL; len64 = 0;   /* crash / OOM-kill */
             eff = GPTPS_E_TASK;
 #if defined(__linux__)
@@ -386,23 +469,27 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 #endif
         return GPTPS_E_INVAL;
     }
-    if (make_pipe_cloexec(inp) != 0) {
+    if (exec_pipe(inp) != 0) {
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
         return GPTPS_E_IO;
     }
-    if (make_pipe_cloexec(outp) != 0) {
-        close(inp[0]); close(inp[1]);
+    if (exec_pipe(outp) != 0) {
+        exec_close(inp[0]); exec_close(inp[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
         return GPTPS_E_IO;
     }
 
-    pid = fork();
+    {
+        int keep[4];
+        keep[0] = inp[0]; keep[1] = inp[1]; keep[2] = outp[0]; keep[3] = outp[1];
+        pid = exec_fork_sweep(keep, 4);
+    }
     if (pid < 0) {
-        close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+        exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -412,8 +499,27 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     if (pid == 0) {
         /* ---- CHILD: wire stdin/stdout to the pipes, cap memory, exec ---- */
         int joined = 0;
-        dup2(inp[0], STDIN_FILENO);
-        dup2(outp[1], STDOUT_FILENO);
+        int i, *ends[4];
+        /* Hoist EVERY pipe end above fd 2 first. A host that daemonised (closed its
+         * stdin, a standard step) leaves fd 0 free, so pipe() hands back inp[0]==0:
+         * dup2(inp[0], 0) is then a no-op that does not even clear FD_CLOEXEC, and
+         * the close() below shuts fd 0 outright - the program execs with no stdin
+         * and the payload is silently dropped. With 0 and 1 both free it is worse:
+         * inp=={0,1}, so close(inp[1]) closes the stdout we just dup2'd onto fd 1.
+         * Any of the four ends can alias, hence all four; closing the low original
+         * keeps it from aliasing a dup2 target below. */
+        ends[0] = &inp[0]; ends[1] = &inp[1]; ends[2] = &outp[0]; ends[3] = &outp[1];
+        for (i = 0; i < 4; ++i) {
+            if (*ends[i] < 3) {
+                int n = fcntl(*ends[i], F_DUPFD, 3);  /* the copy is closed below, so
+                                                       * plain F_DUPFD is enough and
+                                                       * stays POSIX.1-2001-portable */
+                if (n < 0) _exit(127);
+                close(*ends[i]);
+                *ends[i] = n;
+            }
+        }
+        if (dup2(inp[0], STDIN_FILENO) < 0 || dup2(outp[1], STDOUT_FILENO) < 0) _exit(127);
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
         setpgid(0, 0); /* own process group: a timeout kill takes down the program AND its children */
 #if defined(__linux__)
@@ -432,7 +538,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
      * pipe (parent not yet reading) while the parent blocked filling its stdin pipe. */
     {
         gptps_status eff = GPTPS_OK;
-        int killed = 0, oversize = 0, nomem = 0, wstatus = 0;
+        int killed = 0, oversize = 0, nomem = 0, wstatus = 0, reaped = 0;
         gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
         char *buf = NULL; size_t cap = 0, len = 0;
         const char *wp = (const char *)payload;   /* unwritten payload cursor */
@@ -443,7 +549,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         sigset_t sp_old; int sp_masked = 0;
 #endif
 
-        close(inp[0]); close(outp[1]);
+        exec_close(inp[0]); exec_close(outp[1]);
         setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
         /* A write to the child's closed stdin must EPIPE, not kill us - but suppress
          * SIGPIPE WITHOUT mutating the host's process-wide disposition: per-fd on
@@ -459,7 +565,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 #endif
         /* non-blocking stdin so a POLLOUT-guarded write never stalls the read side */
         (void)fcntl(inp[1], F_SETFL, fcntl(inp[1], F_GETFL) | O_NONBLOCK);
-        if (!wleft) { close(inp[1]); in_open = 0; } /* no payload: EOF the child's stdin now */
+        if (!wleft) { exec_close(inp[1]); in_open = 0; } /* no payload: EOF the child's stdin now */
 
         for (;;) {
             struct pollfd pfd[2]; int nfd = 0, oidx, iidx = -1, pr; int slice = 200;
@@ -502,16 +608,16 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             /* feed stdin */
             if (in_open && (pfd[iidx].revents & (POLLOUT | POLLERR | POLLHUP))) {
                 if (pfd[iidx].revents & (POLLERR | POLLHUP)) {   /* child closed its stdin */
-                    close(inp[1]); in_open = 0;
+                    exec_close(inp[1]); in_open = 0;
                 } else {
                     ssize_t w = write(inp[1], wp, wleft);
-                    if (w > 0) { wp += w; wleft -= (size_t)w; if (!wleft) { close(inp[1]); in_open = 0; } }
-                    else if (w < 0 && errno != EINTR && errno != EAGAIN) { close(inp[1]); in_open = 0; }
+                    if (w > 0) { wp += w; wleft -= (size_t)w; if (!wleft) { exec_close(inp[1]); in_open = 0; } }
+                    else if (w < 0 && errno != EINTR && errno != EAGAIN) { exec_close(inp[1]); in_open = 0; }
                 }
             }
         }
-        if (in_open) close(inp[1]);
-        close(outp[0]);
+        if (in_open) exec_close(inp[1]);
+        exec_close(outp[0]);
 #if !defined(F_SETNOSIGPIPE)
         if (sp_masked) {
             /* consume a SIGPIPE our blocked writes may have left pending (else it
@@ -530,13 +636,19 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
              * that it exited. A program that keeps running (or ignores signals) would
              * otherwise pin this worker in waitpid() forever, orphaning the child at
              * shutdown. Give it a bounded grace period, then SIGKILL. */
-            gptps_status why = reap_bounded(pid, &wstatus, 1, deadline, cancel);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
         if (killed)                  eff = kill_st;
         else if (oversize)           eff = GPTPS_E_IO;
         else if (nomem)              eff = GPTPS_E_NOMEM;
+        /* Someone else reaped the child (host ignores SIGCHLD, or runs a wait-any
+         * reaper), so wstatus is untouched and WIFEXITED(0)/WEXITSTATUS(0) would
+         * report every FAILING program as a success. An unknowable exit status is
+         * a task error - that keeps retries, failure policy and dead-lettering
+         * working instead of silently inverting the "non-zero => E_TASK" contract. */
+        else if (!reaped)            eff = GPTPS_E_TASK;
         else if (WIFEXITED(wstatus)) eff = (WEXITSTATUS(wstatus) == 0) ? GPTPS_OK : GPTPS_E_TASK;
         else                         eff = GPTPS_E_TASK; /* killed by a signal */
 #if defined(__linux__)

@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build + test at the tag
         # Do not ship an artifact from a tree that does not pass its own suite.
@@ -131,7 +131,12 @@ jobs:
           } >> NOTES.md
 
       - name: Publish the Release
-        uses: softprops/action-gh-release@v2
+        # Pinned to a COMMIT, not a tag. This is the one step that runs third-party
+        # code with a `contents: write` token, and a tag is mutable - whoever controls
+        # the action's repo can repoint v2 at anything, and it would run here with
+        # permission to publish. The trailing comment records which version the commit
+        # is, so bumping it stays a deliberate, reviewable change.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: "GPTPS ${{ steps.stage.outputs.version }}"
           body_path: NOTES.md

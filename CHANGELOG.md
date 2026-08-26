@@ -7,6 +7,284 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-26
+
+A correctness and hardening release. No breaking change: ABI stays 2.1, append-only,
+and every public signature is unchanged. Everything below was found by auditing the
+1.0.0 tree against its own documented guarantees, and each fix ships with the
+reproduction that demonstrated it.
+
+### Fixed — memory safety
+
+- **Use-after-free: `gptps_unregister_task(GPTPS_REMOVE_CANCEL)` in MANUAL mode.**
+  The MANUAL branch detached only `intake` and `delayed` on the premise that "nothing
+  is in-flight between `gptps_step` calls". That premise was false: `gptps_step`'s
+  second pass ADMITS work at the end of the step, so `ready` (and `done`) routinely
+  still held items of the type being removed — items that keep both `it->reg` and
+  `it->def`, which is interior to the same allocation. The registry slot was freed
+  under them and the next `gptps_step` read it. THREADED was never affected because it
+  blocks on `reg_live_refs`, which counts those queues. Now the MANUAL path detaches
+  `ready`/`done` too (releasing the admission budget they hold, which was also being
+  leaked), and refuses with `GPTPS_E_BUSY` when called re-entrantly from a task body —
+  the same answer a re-entrant `gptps_shutdown` already gives.
+- **Use-after-free: `gptps_dead_letter_drain()`.** The drain detaches the whole list
+  and then walks it with the lock released, which the header explicitly invites a
+  callback to re-enter the engine from. `detach_dead_letter` — the function that gives
+  a retained item an owned name copy before its task type dies — only scans
+  `e->dead_letter`, which the drain had just emptied, so unregistering that type from
+  the callback freed the `gptps_reg` that `item_name()` was about to read. Every item
+  is now self-owned under the lock, with **both** `it->reg` and `it->def` severed.
+- **`gptps_shutdown` on an engine inherited across `fork()`.** It took `e->m` — which
+  may be held by a thread that did not survive — and then joined dispatcher and worker
+  `pthread_t`s that do not exist in the child. Observed: `SIGSEGV` in
+  `__pthread_clockjoin_ex`.
+
+### Fixed — the fork contract, now actually kept
+
+`include/gptps.h` and `docs/SECURITY.md` both said an engine created before a `fork()`
+returns `GPTPS_E_SHUTDOWN` from **every** entry point. Five of thirty-four
+lock-taking entry points checked, and two of those checked only *after* taking the
+lock — which is the hang, not the guard. All of them now check before locking, via a
+single greppable `GPTPS_REFUSE_AFTER_FORK`. The `gptps_settings_*` forwarders check
+too: the settings registry carries its own mutex, equally inherited.
+[`tests/test_fork.c`](tests/test_fork.c) forks a live threaded engine and asserts the
+refusal across mutating, read-only, settings and teardown entry points.
+
+### Fixed — liveness: `limits.shutdown_grace_ms` is now a bound
+
+- **The grace-cancel was not terminal, so the cancelled attempt was RETRIED.** Every
+  other cancel site pairs `it->cancelled = 1` with the flag; this one raised only the
+  flag, so the done-drain took the ordinary retry branch and re-admitted the item with
+  a freshly cleared flag. With `max_retries = 3` a 200 ms grace made shutdown take
+  **3.90 s and run the task body 4 times** — 4× *longer* than having no grace at all,
+  and it discarded a result the body had already produced. Now **0.90 s, body runs
+  once** (the residual is the body's own sleep; nothing can preempt an in-process
+  function).
+- **The grace ignored the backoff queue entirely.** The dispatcher refuses to exit
+  while `delayed` is non-empty, and only promotes an item once its backoff elapses, so
+  a task with `retry_backoff_seconds = 8` held teardown regardless of the grace.
+  Measured **23.70 s with a 0.2 s grace**; now **0.20 s**. Past the deadline the queue
+  is terminated by policy, and every item gets the terminal event it still owed.
+- **`gptps_cancel` on a queued item did not wake the drain waiter.** Cancelling the
+  last live item of a type left a blocked `gptps_unregister_task(DRAIN)` asleep until
+  some unrelated event happened to wake the dispatcher — indefinitely on an idle
+  engine. It now broadcasts `cv_drain` and signals `cv_disp` (the cancelled item may
+  also have been the reserved `top` holding back skip-to-fit backfill).
+
+### Fixed — the exactly-one-terminal-event invariant
+
+The observer seam's whole reconciliation contract, and every add-on built on it,
+depends on every submitted handle reaching exactly one terminal event. Four holes:
+
+- **A constraint hook returning `GPTPS_DENY` could exceed the 256-entry event buffer.**
+  `DENY` does not raise `e->running`, so the admission loop can deny an entire intake
+  queue in one pass — and intake is unbounded by default. Measured: **600 submitted,
+  600 `QUEUED`, 256 terminal** — 344 handles silently lost. The buffer's own comment
+  claimed truncation was "observability only" and bounded by `max_concurrent_tasks`;
+  both were wrong. A full buffer now defers the remaining work to the next pass
+  instead of dropping the event, and both pumps re-run immediately while more is owed.
+  Now **600/600**.
+- **`item->started` was never reset per attempt**, so the done-drain's `!it->started`
+  test read the *previous* attempt's state and a retried item cancelled while sitting
+  in `ready` was freed with no event at all. Cleared at the single choke point every
+  re-admission passes through.
+- **Service instances queued or in restart backoff at `gptps_shutdown` were freed
+  outright.** Measured: `queued=1 terminal=0`. They are now detached and reported.
+- **Work left in the queues when the pumps stopped got no event.** It is now reported
+  — and reported *before* the add-on teardown loop, because that loop calls
+  `gptps_dl_close()` and an observer registered by an add-on lives in the `.so` being
+  unmapped.
+
+### Changed — admission is now O(1) in queue depth, not O(n²) overall
+
+`engine_pass` scanned the whole intake queue **twice per admitted item** — once for the
+best-scoring item that fits, once to unlink it. `limits.max_intake_depth` defaults to
+0 (unbounded, deliberately), so a producer that outran the dispatcher grew the queue to
+O(n) and made draining n items O(n²). It was invisible to the whole suite because it
+only appears once the queue is deep:
+
+| queued items | before | after |
+|---|---|---|
+| 20,000 | 0.183 s (110k/s) | 0.071 s (282k/s) |
+| 40,000 | 1.231 s (32k/s) | 0.105 s (381k/s) |
+| 80,000 | 8.619 s (9.3k/s) | 0.221 s (362k/s) |
+| 160,000 | 36.708 s (4.4k/s) | 0.379 s (422k/s) |
+
+Intake is now held in **admission order** (`sched_score` descending, ties oldest-first)
+rather than submission order, so `top` is the head and the first item that fits is by
+construction the one the old scan chose. Ordering an insert would just relocate the
+quadratic, so an index of each equal-score run's tail keeps it O(1) — real workloads
+use a handful of distinct priorities. The index is strictly advisory; the invariant is
+that no cached tail may dangle.
+
+**No policy changed.** Priority order, FIFO within a priority, skip-to-fit backfill and
+the starvation reserve behave exactly as before —
+[`tests/test_admission_order.c`](tests/test_admission_order.c) pins the exact admission
+sequence, including with a scheduler hook installed, and it was written against 1.0.0
+first so it could prove the order did not move.
+
+### Fixed — executors
+
+- **The OOP child pinned every other executor's pipe descriptors.** `O_CLOEXEC` only
+  fires at `exec()`, and the OOP child never execs — it runs the task function
+  in-process — so it inherited and held open a concurrent PROGRAM executor's stdin
+  write end for the whole OOP task. `cat` never saw EOF and that task ran to its
+  deadline, returning `GPTPS_E_TIMEOUT` with an empty result. Each executor now
+  publishes the ends it owns and the child closes only those (a blanket
+  close-everything is not available: `docs/SECURITY.md` promises a forked child may
+  keep using host-opened descriptors).
+- **A failed `waitpid()` was reported as "child exited 0".** A host that runs
+  `signal(SIGCHLD, SIG_IGN)` or a wait-any reaper auto-reaps our children, so `waitpid`
+  fails with `ECHILD`, `wstatus` keeps its initialiser, and `WIFEXITED(0)` is true with
+  status 0 — a **failing program returned `GPTPS_OK`**. An unknowable exit status is
+  now `GPTPS_E_TASK`, which keeps retries and dead-lettering working.
+- **The PROGRAM child's `dup2` + blind close corrupted stdio when fd 0 or 1 was free.**
+  A host that daemonised (closing stdin — a standard step) leaves fd 0 free, so
+  `pipe()` hands back `inp[0] == 0`; `dup2(inp[0], 0)` is then a no-op and the
+  following `close()` shuts fd 0 outright, so the program execs with no stdin and the
+  payload is silently dropped. Every pipe end is now hoisted above fd 2 first.
+- **Windows: unbounded `WaitForSingleObject(INFINITE)` on the helper threads.** An
+  anonymous pipe reports EOF only when the *last* write handle closes, so a grandchild
+  that inherited stdout kept the reader blocked long after the direct child exited —
+  wedging the worker and the `gptps_shutdown` that joins it. The job is now torn down
+  on every path before the joins, with a grace period and `CancelSynchronousIo` as a
+  last resort when no job object is available.
+- **Windows: the 16 MiB stdout cap stopped reading without killing the child**, so the
+  task could only end at its deadline and reported `GPTPS_E_TIMEOUT` instead of the
+  real cause. POSIX already killed at the cap; the two backends now agree.
+
+### Fixed — configuration and settings
+
+- **`[limits]` values from a config file were cast, not checked.**
+  `max_concurrent_tasks = -1` became 4294967295 and the engine tried to start that many
+  OS threads (observed: spawns until `RLIMIT_NPROC`, then hangs); `max_memory_bytes = -1`
+  silently turned the operator's memory limit into no limit. A sign test alone is not
+  enough — a positive value wider than the destination truncates — so each key is now
+  range-checked against its field and a violation is `GPTPS_E_CONFIG`.
+- **A settings value that `strtoll`/`strtoull` had saturated was accepted as valid**,
+  silently applying a limit nobody asked for. `gptps_task_setting_int` likewise
+  reported `LONG_MAX` as a successful parse — and `long` is 32-bit on Windows and on
+  the i386 CI leg, so an ordinary value like `3000000000` clamped there while working
+  on 64-bit Linux. Both now report the range error.
+- **A `NULL` from `dupn()` mid-parse published a TOML row with a `NULL` section/key**,
+  which the very next `find()` `strcmp`'d — a crash on the following lookup. The TOML
+  array grower also did `p = realloc(p, ...)`, leaking the old block and every string
+  in it and publishing `(array = NULL, count = n)`. An incomplete parse is now a failed
+  parse rather than a partially-populated table.
+- **`gptps_toml_parse_file` trusted `fseek`/`ftell` unchecked**, so passing a directory
+  as the config path requested an ~8 EiB allocation.
+- **`strip_comment()` ignored backslash escapes**, truncating any string value
+  containing an escaped quote before a `#` on every save→reload round trip.
+
+### Fixed — add-ons
+
+- **`durable_queue`: `gptps_dq_recover()` re-submitted quarantined records**, so a
+  poison payload re-ran on every restart, forever. It also accepted payloads the
+  replayer would always reject (destroying that record *and* every record appended
+  after it), left `dq->fp == NULL` after a failed rewrite (the next submit
+  dereferenced it), trusted `ftell()` on an append stream (a failed first append
+  truncated the journal on Windows), and replayed in O(n²) while holding every
+  completed payload in RAM.
+- **`xport`: a half-read reply frame was abandoned without tearing down the link**,
+  desynchronising the worker channel so the *next* submit returned a bogus `GPTPS_OK`
+  carrying the wrong reply. A link that breaks mid-frame is now dead permanently.
+  `submit` also never validated its own arguments against `GPTPS_XPORT_MAX_MSG`.
+- **`remote`: the status codec had no wire code for `E_TASK`/`E_DUP`/`E_ABI`/
+  `E_CONFIG`/`E_BUSY`**, so a remote task's ordinary application failure arrived as
+  `GPTPS_E_IO` — "the link died". `encode_request` also bounded `task` and `item`
+  separately against `UINT32_MAX` but not their sum.
+- **`orch`: installing it made every completed task cost O(tasks completed so far)** —
+  a linear scan of a set that grows for the process lifetime, paid on every terminal
+  event even with zero gates. Now an open-addressed set at load factor ½. A gate whose
+  submission is rejected is also no longer dropped silently; it is retried a **bounded**
+  number of times and then abandoned, so `gptps_orch_pending()` still converges to 0
+  (it is a documented drain predicate, and an unbounded retry would re-copy the gate's
+  payload on every terminal event in the engine).
+- **`tui`: the in-flight gauge underflowed to 4294967295** on a queued-item cancel and
+  permanently poisoned `peak`. `gptps_tui_install` also leaked the latency ring when
+  observer registration failed.
+- **`gpu_quota` plug-in kept the engine in a file-static**, so loading it into a second
+  engine misapplied every quota write and use-after-freed a shut-down engine.
+
+### Fixed — other engine defects
+
+- A failed add-on `setup()` left task types registered: the unwind was capped at 16
+  names, so an add-on that registered 20 before failing kept 4 live and submittable
+  while the host was told the load failed. Measured 4 → 0. The cap is gone.
+- A task name longer than 312 bytes registered fine but could **never** be
+  unregistered, and lost five of its six per-task settings to silent key truncation.
+  `GPTPS_TASK_NAME_MAX` (127) is now documented and enforced at registration.
+- Re-registering a task name while an unregister was blocked draining left the new
+  task with **no settings at all**. The predecessor's settings are now torn down when
+  its name becomes re-registrable, not after the drain.
+- A failed per-item resource snapshot silently skipped the named-resource accounting
+  *and* admitted the item anyway, un-enforcing the budget under memory pressure. It
+  now fails closed.
+- `e->config_path` was leaked on every `gptps_open_ex` failure path.
+
+### Added
+
+- [`tests/test_admission_order.c`](tests/test_admission_order.c) — the admission-order
+  contract, plus the three ways the new queue index could dangle (cache overflow, a
+  cancelled run tail, a bulk unregister). Mutation-tested: removing a cache
+  invalidation makes it a hard ASan use-after-free.
+- [`tests/test_admission_perf.c`](tests/test_admission_perf.c) — a complexity **gate**,
+  not a benchmark. It asserts on the shape of the curve (doubling n must roughly double
+  the time), so it means the same thing on a laptop and a loaded runner. It fails the
+  1.0.0 engine (ratio 4.34) and passes this one (1.96).
+- [`tests/test_fork.c`](tests/test_fork.c) — the fork refusal, across entry points.
+- A regression test for an unsatisfiable `orch` gate.
+- `CONTRIBUTING.md` and `.editorconfig`. There is deliberately **no** `.clang-format`:
+  the code is hand-aligned, and every configuration tried rewrote 57–67% of the tree.
+
+### Changed — build, packaging and CI
+
+- `bin/gptps_conformance` was built only when `GPTPS_BUILD_TESTS=ON`, so a packager's
+  default build installed **no conformance harness at all** while `docs/PACKAGING.md`
+  listed it in the install tree and `docs/PLUGINS.md` told plug-in authors to run it.
+  It now has its own option (`GPTPS_BUILD_CONFORMANCE`, default ON) outside the test
+  block.
+- `gptps.pc` listed `-lpthread`/`-ldl` in `Libs.private` only, but `libgptps` is
+  unconditionally STATIC — so a plain `pkg-config --libs gptps` under-linked and failed
+  on `pthread_create`. CI only ever tested `--static`.
+- The release version lives in `project(VERSION)` **and** `GPTPS_VERSION_STRING`;
+  nothing asserted they agree. Drift is now a configure-time error.
+- `-DGPTPS_HAL_SOURCE=<file>` was documented as a supported downstream knob and never
+  read — setting it silently built the stock HAL. It works now.
+- The s390x CI leg excluded tests by substring, and `demo` also matched
+  `conformance_demo` — the only **positive** control in the conformance set. The three
+  that remained are all `WILL_FAIL`, which passes on any non-zero exit, so the leg
+  would have gone green with a harness that could not `dlopen` anything at all. The
+  exclusion list is now anchored and explicit.
+- `ci.yml` declared no `permissions:` block (inheriting repository defaults, which can
+  be read/write); it is now `contents: read`. Third-party actions are pinned to commit
+  SHAs rather than mutable tags — `action-gh-release` is the one step that runs
+  third-party code with a `contents: write` token.
+
+### Changed — documentation
+
+Every claim that contradicted the code:
+
+- The README's "Liveness guarantees" listed the intake queue among things that "cannot
+  grow without bound" — while `docs/SECURITY.md` correctly said it is unbounded by
+  default. The README now states the exception and why, and notes that admission is
+  O(1) in depth either way.
+- `docs/SECURITY.md` cited `gptps_xport` as proof a forked child may open its own
+  engine; xport's children never open an engine.
+- The README documented a task cost of `mem` / `gpu` / duration; `gptps_cost` has
+  carried only `mem_bytes` since ABI 2.0.
+- `docs/ARCHITECTURE.md` said seven add-ons ship (nine do) and that CI runs nine jobs
+  (eleven, and the two omitted were `werror` and `package`).
+- `docs/PLUGINS.md` said the conformance harness ships in the GitHub release; the
+  release publishes amalgamation sources only.
+
+### Removed
+
+- `CLAUDE.md` and `.claude/` — a repo-level mandate that any AI assistant install a
+  specific third-party tool, enforced by a `PreToolUse` hook that ran on a
+  contributor's machine. Nothing in the build, the tests or the library referenced it.
+
+
 ### Added — `addons/gptps_remote`: the cross-host WIRE PROTOCOL (codec; transport pending)
 - `addons/gptps_xport` says the local socketpair "is the only thing standing between
   this and cross-MACHINE execution: swap it for a TCP socket and the same protocol

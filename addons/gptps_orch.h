@@ -60,7 +60,17 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
                               const gptps_handle *deps, size_t ndeps,
                               gptps_handle *out);
 
-/* Number of gates still waiting on dependencies (not yet released). */
+/* Number of gates not yet released: still waiting on a dependency, or waiting on a
+ * retry of a submission the engine transiently rejected.
+ *
+ * This always converges to 0, which is what makes it usable as a drain predicate. A
+ * gate whose dependencies are all terminal is submitted immediately; if the engine
+ * rejects that submit transiently (the task type is PAUSED, or the intake queue is
+ * full) the gate is retried on each subsequent terminal event, a bounded number of
+ * times, and then abandoned. A permanent rejection - an unregistered task name, a
+ * cost that can never fit the budget, a cost hook that refuses - ends the gate at
+ * once. In both of those cases the task never runs and no event is emitted for it,
+ * so do not treat pending() reaching 0 as proof every gated task ran. */
 size_t gptps_orch_pending(gptps_orch *o);
 
 /* Free the orchestrator. Call AFTER gptps_shutdown(e) so no observer fires. */

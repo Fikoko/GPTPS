@@ -581,7 +581,9 @@ or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c
 
 ## Resource budgets, failures, add-ons
 
-- **Admission:** each task type declares a rough cost (`mem` / `gpu` / duration). The core
+- **Admission:** each task type declares a rough cost (`mem_bytes`; `gpu_units` and
+  `est_duration_ms` were removed in ABI 2.0, and named budgets replaced them — see
+  `gptps_define_resource`). The core
   starts a task only if it fits the live budget — not an all-or-nothing cap. `max_concurrent_tasks=1`
   is strictly sequential; `>1` is concurrent.
 - **Scheduling:** the dispatcher admits the **highest-priority** pending task that fits the live
@@ -735,7 +737,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
 design, the last breaking change) · **9** add-on modules + 1 example binary plug-in ·
-**51** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
+**54** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
 required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
@@ -747,10 +749,16 @@ hang it hangs your host's exit path — so these are contractual, and
   gets cancelled — an external child with no timeout of its own cannot wedge teardown.
 - `gptps_shutdown` / `gptps_step` return `GPTPS_E_BUSY` rather than deadlocking when
   called from a task body or an event callback.
-- Nothing in the engine grows without bound: the intake queue
-  (`limits.max_intake_depth`), the dead-letter list (`limits.max_dead_letters`), and
-  the bytes an out-of-process child can make the parent buffer (16 MiB) are all capped,
-  and truncation is always counted rather than silent.
+- The engine's growable state is bounded, with one deliberate exception. The
+  dead-letter list (`limits.max_dead_letters`, default 1024) and the bytes an
+  out-of-process child can make the parent buffer (16 MiB) are capped, and truncation
+  is always counted rather than silent. The intake queue
+  (`limits.max_intake_depth`) is **unbounded by default** — right for a host that
+  submits its own work, wrong for one that accepts work from elsewhere; set it and
+  handle `GPTPS_E_FULL` if a submitter can outrun your workers. Admission is O(1) in
+  queue depth either way, so leaving it unbounded costs memory, never throughput
+  ([`tests/test_admission_perf.c`](tests/test_admission_perf.c) gates that).
+  [`docs/SECURITY.md`](docs/SECURITY.md) has the full table.
 - Every submitted handle reaches exactly one terminal event — the invariant the
   observer seam, and every add-on built on it, depends on
   ([`tests/test_reconcile.c`](tests/test_reconcile.c)).

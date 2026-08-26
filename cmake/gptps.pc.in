@@ -18,6 +18,12 @@ plugindir=${libdir}/gptps
 Name: gptps
 Description: GPTPS - embeddable C99 general-purpose task processing system
 Version: @PROJECT_VERSION@
-Libs: -L${libdir} -lgptps
+# libgptps is unconditionally STATIC, so its transitive dependencies are ALWAYS
+# required at link time - there is no shared object to carry them. Libs.private is
+# only emitted by `pkg-config --static --libs`, so putting them there left a plain
+# `pkg-config --libs gptps` under-linked and failing on pthread_create/dlopen. They
+# belong in Libs. Libs.private repeats them so `--static` stays correct too (pkg-config
+# de-duplicates), and it is where they move if a shared build is ever added.
+Libs: -L${libdir} -lgptps @GPTPS_PC_PRIVATE_LIBS@
 Libs.private: @GPTPS_PC_PRIVATE_LIBS@
 Cflags: -I${includedir}

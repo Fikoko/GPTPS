@@ -36,17 +36,15 @@
 #  define MSG_NOSIGNAL 0   /* macOS/BSD: rely on SO_NOSIGPIPE (set below) instead */
 #endif
 
-/* Sanity cap on any single framed message (task name / payload / result). A same-
- * machine worker runs your own forked handler, so this is defense-in-depth against a
- * buggy peer rather than a trust boundary - but it bounds a bad length field to a
- * clean GPTPS_E_IO instead of a multi-GB malloc, and is what a cross-host TCP variant
- * of this protocol would require anyway. */
-#define GPTPS_XPORT_MAX_MSG ((uint64_t)256u * 1024u * 1024u)
+/* GPTPS_XPORT_MAX_MSG (the cap on any single framed message) lives in the header:
+ * submit() rejects an oversized argument locally, so the number is part of the
+ * contract a caller has to be able to see. */
 
 typedef struct {
     pid_t     pid;
-    int       fd;      /* parent side of the socketpair to this worker */
+    int       fd;      /* parent side of the socketpair to this worker; -1 once dead */
     apx_mutex mu;      /* serialises one round-trip per worker */
+    int       dead;    /* link torn down mid-frame: never speak to this worker again */
 } xport_worker;
 
 struct gptps_xport {
@@ -104,6 +102,16 @@ static void xport_worker_main(int fd, gptps_xport_run_fn run, void *ud)
 
         st32 = (int32_t)run(task, payload, (size_t)plen, &res, &rlen, ud);
         rl = (uint64_t)rlen;
+        if (rl > GPTPS_XPORT_MAX_MSG) {
+            /* The handler produced a result larger than the frame cap. Shipping it
+             * would make the parent refuse the length half-way through the reply and
+             * abandon the rest of the frame - poisoning every LATER round-trip on this
+             * worker, which is far worse than the one call that failed. Answer IN
+             * FRAME with an empty body instead: the caller gets an honest status and
+             * the channel stays byte-synchronised. */
+            free(res); res = NULL;
+            st32 = (int32_t)GPTPS_E_BUDGET; rlen = 0; rl = 0;
+        }
         if (sock_write_all(fd, &st32, sizeof st32) != 0 ||
             sock_write_all(fd, &rl, sizeof rl) != 0 ||
             (rlen && sock_write_all(fd, res, rlen) != 0)) {
@@ -180,6 +188,7 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 gptps_status *out_task_status)
 {
     xport_worker *w;
+    size_t tl;
     uint32_t tlen;
     uint64_t plen, rl = 0;
     int32_t st32 = (int32_t)GPTPS_E_IO;
@@ -190,12 +199,22 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     if (out_len) *out_len = 0;
     if (out_task_status) *out_task_status = GPTPS_E_IO;
     if (!xp || !task) return GPTPS_E_INVAL;
+    if (len && !payload) return GPTPS_E_INVAL;   /* would send() from a NULL buffer */
 
-    tlen = (uint32_t)strlen(task);
+    /* Enforce the cap on the SENDING side, before a worker is even picked. The worker
+     * enforces it too, but by dropping the link - so an argument the caller could have
+     * been told about locally would instead cost a worker process for the lifetime of
+     * the transport. The uint64_t casts keep this correct (and warning-free) whether
+     * size_t is 32- or 64-bit. */
+    tl = strlen(task);
+    if ((uint64_t)tl > GPTPS_XPORT_MAX_MSG) return GPTPS_E_INVAL;
+    if ((uint64_t)len > GPTPS_XPORT_MAX_MSG) return GPTPS_E_INVAL;
+    tlen = (uint32_t)tl;                         /* provably <= the cap: no truncation */
     plen = (uint64_t)len;
     w = &xp->w[next_rr(xp)];
 
     apx_mutex_lock(&w->mu);
+    if (w->dead) { apx_mutex_unlock(&w->mu); return GPTPS_E_IO; }
     ok = sock_write_all(w->fd, &tlen, sizeof tlen) == 0 &&
          sock_write_all(w->fd, task, tlen) == 0 &&
          sock_write_all(w->fd, &plen, sizeof plen) == 0 &&
@@ -206,6 +225,19 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     if (ok && rl) {
         res = malloc((size_t)rl);
         if (!res || sock_read_all(w->fd, res, (size_t)rl) != 0) { free(res); res = NULL; ok = 0; }
+    }
+    if (!ok) {
+        /* Every failure above bails out with part of a frame still unread (or unsent),
+         * so this link is no longer at a frame boundary: the NEXT submit would read
+         * THIS frame's leftovers as its own status/length and hand the caller a
+         * fabricated reply for work that never ran. There is no resynchronising a
+         * stream protocol, so retire the link instead. Closing it also unblocks a
+         * worker stuck writing the remainder (EPIPE -> it exits), and close() still
+         * reaps the pid. The worker is not respawned; submits that round-robin onto
+         * this slot get an honest GPTPS_E_IO from the check above. */
+        if (w->fd >= 0) close(w->fd);
+        w->fd = -1;
+        w->dead = 1;
     }
     apx_mutex_unlock(&w->mu);
 
@@ -221,7 +253,7 @@ void gptps_xport_close(gptps_xport *xp)
     size_t i;
     if (!xp) return;
     for (i = 0; i < xp->n; ++i) {
-        close(xp->w[i].fd);                 /* worker sees EOF -> exits */
+        if (xp->w[i].fd >= 0) close(xp->w[i].fd);   /* worker sees EOF -> exits */
     }
     for (i = 0; i < xp->n; ++i) {
         int st; while (waitpid(xp->w[i].pid, &st, 0) < 0 && errno == EINTR) { }
