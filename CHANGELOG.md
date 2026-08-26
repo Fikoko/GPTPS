@@ -180,7 +180,13 @@ first so it could prove the order did not move.
   in it and publishing `(array = NULL, count = n)`. An incomplete parse is now a failed
   parse rather than a partially-populated table.
 - **`gptps_toml_parse_file` trusted `fseek`/`ftell` unchecked**, so passing a directory
-  as the config path requested an ~8 EiB allocation.
+  as the config path requested an ~8 EiB allocation. The size check alone fixes that
+  only on glibc, where `ftell` on a directory reports `LLONG_MAX`; on macOS/BSD it
+  returns a plausible size, the allocation succeeds, and only the *read* fails with
+  `EISDIR` — so the parse quietly produced an empty table and the engine started on
+  compiled-in defaults having been handed a path it could not read. A `ferror()` check
+  after the read is what makes the rejection portable (a short read is still fine — it
+  is the truncate-and-rewrite case the buffer terminator exists for).
 - **`strip_comment()` ignored backslash escapes**, truncating any string value
   containing an escaped quote before a `#` on every save→reload round trip.
 

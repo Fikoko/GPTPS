@@ -252,6 +252,18 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
      * that truncates-and-rewrites the file under a SIGHUP-driven reload would
      * otherwise leave the tail of the buffer uninitialised - and parsed. */
     got = fread(buf, 1, (size_t)sz, f);
+    /* A SHORT read is fine (that is the truncate-and-rewrite case above); a read
+     * ERROR is not. This is what makes "the config path is a directory" portable:
+     * glibc's ftell on a directory reports LLONG_MAX, so the size check above
+     * already rejects it - but on macOS/BSD ftell returns a plausible size, the
+     * allocation succeeds, and only the read fails with EISDIR. Without this the
+     * parse quietly produced an EMPTY table there and the engine started with every
+     * compiled-in default, having been handed a path it could not read. */
+    if (ferror(f)) {
+        fclose(f); gptps_free(buf);
+        if (errbuf && errlen) snprintf(errbuf, errlen, "cannot read %s", path);
+        return NULL;
+    }
     buf[got] = 0;
     fclose(f);
 
