@@ -165,7 +165,15 @@ first so it could prove the order did not move.
   silently applying a limit nobody asked for. `gptps_task_setting_int` likewise
   reported `LONG_MAX` as a successful parse — and `long` is 32-bit on Windows and on
   the i386 CI leg, so an ordinary value like `3000000000` clamped there while working
-  on 64-bit Linux. Both now report the range error.
+  on 64-bit Linux. The same gap existed in the engine's independent copy of that
+  grammar (which validates a `gptps_define_global` default) and in the TOML scanner
+  (so `max_memory_bytes = 99999999999999999999999` in a *file* installed `LLONG_MAX`
+  — a limit that reads as no limit). All now report the range error.
+- **A value that fit `unsigned long long` but not its `uint32_t` target was accepted
+  and then truncated by the write callback.** `limits.max_intake_depth = 4294967296`
+  validated fine and became **0**, i.e. the bound the operator had just set silently
+  became *unbounded*. The four `uint32_t`-backed core settings now declare their real
+  ceiling, so the value is refused instead.
 - **A `NULL` from `dupn()` mid-parse published a TOML row with a `NULL` section/key**,
   which the very next `find()` `strcmp`'d — a crash on the following lookup. The TOML
   array grower also did `p = realloc(p, ...)`, leaking the old block and every string

@@ -1413,17 +1413,28 @@ static int gval_ok(gptps_setting_type type, int has_range, double mn, double mx,
     char *end;
     if (!v) return 0;
     switch (type) {
+        /* errno, not just the end pointer: strtoll/strtoull SATURATE at their
+         * limits and report it only through ERANGE, so without this a nonsense
+         * default was accepted and silently became LLONG_MAX / ULLONG_MAX. Mirrors
+         * valid_value() in settings.c, which validates the same grammar at write
+         * time - the two must agree or a default is accepted that no later write to
+         * the same key could reproduce. */
         case GPTPS_SETTING_INT: {
-            long long x = strtoll(v, &end, 10);
+            long long x;
+            errno = 0;
+            x = strtoll(v, &end, 10);
             if (end == v || *end) return 0;
+            if (errno == ERANGE) return 0;
             return !(has_range && ((double)x < mn || (double)x > mx));
         }
         case GPTPS_SETTING_UINT: {
             unsigned long long x; const char *p = v;
             while (*p == ' ' || *p == '\t') ++p;
             if (*p == '-') return 0;
+            errno = 0;
             x = strtoull(v, &end, 10);
             if (end == v || *end) return 0;
+            if (errno == ERANGE) return 0;
             return !(has_range && ((double)x < mn || (double)x > mx));
         }
         case GPTPS_SETTING_DOUBLE: {
@@ -1606,15 +1617,19 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
                      "admission memory budget in bytes", sc_rd_maxmem, sc_wr_maxmem);
     reg_core_setting(e, "limits.max_concurrent_tasks", GPTPS_SETTING_UINT, 0, 1, 1, 65536,
                      "worker pool size (restart to apply)", sc_rd_conc, sc_wr_conc);
-    reg_core_setting(e, "limits.max_intake_depth", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+    /* has_range is not decoration on these four: each write callback casts to
+     * uint32_t, so without a declared ceiling "4294967296" validated fine and then
+     * truncated to 0 - which for max_intake_depth means the bound the operator just
+     * set silently became "unbounded". The range makes the setting refuse instead. */
+    reg_core_setting(e, "limits.max_intake_depth", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
                      "max queued (un-admitted) items before submit returns E_FULL (0 = unbounded)", sc_rd_intake, sc_wr_intake);
-    reg_core_setting(e, "limits.shutdown_grace_ms", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+    reg_core_setting(e, "limits.shutdown_grace_ms", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
                      "ms gptps_shutdown lets in-flight work drain before cancelling it (0 = wait forever)", sc_rd_grace, sc_wr_grace);
-    reg_core_setting(e, "limits.max_dead_letters", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+    reg_core_setting(e, "limits.max_dead_letters", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
                      "max retained dead-lettered items; oldest is evicted past this (0 = unbounded)", sc_rd_dlcap, sc_wr_dlcap);
     reg_core_setting(e, "stats.dead_letters_evicted", GPTPS_SETTING_UINT, 1, 0, 0, 0,
                      "dead-letter entries dropped by limits.max_dead_letters (write to reset)", sc_rd_devict, sc_wr_devict);
-    reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 0, 0, 0,
+    reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
                      "scheduler starvation guard (backfill skips before reserving)", sc_rd_resv, sc_wr_resv);
 
     if (cfg && cfg->config_path) {   /* remember the open path for save/reload defaults */

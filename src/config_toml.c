@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 typedef enum { TT_INT, TT_DBL, TT_BOOL, TT_STR, TT_ARR } toml_type;
 
@@ -35,6 +36,7 @@ struct gptps_toml {
     toml_entry *e;
     size_t      n, cap;
     int         oom;     /* an allocation failed mid-parse: the table is INCOMPLETE */
+    int         range;   /* a numeric literal does not fit its type: the table LIES */
 };
 
 /* A settings file is kilobytes. The cap exists because fopen() on a DIRECTORY
@@ -205,7 +207,15 @@ static int parse_value(struct gptps_toml *t, const char *section, const char *ke
     } else if (strchr(val, '.') || strchr(val, 'e') || strchr(val, 'E')) {
         e->type = TT_DBL; e->d = strtod(val, NULL);
     } else {
-        e->type = TT_INT; e->i = strtoll(val, NULL, 10);
+        {   /* strtoll saturates at LLONG_MIN/MAX and says so only via errno, so
+             * `max_memory_bytes = 99999999999999999999999` used to install
+             * LLONG_MAX - a limit the operator never wrote, and one that reads as
+             * "effectively no limit". Refuse the file instead of clamping it. */
+            char *iend;
+            errno = 0;
+            e->type = TT_INT; e->i = strtoll(val, &iend, 10);
+            if (errno == ERANGE) t->range = 1;
+        }
     }
     return 0;
 }
@@ -288,6 +298,12 @@ gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
     if (t->oom) {
         gptps_toml_free(t);
         if (errbuf && errlen) snprintf(errbuf, errlen, "out of memory parsing %s", path);
+        return NULL;
+    }
+    if (t->range) {
+        gptps_toml_free(t);
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "%s has a number too large for its type", path);
         return NULL;
     }
     return t;
