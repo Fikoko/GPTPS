@@ -74,6 +74,20 @@ stands regardless: a forked child of a threaded process should `exec()` or `_exi
 (`addons/gptps_xport` forks worker processes, but they run the executor directly and
 never open an engine of their own, so it is not an example of this.)
 
+## Signal dispositions
+
+GPTPS never changes a process-wide signal disposition — the host owns those. The
+POSIX program executor suppresses `SIGPIPE` per-fd (`F_SETNOSIGPIPE`) or by masking
+it on its own thread, never with `signal(SIGPIPE, SIG_IGN)`.
+
+The converse is a requirement on the host: **do not set `SIGCHLD` to `SIG_IGN`, and
+do not run a wait-any reaper**, if you use `GPTPS_EXEC_PROGRAM`. Either auto-reaps
+the executor's children, so its `waitpid()` returns `ECHILD` and the exit status is
+unrecoverable. GPTPS reports `GPTPS_E_TASK` rather than assume success — assuming
+success would silently convert every failing program into a passing one. On such a
+host every `GPTPS_EXEC_PROGRAM` task therefore fails immediately.
+`GPTPS_EXEC_OOP` is unaffected; it carries its status over its own result pipe.
+
 ## Denial of service
 
 The engine is bounded by construction, and the bounds are the defence:

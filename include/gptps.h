@@ -269,7 +269,20 @@ typedef struct {
      * bare name (e.g. "wasmtime") is resolved via PATH, an absolute/relative path
      * is used as-is. The engine feeds the payload on the program's stdin and reads
      * its result from stdout; exit code 0 => success, non-zero => GPTPS_E_TASK.
-     * Ignored for INPROC/OOP. Copied by the engine at registration. */
+     * Ignored for INPROC/OOP. Copied by the engine at registration.
+     *
+     * HOST REQUIREMENT: do not set SIGCHLD to SIG_IGN, and do not run a wait-any
+     * reaper (`waitpid(-1, ...)` in a signal handler or a supervisor thread). Either
+     * one auto-reaps this executor's children out from under it, so its waitpid()
+     * fails with ECHILD and the exit status is simply gone. GPTPS will not guess:
+     * it reports GPTPS_E_TASK for such a task rather than assume success, because
+     * assuming success silently turns every FAILING program into a passing one.
+     * That means on a SIG_IGN host every PROGRAM task fails, loudly and
+     * immediately - which is the intended way to discover this. GPTPS deliberately
+     * does not "fix" it by changing the process-wide SIGCHLD disposition; the host
+     * owns its signal dispositions (the same reason the POSIX program executor
+     * suppresses SIGPIPE per-fd rather than globally). GPTPS_EXEC_OOP is unaffected:
+     * it carries its status over its own result pipe. */
     const char *const    *argv;
     /* GPTPS_EXEC_OOP / GPTPS_EXEC_PROGRAM only (v1.9): optional hook run IN THE
      * CHILD after fork - before exec (PROGRAM) or before the run fn (OOP). Harden
