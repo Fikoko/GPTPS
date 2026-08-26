@@ -136,6 +136,42 @@ int main(void)
         CHECK(get(&c_cancelled)  >= 1);   /* at least the explicit cancel landed */
     }
 
+    /* A FAILED setup() must leave the registry exactly as it found it.
+     *
+     * gptps_load_addon reports the failure, so the host is entitled to assume
+     * nothing was installed - and the header explicitly invites it to log and carry
+     * on. A task type left behind is worse than a leak: it is submittable, and its
+     * run/cost pointers live in a module the host believes did not load.
+     *
+     * The unwind used to buffer at most 16 task NAMES in a fixed array, so an add-on
+     * that registered more before failing kept the surplus. addon_unwind registers
+     * 20 and then returns an error; measured on the pre-fix build, 4 survived. */
+    {
+        gptps_config cfg3;
+        gptps *e3 = NULL;
+        size_t before, after;
+        memset(&cfg3, 0, sizeof cfg3);
+        cfg3.struct_size = sizeof cfg3;
+        cfg3.limits.struct_size = sizeof cfg3.limits;
+        cfg3.limits.max_concurrent_tasks = 1;
+        cfg3.mode = GPTPS_RUN_MANUAL;          /* no work is submitted; no threads needed */
+        CHECK(gptps_open_ex(&cfg3, &e3) == GPTPS_OK);
+        if (e3) {
+            before = gptps_task_count(e3);
+            CHECK(gptps_load_addon(e3, ADDON_UNWIND_PATH) != GPTPS_OK);   /* it gives up */
+            after = gptps_task_count(e3);
+            if (after != before) {
+                printf("FAIL failed setup() left %u task type(s) registered\n",
+                       (unsigned)(after - before));
+                ++fails;
+            }
+            /* and the names really are gone, not merely uncounted */
+            CHECK(gptps_task_exists(e3, "uw0")  == 0);
+            CHECK(gptps_task_exists(e3, "uw19") == 0);
+            gptps_shutdown(e3);
+        }
+    }
+
     if (fails) { printf("%d addon check(s) FAILED\n", fails); return 1; }
     printf("all addon checks passed\n");
     return 0;

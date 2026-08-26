@@ -241,6 +241,136 @@ static void test_dead_letter_is_capped(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
+/* ------------------------------------- 6. the grace-cancel must be TERMINAL,
+ *                                          not merely another failed attempt   */
+
+static int g_grace_started;
+static int g_body_runs;
+
+static void obs_grace(const gptps_event *ev, void *ud)
+{ (void)ud; if (ev->kind == GPTPS_EV_STARTED) inc(&g_grace_started); }
+
+/* A body that never polls gptps_is_cancelled. Nothing can preempt an in-process
+ * function, so the only thing a grace period can bound here is how many MORE
+ * times the engine runs it - and the answer has to be zero. */
+static gptps_status task_noncooperative(gptps_ctx *c, void *u)
+{
+    uint64_t t0 = gptps_now_ms(NULL);
+    (void)c; (void)u;
+    inc(&g_body_runs);
+    while (gptps_now_ms(NULL) - t0 < 800) { }
+    return GPTPS_OK;
+}
+
+/* reg_inproc above leaves the memset-zero policy, i.e. max_retries == 0. That is
+ * precisely why the two bugs below shipped: with no retries configured neither the
+ * retry branch nor the backoff queue is ever reached, so the whole suite exercised
+ * the grace only on the one path where it happened to work. */
+static void reg_retry(gptps *e, const char *name, gptps_run_fn fn,
+                      uint32_t retries, uint32_t backoff_s)
+{
+    gptps_task_def d; memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = name; d.run = fn; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.max_retries = retries;
+    d.default_policy.retry_backoff_seconds = backoff_s;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+}
+
+/* Open a threaded engine with a single worker and a SHORT drain bound.
+ * limits.shutdown_grace_ms is a live SETTING, not a gptps_limits field - the
+ * default is 30s, which no test can afford to wait out. */
+static gptps *open_graced(void)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 1;   /* deterministic: one runs, the rest queue */
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (e) CHECK(gptps_settings_set(e, "limits.shutdown_grace_ms", "200") == GPTPS_OK);
+    return e;
+}
+
+/* The grace-cancel used to raise the item's cancel FLAG without also setting
+ * it->cancelled - the pairing every other cancel site does. execute() reports a
+ * raised flag as GPTPS_E_CANCELLED, so the done-drain saw an ordinary failed
+ * attempt, took the RETRY branch, and re-admitted the item with a freshly cleared
+ * flag. With max_retries = 3 a 200ms grace made shutdown take 3.90s and run the
+ * body FOUR times - four times LONGER than having no grace at all, and it threw
+ * away a result the body had already produced. A grace is a bound only if it is
+ * terminal. */
+static void test_grace_cancel_is_terminal(void)
+{
+    gptps *e = open_graced();
+    uint64_t t0, elapsed;
+
+    if (!e) return;
+    gptps_register_observer(e, obs_grace, NULL);
+    set(&g_grace_started, 0);
+    set(&g_body_runs, 0);
+    reg_retry(e, "noncoop", task_noncooperative, 3, 0);
+    CHECK(gptps_submit(e, "noncoop", NULL, 0, NULL) == GPTPS_OK);
+
+    t0 = gptps_now_ms(NULL);
+    while (get(&g_grace_started) < 1 && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(get(&g_grace_started) == 1);
+
+    t0 = gptps_now_ms(NULL);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    elapsed = gptps_now_ms(NULL) - t0;
+
+    /* Ceiling: the 200ms grace plus the one 800ms body already in flight, with
+     * slack for a loaded runner. Retrying even once would blow straight past it. */
+    CHECK(elapsed < 1800);
+    CHECK(get(&g_body_runs) == 1);      /* was 4: the forced stop was retried */
+}
+
+/* --------------------------------- 7. the grace must bound the BACKOFF queue */
+
+static int g_retried;
+static int g_backoff_terminal;
+
+static void obs_backoff(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_RETRIED) inc(&g_retried);
+    if (ev->kind == GPTPS_EV_DEAD_LETTERED || ev->kind == GPTPS_EV_DROPPED) inc(&g_backoff_terminal);
+}
+
+/* The dispatcher refuses to exit while `delayed` is non-empty, and only promotes
+ * an item once its backoff has elapsed - so a retry parked in the backoff queue
+ * held teardown for the whole backoff no matter what the grace said. Measured:
+ * 23.70s with a 0.2s grace and retry_backoff_seconds = 8. Past the deadline the
+ * backoff is moot: the queue is terminated by policy and every item still gets
+ * the terminal event it owes (so far it has only seen EV_RETRIED). */
+static void test_grace_bounds_the_backoff_queue(void)
+{
+    gptps *e = open_graced();
+    uint64_t t0, elapsed;
+
+    if (!e) return;
+    gptps_register_observer(e, obs_backoff, NULL);
+    set(&g_retried, 0);
+    set(&g_backoff_terminal, 0);
+    reg_retry(e, "boom", task_always_fails, 3, 8);   /* 3 x 8s of backoff to sit through */
+    CHECK(gptps_submit(e, "boom", NULL, 0, NULL) == GPTPS_OK);
+
+    /* Wait for attempt 1 to fail and PARK in `delayed` - that is the state under
+     * test; shutting down before it would prove nothing. */
+    t0 = gptps_now_ms(NULL);
+    while (get(&g_retried) < 1 && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(get(&g_retried) == 1);
+
+    t0 = gptps_now_ms(NULL);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    elapsed = gptps_now_ms(NULL) - t0;
+
+    CHECK(elapsed < 2000);              /* was 23700: one whole backoff chain */
+    CHECK(get(&g_backoff_terminal) == 1);   /* and it is reported, not just freed */
+}
+
 int main(void)
 {
     test_reentrant_shutdown_is_refused();
@@ -251,6 +381,8 @@ int main(void)
 #endif
     test_service_restart_is_rate_limited();
     test_dead_letter_is_capped();
+    test_grace_cancel_is_terminal();
+    test_grace_bounds_the_backoff_queue();
 
     if (fails) { printf("%d teardown check(s) FAILED\n", fails); return 1; }
     printf("all teardown checks passed\n");

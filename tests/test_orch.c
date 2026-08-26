@@ -115,6 +115,108 @@ static int check_unsatisfiable_gate(void)
     return bad;
 }
 
+/* The seams a host needs when a gate does NOT get submitted.
+ *
+ * gptps_orch_pending() converging to 0 is what makes it a usable drain predicate,
+ * but on its own it hides the interesting case: a gate the orchestrator gave up on
+ * stops being pending, and its task never ran and never emitted an event. Without
+ * gptps_orch_stalled()/_at() that outcome is indistinguishable from success. And
+ * without gptps_orch_prune()/install_ex the remembered-handle set grows for the
+ * process lifetime, which a long-running host cannot accept.
+ *
+ * MANUAL mode throughout: gptps_step emits every buffered event before it returns,
+ * so once it has drained, the orchestrator has provably seen every terminal event.
+ * The threaded helper above cannot give that - waiting on the task counter proves
+ * the BODY ran, not that the observer has processed the terminal event yet. */
+static gptps *open_manual_engine(void)
+{
+    gptps_config cfg; gptps *e = NULL;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 1;
+    cfg.mode = GPTPS_RUN_MANUAL;
+    gptps_open_ex(&cfg, &e);
+    return e;
+}
+static void step_drain(gptps *e) { size_t r; while (gptps_step(e, &r) == GPTPS_OK && r) { } }
+
+static int check_orch_seams(void)
+{
+    gptps *e;
+    gptps_orch *o;
+    gptps_handle h = 0;
+    char nm[64];
+    gptps_status last = GPTPS_OK;
+    int i, bad = 0;
+
+    /* --- prune: the set is droppable wholesale, and dropping it twice is a no-op */
+    e = open_manual_engine();
+    if (!e) return 1;
+    o = gptps_orch_install(e);
+    if (!o) { gptps_shutdown(e); return 1; }
+    reg(e, "mark", task_mark);
+    for (i = 0; i < 5; ++i) {
+        if (gptps_submit(e, "mark", NULL, 0, &h) != GPTPS_OK) ++bad;
+        step_drain(e);
+    }
+    if (gptps_orch_prune(o) != 5) { printf("FAIL prune did not forget 5 handles\n"); ++bad; }
+    if (gptps_orch_prune(o) != 0) { printf("FAIL a second prune forgot something\n"); ++bad; }
+    gptps_shutdown(e);
+    gptps_orch_close(o);
+
+    /* --- bounded retention: install_ex caps what is remembered */
+    e = open_manual_engine();
+    if (!e) return bad + 1;
+    o = gptps_orch_install_ex(e, 4);
+    if (!o) { gptps_shutdown(e); return bad + 1; }
+    reg(e, "mark", task_mark);
+    for (i = 0; i < 20; ++i) {
+        if (gptps_submit(e, "mark", NULL, 0, &h) != GPTPS_OK) ++bad;
+        step_drain(e);
+    }
+    if (gptps_orch_prune(o) > 4) { printf("FAIL remembered set exceeded done_cap\n"); ++bad; }
+    gptps_shutdown(e);
+    gptps_orch_close(o);
+
+    /* --- a gate on a name that is not registered: abandoned, reported, retryable */
+    e = open_manual_engine();
+    if (!e) return bad + 1;
+    o = gptps_orch_install(e);
+    if (!o) { gptps_shutdown(e); return bad + 1; }
+    reg(e, "mark", task_mark);
+    if (gptps_submit(e, "mark", NULL, 0, &h) != GPTPS_OK) ++bad;
+    /* Create the gate BEFORE stepping. In MANUAL mode nothing has run yet, so the
+     * dependency is genuinely outstanding and a real gate is held. Draining first
+     * would make the dep already-terminal, and gptps_orch_after's fast path would
+     * submit inline and return the engine's refusal to the caller - never creating
+     * the gate this case is about. */
+    if (gptps_orch_after(o, "later", NULL, 0, &h, 1, NULL) != GPTPS_OK) ++bad;
+    step_drain(e);
+    /* each unrelated completion is one retry opportunity; bounded by the retry cap */
+    for (i = 0; i < 60 && gptps_orch_pending(o) != 0; ++i) {
+        if (gptps_submit(e, "mark", NULL, 0, NULL) != GPTPS_OK) break;
+        step_drain(e);
+    }
+    if (gptps_orch_pending(o) != 0) { printf("FAIL stalled gate never converged\n"); ++bad; }
+    if (gptps_orch_stalled(o) != 1) { printf("FAIL stalled gate not reported\n"); ++bad; }
+    if (gptps_orch_stalled_at(o, 0, nm, sizeof nm, &last) != GPTPS_OK) {
+        printf("FAIL stalled_at(0) did not resolve\n"); ++bad;
+    } else {
+        if (strcmp(nm, "later") != 0) { printf("FAIL stalled gate names '%s'\n", nm); ++bad; }
+        if (last != GPTPS_E_NOTFOUND) { printf("FAIL stalled status was %d\n", (int)last); ++bad; }
+    }
+    if (gptps_orch_stalled_at(o, 1, nm, sizeof nm, NULL) != GPTPS_E_NOTFOUND) {
+        printf("FAIL index past the end did not report E_NOTFOUND\n"); ++bad;
+    }
+    reg(e, "later", task_mark);            /* the host fixes what was wrong */
+    if (gptps_orch_retry(o) != 1)   { printf("FAIL retry did not accept the gate\n"); ++bad; }
+    if (gptps_orch_stalled(o) != 0) { printf("FAIL gate still stalled after retry\n"); ++bad; }
+    step_drain(e);
+    gptps_shutdown(e);
+    gptps_orch_close(o);
+    return bad;
+}
+
 int main(void)
 {
     gptps *e;
@@ -226,6 +328,7 @@ int main(void)
     gptps_orch_close(o);
 
     fails += check_unsatisfiable_gate();
+    fails += check_orch_seams();
 
     if (fails) { printf("%d orch check(s) FAILED\n", fails); return 1; }
     printf("all orch checks passed\n");

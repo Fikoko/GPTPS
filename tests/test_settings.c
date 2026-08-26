@@ -44,6 +44,80 @@ static int has_key(gptps *e, const char *key)
     return 0;
 }
 
+
+/* ---- 1.1.0 regressions: numeric range enforcement, and the escaped-quote round
+ * trip. Its own engine and its own files, so nothing above depends on it. ---- */
+static void test_range_and_escape(void)
+{
+    gptps *e = NULL;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+    FILE *f;
+
+    CHECK(gptps_open(NULL, &e) == GPTPS_OK);
+    if (!e) return;
+
+    /* (1) A value that fits unsigned long long but NOT the uint32_t its write
+     * callback casts to. It used to validate fine and then truncate to 0 - so the
+     * intake bound the operator had just set silently became "unbounded", the exact
+     * opposite of what was asked for. Assert the refusal AND that the bound already
+     * in force survived it. */
+    CHECK(gptps_settings_set(e, "limits.max_intake_depth", "4096") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "limits.max_intake_depth", "4294967296") != GPTPS_OK);
+    CHECK(gptps_settings_get(e, "limits.max_intake_depth", b, sizeof b) == GPTPS_OK);
+    CHECK(strcmp(b, "4096") == 0);
+
+    /* (2) A value strtoull/strtoll SATURATES on. errno == ERANGE was not checked,
+     * so the clamped result was applied as if it had been written - and
+     * ULLONG_MAX/LLONG_MAX is precisely the value that reads as "no limit". */
+    CHECK(gptps_settings_set(e, "limits.max_memory_bytes", "1048576") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "limits.max_memory_bytes", "99999999999999999999999") != GPTPS_OK);
+    CHECK(gptps_settings_get(e, "limits.max_memory_bytes", b, sizeof b) == GPTPS_OK);
+    CHECK(strcmp(b, "1048576") == 0);
+
+    /* the same on a signed knob, at both ends */
+    CHECK(gptps_define_global(e, "app.signed", GPTPS_SETTING_INT, "7", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "app.signed", "99999999999999999999999") != GPTPS_OK);
+    CHECK(gptps_settings_set(e, "app.signed", "-99999999999999999999999") != GPTPS_OK);
+    CHECK(gptps_settings_get(e, "app.signed", b, sizeof b) == GPTPS_OK && strcmp(b, "7") == 0);
+    /* not over-strict: it is a range check, not a digit-count check */
+    CHECK(gptps_settings_set(e, "app.signed", "-2147483648") == GPTPS_OK);
+
+    /* (3) the engine keeps its own copy of that grammar to validate a
+     * gptps_define_global default; it had the same gap. */
+    CHECK(gptps_define_global(e, "app.huge", GPTPS_SETTING_INT,
+                              "99999999999999999999999", NULL, 0) == GPTPS_E_CONFIG);
+    CHECK(gptps_define_global(e, "app.hugeu", GPTPS_SETTING_UINT,
+                              "99999999999999999999999", NULL, 0) == GPTPS_E_CONFIG);
+
+    /* (4) strip_comment() ignored backslash escapes, so a string value carrying an
+     * escaped quote ahead of a '#' was cut at the '#' when the file was read back.
+     * The save side was always correct, which is what made it a silent data loss:
+     * it only appeared one reload later. */
+    CHECK(gptps_define_global(e, "app.motd", GPTPS_SETTING_STRING, "x", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "app.motd", "a\"b#c") == GPTPS_OK);
+    CHECK(gptps_settings_save(e, "settings_esc.toml") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "app.motd", "clobbered") == GPTPS_OK);   /* so the reload must do work */
+    CHECK(gptps_settings_reload(e, "settings_esc.toml") == GPTPS_OK);
+    CHECK(gptps_settings_get(e, "app.motd", b, sizeof b) == GPTPS_OK);
+    CHECK(strcmp(b, "a\"b#c") == 0);                                     /* used to be "a" */
+    remove("settings_esc.toml");
+
+    /* (5) the reload path must refuse an out-of-range file value too, and leave the
+     * live value standing - it used to install LLONG_MAX over it. */
+    f = fopen("settings_range.toml", "wb");
+    CHECK(f != NULL);
+    if (f) {
+        fputs("[limits]\nmax_memory_bytes = 99999999999999999999999\n", f);
+        fclose(f);
+        CHECK(gptps_settings_reload(e, "settings_range.toml") == GPTPS_E_CONFIG);
+        CHECK(gptps_settings_get(e, "limits.max_memory_bytes", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "1048576") == 0);
+        remove("settings_range.toml");
+    }
+
+    gptps_shutdown(e);
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -163,6 +237,8 @@ int main(void)
         }
         remove("settings_rt.toml");
     }
+
+    test_range_and_escape();
 
     if (fails) { printf("%d settings check(s) FAILED\n", fails); return 1; }
     printf("all settings checks passed\n");

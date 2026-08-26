@@ -508,9 +508,11 @@ size_t gptps_dq_quarantined(gptps_dq *dq)
     return n;
 }
 
-size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *user_data)
+size_t gptps_dq_drain_quarantine_ex(gptps_dq *dq, gptps_dq_quarantine_cb cb,
+                                    void *user_data, gptps_status *out_compact)
 {
     size_t i, n = 0;
+    if (out_compact) *out_compact = GPTPS_OK;
     if (!dq) return 0;
     apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
@@ -521,14 +523,27 @@ size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *
         dq->recs[i].done = 1;        /* drained => terminally gone */
         ++n;
     }
-    /* Compact the drained records out of the journal. A failure here is not a
-     * failed drain - cb has already seen every payload - and there is no channel
-     * to report it through, so it is deliberately dropped: the journal simply
-     * stays uncompacted and a restart re-quarantines these records for another
-     * drain, which is this add-on's at-least-once contract applied to cb. */
-    if (n) (void)do_rewrite(dq);
+    /* Compact the drained records out of the journal.
+     *
+     * A failure here is genuinely NOT a failed drain: cb has already seen every
+     * payload, and the return value counts what cb saw. What it does mean is that
+     * the journal still holds those records, so a restart re-quarantines them and
+     * cb sees them AGAIN - this add-on's at-least-once contract, applied to the
+     * drain callback. A host whose cb is not idempotent (it bills, it emails, it
+     * files a ticket) has to know that happened, and used to have no way to find
+     * out. Reported through out_compact rather than the return value, so the count
+     * keeps meaning "records drained". */
+    if (n) {
+        gptps_status cst = do_rewrite(dq);
+        if (out_compact) *out_compact = cst;
+    }
     apx_mutex_unlock(&dq->mu);
     return n;
+}
+
+size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *user_data)
+{
+    return gptps_dq_drain_quarantine_ex(dq, cb, user_data, NULL);
 }
 
 gptps_status gptps_dq_compact(gptps_dq *dq)

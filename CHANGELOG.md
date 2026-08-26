@@ -254,6 +254,62 @@ first so it could prove the order did not move.
 - A regression test for an unsatisfiable `orch` gate.
 - `CONTRIBUTING.md` and `.editorconfig`. There is deliberately **no** `.clang-format`:
   the code is hand-aligned, and every configuration tried rewrote 57–67% of the tree.
+- **Regression tests for the rest of this release.** Every fix above was verified with
+  a reproduction while it was being made; these promote them into the suite so they
+  cannot come back. Each one was **mutation-tested** — the fix was reverted and the
+  test watched to go red — because a test that cannot fail reads as coverage without
+  being any: the MANUAL-mode unregister use-after-free, the add-on unwind cap (with a
+  new `tests/addon_unwind.c` fixture that registers 20 types and then fails; 4 survived
+  on the pre-fix build), the task-name bound, both shutdown-grace holes, the
+  terminal-event buffer overflow, a service queued at shutdown, all three executor
+  fixes, and the six config/TOML/settings fixes.
+
+### Added — add-on API (all additive; no existing signature changed)
+
+The 1.1.0 fixes left five gaps that could not be closed without new public functions.
+
+- `gptps_orch_install_ex(e, done_cap)` and `gptps_orch_prune(o)` — **bounded retention**.
+  The orchestrator remembers completed handles so a gate created *after* a dependency
+  finished still resolves, and that set grew for the process lifetime. It can be
+  dropped wholesale at any time, which is not obvious: no *unreleased* gate reads it (a
+  dependency present at gate creation is resolved immediately, and one that terminates
+  later is resolved in the same call that records it). The only cost is that a gate
+  created afterwards naming an already-finished handle waits forever — the same outcome
+  this header already documents for a gate created too late.
+- `gptps_orch_stalled(o)`, `gptps_orch_stalled_at(o, i, buf, cap, &last)` and
+  `gptps_orch_retry(o)` — **a stalled gate is now visible**. A gate the orchestrator
+  gives up submitting stops being pending, and its task never ran and emitted no event;
+  without these that is indistinguishable from success. `stalled_at` copies the task
+  name (never hands out an interior pointer) and reports the status the engine refused
+  it with. `retry` re-submits them all immediately rather than waiting for a terminal
+  event that an idle engine may never produce.
+- `gptps_xport_live(xp)` — and the rotation now **skips retired workers**. A worker whose
+  link breaks mid-frame is retired permanently (a stream protocol cannot be
+  resynchronised), but the round-robin kept handing it every Nth submit: measured, one
+  dead worker in four turned **10 of 40** submits into `GPTPS_E_IO` while three healthy
+  workers sat idle. Now 0. The liveness bit is mirrored under the cursor lock rather
+  than read off the worker's own `dead` field, which is written under a different mutex
+  — the data race that made this a deferral rather than a fix.
+- `gptps_dq_drain_quarantine_ex(dq, cb, ud, &compact_status)` — the plain drain returns
+  how many records the callback saw, which is true whether or not the journal was
+  compacted afterwards, so a compaction failure had no channel. It matters: uncompacted
+  records are replayed to the callback again after a restart. Fine for an idempotent
+  callback, not for one that bills or emails.
+
+### Fixed — Windows (compile-verified only; no Windows runtime here)
+
+- The reader thread's join is now bounded by **closing the pipe handle before joining**
+  rather than after. An anonymous pipe signals EOF only when the last write handle
+  closes, so a grandchild that inherited the child's stdout kept the reader parked in
+  `ReadFile` with nothing left to end it — and the `INFINITE` join then wedged the
+  worker and the `gptps_shutdown` that joins it. `CancelSynchronousIo` is kept as a
+  first attempt (it is the documented mechanism) but is unreliable on anonymous pipes,
+  so the close is what the bound actually rests on. The writer keeps ownership of its
+  own handle — it closes it to give the child EOF — so it is unblocked by the job
+  teardown plus the grace, and that residual is documented rather than papered over.
+  Verified by compiling `src/exec_win.c` clean under `-Wall -Wextra -Werror` against a
+  Win32 shim at `_WIN32_WINNT` 0x0501, 0x0600 and 0x0601; CI compiles it for real on
+  MSVC and mingw. Nothing here executes it.
 
 ### Changed — build, packaging and CI
 

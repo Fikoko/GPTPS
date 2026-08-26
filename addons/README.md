@@ -99,6 +99,12 @@ module registers an observer to mark a record complete once its task reaches a t
 state; `gptps_dq_recover()` re-submits anything a prior run left unfinished.
 
 - **Guarantee:** at-least-once — task bodies must be idempotent.
+- **Quarantine drains are at-least-once too.** `gptps_dq_drain_quarantine()` compacts
+  the drained records out of the journal afterwards; if that compaction fails they are
+  still on disk, so a restart hands them to your callback **again**. Fine for an
+  idempotent callback, not fine for one that bills or emails — use
+  `gptps_dq_drain_quarantine_ex()`, which reports the compaction status separately from
+  the drained count.
 - **Ordering:** call `gptps_dq_close()` **after** `gptps_shutdown()`.
 - **Portability:** Linux/macOS/Windows (via the `addon_compat` mutex + fsync shim).
 
@@ -175,8 +181,21 @@ than in the dispatcher.
 - **Two shapes never terminate at all:** a task type with
   `GPTPS_ON_FAILURE_REQUEUE`, and a `GPTPS_TASK_SERVICE` instance. A gate on one waits
   forever — correctly, but surprisingly.
-- **Caveat:** completed handles are remembered for the process lifetime (prune in a
-  long-running host).
+- **Retention is bounded on request.** Completed handles are remembered so a gate
+  created *after* a dependency finished still resolves. `gptps_orch_install` keeps them
+  for the process lifetime; `gptps_orch_install_ex(e, cap)` drops the set once it
+  reaches `cap`, and `gptps_orch_prune(o)` drops it on demand. Dropping is always safe
+  — no *unreleased* gate reads the set — and its only cost is that a gate created
+  afterwards which names an already-finished handle waits forever, which is the same
+  outcome as creating a gate too late.
+- **A gate that never gets submitted is visible.** A gate whose deps are all satisfied
+  is submitted at once, and that submit can be refused (type paused, intake full, name
+  never registered, cost that can never fit). The orchestrator retries the transient
+  cases a bounded number of times and then gives up, so `gptps_orch_pending()` always
+  converges to 0 — which is what makes it a usable drain predicate, and also what would
+  otherwise hide the failure. `gptps_orch_stalled()` counts the gates it gave up on,
+  `gptps_orch_stalled_at()` names one and reports the status it was refused with, and
+  `gptps_orch_retry()` re-submits them all once you have fixed the cause.
 
 ```c
 gptps_orch *o = gptps_orch_install(engine);
@@ -184,6 +203,15 @@ gptps_submit(engine, "A", ..., &hA);
 gptps_submit(engine, "B", ..., &hB);
 gptps_handle deps[2] = { hA, hB };
 gptps_orch_after(o, "C", ..., deps, 2, NULL);   /* C runs after A and B */
+
+/* did anything fail to launch? */
+if (gptps_orch_stalled(o)) {
+    char task[64]; gptps_status why;
+    gptps_orch_stalled_at(o, 0, task, sizeof task, &why);
+    fprintf(stderr, "gate on '%s' never ran: %s\n", task, gptps_strerror(why));
+    /* ... fix it (resume the type, register the name), then: */
+    gptps_orch_retry(o);
+}
 gptps_shutdown(engine); gptps_orch_close(o);
 ```
 
@@ -314,6 +342,12 @@ out: it forks N persistent worker **processes** and ships each submit to one ove
 socketpair, marshalling the result back. Work therefore runs in a separate address space
 — crash-isolated and independently capped.
 
+- **A broken link retires its worker, and the rotation skips it.** The wire protocol
+  cannot be resynchronised mid-frame — the next submit would read this frame's
+  leftovers as its own reply — so a worker whose link breaks is retired permanently and
+  is not respawned. `gptps_xport_count()` is the pool size and never changes;
+  `gptps_xport_live()` is the remaining capacity and only falls. At 0, every submit
+  returns `GPTPS_E_IO`.
 - **Consumes no seam.** It never calls into an engine and does not use the add-on ABI:
   the core is not on its path. That is the point, not a gap — the composition pattern
   needs nothing from the core, which is why the core offers it nothing.

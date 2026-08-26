@@ -24,6 +24,9 @@ static gptps_status xrun(const char *task, const void *payload, size_t len,
                          void **out, size_t *outlen, void *ud)
 {
     (void)ud;
+    /* Kill this worker mid-frame: the parent is waiting on a reply that will never
+     * come, which is exactly how a real link breaks. */
+    if (strcmp(task, "die") == 0)   _exit(1);
     if (strcmp(task, "fail") == 0)  return GPTPS_E_TASK;
     if (strcmp(task, "empty") == 0) { *out = NULL; *outlen = 0; return GPTPS_OK; }
     {
@@ -92,6 +95,43 @@ int main(void)
     CHECK(gptps_xport_submit(NULL, "x", NULL, 0, NULL, NULL, NULL) == GPTPS_E_INVAL);
 
     gptps_xport_close(xp);   /* returns => all workers reaped cleanly */
+
+    /* A retired worker must leave the ROTATION, not just refuse work.
+     *
+     * A link that breaks mid-frame cannot be resynchronised - the next submit would
+     * read this frame's leftovers as its own status and hand back a fabricated reply
+     * - so the worker is retired permanently. But the round-robin used to hand it
+     * every Nth submit anyway, so one dead worker in four turned a quarter of all
+     * subsequent work into GPTPS_E_IO while three healthy workers sat idle. Measured
+     * on the pre-fix build: 10 of 40 submits failed. It must now be 0, and
+     * gptps_xport_live() must report the real remaining capacity. */
+    {
+        gptps_xport *xd = gptps_xport_open(4, xrun, NULL);
+        CHECK(xd != NULL);
+        if (xd) {
+            void *res = NULL; size_t rl = 0; gptps_status ts = GPTPS_OK;
+            int i, io = 0;
+            CHECK(gptps_xport_count(xd) == 4);
+            CHECK(gptps_xport_live(xd) == 4);
+
+            (void)gptps_xport_submit(xd, "die", NULL, 0, &res, &rl, &ts);
+            free(res);
+            CHECK(gptps_xport_live(xd) == 3);       /* retired, and counted as such */
+            CHECK(gptps_xport_count(xd) == 4);      /* pool SIZE does not change */
+
+            for (i = 0; i < 40; ++i) {
+                res = NULL; rl = 0;
+                if (gptps_xport_submit(xd, "upper", "x", 1, &res, &rl, &ts) != GPTPS_OK) ++io;
+                free(res);
+            }
+            if (io != 0) {
+                printf("FAIL %d/40 submits hit the retired worker\n", io);
+                ++fails;
+            }
+            CHECK(gptps_xport_live(xd) == 3);       /* nothing else died */
+            gptps_xport_close(xd);
+        }
+    }
 
     if (fails) { printf("%d xport check(s) FAILED\n", fails); return 1; }
     printf("all xport (scale-out) checks passed\n");

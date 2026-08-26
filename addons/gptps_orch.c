@@ -28,6 +28,8 @@ typedef struct {
     size_t        remaining;   /* deps not yet terminal */
     int           released;
     unsigned      attempts;    /* rejected release_gate submits so far (see the cap) */
+    int           abandoned;   /* released WITHOUT ever being submitted */
+    gptps_status  last_status; /* the engine's last verdict on this gate's submit */
 } gate;
 
 /* How many times a gate whose dependencies are all satisfied may be re-submitted
@@ -57,6 +59,7 @@ struct gptps_orch {
      * the engine's emit path, and paid even by a host that never gates anything. */
     gptps_handle *done;
     size_t        ndone, dcap;
+    size_t        done_cap;    /* 0 = remember for the process lifetime (the default) */
 };
 
 static char *dup_str(const char *s) { size_t n = strlen(s) + 1; char *o = (char *)malloc(n); if (o) memcpy(o, s, n); return o; }
@@ -117,6 +120,8 @@ static size_t done_slot(const gptps_handle *tab, size_t cap, gptps_handle h)
     return i;
 }
 
+static size_t orch_prune_locked(gptps_orch *o);   /* defined with the public prune */
+
 static int is_done(gptps_orch *o, gptps_handle h)
 {
     if (!o->dcap || !h) return 0;
@@ -148,6 +153,10 @@ static int mark_done(gptps_orch *o, gptps_handle h)
 {
     if (!h) return 0;                /* 0 is the table's empty marker; the engine never
                                       * issues it, so refuse to advance a gate on one */
+    /* An opt-in ceiling on what we remember (gptps_orch_install_ex). Pruning HERE,
+     * before the insert, is what makes the bound real rather than a bound plus one
+     * doubling. */
+    if (o->done_cap && o->ndone >= o->done_cap) (void)orch_prune_locked(o);
     if (is_done(o, h)) return 0;
     /* keep the load factor at 1/2 so probe chains stay short */
     if ((o->ndone + 1) * 2 > o->dcap) {
@@ -186,16 +195,19 @@ static void release_gate(gptps_orch *o, gate *g)
     gptps_handle h = 0;
     gptps_status st = gptps_submit(o->e, g->task, g->payload, g->len, &h);
 
-    if (st == GPTPS_OK) { g->released = 1; return; }
+    g->last_status = st;
+    if (st == GPTPS_OK) { g->released = 1; g->abandoned = 0; return; }
 
     /* Transient: a paused type can be resumed, a full intake can drain, and memory
      * can come back. Everything else - E_BUDGET, E_SHUTDOWN, E_INVAL, a cost hook's
      * own status - will say the same thing next time, so stop now. */
     if (st != GPTPS_E_NOTFOUND && st != GPTPS_E_FULL && st != GPTPS_E_NOMEM) {
-        g->released = 1;
+        g->released = 1; g->abandoned = 1;
         return;
     }
-    if (++g->attempts >= GPTPS_ORCH_RELEASE_ATTEMPTS) g->released = 1;  /* gave up */
+    if (++g->attempts >= GPTPS_ORCH_RELEASE_ATTEMPTS) {                 /* gave up */
+        g->released = 1; g->abandoned = 1;
+    }
     /* the released task is now a normal engine item; we don't track its handle
      * further (chaining onto a deferred gate is out of scope - see the header). */
 }
@@ -223,7 +235,7 @@ static void orch_obs(const gptps_event *ev, void *ud)
     apx_mutex_unlock(&o->mu);
 }
 
-gptps_orch *gptps_orch_install(gptps *e)
+gptps_orch *gptps_orch_install_ex(gptps *e, size_t done_cap)
 {
     gptps_orch *o;
     if (!e) return NULL;
@@ -231,10 +243,97 @@ gptps_orch *gptps_orch_install(gptps *e)
     if (!o) return NULL;
     apx_mutex_init(&o->mu);
     o->e = e;
+    o->done_cap = done_cap;
     if (gptps_register_observer(e, orch_obs, o) != GPTPS_OK) {
         apx_mutex_destroy(&o->mu); free(o); return NULL;
     }
     return o;
+}
+
+gptps_orch *gptps_orch_install(gptps *e) { return gptps_orch_install_ex(e, 0); }
+
+/* Forget every remembered completed handle. Caller holds o->mu.
+ *
+ * Clearing the WHOLE set is correct, which is not obvious. The set answers exactly
+ * one question - "had this handle already terminated when gptps_orch_after named
+ * it?" - and it is consulted nowhere else. A gate that is still unreleased cannot
+ * have any of its outstanding deps in the set: a dep present at creation time was
+ * counted out of `remaining` immediately, and one that terminates later is counted
+ * out by orch_obs in the same call that records it. So no live gate depends on a
+ * single entry here; the only thing pruning costs is a FUTURE gptps_orch_after that
+ * names a handle which finished before the prune - and that gate waits forever,
+ * which is the same outcome gptps_orch.h already documents for a gate created too
+ * late. */
+static size_t orch_prune_locked(gptps_orch *o)
+{
+    size_t n = o->ndone;
+    if (o->done) memset(o->done, 0, o->dcap * sizeof *o->done);
+    o->ndone = 0;
+    return n;
+}
+
+size_t gptps_orch_prune(gptps_orch *o)
+{
+    size_t n;
+    if (!o) return 0;
+    apx_mutex_lock(&o->mu);
+    n = orch_prune_locked(o);
+    apx_mutex_unlock(&o->mu);
+    return n;
+}
+
+size_t gptps_orch_stalled(gptps_orch *o)
+{
+    size_t i, n = 0;
+    if (!o) return 0;
+    apx_mutex_lock(&o->mu);
+    for (i = 0; i < o->ng; ++i) if (o->gates[i].abandoned) ++n;
+    apx_mutex_unlock(&o->mu);
+    return n;
+}
+
+gptps_status gptps_orch_stalled_at(gptps_orch *o, size_t index,
+                                   char *buf, size_t cap, gptps_status *out_last)
+{
+    size_t i, n = 0;
+    if (!o || !buf || !cap) return GPTPS_E_INVAL;
+    apx_mutex_lock(&o->mu);
+    for (i = 0; i < o->ng; ++i) {
+        if (!o->gates[i].abandoned) continue;
+        if (n++ != index) continue;
+        /* copy, never hand out g->task: the gate is freed by gptps_orch_close and
+         * the caller has no way to know when */
+        {   const char *t = o->gates[i].task ? o->gates[i].task : "";
+            size_t L = strlen(t);
+            if (L >= cap) L = cap - 1;
+            memcpy(buf, t, L); buf[L] = '\0';
+        }
+        if (out_last) *out_last = o->gates[i].last_status;
+        apx_mutex_unlock(&o->mu);
+        return GPTPS_OK;
+    }
+    apx_mutex_unlock(&o->mu);
+    return GPTPS_E_NOTFOUND;
+}
+
+size_t gptps_orch_retry(gptps_orch *o)
+{
+    size_t i, n = 0;
+    if (!o) return 0;
+    apx_mutex_lock(&o->mu);
+    for (i = 0; i < o->ng; ++i) {
+        gate *g = &o->gates[i];
+        if (!g->abandoned) continue;
+        /* Re-arm and submit NOW rather than waiting for the next terminal event:
+         * the host has just told us the condition changed (it resumed the paused
+         * type, or drained the queue), and on an idle engine there may never BE
+         * another terminal event to piggyback on. */
+        g->released = 0; g->abandoned = 0; g->attempts = 0;
+        release_gate(o, g);
+        if (!g->abandoned) ++n;
+    }
+    apx_mutex_unlock(&o->mu);
+    return n;
 }
 
 gptps_status gptps_orch_after(gptps_orch *o, const char *task,

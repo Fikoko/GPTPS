@@ -52,6 +52,18 @@ struct gptps_xport {
     size_t        n;
     apx_mutex     cursor_lock;
     uint64_t      cursor;
+    /* Liveness, mirrored here rather than read off xport_worker.dead.
+     *
+     * `dead` is written under that worker's own w->mu, so the rotation - which does
+     * not hold w->mu - cannot read it without a data race. Mirroring the bit under
+     * cursor_lock gives the rotation something it may legally read, and keeps the
+     * skip decision atomic with the cursor advance it feeds.
+     *
+     * Lock order is w->mu -> cursor_lock, and it cannot invert: next_rr RELEASES
+     * cursor_lock before the caller takes w->mu, so no thread ever holds
+     * cursor_lock while acquiring a worker mutex. */
+    unsigned char *alive;
+    size_t         nalive;
 };
 
 /* ---- framed socket I/O (EINTR-safe; SIGPIPE suppressed per-call) ---- */
@@ -142,6 +154,8 @@ gptps_xport *gptps_xport_open(size_t nworkers, gptps_xport_run_fn run, void *use
     if (!xp) return NULL;
     xp->w = (xport_worker *)calloc(nworkers, sizeof *xp->w);
     if (!xp->w) { free(xp); return NULL; }
+    xp->alive = (unsigned char *)calloc(nworkers, 1);
+    if (!xp->alive) { free(xp->w); free(xp); return NULL; }
     apx_mutex_init(&xp->cursor_lock);
 
     for (i = 0; i < nworkers; ++i) {
@@ -166,18 +180,55 @@ gptps_xport *gptps_xport_open(size_t nworkers, gptps_xport_run_fn run, void *use
         close(sp[1]);
         xp->w[i].pid = pid; xp->w[i].fd = sp[0];
         apx_mutex_init(&xp->w[i].mu);
+        xp->alive[i] = 1; xp->nalive = i + 1;            /* born live */
         xp->n = i + 1;                                   /* keep n consistent for a partial teardown */
     }
     return xp;
 }
 
+/* Workers this transport was created with - the pool SIZE, which never changes. */
 size_t gptps_xport_count(gptps_xport *xp) { return xp ? xp->n : 0; }
 
+/* Workers still able to take work. A link that breaks mid-frame is retired for good
+ * (see gptps_xport_submit), and it is not respawned, so this only ever falls. A host
+ * that cares about capacity should watch it: reaching 0 means every subsequent
+ * submit returns GPTPS_E_IO. */
+size_t gptps_xport_live(gptps_xport *xp)
+{
+    size_t n;
+    if (!xp) return 0;
+    apx_mutex_lock(&xp->cursor_lock);
+    n = xp->nalive;
+    apx_mutex_unlock(&xp->cursor_lock);
+    return n;
+}
+
+/* Mark a worker retired. Called with that worker's w->mu held; see the lock-order
+ * note on `alive`. Idempotent. */
+static void mark_dead(gptps_xport *xp, size_t idx)
+{
+    apx_mutex_lock(&xp->cursor_lock);
+    if (xp->alive && xp->alive[idx]) { xp->alive[idx] = 0; xp->nalive -= 1; }
+    apx_mutex_unlock(&xp->cursor_lock);
+}
+
+/* Next LIVE worker, or (size_t)-1 if every one has been retired.
+ *
+ * It used to hand back xp->cursor++ % n unconditionally, so once a worker's link
+ * broke, one submit in every n was answered with GPTPS_E_IO by a pool that still had
+ * healthy workers sitting idle - and with the last worker gone the caller got the
+ * same error either way, but with no way to tell "this one is gone" from "they all
+ * are". Scanning at most n slots keeps it O(pool) and terminating. */
 static size_t next_rr(gptps_xport *xp)
 {
-    size_t idx;
+    size_t idx = (size_t)-1, i;
     apx_mutex_lock(&xp->cursor_lock);
-    idx = (size_t)(xp->cursor++ % xp->n);
+    if (xp->nalive) {
+        for (i = 0; i < xp->n; ++i) {
+            size_t cand = (size_t)(xp->cursor++ % xp->n);
+            if (!xp->alive || xp->alive[cand]) { idx = cand; break; }
+        }
+    }
     apx_mutex_unlock(&xp->cursor_lock);
     return idx;
 }
@@ -188,7 +239,7 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 gptps_status *out_task_status)
 {
     xport_worker *w;
-    size_t tl;
+    size_t tl, wi;
     uint32_t tlen;
     uint64_t plen, rl = 0;
     int32_t st32 = (int32_t)GPTPS_E_IO;
@@ -211,7 +262,11 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     if ((uint64_t)len > GPTPS_XPORT_MAX_MSG) return GPTPS_E_INVAL;
     tlen = (uint32_t)tl;                         /* provably <= the cap: no truncation */
     plen = (uint64_t)len;
-    w = &xp->w[next_rr(xp)];
+    {   size_t idx = next_rr(xp);
+        if (idx == (size_t)-1) return GPTPS_E_IO;   /* every worker has been retired */
+        w = &xp->w[idx];
+        wi = idx;
+    }
 
     apx_mutex_lock(&w->mu);
     if (w->dead) { apx_mutex_unlock(&w->mu); return GPTPS_E_IO; }
@@ -238,6 +293,7 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
         if (w->fd >= 0) close(w->fd);
         w->fd = -1;
         w->dead = 1;
+        mark_dead(xp, wi);          /* so the rotation stops handing work to it */
     }
     apx_mutex_unlock(&w->mu);
 
@@ -260,6 +316,7 @@ void gptps_xport_close(gptps_xport *xp)
         apx_mutex_destroy(&xp->w[i].mu);
     }
     apx_mutex_destroy(&xp->cursor_lock);
+    free(xp->alive);
     free(xp->w);
     free(xp);
 }

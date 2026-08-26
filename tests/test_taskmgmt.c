@@ -272,6 +272,49 @@ int main(void)
         }
     }
 
+    /* ---- a task name longer than GPTPS_TASK_NAME_MAX is refused AT REGISTRATION ----
+     *
+     * Regression: an over-long name used to register fine and then be permanently
+     * unregisterable - gptps_unregister_task bounds the name against its own
+     * "tasks.<name>." buffer and refuses anything longer, so the type could never
+     * be removed again. Worse, the six per-task settings all truncate into the
+     * SAME key, so five of them were silently lost to E_DUP. The bound belongs at
+     * registration, which is the one place it can still be reported to the caller.
+     * At exactly the limit everything must still work, including the settings keys
+     * that motivated the bound - hence the timeout_seconds lookup below. */
+    {
+        gptps *en = NULL;
+        gptps_task_def d;
+        char toolong[201], atmax[GPTPS_TASK_NAME_MAX + 1], key[GPTPS_TASK_NAME_MAX + 32];
+
+        memset(toolong, 'a', sizeof toolong - 1); toolong[sizeof toolong - 1] = '\0';
+        memset(atmax,   'b', sizeof atmax   - 1); atmax[sizeof atmax   - 1] = '\0';
+        CHECK(strlen(atmax) == GPTPS_TASK_NAME_MAX);
+
+        CHECK(gptps_open(NULL, &en) == GPTPS_OK);
+        if (en) {
+            memset(&d, 0, sizeof d);
+            d.struct_size = sizeof d; d.run = task_fast; d.exec = GPTPS_EXEC_INPROC;
+            d.default_cost.struct_size = sizeof d.default_cost;
+            d.default_policy.struct_size = sizeof d.default_policy;
+
+            d.name = toolong;
+            CHECK(gptps_register_task(en, &d) == GPTPS_E_INVAL);
+            CHECK(gptps_task_count(en) == 0);          /* refused, not half-registered */
+            CHECK(gptps_task_exists(en, toolong) == 0);
+
+            d.name = atmax;                            /* exactly at the limit: accepted */
+            CHECK(gptps_register_task(en, &d) == GPTPS_OK);
+            CHECK(gptps_task_exists(en, atmax) == 1);
+            snprintf(key, sizeof key, "tasks.%s.timeout_seconds", atmax);
+            CHECK(has_setting(en, key));               /* the key did not truncate away */
+            /* and it is still removable - the half of the bug that had no workaround */
+            CHECK(gptps_unregister_task(en, atmax, GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);
+            CHECK(gptps_task_count(en) == 0);
+            gptps_shutdown(en);
+        }
+    }
+
     /* ---- MANUAL mode: removal between steps ---- */
     {
         gptps *em = NULL;

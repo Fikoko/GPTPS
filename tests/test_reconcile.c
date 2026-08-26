@@ -171,12 +171,113 @@ static void test_timeout_still_reports_timeout(void)
     CHECK(get(&n_cancelled) == 0);
 }
 
+/* --------------------- a deny-all constraint over more items than the engine's
+ *                        per-pass event buffer holds                           */
+
+static gptps_status task_ok(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
+
+static gptps_admit_decision deny_all(const gptps_constraint_input *in,
+                                     uint32_t *retry_after_ms, void *ud)
+{ (void)in; (void)retry_after_ms; (void)ud; return GPTPS_DENY; }
+
+/* Bigger than GPTPS_PENDING_CAP (256), the buffer engine_pass fills for the
+ * caller to emit with the lock released. */
+#define DENY_N 600
+
+/* GPTPS_DENY does not raise e->running, so nothing throttles the admission loop:
+ * it could deny an ENTIRE intake queue in one pass - and intake is unbounded by
+ * default. Past 256 denials the pass simply stopped recording events while it
+ * kept dead-lettering items. Measured: 600 submitted, 600 QUEUED, 256 terminal -
+ * 344 handles silently lost, which is exactly the reconciliation hole this file
+ * exists to prevent. A full buffer must DEFER the rest of the work to the next
+ * pass, never drop the event.
+ *
+ * MANUAL mode is what makes this exact rather than statistical: gptps_step runs
+ * no threads, so the whole 600-item queue is present for the pass, and the step
+ * is required to keep pumping while events are still owed. */
+static void test_deny_over_event_buffer_reports_every_item(void)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    size_t ran = 1;
+    int i;
+
+    memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 2;
+    cfg.mode = GPTPS_RUN_MANUAL;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    gptps_register_observer(e, obs, NULL);
+    reset();
+    reg(e, "denied", task_ok, GPTPS_ON_FAILURE_DEAD_LETTER);
+    CHECK(gptps_register_constraint(e, deny_all, NULL) == GPTPS_OK);
+
+    for (i = 0; i < DENY_N; ++i) CHECK(gptps_submit(e, "denied", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_step(e, &ran) == GPTPS_OK);
+    CHECK(ran == 0);                        /* denied at admission: nothing ever ran */
+
+    CHECK(get(&n_queued) == DENY_N);
+    CHECK(get(&n_terminal) == DENY_N);      /* was 256 */
+
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
+/* ------------------------- a SERVICE instance still queued at gptps_shutdown */
+
+static void reg_service(gptps *e, const char *name, gptps_run_fn fn)
+{
+    gptps_task_def d; memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = name; d.run = fn; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.flags = GPTPS_TASK_SERVICE;      /* services are THREADED + INPROC only */
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+}
+
+/* Teardown stops services first so the dispatcher can reach its drain condition,
+ * and the instances that had reserved no admission budget - queued in intake, or
+ * sitting in restart backoff - used to be FREED OUTRIGHT there, with no terminal
+ * event at all. Measured: queued=1 terminal=0. That is the steady state for a
+ * service given the restart floor, so it was not an edge case.
+ *
+ * The single worker is occupied by an ordinary task first, so the service is
+ * guaranteed to still be in intake when shutdown runs. The short grace bounds how
+ * long teardown waits on that (non-service) task; the default is 30s. */
+static void test_queued_service_reports_a_terminal_event(void)
+{
+    gptps *e = open1();
+    uint64_t t0;
+    if (!e) return;
+    reset();
+    CHECK(gptps_settings_set(e, "limits.shutdown_grace_ms", "200") == GPTPS_OK);
+    reg(e, "hog", task_block, GPTPS_ON_FAILURE_DEAD_LETTER);
+    reg_service(e, "svc", task_block);
+
+    CHECK(gptps_submit(e, "hog", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (get(&n_started) < 1 && gptps_now_ms(NULL) - t0 < 2000) { }
+    CHECK(get(&n_started) == 1);        /* the only slot is taken */
+
+    CHECK(gptps_submit(e, "svc", NULL, 0, NULL) == GPTPS_OK);   /* queues behind it */
+    CHECK(get(&n_queued) == 2);
+    CHECK(get(&n_started) == 1);        /* the service never got to start */
+
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+
+    CHECK(get(&n_terminal) == 2);       /* was 1: the queued service vanished */
+    CHECK(get(&n_cancelled) == 2);      /* both stopped, neither timed out */
+    CHECK(get(&n_timeout) == 0);
+}
+
 int main(void)
 {
     test_unregister_cancel_reports_every_item();
     test_drop_policy_reports_every_item();
     test_running_cancel_is_not_double_counted();
     test_timeout_still_reports_timeout();
+    test_deny_over_event_buffer_reports_every_item();
+    test_queued_service_reports_a_terminal_event();
 
     if (fails) { printf("%d reconcile check(s) FAILED\n", fails); return 1; }
     printf("all reconcile checks passed\n");

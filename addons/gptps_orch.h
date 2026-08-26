@@ -47,8 +47,34 @@ extern "C" {
 
 typedef struct gptps_orch gptps_orch;
 
-/* Install the orchestrator on an engine (registers one observer). NULL on OOM. */
+/* Install the orchestrator on an engine (registers one observer). NULL on OOM.
+ * Remembers completed handles for the process lifetime; see gptps_orch_install_ex
+ * and gptps_orch_prune if that is too much for your host. */
 gptps_orch *gptps_orch_install(gptps *e);
+
+/* Install with a ceiling on how many completed handles are remembered.
+ * done_cap == 0 is exactly gptps_orch_install.
+ *
+ * The remembered set exists to answer one question: "had this handle already
+ * terminated when gptps_orch_after named it?" Nothing else reads it, so it can be
+ * dropped wholesale at any time - the ONLY consequence is that a gate created
+ * afterwards which names a handle that finished before the drop will wait forever,
+ * which is the same outcome this header already documents for a gate created too
+ * late. Past done_cap entries the set is dropped automatically, so memory is
+ * bounded and the cost is that contract, applied on a schedule you did not pick.
+ *
+ * Use it when gates are created promptly after their dependencies are submitted -
+ * the normal pattern. If your host creates gates long after the fact, leave it
+ * unbounded and call gptps_orch_prune() at a point where YOU know no future gate
+ * will name an older handle. */
+gptps_orch *gptps_orch_install_ex(gptps *e, size_t done_cap);
+
+/* Forget every remembered completed handle; returns how many were forgotten.
+ * Safe at any time - no unreleased gate depends on the set (a dependency present
+ * when the gate was created was resolved immediately, and one that terminates later
+ * is resolved in the same call that records it). See gptps_orch_install_ex for the
+ * one consequence. */
+size_t gptps_orch_prune(gptps_orch *o);
 
 /* Submit `task` to run only after EVERY handle in deps[0..ndeps) reaches a
  * terminal state (finished, failed, dropped, or dead-lettered). If all deps are
@@ -72,6 +98,34 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
  * once. In both of those cases the task never runs and no event is emitted for it,
  * so do not treat pending() reaching 0 as proof every gated task ran. */
 size_t gptps_orch_pending(gptps_orch *o);
+
+/* STALLED GATES.
+ *
+ * A gate whose dependencies are all satisfied is submitted immediately. That submit
+ * can be refused - the task type is paused, the intake queue is full, the name was
+ * never registered, the cost can never fit - and the orchestrator will not retry
+ * forever (see gptps_orch_pending). A gate it gives up on is ABANDONED: it stops
+ * being pending, and its task never ran and never emitted an event. Without these,
+ * that outcome is indistinguishable from success and a host has no way to notice.
+ *
+ * gptps_orch_stalled() counts them. gptps_orch_stalled_at() reports one by index
+ * (0..count-1): `buf` receives a COPY of the task name, truncated to `cap`, and
+ * *out_last (may be NULL) receives the status the engine last refused it with -
+ * GPTPS_E_NOTFOUND for a paused or unregistered type, GPTPS_E_FULL for a full
+ * intake, GPTPS_E_BUDGET for a cost that can never fit. GPTPS_E_NOTFOUND is
+ * returned for an index past the end. The index is only stable while you hold no
+ * other orchestrator call in flight. */
+size_t       gptps_orch_stalled(gptps_orch *o);
+gptps_status gptps_orch_stalled_at(gptps_orch *o, size_t index,
+                                   char *buf, size_t cap, gptps_status *out_last);
+
+/* Re-arm and immediately re-submit every abandoned gate; returns how many were
+ * accepted this time. Call it after fixing the condition that caused the refusal -
+ * resuming a paused task type, draining the intake queue, registering the missing
+ * name. It submits at once rather than waiting for the next terminal event, because
+ * on an idle engine there may never be another one. Gates that are refused again
+ * are simply abandoned again. */
+size_t gptps_orch_retry(gptps_orch *o);
 
 /* Free the orchestrator. Call AFTER gptps_shutdown(e) so no observer fires. */
 void gptps_orch_close(gptps_orch *o);

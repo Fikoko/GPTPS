@@ -448,12 +448,19 @@ target_include_directories(test_addon
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(test_addon PRIVATE gptps)
+# Registers 20 task types and THEN fails, so the unwind is exercised past the
+# 16-name buffer it used to be limited to.
+add_library(addon_unwind MODULE tests/addon_unwind.c)
+target_include_directories(addon_unwind PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_unwind PROPERTIES PREFIX "")
+
 target_compile_definitions(test_addon PRIVATE
     ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
     ADDON_BAD_PATH="$<TARGET_FILE:addon_bad>"
     ADDON_CANCEL_PATH="$<TARGET_FILE:addon_cancel>"
+    ADDON_UNWIND_PATH="$<TARGET_FILE:addon_unwind>"
 )
-add_dependencies(test_addon addon_demo addon_bad addon_cancel)
+add_dependencies(test_addon addon_demo addon_bad addon_cancel addon_unwind)
 add_test(NAME addon COMMAND test_addon)
 set_tests_properties(addon PROPERTIES TIMEOUT 30)
 

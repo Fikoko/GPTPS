@@ -92,8 +92,8 @@ typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize;
  * timeout_s==0) and hiding the oversize/nomem cause behind it, since `killed` is
  * tested first. POSIX already kills at the cap (exec_oop_posix.c: `oversize = 1;
  * kill(-pid, SIGKILL);`); this makes the two backends agree on what the README
- * sells as a hard cap. Do NOT close r->h instead: the parent closes outR
- * unconditionally after the joins, so that would be a double close. */
+ * sells as a hard cap. Do NOT close r->h here: outR is the PARENT's handle to close
+ * (it does so just before joining this thread), and closing it twice is a bug. */
 static void reader_stop_child(reader_ctx *r)
 {
     if (r->assigned) TerminateJobObject(r->job, 1);
@@ -230,22 +230,38 @@ return GPTPS_E_NOMEM; }
         if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
     }
     WaitForSingleObject(pi.hProcess, INFINITE); /* terminated above => bounded */
-    /* Without a job (assigned==0: CreateJobObject failed, or we are already inside a
-     * non-nestable job - common in CI containers) a descendant is unreachable, so
-     * give each helper a grace period and then cancel its blocking call. Unreliable
-     * on anonymous pipes, hence a last resort rather than the mechanism; and only
-     * after the grace period, so a task that is merely slow is never truncated. */
+
+    /* The WRITER first, because it is the one whose handle the parent does not own:
+     * writer_proc closes w->h itself to give the child EOF on stdin, so the parent
+     * closing it too would be a double close. Killing the job/child normally breaks
+     * the pipe and its WriteFile fails immediately; the grace plus
+     * CancelSynchronousIo covers the case where it does not (assigned == 0 AND a
+     * grandchild still holds the child's stdin read end). See the note below for the
+     * residual. */
     if (wt) {
         if (WaitForSingleObject(wt, GPTPS_WIN_JOIN_GRACE_MS) == WAIT_TIMEOUT) GPTPS_WIN_CANCEL_SYNC_IO(wt);
         WaitForSingleObject(wt, INFINITE); CloseHandle(wt);
     }
+
+    /* The READER's handle IS ours, so close it BEFORE joining rather than after.
+     * That is the deterministic unblock: reader_proc's next ReadFile fails and the
+     * thread returns. The alternative - joining first and closing after - is what
+     * made this join unbounded, because an anonymous pipe signals EOF only when the
+     * LAST write handle closes, so a grandchild that inherited outW kept the reader
+     * parked in ReadFile with nothing left to end it. CancelSynchronousIo is kept as
+     * a belt-and-braces first attempt (it is the documented mechanism), but it is
+     * unreliable on anonymous pipes, which is exactly why the close is what the
+     * bound actually rests on. rc.buf is untouched by the close and stays valid: it
+     * lives in this frame and we still join before reading it. */
     if (rt) {
         if (WaitForSingleObject(rt, GPTPS_WIN_JOIN_GRACE_MS) == WAIT_TIMEOUT) GPTPS_WIN_CANCEL_SYNC_IO(rt);
+        CloseHandle(outR);
+        outR = NULL;
         WaitForSingleObject(rt, INFINITE); CloseHandle(rt);
     }
     GetExitCodeProcess(pi.hProcess, &code);
 
-    CloseHandle(outR);
+    if (outR) CloseHandle(outR);          /* no reader thread was ever started */
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     if (job) CloseHandle(job);
 

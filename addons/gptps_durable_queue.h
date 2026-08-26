@@ -76,6 +76,21 @@ typedef void (*gptps_dq_quarantine_cb)(const char *task_name, const void *payloa
                                        size_t len, void *user_data);
 size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *user_data);
 
+/* As above, and reports whether the journal was successfully compacted afterwards.
+ *
+ * The return value counts records the callback saw, and that is true either way -
+ * so a compaction failure cannot be signalled through it. But the consequence
+ * matters: if compaction fails the drained records are still in the journal, so a
+ * RESTART re-quarantines them and your callback sees them a second time. That is
+ * this add-on's at-least-once contract applied to the drain, and it is fine for an
+ * idempotent callback and not fine for one that bills, emails, or files a ticket.
+ *
+ * *out_compact (may be NULL) receives GPTPS_OK if the journal was compacted, the
+ * failure status if it was not, and GPTPS_OK when there was nothing to drain.
+ * Everything else - including the at-least-once guarantee itself - is unchanged. */
+size_t gptps_dq_drain_quarantine_ex(gptps_dq *dq, gptps_dq_quarantine_cb cb,
+                                    void *user_data, gptps_status *out_compact);
+
 /* Rewrite the journal to contain only still-pending records, bounding its growth
  * within a long-running process. Returns GPTPS_OK or GPTPS_E_IO.
  *

@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>            /* dup2 / close: cases I and J run with fd 0/1 free */
+#include <fcntl.h>             /* fcntl(F_DUPFD, 3): park the saved stdio fds above fd 2 */
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -89,6 +91,7 @@ int main(void)
     static const char *fail[]  = { "/bin/sh", "-c", "exit 7", (const char *)0 };
     static const char *hang[]  = { "/bin/sh", "-c", "sleep 10", (const char *)0 };
     static const char *inf[]   = { "/bin/sh", "-c", "sleep 100000", (const char *)0 };
+    static const char *catp[]  = { "/bin/cat", (const char *)0 };   /* case I: no shell in between */
 
     /* register-time validation: PROGRAM needs an argv */
     {
@@ -178,6 +181,72 @@ int main(void)
         gptps_shutdown(e);
         CHECK(sigaction(SIGPIPE, NULL, &got) == 0);
         CHECK(got.sa_handler == SIG_DFL);          /* not SIG_IGN => host disposition preserved */
+    }
+
+    /* I) the host daemonised - it closed fd 0 and/or fd 1 before submitting - so
+     * pipe() hands the executor those very descriptors back. The child then did
+     * dup2(inp[0], 0) with inp[0] == 0 (a no-op) and the blind close(inp[0]) right
+     * after shut fd 0 outright: the program exec'd with NO stdin, read EOF at once
+     * and the payload was silently dropped (FINISHED with an empty result). With
+     * both 0 and 1 free it is worse - inp == {0,1}, so close(inp[1]) closes the
+     * stdout that was just dup2'd onto fd 1. The fix hoists every pipe end above
+     * fd 2 before any dup2; assert the payload round-trips in all three shapes.
+     *
+     * Every descriptor is restored before a single CHECK runs: with fd 1 closed
+     * printf() writes into a pipe the executor owns, so a failure reported inside
+     * the window would be invisible (or corrupt the child's stdout stream). */
+    {
+        const char *msg = "daemonised-payload";
+        int mode;
+        for (mode = 0; mode < 3; ++mode) {   /* 0: stdin free, 1: stdout free, 2: both */
+            int save0 = -1, save1 = -1, sub, fin, rl;
+            reset();
+            e = open_prog("catio", catp, 5); /* opened BEFORE the close, so the engine's
+                                              * own descriptors are already allocated and
+                                              * only the executor's pipes land low */
+            CHECK(e);
+            if (!e) continue;
+            /* Park both copies above fd 2 BEFORE freeing anything: a plain dup() of
+             * stdout with fd 0 already closed would hand back fd 0 itself, and
+             * restoring stdin would then clobber the only copy of stdout. */
+            if (mode != 1) save0 = fcntl(STDIN_FILENO,  F_DUPFD, 3);
+            if (mode != 0) save1 = fcntl(STDOUT_FILENO, F_DUPFD, 3);
+            if (mode != 1) close(STDIN_FILENO);
+            if (mode != 0) close(STDOUT_FILENO);
+            sub = gptps_submit(e, "catio", msg, strlen(msg), &h);
+            gptps_shutdown(e);               /* blocks until the task is terminal */
+            fin = get(&g_finished); rl = get(&g_rlen);
+            if (save0 >= 0) { dup2(save0, STDIN_FILENO);  close(save0); }
+            if (save1 >= 0) { dup2(save1, STDOUT_FILENO); close(save1); }
+            CHECK(sub == GPTPS_OK);
+            CHECK(fin == 1);
+            CHECK(rl == (int)strlen(msg));   /* 0 => the payload never reached the program */
+            CHECK(strcmp(g_result, msg) == 0);
+        }
+    }
+
+    /* J) a host that runs signal(SIGCHLD, SIG_IGN) - the standard daemon idiom -
+     * has the kernel auto-reap our children, so the executor's waitpid() fails with
+     * ECHILD and never fills wstatus. The old code read the zero initialiser:
+     * WIFEXITED(0) is true with WEXITSTATUS(0) == 0, so a program that really
+     * exited 7 was reported as GPTPS_OK - inverting the "non-zero exit => E_TASK"
+     * contract and silently skipping retries and dead-lettering. An unknowable exit
+     * status is now E_TASK. Note the documented consequence (include/gptps.h): on a
+     * SIG_IGN host EVERY program task reports E_TASK, successes included - so this
+     * asserts "not reported as success", not any particular success. */
+    {
+        struct sigaction ign, old_chld;
+        int fin, fail_n;
+        memset(&ign, 0, sizeof ign); ign.sa_handler = SIG_IGN; sigemptyset(&ign.sa_mask);
+        CHECK(sigaction(SIGCHLD, &ign, &old_chld) == 0);
+        reset();
+        e = open_prog("nochld", fail, 5); CHECK(e);   /* `fail` really exits 7 */
+        CHECK(gptps_submit(e, "nochld", NULL, 0, &h) == GPTPS_OK);
+        gptps_shutdown(e);
+        fin = get(&g_finished); fail_n = get(&g_failed);
+        CHECK(sigaction(SIGCHLD, &old_chld, NULL) == 0);  /* leave the host's disposition as found */
+        CHECK(fin == 0);                                  /* was 1: "child exited 0" */
+        CHECK(fail_n >= 1);
     }
 
     if (fails) { printf("%d program check(s) FAILED\n", fails); return 1; }

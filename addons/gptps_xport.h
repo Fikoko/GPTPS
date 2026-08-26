@@ -70,6 +70,15 @@ gptps_xport *gptps_xport_open(size_t nworkers, gptps_xport_run_fn run, void *use
  * rather than respawned, and stays counted here - see submit(). */
 size_t gptps_xport_count(gptps_xport *xp);
 
+/* Workers still able to take work, <= gptps_xport_count().
+ *
+ * A worker whose link breaks mid-frame is retired permanently - the stream cannot be
+ * resynchronised, so the alternative would be handing a caller a fabricated reply -
+ * and it is not respawned. The rotation skips retired workers, so a broken link no
+ * longer costs one submit in every N; but capacity really has fallen, and this is how
+ * a host sees that. At 0, every subsequent gptps_xport_submit returns GPTPS_E_IO. */
+size_t gptps_xport_live(gptps_xport *xp);
+
 /* Ship one unit of work to a worker (round-robin) and BLOCK until it replies.
  * *out_result (may be NULL) receives a malloc'd result the CALLER frees; *out_len its
  * length. *out_task_status (may be NULL) receives the handler's own status. The return

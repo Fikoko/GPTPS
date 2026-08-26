@@ -124,6 +124,59 @@ int main(void)
         gptps_shutdown(e);
     }
 
+    /* 4) MANUAL + GPTPS_REMOVE_CANCEL while `ready` still holds ADMITTED items.
+     *
+     * Regression (use-after-free). The MANUAL unregister path detached only
+     * `intake` and `delayed`, on the premise that "nothing is in flight between
+     * gptps_step calls". That premise is false: gptps_step's second pass ADMITS
+     * work at the END of the step, so `ready` (and `done`) routinely still hold
+     * items of the type being removed when the host regains control - and those
+     * items keep both it->reg and it->def, which points INTO the same reg
+     * allocation. GPTPS_REMOVE_CANCEL freed the reg under them and the NEXT
+     * gptps_step read the freed slot.
+     *
+     * ASAN-SENSITIVE: a freed-then-read slot usually still holds plausible bytes,
+     * so an ordinary build can pass on the broken engine; run this file under
+     * -fsanitize=address to see the heap-use-after-free itself. What is asserted
+     * below is the observable half, which fails on the broken engine either way:
+     * the cancelled item gets its one terminal event, and the engine still WORKS
+     * afterwards - detaching `ready` also has to release the admission budget
+     * those items hold, which was leaked too. With max_concurrent_tasks = 1 a
+     * leaked budget means nothing is ever admitted again.
+     *
+     * conc = 1 + two submits + exactly ONE step is the shape that leaves the
+     * second item sitting admitted in `ready`. */
+    {
+        gptps *e = open_manual(1);
+        size_t n; gptps_handle h; int i;
+
+        reg(e, "t", ok_task);
+        gptps_set_event_cb(e, on_event, NULL);
+        g_runs = ev_queued = ev_started = ev_finished = ev_failed = 0;
+
+        for (i = 0; i < 2; ++i) CHECK(gptps_submit(e, "t", NULL, 0, &h) == GPTPS_OK);
+        CHECK(gptps_step(e, &n) == GPTPS_OK);
+        CHECK(n == 1);                       /* one ran; the second is now in `ready` */
+        CHECK(g_runs == 1);
+
+        CHECK(gptps_unregister_task(e, "t", GPTPS_REMOVE_CANCEL) == GPTPS_OK);
+        CHECK(gptps_task_exists(e, "t") == 0);
+        CHECK(gptps_submit(e, "t", NULL, 0, &h) == GPTPS_E_NOTFOUND);
+        CHECK(ev_failed == 1);               /* the admitted item is CANCELLED, not lost */
+        CHECK(g_runs == 1);                  /* and it did NOT run after its type died */
+
+        CHECK(gptps_step(e, &n) == GPTPS_OK);/* this is the step that read the freed reg */
+        CHECK(n == 0);
+
+        /* still a working engine: the cancelled item gave its admission budget back */
+        reg(e, "t2", ok_task);
+        CHECK(gptps_submit(e, "t2", NULL, 0, &h) == GPTPS_OK);
+        CHECK(gptps_step(e, &n) == GPTPS_OK);
+        CHECK(n == 1);
+        CHECK(g_runs == 2);
+        gptps_shutdown(e);
+    }
+
     if (fails) { printf("%d step check(s) FAILED\n", fails); return 1; }
     printf("all step checks passed\n");
     return 0;

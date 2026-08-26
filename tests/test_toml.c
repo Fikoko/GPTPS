@@ -10,6 +10,7 @@
 #include "gptps.h"
 #include "gptps_internal.h"   /* internal TOML parser API */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef ADDON_DEMO_PATH
@@ -17,6 +18,13 @@
 #endif
 
 #define CFG_PATH "gptps_toml_test.toml"
+#define ESC_PATH "gptps_toml_esc.toml"
+#define BAD_PATH "gptps_toml_bad.toml"
+
+/* Any single allocation the parser makes is bounded by the file-size cap it
+ * enforces (16 MiB); this is that, with generous headroom. It is a REGRESSION
+ * threshold, not a tuning knob - see test_dir_as_config_path. */
+#define SANE_ALLOC_MAX (64UL * 1024UL * 1024UL)
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -123,6 +131,162 @@ static void test_parser(void)
     gptps_toml_free(t);
 }
 
+
+/* ---- recording allocator: the witness for the directory-as-config-path bug ----
+ * gptps_toml_parse_file used to trust fseek/ftell, and ftell on a directory reports
+ * LONG_MAX on POSIX, so the parser asked for an ~8 EiB buffer. The RETURN VALUE does
+ * not distinguish the bug from the fix - a refused huge malloc surfaces as the same
+ * NULL - so the only honest witness is the size that was REQUESTED. These hooks
+ * record the peak request and refuse anything absurd rather than handing it to
+ * libc, so a regression fails a check instead of taking the process down with it. */
+static size_t a_peak;
+static void *rec_malloc(size_t n, void *ud)
+{
+    (void)ud;
+    if (n > a_peak) a_peak = n;
+    return (n > SANE_ALLOC_MAX) ? NULL : malloc(n);
+}
+static void *rec_realloc(void *p, size_t n, void *ud)
+{
+    (void)ud;
+    if (n > a_peak) a_peak = n;
+    return (n > SANE_ALLOC_MAX) ? NULL : realloc(p, n);
+}
+static void rec_free(void *p, void *ud) { (void)ud; free(p); }
+
+/* A directory passed as the config path must be refused as a config error - and
+ * refused by INSPECTION, not by an allocator that happened to say no. Simply
+ * reaching the end of this function is the other half of the assertion: the old
+ * code neither hung nor aborted here only by the grace of malloc returning NULL,
+ * and under a sanitizer (or a host allocator that aborts on failure) it did. */
+static void test_dir_as_config_path(void)
+{
+    gptps_allocator a;
+    gptps *e = NULL;
+    gptps_toml *t;
+    char err[128];
+
+    memset(&a, 0, sizeof a);
+    a.struct_size = sizeof a;
+    a.malloc_fn = rec_malloc; a.realloc_fn = rec_realloc; a.free_fn = rec_free;
+    a_peak = 0;
+    CHECK(gptps_set_allocator(&a) == GPTPS_OK);
+
+    /* the repro's own path, then "." - the second is a directory on every platform,
+     * so the guard is still exercised where /tmp does not exist */
+    err[0] = 0;
+    t = gptps_toml_parse_file("/tmp", err, sizeof err);
+    CHECK(t == NULL);
+    gptps_toml_free(t);
+    err[0] = 0;
+    t = gptps_toml_parse_file(".", err, sizeof err);
+    CHECK(t == NULL);
+    CHECK(err[0] != 0);            /* and it must SAY why, not fail silently */
+    gptps_toml_free(t);
+
+    CHECK(gptps_open("/tmp", &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+    CHECK(gptps_open(".", &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+
+    CHECK(gptps_set_allocator(NULL) == GPTPS_OK);
+    CHECK(a_peak <= SANE_ALLOC_MAX);   /* the ~8 EiB request must never have happened */
+}
+
+/* strip_comment() used to flip its in-string flag on the ESCAPED quote of
+ * `"a\"b#c"`, conclude the following '#' started a comment and cut the line there.
+ * The value came back as `a`: silent truncation of any string carrying an escaped
+ * quote ahead of a '#', on every save->reload round trip (the round trip itself is
+ * pinned in test_settings.c). The comment stripper must still strip real ones. */
+static void test_comment_escapes(void)
+{
+    gptps_toml *t;
+    const char *s;
+    long long ll = 0;
+    FILE *f = fopen(ESC_PATH, "wb");
+
+    CHECK(f != NULL);
+    if (!f) return;
+    fputs("[app]\n"
+          "motd = \"a\\\"b#c\"\n"        /* motd = "a\"b#c"   -> a"b#c    */
+          "say  = \"hi\" #1\n"           /* a genuine comment still goes  */
+          "x    = 5 # five\n"
+          "p    = \"c:\\\\tmp\" # win\n", f);   /* escaped backslash, then a comment */
+    fclose(f);
+
+    t = gptps_toml_parse_file(ESC_PATH, NULL, 0);
+    CHECK(t != NULL);
+    if (t) {
+        s = gptps_toml_str(t, "app", "motd");
+        CHECK(s && strcmp(s, "a\"b#c") == 0);     /* used to be "a" */
+        s = gptps_toml_str(t, "app", "say");
+        CHECK(s && strcmp(s, "hi") == 0);         /* the fix must not eat comments */
+        s = gptps_toml_str(t, "app", "p");
+        CHECK(s && strcmp(s, "c:\\tmp") == 0);
+        CHECK(gptps_toml_int(t, "app", "x", &ll) && ll == 5);
+    }
+    gptps_toml_free(t);
+    remove(ESC_PATH);
+}
+
+static int write_bad(const char *body)
+{
+    FILE *f = fopen(BAD_PATH, "wb");
+    if (!f) return -1;
+    fputs(body, f);
+    fclose(f);
+    return 0;
+}
+
+/* [limits] read from a FILE used to be cast into its field, not checked against it.
+ * Each case below installed a limit the operator never wrote - and in every case
+ * the wrong value reads as "no limit at all", which is the dangerous direction. */
+static void test_limits_range(void)
+{
+    gptps *e = NULL;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+
+    /* strtoll saturates and reports it only via errno: this used to become
+     * LLONG_MAX, i.e. an unlimited memory budget. */
+    CHECK(write_bad("[limits]\nmax_memory_bytes = 99999999999999999999999\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+
+    /* -1 used to become 4294967295 and the engine then tried to start that many OS
+     * threads (observed: spawns until RLIMIT_NPROC, then hangs). */
+    CHECK(write_bad("[limits]\nmax_concurrent_tasks = -1\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+
+    /* a sign test alone is not enough: a POSITIVE value wider than the uint32_t
+     * destination truncates - 4294967296 became 0, i.e. unbounded intake. */
+    CHECK(write_bad("[limits]\nmax_intake_depth = 4294967296\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+
+    CHECK(write_bad("[limits]\nmax_memory_bytes = -1\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+
+    /* ... and the guard must not be over-strict. An ordinary config still opens,
+     * carrying exactly the values it asked for. */
+    CHECK(write_bad("[limits]\n"
+                    "max_memory_bytes = 1073741824\n"
+                    "max_intake_depth = 4096\n"
+                    "max_concurrent_tasks = 2\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_settings_get(e, "limits.max_memory_bytes", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "1073741824") == 0);
+        CHECK(gptps_settings_get(e, "limits.max_intake_depth", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "4096") == 0);
+        CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "2") == 0);
+        gptps_shutdown(e); e = NULL;
+    }
+    remove(BAD_PATH);
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -135,6 +299,11 @@ int main(void)
     CHECK(gptps_open("/no/such/dir/none.toml", &e) == GPTPS_E_CONFIG);
 
     test_parser();
+
+    /* 1.1.0 config hardening (each pins a fix that shipped with its own repro) */
+    test_dir_as_config_path();
+    test_comment_escapes();
+    test_limits_range();
 
     /* Phase A: addons[] auto-load -> the plugin's task runs end-to-end */
     reset();
