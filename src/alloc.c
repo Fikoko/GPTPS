@@ -48,6 +48,16 @@ void *gptps_malloc(size_t size)
 
 void *gptps_realloc(void *ptr, size_t size)
 {
+    /* Route a NULL ptr to malloc_fn rather than forwarding it, so realloc_fn is
+     * never handed one - the same courtesy free_fn already gets below. The core
+     * uses realloc-as-malloc for every growable buffer (the TOML table and its
+     * arrays, the resource table, the per-item resource snapshot, both executors'
+     * capture buffers), so a first growth ALWAYS passes NULL. A host reading the
+     * header's explicit "free_fn needn't handle NULL" reasonably infers the same of
+     * realloc_fn, and a pool allocator written on that assumption dereferences
+     * NULL - HDR and crashes inside the host's own code. Behaviour-neutral on the
+     * libc path: realloc(NULL, n) is defined as malloc(n). */
+    if (!ptr) return gptps_malloc(size);
     return g_have ? g_alloc.realloc_fn(ptr, size, g_alloc.user_data) : realloc(ptr, size);
 }
 

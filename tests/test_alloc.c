@@ -16,13 +16,16 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
 /* counting allocator (manual engine => single-threaded => plain counters are safe).
- * gptps_free never passes NULL (the wrapper guards it), so every cnt_free is a live
- * block. realloc keeps the block count steady (one in, one out) unless it was a
- * fresh allocation (ptr == NULL). */
+ * This doubles as the contract test for what gptps.h GUARANTEES a hook: neither
+ * cnt_free nor cnt_realloc may ever see a NULL pointer, so both assert it rather
+ * than defensively handling it - a host writing a pool allocator is entitled to
+ * take the header at its word, and this is what keeps the word true. A growth from
+ * nothing is routed to malloc_fn, so cnt_realloc always resizes a live block and
+ * the block count stays steady (one in, one out). */
 static long live, allocs;
 static void *cnt_malloc(size_t n, void *ud)           { void *p; (void)ud; p = malloc(n); if (p) { ++live; ++allocs; } return p; }
-static void *cnt_realloc(void *p, size_t n, void *ud) { (void)ud; if (!p) { void *q = malloc(n); if (q) { ++live; ++allocs; } return q; } return realloc(p, n); }
-static void  cnt_free(void *p, void *ud)              { (void)ud; free(p); --live; }
+static void *cnt_realloc(void *p, size_t n, void *ud) { (void)ud; CHECK(p != NULL); return realloc(p, n); }
+static void  cnt_free(void *p, void *ud)              { (void)ud; CHECK(p != NULL); free(p); --live; }
 
 static gptps_status echo_task(gptps_ctx *ctx, void *ud)
 {
@@ -72,6 +75,14 @@ int main(void)
         gptps *e; size_t n; gptps_handle h; int i;
         live = allocs = 0;
         e = open_manual();
+        /* BEFORE registering: gptps_define_resource grows e->resources - and then
+         * every task's per-resource cost vector - through gptps_realloc from a NULL
+         * base. That is the realloc-as-malloc path the header's "realloc_fn is never
+         * called with ptr == NULL" guarantee exists for, and driving it here is what
+         * gives cnt_realloc's CHECK(p != NULL) something to catch. Two resources, so
+         * a genuine grow-an-existing-block realloc happens too. */
+        CHECK(gptps_define_resource(e, "gpu",  4) == GPTPS_OK);
+        CHECK(gptps_define_resource(e, "disk", 2) == GPTPS_OK);
         reg_echo(e);
         for (i = 0; i < 4; ++i) CHECK(gptps_submit(e, "echo", "payload", 7, &h) == GPTPS_OK);
         do { CHECK(gptps_step(e, &n) == GPTPS_OK); } while (n);

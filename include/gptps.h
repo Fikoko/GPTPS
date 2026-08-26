@@ -308,6 +308,13 @@ typedef struct {
  * to the C library. All three function pointers are required. Lets a host with a
  * static pool / no libc heap (embedded, bare-metal) own GPTPS's memory. Covers
  * the portable core; the HAL manages its own memory (replace it for exotic RAM).
+ *
+ * WHAT GPTPS GUARANTEES YOUR HOOKS (so you can write the narrowest thing that
+ * works): realloc_fn is never called with ptr == NULL - a growth from nothing goes
+ * to malloc_fn - and free_fn is never called with ptr == NULL. Otherwise these are
+ * ordinary malloc/realloc/free semantics; returning NULL surfaces as
+ * GPTPS_E_NOMEM rather than crashing. malloc_fn may be called with size 0 and must
+ * return a non-NULL, free-able pointer for it.
  * ==========================================================================*/
 typedef struct {
     size_t struct_size;                              /* = sizeof(gptps_allocator) */

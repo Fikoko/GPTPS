@@ -229,6 +229,16 @@ first so it could prove the order did not move.
   *and* admitted the item anyway, un-enforcing the budget under memory pressure. It
   now fails closed.
 - `e->config_path` was leaked on every `gptps_open_ex` failure path.
+- **The allocator seam forwarded `ptr == NULL` to a host's `realloc_fn`.** The header
+  explicitly exempts `free_fn` from ever seeing `NULL`, so a host writing a pool
+  allocator reasonably infers the same of `realloc_fn` — and the core uses
+  realloc-as-malloc for every growable buffer, so the *first* growth always passed
+  `NULL`. A pool `realloc_fn` that trusted the docs dereferenced `NULL - HDR` and
+  crashed inside the host's own code. `gptps_realloc` now routes a `NULL` to
+  `malloc_fn`, `gptps.h` states the guarantee instead of leaving it implicit, and
+  `tests/test_alloc.c` asserts it (its counting hooks now refuse `NULL` rather than
+  handling it, and the test drives `gptps_define_resource` so the realloc-from-nothing
+  path is actually exercised).
 
 ### Added
 
