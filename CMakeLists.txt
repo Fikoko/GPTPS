@@ -247,6 +247,14 @@ target_link_libraries(test_backpressure PRIVATE gptps)
 add_test(NAME backpressure COMMAND test_backpressure)
 set_tests_properties(backpressure PROPERTIES TIMEOUT 30)
 
+add_executable(test_budget_shrink tests/test_budget_shrink.c)
+target_include_directories(test_budget_shrink
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_budget_shrink PRIVATE gptps)
+add_test(NAME budget_shrink COMMAND test_budget_shrink)
+set_tests_properties(budget_shrink PROPERTIES TIMEOUT 30)
+
 add_executable(test_submit_ex tests/test_submit_ex.c)
 target_include_directories(test_submit_ex
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

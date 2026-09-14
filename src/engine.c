@@ -896,6 +896,26 @@ static int res_fits(const gptps *e, const gptps_item *it)
     return 1;
 }
 
+/* Can this item EVER fit, i.e. is its declared cost within the ABSOLUTE budget?
+ * submit() rejects such an item with GPTPS_E_BUDGET, but a budget lowered at runtime
+ * (limits.max_memory_bytes, gptps_define_resource re-budget) can strand an item that
+ * was admissible when queued: it never fits, so it is never admitted, never reaches a
+ * terminal event, and - via the reserve-for-`top` starvation guard - blocks everything
+ * behind it and holds gptps_shutdown forever (the dispatcher exits only on an empty
+ * intake). The admission scan uses this to dead-letter such an item in place, with the
+ * same E_BUDGET the submit-time check would have given. DISPATCHER context, e->m held. */
+static int res_never_fits(const gptps *e, const gptps_item *it)
+{
+    size_t i;
+    const uint64_t *cost;
+    if (it->cost.mem_bytes > e->limits.max_memory_bytes) return 1;
+    cost = (it->reg ? it->reg->res_cost : NULL);
+    if (!e->nres || !cost) return 0;
+    for (i = 0; i < e->nres; ++i)
+        if (cost[i] > e->resources[i].budget) return 1;
+    return 0;
+}
+
 static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         uint64_t *out_next_wake, int *out_more)
 {
@@ -1171,9 +1191,29 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
              * oldest at that score) - the item the old full-queue scan picked. Walking
              * only as far as that item is what makes admission O(1) in the common case
              * where the head fits, instead of O(queue depth) per admitted item. */
-            for (prv = NULL, cur = e->intake.head; cur; prv = cur, cur = cur->next)
-                if (e->reserved_mem + cur->cost.mem_bytes <= e->limits.max_memory_bytes &&
-                    res_fits(e, cur)) { best = cur; best_prev = prv; break; }
+            {
+                gptps_item *stranded = NULL, *stranded_prev = NULL;
+                for (prv = NULL, cur = e->intake.head; cur; prv = cur, cur = cur->next) {
+                    if (res_never_fits(e, cur)) { stranded = cur; stranded_prev = prv; break; }
+                    if (e->reserved_mem + cur->cost.mem_bytes <= e->limits.max_memory_bytes &&
+                        res_fits(e, cur)) { best = cur; best_prev = prv; break; }
+                }
+                if (stranded) {
+                    /* Never-fits after a runtime budget shrink: give it the terminal
+                     * event submit() would have, with the lock still held so it is
+                     * gone before the next scan. Same shape as the DENY path below;
+                     * like it, stop while the item is still queued if pend[] is full. */
+                    if (npend >= GPTPS_PENDING_CAP) { more = 1; break; }
+                    intake_unlink(e, stranded, stranded_prev);
+                    stranded->outcome = GPTPS_E_BUDGET;
+                    pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = stranded->handle;
+                    ev_set_name(pend[npend].name, item_name(stranded)); pend[npend].status = GPTPS_E_BUDGET;
+                    pend[npend].attempt = stranded->attempt; pend[npend].mem = stranded->cost.mem_bytes;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    dead_letter_push(e, stranded);
+                    continue;                            /* rescan: the head may have changed */
+                }
+            }
 
             if (!best) break;                            /* nothing fits the live budget now */
             if (best != top && top->skips >= e->reserve_after_skips)
@@ -2014,6 +2054,9 @@ gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
     for (i = 0; i < e->nres; ++i)                       /* existing => just re-budget */
         if (strcmp(e->resources[i].name, name) == 0) {
             e->resources[i].budget = budget;
+            /* Wake the dispatcher: a raise may admit waiting work now, and a shrink
+             * may strand queued items that the admission scan must dead-letter. */
+            gptps_cond_signal(e->cv_disp);
             gptps_mutex_unlock(e->m);
             return GPTPS_OK;
         }

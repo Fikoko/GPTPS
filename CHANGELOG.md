@@ -7,6 +7,18 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — liveness
+
+- **Runtime budget shrink stranded queued work and hung `gptps_shutdown`.** The
+  never-fits check (`GPTPS_E_BUDGET`) ran only at submit. Lowering
+  `limits.max_memory_bytes` or re-budgeting a named resource below the declared cost
+  of an already-queued item left it in intake with no terminal event; the
+  reserve-for-`top` starvation guard then admitted nothing behind it, and the
+  dispatcher, which exits only on an empty intake, held `gptps_shutdown` past the
+  grace bound (`tests/test_hang.c`'s guarantee, broken from a settings write). The
+  admission scan now dead-letters a never-fits item in place with `E_BUDGET`, and
+  `gptps_define_resource` wakes the dispatcher on a re-budget. `tests/test_budget_shrink.c`.
+
 ## [1.1.0] - 2026-08-26
 
 A correctness and hardening release. No breaking change: ABI stays 2.1, append-only,
