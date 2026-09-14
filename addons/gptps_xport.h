@@ -1,39 +1,56 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
- * gptps_xport.h - scale-OUT by composition: a worker-PROCESS transport (add-on).
+ * gptps_xport.h - scale OUT by composition: N persistent worker PROCESSES, each with
+ * its own address space, and - in engine mode - its own GPTPS engine.
  *
- * The gptps_pool add-on scales up by running N engines in ONE process. This one
- * scales OUT: it forks N persistent worker PROCESSES, and each submit is shipped to
- * a worker over IPC and its result marshalled back. Work therefore executes in a
- * SEPARATE address space (crash-isolated, independently capped) - and the local
- * socketpair here is the only thing standing between this and cross-MACHINE
- * execution: swap it for a TCP socket and the same protocol reaches another host.
+ * Where gptps_pool runs N engine shards inside one process, this forks N workers and
+ * ships work to them over a socketpair. Two modes, chosen by what you put in the
+ * config:
  *
- * It is the reference case for the COMPOSITION pattern, and the distinction is worth
- * being exact about: this file consumes no seam at all. It never calls into an engine,
- * registers no task, constraint, observer or scheduler, and does not use the add-on
- * host-table ABI. The core is not on its path. That is the point rather than a gap -
- * the pattern needs nothing from the core, which is why the core offers it nothing.
- * (The four REAL seams are real because the core CALLS something: a task's run, a
- * constraint, a scheduler score, an observer. A transport sits on the other side of
- * the engine and calls IN, so an interface for it would be a vtable with no call site.)
+ *   ENGINE MODE (gptps_xport_open_ex with `tasks`): every worker opens an engine,
+ *   registers your task table, and runs whatever the link hands it THROUGH that
+ *   engine. So the worker pool, the memory and named-resource budgets, retries,
+ *   timeouts, dead-letter and the constraint/scheduler/observer seams all apply per
+ *   worker process, exactly as they would in-process. Scaling out keeps everything
+ *   GPTPS is for. The reply carries the item's terminal status (GPTPS_OK with the
+ *   result on FINISHED; the failure status on DEAD_LETTERED / DROPPED; E_CANCELLED).
  *
- * Like the pool, it needs NO core change - it is built on POSIX IPC plus a handler you
- * supply. The transport is the MECHANISM (route + marshal + supervise workers); how
- * a worker actually runs a task is your handler's business (dispatch on the name;
- * inside it you may drive a gptps engine, an executor, or plain C).
+ *   HANDLER MODE (gptps_xport_open, or open_ex with `run`): the worker runs a bare
+ *   handler per request, one at a time, with no engine behind it. This is the
+ *   original transport, kept unchanged for hosts that want plain crash-isolated RPC.
  *
- *   xp = gptps_xport_open(4, my_run, ud);       // 4 worker processes
- *   gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);
- *   free(res);
- *   gptps_xport_close(xp);                        // stops + reaps the workers
+ * The link is MULTIPLEXED: every request carries an id, a reader thread per link
+ * matches replies to waiters, and up to `max_in_flight` requests may be outstanding
+ * per worker (beyond that submit returns GPTPS_E_FULL - the same backpressure shape
+ * as the core's limits.max_intake_depth). That is what makes engine mode useful: a
+ * worker with 8 engine threads receives 8 concurrent requests, not one.
  *
- * POSIX only (fork + socketpair), like GPTPS_EXEC_OOP. The handler runs in a forked
- * child, so it must be fork-safe / self-contained (call gptps_xport_open before you
- * start other threads, or keep the handler independent of inherited threaded state).
- * The wire format is native-endian (a same-machine socketpair); a cross-host TCP
- * transport would serialise with a fixed byte order.
+ * Both blocking and asynchronous submission share that path:
+ *   gptps_xport_submit()        blocks the caller until the reply
+ *   gptps_xport_submit_async()  returns at once; the reply arrives on a callback
+ *
+ * What it still is not:
+ *   - Not cross-host. Parent and child are the SAME forked binary, so the frames are
+ *     native-endian and unversioned by construction - there is no second peer that
+ *     could disagree. A cross-host transport needs gptps_remote's codec.
+ *   - Not self-healing. A worker whose link breaks is retired for good; every
+ *     request outstanding on it fails with GPTPS_E_IO. It is not respawned: the
+ *     parent now has reader threads, and fork() from a multi-threaded process is
+ *     only safe before those exist. gptps_xport_live() tells you how many remain.
+ *   - POSIX only (fork + socketpair), like GPTPS_EXEC_OOP.
+ *
+ * Fork safety: gptps_xport_open* forks. Call it before your process starts other
+ * threads (a forked child of a multi-threaded parent may deadlock on a lock some
+ * other thread held). In engine mode the child opens a FRESH engine after the fork;
+ * it never touches the parent's.
+ *
+ * Teardown: gptps_xport_close() is a graceful drain. It closes the request side of
+ * every link; a worker in engine mode sees EOF, runs gptps_shutdown on its engine
+ * (bounded by that engine's limits.shutdown_grace_ms - set it in `engine_cfg` if
+ * the default 30s is too long for you), sends the remaining replies, and exits.
+ * Blocking submits outstanding at close time therefore get real answers; async
+ * ones get their callback. Only then are the readers joined and the pids reaped.
  */
 #ifndef GPTPS_XPORT_H
 #define GPTPS_XPORT_H
@@ -46,58 +63,89 @@ extern "C" {
 
 typedef struct gptps_xport gptps_xport;
 
-/* Cap on any single framed message (task name, payload, or result). A same-machine
- * worker runs your own forked handler, so this is defense-in-depth against a buggy
- * peer rather than a trust boundary - but it bounds a bad length field to a clean
- * failure instead of a multi-GB malloc, and is what a cross-host TCP variant of this
- * protocol would require anyway. It is public because submit() REJECTS an oversized
- * task name or payload (GPTPS_E_INVAL), so a caller has to be able to test for it. */
+/* Cap on any single framed message (task name, payload, or result). submit()
+ * rejects an oversized argument locally with GPTPS_E_INVAL; a worker whose handler
+ * produces a result over this answers GPTPS_E_BUDGET in frame. */
 #define GPTPS_XPORT_MAX_MSG ((uint64_t)256u * 1024u * 1024u)
 
-/* Runs one unit of work IN THE WORKER PROCESS. Return GPTPS_OK (or an error) and,
- * on success, a malloc'd result in *out_result (*out_len bytes) that the transport
- * sends back and then frees on the worker side. NULL/0 result is allowed. A result
- * larger than GPTPS_XPORT_MAX_MSG cannot be framed: the transport frees it and
- * replies GPTPS_E_BUDGET with no result, rather than dropping the link. */
+#define GPTPS_XPORT_DEFAULT_IN_FLIGHT 64u
+
+/* HANDLER MODE: runs in the worker process, once per request, one at a time.
+ * *out_result is malloc'd by the handler (or NULL); the transport frees it. */
 typedef gptps_status (*gptps_xport_run_fn)(const char *task, const void *payload, size_t len,
                                            void **out_result, size_t *out_len, void *user_data);
 
-/* Fork `nworkers` (>=1) worker processes, each looping on `run`. Returns NULL on a
- * bad argument or a fork/socket failure (any already-forked workers are reaped). */
+/* ASYNC reply. Runs on the link's reader thread, with no transport lock held.
+ *   io == GPTPS_OK   : the worker answered; task_status / res / len are the answer.
+ *   io == GPTPS_E_IO : the link died first; task_status / res / len are unset.
+ * `res` is valid only for the duration of the callback - copy it if you keep it.
+ * The callback may call gptps_xport_submit_async (or _submit) but must not call
+ * gptps_xport_close, which joins the very thread the callback is running on. */
+typedef void (*gptps_xport_reply_fn)(uint64_t request_id, gptps_status io,
+                                     gptps_status task_status, const void *res, size_t len,
+                                     void *user_data);
+
+/* ENGINE MODE hook: runs in EACH worker process, after its engine is open and the
+ * task table registered, before the first request. Define named resources, register
+ * constraints, install gptps_stats / gptps_durable_queue, set priorities - anything
+ * you would do to an in-process engine between open and the first submit. */
+typedef void (*gptps_xport_child_init_fn)(gptps *worker_engine, void *user_data);
+
+typedef struct {
+    size_t   struct_size;              /* = sizeof(gptps_xport_config) */
+    size_t   nworkers;                 /* >= 1 */
+    uint32_t max_in_flight;            /* per worker link; 0 => GPTPS_XPORT_DEFAULT_IN_FLIGHT.
+                                        * Beyond it, submit returns GPTPS_E_FULL. */
+
+    /* HANDLER MODE - set `run`, leave `tasks` NULL. */
+    gptps_xport_run_fn  run;
+    void               *user_data;
+
+    /* ENGINE MODE - set `tasks`/`ntasks`, leave `run` NULL. Setting both is
+     * GPTPS_E_INVAL (open returns NULL). */
+    const gptps_config     *engine_cfg;   /* NULL => each worker auto-tunes to the WHOLE
+                                           * machine - which oversubscribes for N > 1,
+                                           * exactly like gptps_pool. Size the limits so
+                                           * the workers SUM to what the box can bear. */
+    const gptps_task_def   *tasks;        /* registered, in order, on every worker's engine */
+    size_t                  ntasks;
+    gptps_xport_child_init_fn child_init; /* optional */
+    void                   *child_init_ud;
+} gptps_xport_config;
+
+/* Open N workers. NULL on any failure (nothing is left running). */
+gptps_xport *gptps_xport_open_ex(const gptps_xport_config *cfg);
+
+/* HANDLER MODE shorthand, unchanged from before: N workers running `run`. */
 gptps_xport *gptps_xport_open(size_t nworkers, gptps_xport_run_fn run, void *user_data);
 
-/* Number of worker processes forked by open(). A worker whose link failed is retired
- * rather than respawned, and stays counted here - see submit(). */
+/* Workers this transport was created with - the pool SIZE, which never changes. */
 size_t gptps_xport_count(gptps_xport *xp);
 
-/* Workers still able to take work, <= gptps_xport_count().
- *
- * A worker whose link breaks mid-frame is retired permanently - the stream cannot be
- * resynchronised, so the alternative would be handing a caller a fabricated reply -
- * and it is not respawned. The rotation skips retired workers, so a broken link no
- * longer costs one submit in every N; but capacity really has fallen, and this is how
- * a host sees that. At 0, every subsequent gptps_xport_submit returns GPTPS_E_IO. */
+/* Workers still able to take work. Only ever falls; at 0 every submit is E_IO. */
 size_t gptps_xport_live(gptps_xport *xp);
 
-/* Ship one unit of work to a worker (round-robin) and BLOCK until it replies.
- * *out_result (may be NULL) receives a malloc'd result the CALLER frees; *out_len its
- * length. *out_task_status (may be NULL) receives the handler's own status. The return
- * value is the TRANSPORT status: GPTPS_OK if the round-trip completed (then check
- * out_task_status), GPTPS_E_IO if the worker died / the link failed, GPTPS_E_INVAL on
- * a bad argument - a NULL xp or task, a NULL payload with a nonzero len, or a task
- * name or payload above GPTPS_XPORT_MAX_MSG. Thread-safe: concurrent callers fan out
- * across the workers.
- *
- * A link that fails MID-FRAME cannot be resynchronised, so it is retired: that worker
- * is not respawned and every later submit routed to it returns GPTPS_E_IO. That is the
- * honest answer - the alternative is reading the abandoned frame's leftover bytes as
- * the next reply and returning a result for work that never ran. */
+/* Requests outstanding right now across all live links. */
+size_t gptps_xport_in_flight(gptps_xport *xp);
+
+/* Round-robin a request to the next live worker and BLOCK until its reply.
+ * Returns GPTPS_OK when the worker answered (then *out_task_status is the task's
+ * own status, *out_result the malloc'd result or NULL - free it), GPTPS_E_IO when
+ * the link broke first, GPTPS_E_FULL when that worker already has max_in_flight
+ * outstanding, GPTPS_E_INVAL for a bad argument. */
 gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 const void *payload, size_t len,
                                 void **out_result, size_t *out_len,
                                 gptps_status *out_task_status);
 
-/* Close each worker's link (the worker sees EOF and exits), reap them, and free. */
+/* Same routing and backpressure, but returns as soon as the request is on the wire;
+ * `cb` gets the reply (or E_IO). *out_request_id (may be NULL) identifies it. */
+gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
+                                      const void *payload, size_t len,
+                                      gptps_xport_reply_fn cb, void *user_data,
+                                      uint64_t *out_request_id);
+
+/* Graceful drain (see header), then reap and free. Not from a reply callback. */
 void gptps_xport_close(gptps_xport *xp);
 
 #ifdef __cplusplus

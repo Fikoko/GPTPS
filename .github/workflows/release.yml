@@ -170,5 +170,7 @@ jobs:
             dist/gptps_tui.h
             dist/gptps_wasm_exec.c
             dist/gptps_wasm_exec.h
+            dist/gptps_stats.c
+            dist/gptps_stats.h
             dist/gptps_xport.c
             dist/gptps_xport.h

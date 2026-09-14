@@ -522,6 +522,11 @@ if(UNIX)
     target_link_libraries(test_xport PRIVATE gptps_xport)
     add_test(NAME xport COMMAND test_xport)
     set_tests_properties(xport PROPERTIES TIMEOUT 30)
+    add_executable(test_xport_engine tests/test_xport_engine.c) # scale-out, ENGINE MODE: an engine per worker process
+    target_include_directories(test_xport_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(test_xport_engine PRIVATE gptps_xport)
+    add_test(NAME xport_engine COMMAND test_xport_engine)
+    set_tests_properties(xport_engine PROPERTIES TIMEOUT 60)
     endif()
 
     add_executable(test_stress tests/test_stress.c) # concurrent-producer submit stress (off-lock copy under contention)
@@ -601,6 +606,14 @@ target_include_directories(test_pool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(test_pool PRIVATE gptps_pool)
 add_test(NAME pool COMMAND test_pool)
 set_tests_properties(pool PROPERTIES TIMEOUT 30)
+endif()
+
+if(TARGET gptps_stats AND TARGET gptps_pool)
+add_executable(test_stats tests/test_stats.c)         # observer-seam counters; merged across pool shards
+target_include_directories(test_stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_stats PRIVATE gptps_stats gptps_pool)
+add_test(NAME stats COMMAND test_stats)
+set_tests_properties(stats PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_durable_queue)

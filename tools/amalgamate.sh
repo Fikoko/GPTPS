@@ -44,9 +44,10 @@ durable_queue|gptps_durable_queue.c|gptps_durable_queue.h|crash-durable submissi
 gpu_quota|gptps_gpu_quota.c|gptps_gpu_quota.h|named-resource admission quota
 orch|gptps_orch.c|gptps_orch.h|run-after / fan-in orchestration
 pool|gptps_pool.c|gptps_pool.h|N-shard engine router (scale-up)
+stats|gptps_stats.c|gptps_stats.h|counters, gauges and latency on the observer seam
 tui|gptps_tui.c|gptps_tui.h|real-time terminal dashboard
 wasm_exec|gptps_wasm_exec.c|gptps_wasm_exec.h|module-as-task, pluggable runtime
-xport|gptps_xport.c|gptps_xport.h|worker-process transport (scale-out; POSIX)"
+xport|gptps_xport.c|gptps_xport.h|worker processes, each with its own engine (scale-out; POSIX)"
 
 OUT=""
 WANT="none"

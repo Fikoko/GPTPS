@@ -372,7 +372,7 @@ jobs:
           # A test not named here RUNS: adding one and forgetting this list makes the
           # job fail loudly, which is the right direction to be wrong in.
           ctest --test-dir build-s390x --output-on-failure --no-tests=error \
-            -E '^(oop|program|program_helper|cgroup|addon|addon_ns|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|wasm|tui|hang|durable|stress|gptps_bench_pool|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm)$'
+            -E '^(oop|program|program_helper|cgroup|addon|addon_ns|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|xport_engine|wasm|tui|hang|durable|stress|gptps_bench_pool|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm)$'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
   # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL

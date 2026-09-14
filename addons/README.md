@@ -35,9 +35,10 @@ more useful than calling everything an add-on.
 | `orch` | module | observer | all | `gptps::orch` | `gptps-orch` |
 | `pool` | *composition* | none — public API only | all | `gptps::pool` | `gptps-pool` |
 | `remote` | module | none — wire codec | all | `gptps::remote` | `gptps-remote` |
+| `stats` | module | observer | all | `gptps::stats` | `gptps-stats` |
 | `tui` | module | observer + settings | all | `gptps::tui` | `gptps-tui` |
 | `wasm_exec` | module | task | all | `gptps::wasm_exec` | `gptps-wasm_exec` |
-| `xport` | *composition* | none — public API only | **POSIX** | `gptps::xport` | `gptps-xport` |
+| `xport` | *composition* | none — public API only (owns an engine per worker) | **POSIX** | `gptps::xport` | `gptps-xport` |
 
 ## Getting one
 
@@ -259,9 +260,9 @@ What a network commits to that a socketpair does not, and what this fixes:
 - **`gptps_status` values become wire-visible.** The enum fixes only `GPTPS_OK = 0`;
   the rest are positional. The wire carries its own stable codes, and one from a newer
   peer degrades to `GPTPS_E_IO` rather than being reinterpreted.
-- **A request id**, so a transport *can* multiplex. `xport` holds a lock across the
-  whole round trip, which caps a link at one in-flight request — fine at socketpair
-  latency, a hard ceiling of a few thousand/sec over a real network.
+- **A request id**, so a transport *can* multiplex. `xport` now carries one too (its
+  links are multiplexed, `max_in_flight` per worker); the codec here defines the same
+  idea with a fixed width and byte order a foreign peer can rely on.
 - **A length cap that is a defence.** `xport` allows 256 MiB, reasonable against your
   own forked child; from an unauthenticated peer it is one-packet memory exhaustion.
   Default here is 1 MiB, per-link configurable, and checked *before* the caller is
@@ -271,6 +272,42 @@ What a network commits to that a socketpair does not, and what this fixes:
 peer. On a listening socket that is remote code *selection* by whoever can connect.
 There is no authentication and no encryption here by design — run it inside a trusted
 boundary (loopback, WireGuard, a TLS terminator, an SSH tunnel), never on an open port.
+
+## stats — counters, gauges and latency on the observer seam
+
+`gptps_stats.c` / `gptps_stats.h`. The README's non-goals table promises "aggregate in an
+observer add-on" and then, until now, no such add-on existed. This is it: one observer
+per engine keeps **totals** (queued / started / finished / failed / retried /
+dead-lettered / dropped / cancelled), **live gauges** (pending in the queue, in flight),
+and **latency** (queue wait, and run time per attempt: sum, max, sample count) — for the
+engine and per task type. A snapshot is a plain struct; exporting it to Prometheus,
+statsd, OTel or a log line is the host's ten lines, which is exactly what keeps this
+module from dating the library to a wire format.
+
+```c
+gptps_stats *st = gptps_stats_install(e);          // BEFORE you submit anything
+...
+gptps_stats_counters c;
+gptps_stats_total(st, &c);                          // c.pending, c.in_flight, c.run_ms_sum / c.run_samples ...
+gptps_stats_task(st, "resize", &c);                 // one task type
+... gptps_shutdown(e); gptps_stats_close(st);       // close AFTER shutdown, like await
+```
+
+- **Scaling:** one `gptps_stats` per engine. With `gptps_pool`, install one on each
+  `gptps_pool_shard(p, i)` and fold them with `gptps_stats_merge()` — the sum is the pool.
+  With `gptps_xport` in engine mode, install it from the `child_init` hook; each worker
+  process then has its own.
+- **Order-independent:** `QUEUED` is emitted on the submitting thread and everything
+  else on the dispatcher, so a fast task can report `STARTED` (or `FINISHED`) before its
+  own `QUEUED`. Every transition is keyed on the handle's current state, not on arrival
+  order; the one visible effect is that a `STARTED` that outruns its `QUEUED` has no
+  queue-wait sample.
+- **Cost:** one lock and one hash lookup per event. The handle table is bounded by the
+  engine's own queue.
+- **Not settings.** The counters are deliberately not registered in the settings
+  registry: there is no `gptps_unregister_setting`, so a registered read callback
+  would outlive `gptps_stats_close`. If a host wants them in the TUI, that is the
+  accessor argument the non-goals table asks for.
 
 ## tui — real-time terminal dashboard
 
@@ -338,26 +375,61 @@ gptps_wasm_close(w);
 ## xport — scale OUT by composition (POSIX)
 
 `gptps_xport.c` / `gptps_xport.h`. Where `pool` scales up inside one process, this scales
-out: it forks N persistent worker **processes** and ships each submit to one over a
-socketpair, marshalling the result back. Work therefore runs in a separate address space
-— crash-isolated and independently capped.
+out: it forks N persistent worker **processes** and ships each request to one over a
+socketpair, marshalling the result back. Work runs in a separate address space —
+crash-isolated and independently capped. Two modes:
 
-- **A broken link retires its worker, and the rotation skips it.** The wire protocol
-  cannot be resynchronised mid-frame — the next submit would read this frame's
-  leftovers as its own reply — so a worker whose link breaks is retired permanently and
-  is not respawned. `gptps_xport_count()` is the pool size and never changes;
-  `gptps_xport_live()` is the remaining capacity and only falls. At 0, every submit
-  returns `GPTPS_E_IO`.
-- **Consumes no seam.** It never calls into an engine and does not use the add-on ABI:
-  the core is not on its path. That is the point, not a gap — the composition pattern
-  needs nothing from the core, which is why the core offers it nothing.
-- **POSIX only** (`fork` + `socketpair`), like `GPTPS_EXEC_OOP`. Windows has no `fork`,
-  and faking it would make the module dictate your program's startup.
-- **Fork safety:** the handler runs in a forked child, so call `gptps_xport_open`
-  before you start other threads.
-- **Wire format is native-endian** — it is a same-machine socketpair. A cross-host
-  transport would need a fixed byte order, a versioned header and a request id; the
-  header says so rather than implying TCP is a drop-in swap.
+- **Engine mode** (`gptps_xport_open_ex` with a task table): **every worker runs its own
+  GPTPS engine.** The worker pool, memory and named-resource budgets, retries, timeouts,
+  dead-letter and all four seams apply per worker process, exactly as in-process. The
+  reply carries the item's terminal status: `GPTPS_OK` + result on `FINISHED`, the
+  failure status on `DEAD_LETTERED` / `DROPPED`, `E_CANCELLED`. A `child_init` hook runs
+  in each worker between open and the first request — define resources, register
+  constraints, install `stats` or `durable_queue` there. This is the mode that makes
+  scale-out *keep* what GPTPS is for; `pool` and `xport` are now the same pattern at two
+  levels (engines behind a router; engines behind a link).
+- **Handler mode** (`gptps_xport_open`, unchanged): a bare handler per request, no engine.
+  Plain crash-isolated RPC, for hosts that want exactly that.
+
+```c
+gptps_xport_config cfg = { .struct_size = sizeof cfg, .nworkers = 4,
+                           .engine_cfg = &per_worker_limits, .tasks = table, .ntasks = n,
+                           .child_init = install_stats };
+gptps_xport *xp = gptps_xport_open_ex(&cfg);
+gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);          // blocks
+gptps_xport_submit_async(xp, "resize", buf, len, on_reply, ud, &request_id);    // returns at once
+gptps_xport_close(xp);                                                           // graceful drain
+```
+
+- **Multiplexed links.** Every request carries an id; a reader thread per link matches
+  replies to waiters; up to `max_in_flight` requests (default 64) may be outstanding per
+  worker, beyond which submit returns `GPTPS_E_FULL` — the same backpressure shape as the
+  core's `limits.max_intake_depth`. A worker with 8 engine threads therefore receives 8
+  concurrent requests, which is what makes engine mode useful. (The old transport held a
+  lock across the whole round-trip: one request per link.)
+- **Sizing, engine mode:** a `NULL engine_cfg` auto-tunes *each* worker to the whole
+  machine, which oversubscribes for N > 1 — set `engine_cfg` so the workers *sum* to
+  what the box can bear, exactly as with `pool` shards. The worker's
+  `limits.shutdown_grace_ms` bounds how long `gptps_xport_close` waits for its drain.
+- **A broken link retires its worker, and the rotation skips it.** Everything
+  outstanding on it fails with `GPTPS_E_IO`. It is not respawned — the parent now has
+  reader threads, and `fork()` from a multi-threaded process is only safe before those
+  exist. `gptps_xport_count()` is the pool size and never changes; `gptps_xport_live()`
+  is the remaining capacity and only falls. At 0, every submit returns `GPTPS_E_IO`.
+- **Graceful close.** `close()` shuts the request side of each link; a worker sees EOF,
+  drains (engine mode: `gptps_shutdown`, bounded by its grace), sends what it still
+  owes, and exits. Blocking submits outstanding at close get real answers; async ones
+  get their callback. Only then are readers joined and pids reaped.
+- **Consumes no seam.** It never calls into the *parent's* engine and does not use the
+  add-on ABI; the child's engine is its own, opened fresh after the fork (the supported
+  case in [docs/SECURITY.md](../docs/SECURITY.md)). The composition pattern needs
+  nothing from the core, which is why the core offers it nothing.
+- **POSIX only** (`fork` + `socketpair`), like `GPTPS_EXEC_OOP`.
+- **Fork safety:** call `gptps_xport_open*` before you start other threads.
+- **Wire format is native-endian and unversioned** — parent and child are the same
+  forked binary, so there is no second peer that could disagree. A cross-host transport
+  needs `remote`'s codec, and a request id (which this framing now has) is the first
+  thing it would carry across.
 
 ---
 

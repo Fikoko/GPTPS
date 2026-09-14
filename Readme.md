@@ -426,23 +426,31 @@ shard is a full engine. [`examples/bench_pool`](examples/bench_pool.c) measures 
 large item count if you rerun it: the CI-quick default of 40k finishes in ~20ms and is
 noise-dominated.
 
-**Scale out — worker processes (`gptps_xport`).** Fork N persistent worker *processes* and
-ship each submit to one over IPC, marshalling the result back — work runs in a separate
-address space (crash-isolated). POSIX only, like `EXEC_OOP` (Windows has no `fork`):
+**Scale out — worker processes (`gptps_xport`).** Fork N persistent worker *processes*,
+**each running its own engine**, and ship each request to one over a multiplexed IPC
+link. Work runs in a separate address space (crash-isolated), and the worker's pool,
+budgets, retries, timeouts, dead-letter and seams all apply *there* — scaling out keeps
+everything the engine does. POSIX only, like `EXEC_OOP` (Windows has no `fork`):
 
 ```c
-gptps_xport *xp = gptps_xport_open(4, my_handler, ud);   /* 4 worker processes */
-gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);
-gptps_xport_close(xp);
+gptps_xport_config xc = { .struct_size = sizeof xc, .nworkers = 4,
+                          .engine_cfg = &per_worker_limits, .tasks = table, .ntasks = n };
+gptps_xport *xp = gptps_xport_open_ex(&xc);                 /* 4 workers, an engine in each */
+gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);        /* blocks */
+gptps_xport_submit_async(xp, "resize", buf, len, on_reply, ud, NULL);         /* callback */
+gptps_xport_close(xp);                                      /* graceful drain */
 ```
+
+`gptps_xport_open(n, handler, ud)` still gives you the bare-handler transport (no engine
+in the worker) for plain crash-isolated RPC. Watch either with `gptps_stats`: install it
+from the `child_init` hook and each worker keeps its own counters.
 
 **Going cross-machine is not a socket swap, and `addons/gptps_remote` says why.** It is the
 wire *codec* — versioned header, fixed big-endian byte order, a request id, stable status
 codes, a 1 MiB cap — written down because `xport`'s framing is native-endian (silent
 corruption between a little- and a big-endian host), its `gptps_status` values are
-positional (so they would become wire-visible), it holds a lock across the whole round trip
-(one in-flight request per link), and its 256 MiB cap is a one-packet DoS from a peer you
-did not fork. There is deliberately **no transport yet** and the codec is **not published**
+positional (so they would become wire-visible), and its 256 MiB cap is a one-packet DoS
+from a peer you did not fork. There is deliberately **no transport yet** and the codec is **not published**
 as a release artifact: shipping it is what would create a permanent version-1 peer. Build a
 transport on it when you have a reason to, with
 [docs/SECURITY.md](docs/SECURITY.md) read first — the `task` field of a request is a
@@ -687,7 +695,8 @@ gptps/
 │   ├── hal_posix.c      POSIX backend (threads, clock, dynload, detection);  hal_win.c  Win32 backend
 │   └── exec_oop_posix.c out-of-process + external-program executors;  exec_win.c  Win32 executor
 ├── addons/              ← optional modules, one installable library each (gptps::pool, …)
-│   ├── gptps_pool.c     scale-UP: N engine shards + a router;  gptps_xport.c  scale-OUT: worker processes
+│   ├── gptps_pool.c     scale-UP: N engine shards + a router;  gptps_xport.c  scale-OUT: worker processes, an engine in each
+│   ├── gptps_stats.c    counters / gauges / latency on the observer seam (per engine, per task, mergeable)
 │   ├── gptps_await.c    blocking wait(handle);  gptps_orch.c  run-after / fan-in dependencies
 │   ├── gptps_durable_queue.c  crash-durable journal;  gptps_gpu_quota.c  named-resource quota
 │   ├── gptps_wasm_exec.c  module-as-task;  gptps_tui.c  live terminal dashboard
@@ -725,19 +734,20 @@ registry (typed get/set + validation + round-trip persistence + add-on-extensibl
 embedded / bare-metal hosts, **supervised long-running services** (`GPTPS_TASK_SERVICE`),
 the **pluggable scheduler seam** (`gptps_set_scheduler`, with declared ownership so two
 add-ons cannot silently fight over it), **scale-up** (`gptps_pool` shards) and
-**scale-out** (`gptps_xport` worker processes), the optional platform-optimized HAL
+**scale-out** (`gptps_xport` worker processes, each with its own engine), the optional platform-optimized HAL
 (`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the settings editor), the
 crash-durable queue, a blocking `wait(handle)`, run-after/fan-in dependencies, GPU-quota
-and WASM-executor add-ons, the examples + benchmark, CMake + CI + single-file
-amalgamation.
+and WASM-executor add-ons, **observer-seam stats** (`gptps_stats`: totals, gauges,
+latency, per task, mergeable across shards), the examples + benchmark, CMake + CI +
+single-file amalgamation.
 
 **Binary plug-ins work** as of ABI 2.1 — see [Add-ons and plug-ins](#add-ons-and-plug-ins).
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
-design, the last breaking change) · **9** add-on modules + 1 example binary plug-in ·
-**54** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
+design, the last breaking change) · **10** add-on modules + 1 example binary plug-in ·
+**57** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
 required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
@@ -804,7 +814,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 |---|---|
 | **Distributed *scheduling*** (which node runs what, work stealing, membership, failure detection, global fair-share, rebalancing) | Note the boundary, because the neighbouring thing IS permitted. **Transport** — route work to a *named* remote, marshal it, bring the result back, exclude a dead endpoint, retry elsewhere — is an add-on, and a welcome one: that is exactly the step `gptps_xport` gestures at — and `addons/gptps_remote` has already written down the wire format it would need, precisely so nobody mistakes it for a socket swap. **Scheduling** is where it stops. The moment a module needs the global state of *other* nodes it needs consensus, and the failure model changes completely: the novel thing here is *single-process* self-throttling admission, and a cluster scheduler is a different product. Node selection is a router's business (`gptps_pool` already picks a shard); admission *ordering* is `gptps_set_scheduler`'s; neither is a cluster scheduler. |
 | **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/gptps_durable_queue` already does it on the public API. |
-| **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on; if one genuinely cannot be written, that is an argument for a specific *accessor*, not a format. |
+| **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on — `addons/gptps_stats` **is** that add-on (totals, gauges, latency; no format) — and export from its snapshot in your host. If something genuinely cannot be observed from the seam, that is an argument for a specific *accessor*, not a format. |
 | **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` does not need to be in the mechanism — and this row no longer asks you to take that on faith: `addons/gptps_await` **is** those lines, on the observer seam, with no core change. The core already supplies the one guarantee such a wait needs — every submitted handle reaches exactly one terminal event (`tests/test_reconcile`) — so nothing was missing. Chaining and dependencies are `addons/gptps_orch`'s job, not a future's. |
 | **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. (Note what "terminal" means there: `GPTPS_EV_FAILED` is emitted per *attempt*, so a dependency that merely retries must not release a gate.) |
 | **A logging framework** | `gptps_set_log_sink` is one function pointer. Anything more is your host's job. |
@@ -813,7 +823,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 
 **The tie-break, when nothing above decides it:** *does a user with a name want this?*
 Not "would this be useful" — every proposal is useful to someone hypothetical. This
-project reached **55 public functions and 9 add-ons** before it had a single user, which
+project reached **55 public functions and 10 add-ons** before it had a single user, which
 is the failure mode the rule exists to prevent — and those numbers have only gone up
 since the rule was written, so it applies to the next proposal harder than it did to the
 last one.

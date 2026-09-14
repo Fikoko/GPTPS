@@ -71,8 +71,9 @@ the refusal across mutating, read-only, settings and teardown entry points.
 
 A child that opens its **own** engine after forking is fully supported. The POSIX rule
 stands regardless: a forked child of a threaded process should `exec()` or `_exit()`.
-(`addons/gptps_xport` forks worker processes, but they run the executor directly and
-never open an engine of their own, so it is not an example of this.)
+(`addons/gptps_xport` in engine mode is exactly this case: each forked worker opens a
+fresh engine of its own after the fork and never touches the parent's. Its handler mode
+runs the handler directly and opens no engine.)
 
 ## Signal dispositions
 

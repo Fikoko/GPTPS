@@ -7,6 +7,24 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — scaling by composition, made real
+
+- **`gptps_xport` engine mode.** Every worker process now runs its own GPTPS engine:
+  `gptps_xport_open_ex` takes an `engine_cfg`, a task table and an optional `child_init`
+  hook, and the worker's pool, budgets, retries, timeouts, dead-letter and seams all
+  apply per worker process. The reply carries the item's terminal status. The link is
+  multiplexed (request ids, a reader thread per link, `max_in_flight` per worker with
+  `GPTPS_E_FULL` backpressure), `gptps_xport_submit_async` delivers replies on a
+  callback, `gptps_xport_in_flight` reports outstanding requests, and `gptps_xport_close`
+  is a graceful drain. `gptps_xport_open(n, handler, ud)` and every existing signature
+  are unchanged; `tests/test_xport.c` passes untouched. `tests/test_xport_engine.c`
+  covers concurrency over one link, in-worker retries, timeout → dead-letter, unknown
+  task, backpressure, `child_init`, link death and graceful close.
+- **`gptps_stats`.** The observer-seam aggregation the non-goals table promised:
+  totals, live gauges (pending, in flight) and latency (queue wait, run time) per engine
+  and per task type, order-independent across the core's threads, `gptps_stats_merge`
+  for folding `gptps_pool` shards. No wire format. `tests/test_stats.c`.
+
 ### Fixed — liveness
 
 - **Runtime budget shrink stranded queued work and hung `gptps_shutdown`.** The

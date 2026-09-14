@@ -13,7 +13,7 @@
 # two engines in one process. The dlopen tier is the supported way to get a binary
 # boundary, and it works precisely BECAUSE a plug-in links no core symbols at all.
 
-set(GPTPS_ADDON_ALL await durable_queue gpu_quota orch pool remote tui wasm_exec xport)
+set(GPTPS_ADDON_ALL await durable_queue gpu_quota orch pool remote stats tui wasm_exec xport)
 
 # GPTPS_ADDONS is the human knob; the per-add-on GPTPS_ADDON_<NAME> booleans are what
 # a distro packager scripts against. The list only sets their DEFAULTS.
@@ -119,8 +119,9 @@ gptps_addon(remote        SOURCE gptps_remote.c        HEADER gptps_remote.h    
 # tui is TTY-dependent at RUNTIME only - gptps_tui_run self-skips without a TTY, and
 # render/press are headless and unit-tested. It compiles everywhere (POSIX termios and
 # the Windows console are both handled inside the add-on), so there is nothing to gate.
+gptps_addon(stats         SOURCE gptps_stats.c         HEADER gptps_stats.h         DESC "counters, gauges and latency on the observer seam")
 gptps_addon(tui           SOURCE gptps_tui.c           HEADER gptps_tui.h           DESC "real-time terminal dashboard")
 gptps_addon(wasm_exec     SOURCE gptps_wasm_exec.c     HEADER gptps_wasm_exec.h     DESC "module-as-task, pluggable runtime")
-gptps_addon(xport         SOURCE gptps_xport.c         HEADER gptps_xport.h         DESC "worker-process transport (scale-out; POSIX)" POSIX_ONLY)
+gptps_addon(xport         SOURCE gptps_xport.c         HEADER gptps_xport.h         DESC "worker processes, each with its own engine (scale-out; POSIX)" POSIX_ONLY)
 
 set(GPTPS_BUILT_ADDONS "${_built}" PARENT_SCOPE)
