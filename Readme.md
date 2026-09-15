@@ -474,8 +474,17 @@ gptps_set_scheduler(e, earliest_deadline_first, NULL);
 sections; OFF by default keeps the portable pthread HAL. The HAL is a module boundary, so a
 downstream can drop in its own platform-optimized backend.
 
-`gptps_pool` and `gptps_xport` are add-ons ([`addons/`](addons/)) built entirely on the
-public API — the proof that scaling here needs no core change.
+**Balance batches of mixed-size work (`gptps_balance`).** Round-robin is the wrong
+router for a heavy-tailed *batch*: one shard draws three long items while its neighbours
+idle, and nothing can move them once they are inside an engine's queue. `gptps_balance`
+keeps the queue in the router and hands each shard work only as it frees up
+(join-shortest-queue with late binding — work-stealing in effect), adapting to any task
+size without being told sizes. Measured on 4 shards: 27–31% shorter makespan for
+200–1,000-item batches, and no difference on a 20,000-item stream, where round-robin is
+already balanced by the law of large numbers. `examples/bench_balance.c` reproduces both.
+
+`gptps_pool`, `gptps_balance` and `gptps_xport` are add-ons ([`addons/`](addons/)) built
+entirely on the public API — the proof that scaling here needs no core change.
 
 ## Live terminal dashboard
 
@@ -696,6 +705,7 @@ gptps/
 │   └── exec_oop_posix.c out-of-process + external-program executors;  exec_win.c  Win32 executor
 ├── addons/              ← optional modules, one installable library each (gptps::pool, …)
 │   ├── gptps_pool.c     scale-UP: N engine shards + a router;  gptps_xport.c  scale-OUT: worker processes, an engine in each
+│   ├── gptps_balance.c  late-binding load balancer above pool (join-shortest-queue; any task size)
 │   ├── gptps_stats.c    counters / gauges / latency on the observer seam (per engine, per task, mergeable)
 │   ├── gptps_await.c    blocking wait(handle);  gptps_orch.c  run-after / fan-in dependencies
 │   ├── gptps_durable_queue.c  crash-durable journal;  gptps_gpu_quota.c  named-resource quota
@@ -746,8 +756,8 @@ Each add-on is its own installable library (`gptps::pool`, …) with a header, a
 and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
-design, the last breaking change) · **10** add-on modules + 1 example binary plug-in ·
-**57** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
+design, the last breaking change) · **11** add-on modules + 1 example binary plug-in ·
+**59** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
 required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
@@ -823,7 +833,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 
 **The tie-break, when nothing above decides it:** *does a user with a name want this?*
 Not "would this be useful" — every proposal is useful to someone hypothetical. This
-project reached **55 public functions and 10 add-ons** before it had a single user, which
+project reached **55 public functions and 11 add-ons** before it had a single user, which
 is the failure mode the rule exists to prevent — and those numbers have only gone up
 since the rule was written, so it applies to the next proposal harder than it did to the
 last one.

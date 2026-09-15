@@ -9,6 +9,16 @@ the release version and is documented in `include/gptps.h`.
 
 ### Added — scaling by composition, made real
 
+- **`gptps_balance`.** A late-binding router above `gptps_pool`: work waits in one
+  priority queue here and each shard is handed only what it can run plus a bounded
+  `shard_depth`; a terminal event on any shard (observer seam) dispatches the next
+  item to the least-loaded shard. Join-shortest-queue, work-stealing in effect,
+  adaptive to any task size. Events are forwarded with balance handles and every
+  handle reaches exactly one terminal event. Measured (`examples/bench_balance.c`,
+  4 shards, heavy tail): 27–31% shorter makespan for 200–1,000-item batches; no
+  difference on a 20,000-item stream, where round-robin is already balanced. It is a
+  batch-and-burst tool, not a throughput tool. No core change. `tests/test_balance.c`.
+
 - **`gptps_xport` engine mode.** Every worker process now runs its own GPTPS engine:
   `gptps_xport_open_ex` takes an `engine_cfg`, a task table and an optional `child_init`
   hook, and the worker's pool, budgets, retries, timeouts, dead-letter and seams all

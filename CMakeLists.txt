@@ -542,6 +542,14 @@ if(UNIX)
     add_test(NAME gptps_bench_pool COMMAND gptps_bench_pool)   # runs the CI-quick default; prints the scaling table
     set_tests_properties(gptps_bench_pool PROPERTIES TIMEOUT 60)
     endif()
+
+    if(TARGET gptps_balance AND TARGET gptps_await)
+    add_executable(gptps_bench_balance examples/bench_balance.c) # round-robin vs late binding on a heavy-tailed workload
+    target_include_directories(gptps_bench_balance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(gptps_bench_balance PRIVATE gptps_balance gptps_await)
+    add_test(NAME gptps_bench_balance COMMAND gptps_bench_balance)   # CI-quick default; prints both makespans
+    set_tests_properties(gptps_bench_balance PROPERTIES TIMEOUT 120)
+    endif()
 endif()
 
 # Portable add-on tests (all platforms): the add-on sources are portable
@@ -614,6 +622,14 @@ target_include_directories(test_stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_link_libraries(test_stats PRIVATE gptps_stats gptps_pool)
 add_test(NAME stats COMMAND test_stats)
 set_tests_properties(stats PROPERTIES TIMEOUT 30)
+endif()
+
+if(TARGET gptps_balance AND TARGET gptps_stats)
+add_executable(test_balance tests/test_balance.c)     # late-binding router above pool; distribution checked with stats
+target_include_directories(test_balance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_balance PRIVATE gptps_balance gptps_stats)
+add_test(NAME balance COMMAND test_balance)
+set_tests_properties(balance PROPERTIES TIMEOUT 60)
 endif()
 
 if(TARGET gptps_durable_queue)

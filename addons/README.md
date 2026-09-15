@@ -21,14 +21,16 @@ the host calls — `gptps_dq_submit()`, `gptps_orch_after()`, `gptps_tui_run()`.
 other tier — the diff between those two files is the clearest available description of
 the difference.
 
-Two of them are not add-ons in the loader's sense at all: **`pool` and `xport` are
-composition libraries**. They register on no seam, use no host table, and sit *above*
-the engine rather than inside it (`pool` owns N whole engines). Naming that plainly is
-more useful than calling everything an add-on.
+Three of them are not add-ons in the loader's sense at all: **`pool`, `balance` and
+`xport` are composition libraries**. They use no host table and sit *above* the engine
+rather than inside it (`pool` owns N whole engines; `balance` owns the queue in front
+of them; `xport` owns N worker processes). Naming that plainly is more useful than
+calling everything an add-on.
 
 | Add-on | Tier | Seam(s) used | Platform | CMake target | pkg-config |
 |---|---|---|---|---|---|
 | `await` | module | observer | all | `gptps::await` | `gptps-await` |
+| `balance` | *composition* | observer (on each shard) — routes above `pool` | all | `gptps::balance` | `gptps-balance` |
 | `durable_queue` | module | observer | all | `gptps::durable_queue` | `gptps-durable_queue` |
 | `gpu_quota` | module | *(named resources)* | all | `gptps::gpu_quota` | `gptps-gpu_quota` |
 | `gpu_quota_plugin` | **plug-in** | *(named resources + settings)* | all | *(MODULE, `.so`)* | — |
@@ -90,6 +92,66 @@ gptps_shutdown(engine); gptps_await_close(aw);
 
 `gptps_await_quiesce(aw, n, ms)` covers "tell me when N things are done" — it needs no
 retention at all, so it is the right call for bulk work and benchmarks.
+
+## balance — late-binding load balancer above pool
+
+`gptps_balance.c` / `gptps_balance.h`. `pool` routes each submit to a shard as it
+arrives — round-robin or by key. Right for uniform work, wrong for mixed sizes: one
+shard can hold three long items while its neighbours idle, and nothing can move them,
+because an item inside an engine's queue belongs to that engine (the public API has
+no "give me back a queued item", and should not — that queue is the engine's admission
+ledger). This module keeps the queue where it *can* be re-routed: in the router. Work
+waits here, in one priority queue; each shard is handed only what it can run now plus
+a bounded depth; when a shard finishes something (observer seam) the next item goes to
+whichever shard has the least outstanding. Join-shortest-queue with late binding —
+work-stealing in effect, since idle shards pull — and it adapts to any task size
+without knowing sizes in advance: a shard running one long item simply stops being the
+shortest queue.
+
+```c
+p = gptps_pool_open(4, &cfg); gptps_pool_register_task(p, &def);
+b = gptps_balance_open(p, NULL);              // BEFORE submitting; NULL cfg => depth 2x workers
+gptps_balance_set_event_cb(b, on_event, ud);  // events carry BALANCE handles
+gptps_balance_submit(b, "resize", buf, len, &h);
+gptps_balance_submit_ex(b, "resize", buf, len, /*priority*/ 5, &h);
+... gptps_pool_close(p); gptps_balance_close(b);   // close AFTER the pool
+```
+
+- **Events:** the host sees the engine's lifecycle events for balanced work with the
+  handle rewritten to the balance handle, plus a `QUEUED` emitted here at submit (the
+  item queued *here*) and a terminal `DEAD_LETTERED` / `DROPPED` for an item this module
+  could not hand over (shard refused the submit, or close with work still queued).
+  Every balance handle reaches exactly one terminal event — the core's guarantee,
+  kept. Work submitted straight to a shard is neither seen nor counted.
+- **`shard_depth`:** how many items a shard may hold at once (running + waiting in
+  *its* queue). Deep enough that the engine's skip-to-fit and starvation guard still
+  have something to order; shallow enough that a late-arriving long item cannot bury a
+  shard. Set it to `max_concurrent_tasks` for no prefetch at all.
+- **Priority** orders the router queue (then FIFO) and is passed to the shard on
+  dispatch, so the engine's ordering agrees with the router's.
+- **`gptps_balance_queued()`** / **`gptps_balance_shard_load(i)`** are the gauges;
+  install `stats` on the shards for everything else.
+- **Cost:** one lock and one hash lookup per event; a copy of the payload while the
+  item waits here (the engine copies again at dispatch).
+- **THREADED shards only**: dispatch is driven from their dispatcher threads.
+- **Measured — and where it does NOT help.** `examples/bench_balance.c` runs the same
+  heavy-tailed workload (1 in 32 items 100× longer) through round-robin `pool` and
+  through `balance` on the same 4 shards. On a 32-thread machine, makespan vs ideal:
+
+  | items | round-robin | late binding | balance / rr |
+  |---:|---:|---:|---:|
+  | 200 | 1.98× | 1.44× | **0.73** |
+  | 1,000 | 1.54× | 1.07× | **0.69** |
+  | 20,000 | 1.01× | 0.98× | 0.96 |
+
+  The last row is the honest one: on a long, stationary stream the law of large
+  numbers balances round-robin for free, and this module buys nothing. It earns its
+  place for **batches and bursts** — "render these 40 thumbnails", "process this
+  upload" — where a few long items landing on one shard is the whole makespan, and
+  for **per-item wait**, where a short item is no longer stuck behind a long one.
+  Task bodies spin, so the bench needs ≥ 4 free cores to mean anything.
+- **Not** cross-process (`xport` in engine mode is a fine thing to put behind a
+  shard) and **not** a scheduler for the shards' own queues.
 
 ## durable_queue — crash-durable submission
 

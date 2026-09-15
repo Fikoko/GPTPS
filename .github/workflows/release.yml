@@ -158,6 +158,8 @@ jobs:
             dist/gptps-addons.tar.gz
             dist/gptps_await.c
             dist/gptps_await.h
+            dist/gptps_balance.c
+            dist/gptps_balance.h
             dist/gptps_durable_queue.c
             dist/gptps_durable_queue.h
             dist/gptps_gpu_quota.c

@@ -13,7 +13,7 @@
 # two engines in one process. The dlopen tier is the supported way to get a binary
 # boundary, and it works precisely BECAUSE a plug-in links no core symbols at all.
 
-set(GPTPS_ADDON_ALL await durable_queue gpu_quota orch pool remote stats tui wasm_exec xport)
+set(GPTPS_ADDON_ALL await balance durable_queue gpu_quota orch pool remote stats tui wasm_exec xport)
 
 # GPTPS_ADDONS is the human knob; the per-add-on GPTPS_ADDON_<NAME> booleans are what
 # a distro packager scripts against. The list only sets their DEFAULTS.
@@ -112,6 +112,13 @@ gptps_addon(durable_queue SOURCE gptps_durable_queue.c HEADER gptps_durable_queu
 gptps_addon(gpu_quota     SOURCE gptps_gpu_quota.c     HEADER gptps_gpu_quota.h     DESC "named-resource admission quota")
 gptps_addon(orch          SOURCE gptps_orch.c          HEADER gptps_orch.h          DESC "run-after / fan-in orchestration")
 gptps_addon(pool          SOURCE gptps_pool.c          HEADER gptps_pool.h          DESC "N-shard engine router (scale-up)")
+gptps_addon(balance       SOURCE gptps_balance.c       HEADER gptps_balance.h       DESC "late-binding load balancer above pool")
+if(TARGET gptps_balance)
+    if(NOT TARGET gptps_pool)
+        message(FATAL_ERROR "gptps: add-on 'balance' needs 'pool' (it routes above a gptps_pool); add pool to GPTPS_ADDONS")
+    endif()
+    target_link_libraries(gptps_balance PUBLIC gptps_pool)
+endif()
 # remote is the wire CODEC only - pure byte transformations, no sockets and no
 # platform calls, so it builds everywhere including Windows and the s390x leg that
 # actually exercises its byte order.

@@ -40,6 +40,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # distributed set until a transport - and a user who wants one - exists.
 # tools/check_addon_coverage.sh has a matching exemption.
 ADDONS="await|gptps_await.c|gptps_await.h|blocking wait(handle) on the observer seam
+balance|gptps_balance.c|gptps_balance.h|late-binding load balancer above pool (needs pool)
 durable_queue|gptps_durable_queue.c|gptps_durable_queue.h|crash-durable submission journal
 gpu_quota|gptps_gpu_quota.c|gptps_gpu_quota.h|named-resource admission quota
 orch|gptps_orch.c|gptps_orch.h|run-after / fan-in orchestration
@@ -74,7 +75,13 @@ case "$WANT" in
           for a in $SEL; do
               printf '%s\n' "$ALL" | grep -qx "$a" || {
                   echo "amalgamate.sh: unknown add-on '$a'. Known: $(echo $ALL)" >&2; exit 2; }
-          done ;;
+          done
+          # balance is a composition ABOVE pool (its header includes gptps_pool.h):
+          # emit pool alongside it rather than hand the user a file that cannot
+          # compile. Said out loud, not silently, like every other selector here.
+          case " $SEL " in *" balance "*) case " $SEL " in *" pool "*) ;; *)
+              echo "amalgamate.sh: 'balance' needs 'pool'; adding pool to the selection." >&2
+              SEL="$SEL pool" ;; esac ;; esac ;;
 esac
 
 # The generated files are the DISTRIBUTED form of GPTPS - for many consumers the
