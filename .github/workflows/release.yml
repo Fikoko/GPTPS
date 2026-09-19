@@ -26,6 +26,29 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Verify tag, source version, and changelog agree
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "ERROR: release tag must be vMAJOR.MINOR.PATCH"; exit 1;
+          }
+          cmake_version="$(sed -n 's/^project(gptps VERSION \([0-9][0-9.]*\) LANGUAGES C)$/\1/p' CMakeLists.txt)"
+          header_version="$(sed -n 's/^#define GPTPS_VERSION_STRING "\([0-9][0-9.]*\)"$/\1/p' include/gptps.h)"
+          major="$(sed -n 's/^#define GPTPS_VERSION_MAJOR \([0-9][0-9]*\)$/\1/p' include/gptps.h)"
+          minor="$(sed -n 's/^#define GPTPS_VERSION_MINOR \([0-9][0-9]*\)$/\1/p' include/gptps.h)"
+          patch="$(sed -n 's/^#define GPTPS_VERSION_PATCH \([0-9][0-9]*\)$/\1/p' include/gptps.h)"
+          numeric_version="$major.$minor.$patch"
+          for actual in "$cmake_version" "$header_version" "$numeric_version"; do
+            test "$actual" = "$tag_version" || {
+              echo "ERROR: tag $tag_version disagrees with source version $actual"; exit 1;
+            }
+          done
+          grep -q "^## \[$tag_version\]" CHANGELOG.md || {
+            echo "ERROR: CHANGELOG.md has no [$tag_version] section"; exit 1;
+          }
+
       - name: Build + test at the tag
         # Do not ship an artifact from a tree that does not pass its own suite.
         #

@@ -7,6 +7,13 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — release metadata
+
+- **Release versions could drift between build metadata and the public API.** CMake,
+  numeric/string macros, release tags and changelog sections are now checked together.
+
+## [1.2.0] - 2026-09-16
+
 ### Added — scaling by composition, made real
 
 - **`gptps_balance`.** A late-binding router above `gptps_pool`: work waits in one

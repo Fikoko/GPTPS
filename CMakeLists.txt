@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
-project(gptps VERSION 1.1.0 LANGUAGES C)
+project(gptps VERSION 1.2.0 LANGUAGES C)
 
 # GPTPS - General Purpose Task Processing System.
 # Embeddable, in-process C99 task-processing library. Core is strict C99;
@@ -41,6 +41,24 @@ elseif(NOT CMAKE_MATCH_1 STREQUAL PROJECT_VERSION)
         "version drift: project(VERSION ${PROJECT_VERSION}) but include/gptps.h says "
         "GPTPS_VERSION_STRING \"${CMAKE_MATCH_1}\". Update both.")
 endif()
+
+# The public numeric macros are part of the same release contract.  Checking only
+# GPTPS_VERSION_STRING previously allowed a release to report a different version
+# to callers that use GPTPS_VERSION_MAJOR/MINOR/PATCH.
+foreach(_part MAJOR MINOR PATCH)
+    string(REGEX MATCH
+        "#define[ \t]+GPTPS_VERSION_${_part}[ \t]+([0-9]+)"
+        _ "${_gptps_hdr}")
+    if(CMAKE_MATCH_1 STREQUAL "")
+        message(FATAL_ERROR
+            "could not read GPTPS_VERSION_${_part} from include/gptps.h")
+    endif()
+    if(NOT CMAKE_MATCH_1 EQUAL PROJECT_VERSION_${_part})
+        message(FATAL_ERROR
+            "version drift: project ${_part} is ${PROJECT_VERSION_${_part}} but "
+            "GPTPS_VERSION_${_part} is ${CMAKE_MATCH_1}")
+    endif()
+endforeach()
 unset(_gptps_hdr)
 
 # --- library (grows as modules land) ---------------------------------------
@@ -284,7 +302,12 @@ target_include_directories(test_engine
 )
 target_link_libraries(test_engine PRIVATE gptps)
 add_test(NAME engine COMMAND test_engine)
-set_tests_properties(engine PROPERTIES TIMEOUT 30)
+
+add_executable(test_version tests/test_version.c)
+target_link_libraries(test_version PRIVATE gptps)
+target_include_directories(test_version PRIVATE include)
+add_test(NAME version COMMAND test_version)
+set_tests_properties(engine version PROPERTIES TIMEOUT 30)
 
 add_executable(test_failure tests/test_failure.c)
 target_include_directories(test_failure
