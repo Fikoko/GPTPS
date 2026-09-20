@@ -28,7 +28,6 @@ static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
 static gptps *g_engine;
 static int    g_cb_shutdown_rc = 999;
 static int    g_task_shutdown_rc = 999;
-static int    g_started;
 static int    g_service_runs;
 static void set(int *p, int v) { __atomic_store_n(p, v, __ATOMIC_SEQ_CST); }
 
@@ -117,6 +116,8 @@ static void test_reentrant_step_is_refused(void)
 /* -------------------------------------- 3. shutdown bounds a no-timeout child */
 
 #if !defined(_WIN32)
+static int g_started;
+
 static void obs_started(const gptps_event *ev, void *ud)
 { (void)ud; if (ev->kind == GPTPS_EV_STARTED) inc(&g_started); }
 
