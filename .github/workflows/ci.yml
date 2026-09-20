@@ -261,6 +261,16 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error
+      # The Ubuntu werror job cannot see code behind _WIN32 or variables whose use
+      # is gated to POSIX. Keep the native Win32 sources and test suite warning-clean
+      # under an optimized build too, where flow-sensitive diagnostics are active.
+      - name: Configure (-O2, -Werror)
+        run: cmake -S . -B build-werror -G Ninja -DCMAKE_BUILD_TYPE=Release
+             -DCMAKE_C_FLAGS="-std=c99 -O2 -Wall -Wextra -Werror -Wno-unused-parameter"
+      - name: Build (-Werror)
+        run: cmake --build build-werror
+      - name: Test (-Werror)
+        run: ctest --test-dir build-werror --output-on-failure --no-tests=error
       - name: Single-file amalgamation build
         run: |
           sh tools/amalgamate.sh
