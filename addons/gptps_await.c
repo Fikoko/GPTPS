@@ -63,9 +63,15 @@ struct gptps_await {
  * run again. The one exception is a cancel, which is emitted exactly once - by
  * execute() if the item ran, or by the dispatcher if it never started.
  *
- * This is the same predicate tests/test_reconcile.c uses to assert that every
- * submitted handle reaches EXACTLY ONE terminal event; that guarantee is what makes
- * a single delivery per waiter correct. addons/gptps_orch.c uses it too. */
+ * This is the same predicate tests/test_reconcile.c uses; addons/gptps_orch.c uses it
+ * too. A single delivery per waiter is correct because a ONE-SHOT handle reaches
+ * exactly one terminal event. The two shapes outside that are the two you would not
+ * await for a result anyway: a REQUEUE item has not finished while it is still
+ * requeueing, so a wait on it returns GPTPS_E_TIMEOUT until shutdown dead-letters it;
+ * and a SERVICE handle is an uptime rather than a result, so successive waits each
+ * return OK, once per run. Neither corrupts this observer - a waiter takes the next
+ * terminal event it sees - but a caller expecting "wait once, get the answer" gets
+ * something else, so gptps_await_wait says so too. */
 static int is_terminal(const gptps_event *ev)
 {
     if (ev->kind == GPTPS_EV_FINISHED ||

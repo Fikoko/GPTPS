@@ -7,6 +7,34 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — a handle that closed in silence, and the guarantee that oversold itself
+
+- **A `GPTPS_ON_FAILURE_REQUEUE` item reached shutdown without a terminal event.** The
+  drain refuses to re-admit it — an always-failing requeue would hang shutdown forever —
+  and dead-letters it instead, but it never emitted the `DEAD_LETTERED` that says so. It
+  was the one shape that could reach shutdown and close in silence: `gptps_await` on such
+  a handle never returned, and every add-on that reconciles terminal events leaked a slot
+  per item. Measured before: 8 of 8 handles ended with zero terminal events after
+  `gptps_shutdown` returned; after: 8 of 8 close with `DEAD_LETTERED`.
+  `tests/test_reconcile.c` now pins it — the file the Readme cites as proof of the
+  invariant previously had no case for this path, and the new one fails without the fix.
+
+- **"Every submitted handle reaches exactly one terminal event" was stated
+  unconditionally in eleven places, and is false for two opt-in shapes.** A REQUEUE item
+  stays open for as long as its body keeps failing — that is the policy working as
+  designed, and shutdown now closes it. A `GPTPS_TASK_SERVICE` handle is a supervised
+  *lifetime*, not a completion: under the default always-up policy every clean exit emits
+  a `FINISHED` before the restart, so one handle up for 1.5 seconds emitted 15 of them.
+  `GPTPS_TASK_RETIRE_ON_OK` is the one service shape that emits exactly one. `Readme.md`,
+  `CONTRIBUTING.md`, `include/gptps.h`'s SERVICE block, `tests/test_reconcile.c`,
+  `src/engine.c` and the `orch` / `await` / `stats` / `balance` add-on docs now state the
+  real contract and name both exceptions. Two of those sites were wrong in the opposite
+  direction — `gptps_orch.h` and `addons/README.md` claimed a service NEVER terminates,
+  when it terminates too often, which is the more dangerous error for a dependency gate.
+  `gptps_balance` turns out to enforce the guarantee itself rather than inherit it (it
+  drops its handle mapping on the first terminal event), which also means it stops
+  counting a service against its shard's load while the instance is still up.
+
 ### Fixed — the observer contract, and what it cost two add-ons
 
 - **`include/gptps.h` never said event order is not guaranteed.** `QUEUED` is emitted by

@@ -29,12 +29,18 @@
  *   must not release your gate, and a FAILED carrying GPTPS_E_TIMEOUT is a failed
  *   attempt like any other.
  *
- *   Two dependency shapes NEVER reach a terminal state, so a gate on one waits
- *   forever - correctly, but surprisingly:
- *     - a task type with on_failure = GPTPS_ON_FAILURE_REQUEUE, which is
- *       re-admitted instead of ending (until shutdown, which dead-letters it);
- *     - a GPTPS_TASK_SERVICE instance, which is supervised to stay up by design.
- *   Depend on those only if you will cancel them, which IS terminal.
+ *   Two dependency shapes do not reach a terminal state the way a one-shot does,
+ *   and each is surprising in a DIFFERENT direction:
+ *     - a task type with on_failure = GPTPS_ON_FAILURE_REQUEUE never terminates
+ *       while it keeps failing, because it is re-admitted instead of ending, so a
+ *       gate on it waits - correctly - until shutdown finally dead-letters it;
+ *     - a GPTPS_TASK_SERVICE instance terminates too OFTEN, not too rarely. It is
+ *       supervised to stay up, and under the default always-up policy every clean
+ *       exit emits a FINISHED before the restart - a handle up for a second can
+ *       emit a dozen. A gate on one therefore releases on the FIRST run to end,
+ *       which is almost never what "wait for the service" was meant to mean.
+ *   Depend on the first only if you will cancel it, which IS terminal. Do not
+ *   depend on the second at all unless you want exactly that first-run edge.
  */
 #ifndef GPTPS_ORCH_H
 #define GPTPS_ORCH_H

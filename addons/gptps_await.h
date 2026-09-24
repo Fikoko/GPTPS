@@ -72,7 +72,12 @@ gptps_await *gptps_await_install_ex(gptps *e, size_t cap);
  *                     *out_len carry a malloc'd copy of the result, which the CALLER
  *                     frees. Pass NULL for any out-param you do not want.
  *   GPTPS_E_TIMEOUT   no terminal event arrived in time - the task may still be
- *                     running, or its completion was evicted from the ring.
+ *                     running, its completion may have been evicted from the ring,
+ *                     or the handle may be one that never terminates on its own: a
+ *                     GPTPS_ON_FAILURE_REQUEUE item keeps requeueing while its body
+ *                     fails, so every wait on it times out until gptps_shutdown
+ *                     dead-letters it. Retrying such a wait will not help; cancel
+ *                     the handle, which IS terminal, or do not await it.
  *   GPTPS_E_INVAL     bad arguments.
  *   GPTPS_E_NOMEM     could not register the wait.
  *
@@ -81,7 +86,15 @@ gptps_await *gptps_await_install_ex(gptps *e, size_t cap);
  * successful wait. (The same split addons/gptps_xport uses for transport vs task.)
  *
  * timeout_ms == 0 polls: it returns immediately, with GPTPS_E_TIMEOUT if the handle
- * has not already completed. */
+ * has not already completed.
+ *
+ * One wait, one answer - for a ONE-SHOT handle. A GPTPS_TASK_SERVICE handle is an
+ * uptime rather than a result: under the default always-up policy each run ends with
+ * its own terminal event, so successive waits on the same service handle each return
+ * GPTPS_OK, once per run, rather than once ever. That is the observer seam reporting
+ * honestly, not a bug here - but if you wanted "wait until this service stops", wait
+ * for the FAILED/GPTPS_E_CANCELLED that a cancel, an unregister or shutdown produces,
+ * which is the one terminal event a service emits exactly once. */
 gptps_status gptps_await_wait(gptps_await *aw, gptps_handle h, unsigned timeout_ms,
                               void **out_result, size_t *out_len,
                               gptps_status *out_status);

@@ -781,7 +781,16 @@ hang it hangs your host's exit path — so these are contractual, and
   [`docs/SECURITY.md`](docs/SECURITY.md) has the full table.
 - Every submitted handle reaches exactly one terminal event — the invariant the
   observer seam, and every add-on built on it, depends on
-  ([`tests/test_reconcile.c`](tests/test_reconcile.c)).
+  ([`tests/test_reconcile.c`](tests/test_reconcile.c)). It holds for a one-shot task
+  through success, retries, timeouts, cancellation, removal in any mode, a constraint
+  denial, a budget shrunk under a queued item, and shutdown in every drain state. Two
+  opt-in shapes are deliberately outside it, and both are knowable before you submit:
+  a `GPTPS_ON_FAILURE_REQUEUE` item is unbounded by design, so its handle stays open
+  for as long as the body keeps failing — shutdown closes it with `DEAD_LETTERED`; and
+  a `GPTPS_TASK_SERVICE` handle is a supervised *lifetime* rather than a completion,
+  so it emits one terminal event per run while it is up, and exactly one
+  `FAILED`/`GPTPS_E_CANCELLED` when it is finally stopped. A submit that returned an
+  error created no handle and emits nothing at all.
 
 Platforms (all CI-verified): **Linux** and **macOS** are full. **Windows** (Win32 HAL
 via `src/hal_win.c`) runs the engine, scheduler, config, the in-process and
@@ -825,7 +834,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 | **Distributed *scheduling*** (which node runs what, work stealing, membership, failure detection, global fair-share, rebalancing) | Note the boundary, because the neighbouring thing IS permitted. **Transport** — route work to a *named* remote, marshal it, bring the result back, exclude a dead endpoint, retry elsewhere — is an add-on, and a welcome one: that is exactly the step `gptps_xport` gestures at — and `addons/gptps_remote` has already written down the wire format it would need, precisely so nobody mistakes it for a socket swap. **Scheduling** is where it stops. The moment a module needs the global state of *other* nodes it needs consensus, and the failure model changes completely: the novel thing here is *single-process* self-throttling admission, and a cluster scheduler is a different product. Node selection is a router's business (`gptps_pool` already picks a shard); admission *ordering* is `gptps_set_scheduler`'s; neither is a cluster scheduler. |
 | **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/gptps_durable_queue` already does it on the public API. |
 | **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on — `addons/gptps_stats` **is** that add-on (totals, gauges, latency; no format) — and export from its snapshot in your host. If something genuinely cannot be observed from the seam, that is an argument for a specific *accessor*, not a format. |
-| **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` does not need to be in the mechanism — and this row no longer asks you to take that on faith: `addons/gptps_await` **is** those lines, on the observer seam, with no core change. The core already supplies the one guarantee such a wait needs — every submitted handle reaches exactly one terminal event (`tests/test_reconcile`) — so nothing was missing. Chaining and dependencies are `addons/gptps_orch`'s job, not a future's. |
+| **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` does not need to be in the mechanism — and this row no longer asks you to take that on faith: `addons/gptps_await` **is** those lines, on the observer seam, with no core change. The core already supplies the one guarantee such a wait needs — a one-shot handle reaches exactly one terminal event (`tests/test_reconcile`) — so nothing was missing. The two shapes outside that guarantee are the two you would not await anyway: a `GPTPS_ON_FAILURE_REQUEUE` item has not finished while it is still requeueing, and a `GPTPS_TASK_SERVICE` handle is an uptime, not a result, so a wait on it returns once per run rather than once ever. Chaining and dependencies are `addons/gptps_orch`'s job, not a future's. |
 | **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. (Note what "terminal" means there: `GPTPS_EV_FAILED` is emitted per *attempt*, so a dependency that merely retries must not release a gate.) |
 | **A logging framework** | `gptps_set_log_sink` is one function pointer. Anything more is your host's job. |
 | **More executor kinds** | Three (in-process, forked, external program) span the trust and isolation axes. A fourth is nearly always "an existing one plus a runtime" — which is what `addons/gptps_wasm_exec` is. The enum is also now *closed in code* - `gptps_register_task` rejects a kind it does not know, so an older core meeting a newer add-on refuses the work rather than silently running it as something else. |

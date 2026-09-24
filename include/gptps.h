@@ -234,6 +234,16 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * (a DRAIN is auto-upgraded to CANCEL, since a service never drains on its own),
  * and gptps_shutdown stops them all. A service must poll gptps_is_cancelled() to
  * be stoppable - the same cooperative contract as any in-process cancel.
+ * WHAT AN OBSERVER SEES. A service handle is a supervised LIFETIME, not a
+ * completion, so it does not obey the one-terminal-event-per-handle rule a one-shot
+ * does: each run emits its own STARTED and its own terminal event, and under the
+ * default always-up policy a clean exit emits FINISHED and then restarts - a service
+ * up for one second can emit a dozen. The single terminal event a service emits
+ * exactly once is the FAILED carrying GPTPS_E_CANCELLED that gptps_cancel,
+ * gptps_unregister_task or gptps_shutdown produces; that is the one to wait for if
+ * you want "until this service stops". GPTPS_TASK_RETIRE_ON_OK is the exception: it
+ * retires on a clean exit, so such a handle emits exactly one terminal event like
+ * any other task.
  * v1 restrictions (rejected at registration with GPTPS_E_INVAL): INPROC executor
  * only, THREADED mode only (a service's infinite loop cannot be run to completion
  * by the MANUAL gptps_step pump), and no timeout_seconds. */

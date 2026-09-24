@@ -85,9 +85,12 @@ static void *dup_mem(const void *s, size_t n) { void *o; if (!n) return NULL; o 
  * A FAILED carrying E_TIMEOUT is therefore not terminal either - a timed-out item
  * still goes through retry and the on_failure policy like any other failure.
  *
- * This is the same predicate tests/test_reconcile.c uses to assert that every
- * submitted handle reaches EXACTLY ONE terminal event, and the same one
- * durable_queue.c already applies. */
+ * This is the same predicate tests/test_reconcile.c uses, and the same one
+ * durable_queue.c already applies. What that test asserts is exactly one terminal
+ * event per ONE-SHOT handle; a REQUEUE item emits none while it keeps failing, and a
+ * SERVICE handle emits one per run. The gate below is written to survive both - see
+ * the header - so this predicate stays a definition of "terminal", not a promise
+ * about how many times it fires for a given handle. */
 static int is_terminal(const gptps_event *ev)
 {
     if (ev->kind == GPTPS_EV_FINISHED ||

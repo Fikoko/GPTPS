@@ -121,8 +121,14 @@ gptps_balance_submit_ex(b, "resize", buf, len, /*priority*/ 5, &h);
   handle rewritten to the balance handle, plus a `QUEUED` emitted here at submit (the
   item queued *here*) and a terminal `DEAD_LETTERED` / `DROPPED` for an item this module
   could not hand over (shard refused the submit, or close with work still queued).
-  Every balance handle reaches exactly one terminal event — the core's guarantee,
-  kept. Work submitted straight to a shard is neither seen nor counted.
+  Every balance handle reaches exactly one terminal event — enforced *here*, not
+  merely inherited: the router drops its shard-handle mapping on the first terminal
+  event, so a later one for the same shard handle finds nothing and is not forwarded.
+  That makes the guarantee hold even for a `GPTPS_TASK_SERVICE`, whose handle emits
+  one terminal event per run — but it also means the router stops counting that
+  instance against its shard's load while the service is still up, so do not route
+  services through a balancer. Work submitted straight to a shard is neither seen nor
+  counted.
 - **`shard_depth`:** how many items a shard may hold at once (running + waiting in
   *its* queue). Deep enough that the engine's skip-to-fit and starvation guard still
   have something to order; shallow enough that a late-arriving long item cannot bury a
@@ -241,9 +247,12 @@ than in the dispatcher.
   carrying `GPTPS_E_CANCELLED`. A plain `FAILED` is **not** terminal — it is emitted
   after every failed *attempt*, and a dependency that merely retries must not release
   your gate.
-- **Two shapes never terminate at all:** a task type with
-  `GPTPS_ON_FAILURE_REQUEUE`, and a `GPTPS_TASK_SERVICE` instance. A gate on one waits
-  forever — correctly, but surprisingly.
+- **Two shapes do not terminate like a one-shot**, and they fail in opposite
+  directions. A task type with `GPTPS_ON_FAILURE_REQUEUE` never terminates while it
+  keeps failing, so a gate on it waits — correctly — until shutdown dead-letters it.
+  A `GPTPS_TASK_SERVICE` instance terminates too *often*: under the default always-up
+  policy every clean exit emits a `FINISHED` before the restart, so a gate on one
+  releases on the first run to end, not when the service stops.
 - **Retention is bounded on request.** Completed handles are remembered so a gate
   created *after* a dependency finished still resolves. `gptps_orch_install` keeps them
   for the process lifetime; `gptps_orch_install_ex(e, cap)` drops the set once it

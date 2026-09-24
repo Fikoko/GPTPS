@@ -8,8 +8,8 @@
  * The handle table holds one small entry per item that is queued or in flight and is
  * bounded by the engine's own queue, so it costs what the engine already costs.
  *
- * Accounting, per handle, driven by the core's event contract (every submitted
- * handle reaches exactly one terminal event; FAILED is per attempt):
+ * Accounting, per handle, driven by the core's event contract (a ONE-SHOT handle
+ * reaches exactly one terminal event; FAILED is per attempt):
  *
  *   QUEUED         -> PENDING            pending++
  *   STARTED        -> RUNNING            pending--  in_flight++   wait sample
@@ -23,6 +23,17 @@
  *
  * An event for a handle this observer never saw QUEUED (work submitted before install)
  * bumps the totals only: with no state to move, adjusting a gauge would be a guess.
+ *
+ * The two handle shapes outside the one-terminal rule are safe here, but they make the
+ * TOTALS mean something different from the gauges, which is worth knowing before you
+ * graph them. A GPTPS_TASK_SERVICE handle emits a terminal event per RUN, so `finished`
+ * counts service runs rather than service instances, and one long-lived instance can
+ * dominate a totals column while `in_flight` correctly shows one. A
+ * GPTPS_ON_FAILURE_REQUEUE item emits a per-attempt FAILED each time round and no
+ * terminal event until shutdown dead-letters it, so it sits in LIMBO between attempts
+ * and its `failed` count grows without a matching terminal. Neither corrupts a gauge -
+ * every transition above is still driven by the state the handle is actually in - but
+ * `queued == terminal` is an identity for one-shot work only.
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
