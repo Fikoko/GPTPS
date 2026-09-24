@@ -517,7 +517,19 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
             const char *pc = "";
             if (k->hotkey) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
             if (terminal) {
-                unsigned okp = k->finished * 100u / terminal;
+                /* 64-bit intermediate, then clamp. k->finished is a plain unsigned counter that
+                 * only ever climbs, so a long-lived engine crosses 42,949,673 finished items on
+                 * one task - twelve hours at a thousand a second - and `finished * 100u` wraps
+                 * past 2^32: the ok% column flips from 100 to 0 with nothing else in the row
+                 * changing, and stays wrong for the life of the process. The clamp is not
+                 * decoration either. `terminal` is itself a 32-bit sum, so once finished + dead
+                 * passes UINT_MAX it wraps to a tiny divisor and the quotient reaches ten
+                 * digits - more than pct holds, which is what GCC 16's -Wformat-truncation
+                 * objects to. Clamped, the invariant both the %3u here and the %5s column
+                 * below already assume - okp is 0..100, three digits - is true rather than
+                 * merely hoped for, so the table cannot shear either. */
+                unsigned okp = (unsigned)((unsigned long long)k->finished * 100u / terminal);
+                if (okp > 100u) okp = 100u;
                 snprintf(pct, sizeof pct, "%3u%%", okp);
                 if (color) pc = (okp >= 90) ? G : (okp >= 50) ? "\x1b[33m" : R;   /* green/yellow/red */
             } else strcpy(pct, "  --");
