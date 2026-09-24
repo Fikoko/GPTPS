@@ -5,14 +5,36 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.2.1] - 2026-09-24
+
+A release-metadata correction. No API, ABI or behaviour change to the core; ABI stays 2.1.
 
 ### Fixed — release metadata
 
 - **Release versions could drift between build metadata and the public API.** CMake,
   numeric/string macros, release tags and changelog sections are now checked together.
+  v1.2.0 shipped a tree whose numeric macros still read 1.0.0 while `project(VERSION)` and
+  `GPTPS_VERSION_STRING` read 1.1.0, because the configure guard compared only the string -
+  so anything reading `GPTPS_VERSION_MAJOR/MINOR/PATCH` got a two-release-old answer from a
+  current library. Configure now compares all three; `tests/test_version.c` compares them
+  again from the compiled side, including `gptps_version()`, which CMake cannot see; the
+  amalgamation job runs that same test against the GENERATED header, since the drop-in is
+  the form most people consume and CMake never runs for it; and the release workflow refuses
+  a tag that disagrees with CMake, either macro set, or this file. Found and fixed by
+  @kuntakinte7270 in #3.
 
-## [1.2.0] - 2026-09-16
+### Fixed — add-ons
+
+- **`gptps_tui` showed 0% for a task whose every item had succeeded.** The TASKS table
+  computed `ok%` as `finished * 100u / terminal` in 32-bit arithmetic, so a task crossing
+  42,949,673 finished items - about twelve hours at a thousand a second - wrapped past 2^32
+  and flipped the column from 100 to 0, then stayed wrong for the life of the process. The
+  multiply is now 64-bit and the quotient clamped to 0..100, which also makes the width
+  invariant the `%3u` and the `%5s` column both assume true by construction instead of by
+  hope: GCC 16's `-Wformat-truncation` was right to refuse it, and refusing it broke
+  `-Werror` builds on that compiler. `addons/gptps_tui.c`.
+
+## [1.2.0] - 2026-09-15
 
 ### Added — scaling by composition, made real
 

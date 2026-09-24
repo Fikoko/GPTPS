@@ -757,7 +757,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
 design, the last breaking change) · **11** add-on modules + 1 example binary plug-in ·
-**59** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
+**60** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
 required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
