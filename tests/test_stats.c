@@ -72,9 +72,13 @@ static void test_totals_and_latency(void)
     CHECK(c.terminal == 5);
     CHECK(c.pending == 0 && c.in_flight == 0);
     CHECK(c.run_samples == 6);
-    /* QUEUED is emitted on the submitting thread, so the FIRST submit's STARTED can
-     * outrun it (queue time unknown -> no sample); the rest queue behind a 20ms task. */
-    CHECK(c.wait_samples >= 5 && c.wait_samples <= 6);
+    /* Every started attempt now yields a wait sample. QUEUED is emitted on the
+     * submitting thread, so the FIRST submit's STARTED can outrun it - this used to
+     * mean "queue time unknown, no sample", and the range this CHECK allowed was the
+     * loss. The QUEUED arm recovers it as a lower bound instead, because the items
+     * that win that race are the ones that waited least and dropping them pulled the
+     * reported mean up. Exact, not a range: a range cannot fail when the fix regresses. */
+    CHECK(c.wait_samples == 6);
     CHECK(c.run_ms_sum >= 3 * 20);    /* three 20ms tasks */
     CHECK(c.run_ms_max >= 20 && c.run_ms_max <= c.run_ms_sum);
     /* everything queued behind the first 20ms task waited for it */

@@ -193,6 +193,18 @@ static void stats_observe(const gptps_event *ev, void *ud)
         BUMP(queued);
         if (slot) {
             slot->seen_queued = 1;
+            /* A STARTED that outran this QUEUED carried off the wait sample: the STARTED
+             * arm below samples only when the queue time is already known, and out of
+             * order it is not. Recover it here rather than drop it. This event's ts was
+             * stamped when the submitting thread finally reached the emit, at or after
+             * the real enqueue, so started - this is a LOWER bound on the true wait; when
+             * even that inverts, the item started before its own notification left the
+             * submitter and 0 is the only honest answer. Dropping the sample instead
+             * biases the reported mean UP, because the items that lose this race are
+             * exactly the ones that waited least. Placement is load-bearing: tab_del()
+             * backward-shifts and invalidates `slot`, so the sample must be taken first. */
+            if (!slot->have_queued_ms && slot->have_started_ms)
+                sample_wait(s, t, (slot->started_ms > ev->ts_ms) ? slot->started_ms - ev->ts_ms : 0);
             if (slot->state == ST_DONE) { tab_del(s, slot); break; }   /* already over */
             if (slot->state == ST_NONE) { slot->state = ST_PENDING; GAUGE(pending, 1); }
             if (!slot->have_queued_ms) { slot->queued_ms = ev->ts_ms; slot->have_queued_ms = 1; }

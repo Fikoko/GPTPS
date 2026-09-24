@@ -61,8 +61,13 @@ typedef struct {
     uint64_t in_flight;            /* started and not yet finished/failed */
 
     /* latency, in ms, over events whose QUEUED/STARTED this observer saw */
-    uint64_t wait_samples;         /* STARTED events with a known queue time */
-    uint64_t wait_ms_sum;          /* QUEUED (or RETRIED) -> STARTED */
+    uint64_t wait_samples;         /* attempts with a known queue time (see wait_ms_sum) */
+    uint64_t wait_ms_sum;          /* QUEUED (or RETRIED) -> STARTED. When the STARTED callback
+                                    * outran the QUEUED one - event order is not guaranteed across
+                                    * threads - the queue time is only BOUNDED, and the sample is
+                                    * that lower bound (0 if even the bound inverts). Recovering it
+                                    * beats dropping it: the items that lose that race are the ones
+                                    * that waited least, so dropping them skews the mean up. */
     uint64_t wait_ms_max;
     uint64_t run_samples;          /* FINISHED/FAILED events with a known start time */
     uint64_t run_ms_sum;           /* STARTED -> FINISHED/FAILED */
