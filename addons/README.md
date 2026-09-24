@@ -125,10 +125,14 @@ gptps_balance_submit_ex(b, "resize", buf, len, /*priority*/ 5, &h);
   merely inherited: the router drops its shard-handle mapping on the first terminal
   event, so a later one for the same shard handle finds nothing and is not forwarded.
   That makes the guarantee hold even for a `GPTPS_TASK_SERVICE`, whose handle emits
-  one terminal event per run — but it also means the router stops counting that
-  instance against its shard's load while the service is still up, so do not route
-  services through a balancer. Work submitted straight to a shard is neither seen nor
-  counted.
+  one terminal event per run. **A service is refused** (`GPTPS_E_INVAL` at submit):
+  taking its first run-end for the item finishing would leave the router counting a
+  free slot that does not exist — and, worse, would drop the item from the list
+  `gptps_balance_close` cancels, so close would free the balancer with the instance
+  still running and its observer still registered. That is a use-after-free, not a
+  skew, which is why it is refused at the boundary rather than accounted for. Start
+  services on the pool's shards directly (`gptps_pool_shard`); a balancer is for work
+  items. Work submitted straight to a shard is neither seen nor counted.
 - **`shard_depth`:** how many items a shard may hold at once (running + waiting in
   *its* queue). Deep enough that the engine's skip-to-fit and starvation guard still
   have something to order; shallow enough that a late-arriving long item cannot bury a

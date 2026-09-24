@@ -7,6 +7,33 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — routing a service through a balancer was a use-after-free
+
+- **`gptps_balance` now refuses a `GPTPS_TASK_SERVICE` at submit (`GPTPS_E_INVAL`).**
+  A service handle emits one terminal event per run, and the router took the first of
+  them for the item finishing: it dropped the shard mapping, decremented that shard's
+  load and freed the item while the instance was still on the shard and about to
+  restart. The visible half was a permanent phantom free slot — measured, shard loads
+  `[0,0]` with the instance still running. The dangerous half is that losing the item
+  also loses the only handle `gptps_balance_close` had on it, so close freed the
+  balancer while the instance was still running with the module's observer registered:
+  ASan reports a heap-use-after-free in `observe()`, read on a worker thread. There is
+  no bookkeeping fix for a lifetime the module was never told about, so it is refused
+  at the boundary. `tests/test_balance.c` pins it — without the refusal that test does
+  not merely fail, it crashes. Start services on the shards directly; a balancer is
+  for work items.
+
+- **ABI 2.2: `gptps_task_info` gained `flags`.** Nothing could introspect whether a
+  registered type was a `GPTPS_TASK_SERVICE` — a caller could see its executor, policy
+  and counters but not the one property that decides whether its handle ends once or
+  once per run, which is exactly what `gptps_balance` needed. Additive, and the loader
+  compares ABI MAJOR only, so no add-on is refused. `gptps_task_get_info` now validates
+  against a frozen 1.0.0 floor instead of `sizeof`, and writes the new field only when
+  the caller's `struct_size` covers it — without that, appending would have started
+  returning `GPTPS_E_INVAL` to every already-compiled caller, which is the trap
+  `src/gptps_internal.h` exists to prevent. Verified: a caller passing the pre-2.2
+  `struct_size` still gets `GPTPS_OK`.
+
 ### Fixed — a handle that closed in silence, and the guarantee that oversold itself
 
 - **A `GPTPS_ON_FAILURE_REQUEUE` item reached shutdown without a terminal event.** The

@@ -59,6 +59,20 @@ static void reg(gptps_pool *p, const char *n, gptps_run_fn f, void *ud)
     d.default_policy.struct_size = sizeof d.default_policy;
     CHECK(gptps_pool_register_task(p, &d) == GPTPS_OK);
 }
+/* a service body: loops until stopped, like every supervised instance must */
+static gptps_status t_svc(gptps_ctx *c, void *u)
+{ (void)u; while (!gptps_is_cancelled(c)) { } return GPTPS_E_CANCELLED; }
+
+static void reg_service(gptps_pool *p, const char *n, gptps_run_fn f)
+{
+    gptps_task_def d; memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = n; d.run = f; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.flags = GPTPS_TASK_SERVICE;           /* legal on a pool; NOT through a balancer */
+    CHECK(gptps_pool_register_task(p, &d) == GPTPS_OK);
+}
+
 static gptps_pool *open_pool(size_t nshards)
 {
     gptps_config cfg; gptps_pool *p; size_t i;
@@ -179,11 +193,54 @@ static void test_dispatched_cancel_and_close(void)
     for (i = 0; i < 4; ++i) CHECK(get(&terminals[hs[i]]) == 1);
 }
 
+/* 4) a service is refused at the boundary. Routed through here it would corrupt the
+ *    router's own load accounting, and nothing in the event stream would show it: a
+ *    service's FIRST run ends with its own terminal event, which this module takes
+ *    for the item finishing - it drops the shard mapping, decrements that shard's
+ *    load and frees the item, while the instance is still on the shard and about to
+ *    restart. The router then believes in a free slot that does not exist, for good.
+ *    Measured before the check: shard loads [0,0] with the instance still running.
+ *
+ *    Worse, losing the item loses the only handle close() had on it. Without the
+ *    refusal this very test does not merely fail, it CRASHES: gptps_balance_close
+ *    frees the balancer while the instance is still running with this module's
+ *    observer registered, and ASan reports a heap-use-after-free in observe() on a
+ *    worker thread. Forwarding was never the problem (a later terminal event for the
+ *    same shard handle finds no mapping, so a balance handle still reaches exactly
+ *    one) - which is why this had to be refused at the boundary, not detected. */
+static void test_service_is_refused(void)
+{
+    gptps_pool *p = open_pool(2); gptps_balance *b; gptps_balance_handle h = 12345;
+    gptps_balance_config bc; memset(&bc, 0, sizeof bc);
+    bc.struct_size = sizeof bc; bc.shard_depth = 2;
+    reset_log();
+    reg(p, "plain", t_short, NULL);
+    reg_service(p, "svc", t_svc);
+    b = gptps_balance_open(p, &bc);
+    CHECK(b != NULL);
+    if (!b) { gptps_pool_close(p); return; }
+    gptps_balance_set_event_cb(b, on_ev, NULL);
+
+    CHECK(gptps_balance_submit(b, "svc", NULL, 0, &h) == GPTPS_E_INVAL);
+    CHECK(h == 0);                                   /* refused: no handle issued */
+    CHECK(gptps_balance_queued(b) == 0);
+    CHECK(gptps_balance_shard_load(b, 0) == 0 && gptps_balance_shard_load(b, 1) == 0);
+    CHECK(terminal_total() == 0);                    /* and no phantom terminal event */
+
+    /* an ordinary type on the same pool is untouched by the check */
+    CHECK(gptps_balance_submit(b, "plain", NULL, 0, &h) == GPTPS_OK);
+    wait_terminals(1);
+    CHECK(terminal_total() == 1);
+
+    gptps_balance_close(b); gptps_pool_close(p);
+}
+
 int main(void)
 {
     test_distribution();
     test_order_and_cancel();
     test_dispatched_cancel_and_close();
+    test_service_is_refused();
     if (fails) { printf("%d balance check(s) FAILED\n", fails); return 1; }
     printf("all balance checks passed\n");
     return 0;

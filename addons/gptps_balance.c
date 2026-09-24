@@ -303,6 +303,46 @@ gptps_status gptps_balance_set_event_cb(gptps_balance *b, gptps_event_cb cb, voi
     return GPTPS_OK;
 }
 
+/* A balancer hands out WORK ITEMS. A GPTPS_TASK_SERVICE handle is a supervised
+ * lifetime instead, and routing one through here corrupts the router's own
+ * accounting in a way it cannot detect from the event stream: under the default
+ * always-up policy each run of a service ends with its own terminal event, and this
+ * module treats the FIRST one as the item finishing - it drops the shard mapping,
+ * decrements that shard's load and frees the item, while the instance is still
+ * occupying the shard and about to restart. From then on the router believes that
+ * shard has a free slot it does not have, permanently, and over-sends to it.
+ *
+ * The skewed load is the visible half. The dangerous half is that losing track of the
+ * item also loses the only handle close() had on it: gptps_balance_close cancels the
+ * work it still knows about, and a service dropped at its first run-end is no longer
+ * on that list - so close frees the balancer while the instance is still running on
+ * the shard with this module's observer still registered, and the next event it emits
+ * reads freed memory. Reproduced under ASan: heap-use-after-free in observe(), read
+ * on a worker thread, freed by gptps_balance_close. So this is refused rather than
+ * merely accounted for - there is no bookkeeping fix for a lifetime this module was
+ * never told about.
+ *
+ * Forwarding was never the problem: a later terminal event for the same shard handle
+ * finds no mapping and is not forwarded, so a balance handle still reaches exactly one
+ * terminal event. That is precisely why the defect had to be refused at the boundary
+ * instead of detected downstream - by the time it shows, the evidence is gone.
+ *
+ * O(task types) per submit, with the same shape as the gptps_task_exists check
+ * above; types are registered at setup and are few. `flags` needs ABI 2.2. */
+static int task_is_service(gptps *e, const char *name)
+{
+    gptps_task_info ti;
+    size_t n = gptps_task_count(e), i;
+    for (i = 0; i < n; ++i) {
+        memset(&ti, 0, sizeof ti);
+        ti.struct_size = sizeof ti;
+        if (gptps_task_get_info(e, i, &ti) != GPTPS_OK) continue;
+        if (ti.name && strcmp(ti.name, name) == 0)
+            return (ti.flags & GPTPS_TASK_SERVICE) != 0;
+    }
+    return 0;
+}
+
 gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
                                      const void *payload, size_t len, int32_t priority,
                                      gptps_balance_handle *out)
@@ -312,6 +352,7 @@ gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
     if (!b || !task || !*task) return GPTPS_E_INVAL;
     if (len && !payload) return GPTPS_E_INVAL;
     if (!gptps_task_exists(b->sh[0].e, task)) return GPTPS_E_NOTFOUND;
+    if (task_is_service(b->sh[0].e, task)) return GPTPS_E_INVAL;
 
     it = (bitem *)calloc(1, sizeof *it);
     if (!it) return GPTPS_E_NOMEM;
