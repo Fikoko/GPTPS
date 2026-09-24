@@ -12,8 +12,11 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-54 tests, no external dependencies beyond pthreads and `dlopen` on POSIX. A change is
-not done until they all pass.
+No external dependencies beyond pthreads and `dlopen` on POSIX. A change is not done
+until every test passes. The suite's size is deliberately not quoted here: `ctest`
+runs a different number on each platform and add-on selection (60 on Linux with
+everything built, 48 on Windows, fewer with `GPTPS_ADDONS` narrowed), so a figure in
+prose only ever drifts. `ctest --test-dir build -N` prints the real one.
 
 Before opening a pull request, run what CI runs — these catch most of what review
 would otherwise have to:
