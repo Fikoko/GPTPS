@@ -1,7 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
- * test_reconcile.c - every submitted handle reaches EXACTLY ONE terminal event.
+ * test_reconcile.c - every submitted ONE-SHOT handle reaches EXACTLY ONE terminal
+ * event. The two opt-in shapes outside that rule - GPTPS_ON_FAILURE_REQUEUE, which
+ * stays open while it requeues, and GPTPS_TASK_SERVICE, which emits one per run -
+ * are documented in Readme.md and gptps.h. Both still have to CLOSE when the engine
+ * does, and the last two cases here pin exactly that: whatever a policy does while
+ * the engine runs, teardown owes every live handle a terminal event.
  *
  * The core deliberately never aggregates: observers are the only completion
  * channel, so an item that vanishes without a terminal event makes every add-on
@@ -270,6 +275,35 @@ static void test_queued_service_reports_a_terminal_event(void)
     CHECK(get(&n_timeout) == 0);
 }
 
+/* A REQUEUE item is re-admitted instead of ending, so while the engine runs it owes
+ * no terminal event - that is the policy working, not a gap. Shutdown is different:
+ * the drain refuses to re-admit it (an always-failing requeue would hang teardown
+ * forever) and dead-letters it instead, and that disposition used to be SILENT.
+ * Measured before the fix: 8 of 8 handles ended with zero terminal events after
+ * gptps_shutdown had returned. It was the one shape that could reach teardown and
+ * close without saying so - a gptps_await on such a handle never returned, and every
+ * add-on that reconciles terminal events leaked a slot per item. */
+static void test_requeue_is_closed_by_the_drain(void)
+{
+    gptps *e = open1();
+    uint64_t t0;
+    if (!e) return;
+    reset();
+    reg(e, "rq", task_fail, GPTPS_ON_FAILURE_REQUEUE);
+
+    CHECK(gptps_submit(e, "rq", NULL, 0, NULL) == GPTPS_OK);
+    /* wait for a second attempt: proof it is really looping, not merely failing once */
+    t0 = gptps_now_ms(NULL);
+    while (get(&n_started) < 2 && gptps_now_ms(NULL) - t0 < 3000) { }
+    CHECK(get(&n_started) >= 2);
+    CHECK(get(&n_terminal) == 0);       /* and owes nothing at all while it loops */
+
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+
+    CHECK(get(&n_terminal) == 1);       /* was 0: the drain dead-lettered it in silence */
+    CHECK(get(&n_timeout) == 0);        /* a drain is not a deadline breach */
+}
+
 int main(void)
 {
     test_unregister_cancel_reports_every_item();
@@ -278,6 +312,7 @@ int main(void)
     test_timeout_still_reports_timeout();
     test_deny_over_event_buffer_reports_every_item();
     test_queued_service_reports_a_terminal_event();
+    test_requeue_is_closed_by_the_drain();
 
     if (fails) { printf("%d reconcile check(s) FAILED\n", fails); return 1; }
     printf("all reconcile checks passed\n");

@@ -789,7 +789,8 @@ static void *worker_main(void *arg)
 
 /* Retry/dead-letter events buffered per dispatch pass for lock-free emit.
  * These are TERMINAL events - the observer seam's whole reconciliation contract
- * ("every submitted handle reaches exactly one terminal event") rests on them - so
+ * ("every submitted one-shot handle reaches exactly one terminal event") rests on
+ * them, and so does the REQUEUE drain's own dead-letter emit below - so
  * a full buffer must never silently drop one. Both producers instead stop early and
  * report saturation through engine_pass's `out_more`, leaving the remaining work
  * queued for the next pass; both pumps re-run immediately while more is due. The
@@ -1029,7 +1030,22 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     case GPTPS_ON_FAILURE_REQUEUE:
                         if (e->stopping) {
                             /* never re-admit during drain: an always-failing
-                             * REQUEUE task would otherwise hang shutdown forever */
+                             * REQUEUE task would otherwise hang shutdown forever.
+                             *
+                             * The handle is still owed its terminal event. What
+                             * happens here IS the dead-letter disposition, reached by
+                             * a different road, and an observer reconciling handles
+                             * cannot tell the two apart and should not have to. Until
+                             * this emit existed a REQUEUE item was the one shape that
+                             * could reach shutdown and close in silence: gptps_await
+                             * on it never returned, and every add-on that counts
+                             * terminal events leaked a slot per item. */
+                            if (npend < GPTPS_PENDING_CAP) {
+                                pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
+                                ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
+                                pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
+                                pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                            }
                             dead_letter_push(e, it);
                         } else {
                             /* re-enqueue via delayed so retry_backoff is honored,
