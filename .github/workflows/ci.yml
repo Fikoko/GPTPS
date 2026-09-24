@@ -271,6 +271,15 @@ jobs:
         run: cmake --build build-werror
       - name: Test (-Werror)
         run: ctest --test-dir build-werror --output-on-failure --no-tests=error
+      # Exercise the installed CMake exports on Windows, not just in-tree targets.
+      - name: Install and run an out-of-tree consumer
+        run: |
+          set -eu
+          cmake --install build --prefix "$PWD/stage-windows"
+          cmake -S tests/consumer -B build-consumer -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_PREFIX_PATH="$PWD/stage-windows"
+          cmake --build build-consumer
+          ./build-consumer/consumer.exe
       - name: Single-file amalgamation build
         run: |
           sh tools/amalgamate.sh
