@@ -385,9 +385,21 @@ enabled automatically). Panes/metrics:
 
 - **Cost is a budgeted knob** — the dashboard runs on the engine's worker threads, so
   its own CPU/RAM is tunable **at runtime**:
-  - **KPI level** (`gptps_tui_set_kpi`, or `m` live): `MINIMAL` = counts only;
+  - **KPI level** (`gptps_tui_set_kpi`, or `m` live): `OFF` = installed but off the
+    event path — the observer returns *before* it takes the dashboard lock and both
+    rings are freed, which is the tier for leaving the dashboard in place after you
+    have stopped looking at it (counters do not advance while off);
+    `MINIMAL` = counts only — cheap in work, but still one mutex per event;
     `NORMAL` = + per-task table + recent log; `FULL` = + per-handle latency (allocates
-    a ring; **freed when you drop below FULL**).
+    a ring; **freed when you drop below FULL**). `m` cycles `MINIMAL`→`NORMAL`→`FULL`
+    and never *into* `OFF`, so a stray keypress cannot blind the dashboard.
+  - **Latency window** (`gptps_tui_set_latency_window`, or `tui.latency_window`): size
+    it to your in-flight **depth**, not your throughput. An entry lives from `QUEUED`
+    to `FINISHED`, so a burst deeper than the window overwrites live entries before
+    they resolve — and because the entries lost that way are the ones that waited
+    least, `avg ms` reads **high**. This is the one distortion the add-on cannot fix
+    for you; the ordering inversion (a `FINISHED` that outruns its own `QUEUED`) is
+    handled internally with a tombstone, the same way `gptps_stats` handles it.
   - **Cadence** (`gptps_tui_set_mode`, or `p` live): `CONTINUOUS`, `ON_DEMAND`,
     `PAUSED`. `gptps_tui_snapshot()` renders one frame on demand.
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and

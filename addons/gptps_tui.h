@@ -44,7 +44,18 @@ typedef struct gptps_tui gptps_tui;
  * so dial it to what you can spare. Tunable at runtime (gptps_tui_set_kpi). */
 typedef enum {
     GPTPS_TUI_KPI_DEFAULT = 0, /* = FULL (sensible zero-init default) */
-    GPTPS_TUI_KPI_MINIMAL,     /* cumulative counts only - cheapest, ~no per-event work */
+    /* Installed but OFF the event path: the observer returns before it takes the
+     * dashboard lock, so an event costs one predictable-branch read of a flag and
+     * nothing else, and the recent-event and latency rings are freed. MINIMAL is
+     * cheap in work but NOT free in contention - it still acquires one global
+     * mutex per event, on every worker, the dispatcher and every submitting
+     * thread. This tier is for leaving the dashboard installed after you are done
+     * looking at it: the handle, the settings and the per-task labels all stay
+     * valid, so raising the tier again costs nothing but the re-allocation.
+     * Counters do not advance while OFF, so totals resume from where they stopped
+     * rather than from where the engine actually is - the price of paying nothing. */
+    GPTPS_TUI_KPI_OFF,
+    GPTPS_TUI_KPI_MINIMAL,     /* cumulative counts only - one lock per event, no allocation */
     GPTPS_TUI_KPI_NORMAL,      /* + per-task table + recent-events log */
     GPTPS_TUI_KPI_FULL         /* + per-handle latency tracking (allocates a ring) */
 } gptps_tui_kpi;
@@ -66,7 +77,13 @@ typedef struct {
     int         show_recent;   /* recent-events log: >=0 show (default), <0 hide */
     int         kpi;           /* gptps_tui_kpi: how much to compute (0 => FULL) */
     int         mode;          /* gptps_tui_mode: live-loop cadence (0 => CONTINUOUS) */
-    int         latency_window;/* handles tracked for latency at FULL (0 => 1024) */
+    int         latency_window;/* handles tracked for latency at FULL (0 => 1024). Size it to your
+                                * in-flight DEPTH, not your throughput: an entry is written at
+                                * QUEUED and consumed at FINISHED, so a burst that backs up past
+                                * this many items overwrites live entries before their latency is
+                                * resolved and those samples are lost. The loss is not neutral -
+                                * it drops the shortest waits first, so avg ms reads HIGH. Also
+                                * settable at runtime as `tui.latency_window`. */
     const char *title;         /* dashboard title (default "tasks") */
     FILE       *out;           /* output stream (NULL => stdout) */
     const char *settings_path; /* where the Settings pane's 'w' (save) writes (NULL => engine's open path) */
@@ -98,6 +115,9 @@ int gptps_tui_press(gptps_tui *t, int key);
  * Lowering the KPI level frees the latency ring and stops the per-event work;
  * raising it to FULL re-allocates it. */
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level);
+/* Resize the FULL-tier latency ring (0 => 1024, capped at 1<<20). Size it to the
+ * in-flight DEPTH you expect; see cfg.latency_window. Drops the entries in flight. */
+gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles);
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode);
 gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms);
 

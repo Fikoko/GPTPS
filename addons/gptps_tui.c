@@ -80,12 +80,25 @@ struct gptps_tui {
     int              ntasks;
     tui_event       *recent;
     int              rcap, rn, rhead;
-    struct { gptps_handle h; uint64_t ts; } *lat;  /* handle->queued-ts ring for latency */
+    /* handle -> queued-ts ring for latency. `done` marks a TOMBSTONE: a FINISHED that
+     * arrived before its own QUEUED, holding the finish time until the late QUEUED
+     * turns the pair into a sample. See tui_on_event. */
+    struct { gptps_handle h; uint64_t ts; int done; } *lat;
     int              lat_cap, lat_head;
+    int              lat_tomb;      /* tombstones live in the ring (see tui_on_event) */
     int              scroll;        /* recent-log scroll offset (lines back) */
     int              kpi;           /* effective gptps_tui_kpi (never DEFAULT) */
     int              mode;          /* effective gptps_tui_mode */
     int              dirty;         /* state changed since last paint (for ON_DEMAND) */
+    /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
+     * all - taking a mutex to discover you have nothing to do is the entire cost this
+     * tier exists to remove. `volatile` rather than an atomic because an add-on has no
+     * atomic to reach for in the drop-in build: the amalgamation ships gptps.c and
+     * gptps.h only, so the HAL's gptps_flag is not declared there. The race is benign
+     * by construction - one writer (gptps_tui_set_kpi, under the lock), a single word,
+     * and a stale read costs one extra event processed or skipped at the instant the
+     * tier changes, which breaks no invariant the dashboard keeps. */
+    volatile int     off;           /* KPI OFF: leave the event path entirely */
     /* Settings pane state - touched only by the run/press/render thread (not the
      * observer), so it needs no lock. */
     int              pane;          /* TUI_PANE_* */
@@ -131,6 +144,7 @@ static void tui_on_event(const gptps_event *ev, void *ud)
 {
     gptps_tui *t = (gptps_tui *)ud;
     tui_task *tk;
+    if (t->off) return;              /* KPI OFF: before the lock, deliberately - see the field */
     mu_lock(&t->mu);
     switch (ev->kind) {
         case GPTPS_EV_QUEUED:        t->q++;    break;
@@ -151,9 +165,47 @@ static void tui_on_event(const gptps_event *ev, void *ud)
      * (FULL), and that ring is freed when the KPI level is lowered. */
     if (t->kpi < GPTPS_TUI_KPI_NORMAL) { mu_unlock(&t->mu); return; }
 
-    if (t->lat && ev->kind == GPTPS_EV_QUEUED) {          /* remember queued time per handle */
-        t->lat[t->lat_head].h = ev->handle; t->lat[t->lat_head].ts = ev->ts_ms;
-        t->lat_head = (t->lat_head + 1) % t->lat_cap;
+    /* Latency, and why this is not simply "record at QUEUED, resolve at FINISHED".
+     *
+     * Event order is NOT guaranteed across threads (see the EVENTS block in gptps.h):
+     * QUEUED is emitted by the submitting thread after the engine lock is dropped, and
+     * the dispatcher was signalled while it was still held, so a task that runs in under
+     * a microsecond reports FINISHED before its own QUEUED callback has run. Resolving
+     * only at FINISHED silently loses every one of those, and the loss is not neutral -
+     * the items that win that race are by construction the ones that waited least, so
+     * dropping them drags the reported average UP. gptps_stats meets the same inversion
+     * and answers it the same way, with a tombstone the late event clears.
+     *
+     * So: a FINISHED with no entry leaves one (done=1, holding the finish time), and the
+     * QUEUED that arrives afterwards completes the sample instead of starting a new one.
+     *
+     * This buys back the sub-millisecond tail; it does NOT make avg ms exact. The larger
+     * distortion in the same column is the ring being too small for the in-flight depth:
+     * an entry lives from QUEUED to FINISHED, so a burst that backs up past lat_cap items
+     * overwrites live entries before they resolve, and those samples are lost too - with
+     * the same upward skew and no late QUEUED involved. That one is the caller's to size
+     * (cfg.latency_window, or tui.latency_window at runtime), which is why it is a knob
+     * and not a guess. */
+    if (t->lat && ev->kind == GPTPS_EV_QUEUED) {
+        int j, slot = -1;
+        if (t->lat_tomb) {
+            for (j = 0; j < t->lat_cap; ++j)           /* a terminal event beat us here */
+                if (t->lat[j].h == ev->handle && t->lat[j].done) { slot = j; break; }
+        }
+        if (slot >= 0) {
+            tui_task *lk = task_for(t, ev->task_name);
+            if (lk) {
+                uint64_t l = (t->lat[slot].ts >= ev->ts_ms) ? t->lat[slot].ts - ev->ts_ms : 0;
+                lk->lat_sum_ms += l; lk->lat_n++;
+                if (l > lk->lat_max_ms) lk->lat_max_ms = l;
+            }
+            t->lat[slot].h = 0; t->lat[slot].done = 0; --t->lat_tomb;
+        } else {                                      /* the ordinary path: start the clock */
+            if (t->lat[t->lat_head].done && t->lat[t->lat_head].h) --t->lat_tomb;  /* evicting one */
+            t->lat[t->lat_head].h = ev->handle; t->lat[t->lat_head].ts = ev->ts_ms;
+            t->lat[t->lat_head].done = 0;
+            t->lat_head = (t->lat_head + 1) % t->lat_cap;
+        }
     }
 
     if ((tk = task_for(t, ev->task_name)) != NULL) {
@@ -162,15 +214,27 @@ static void tui_on_event(const gptps_event *ev, void *ud)
             case GPTPS_EV_FINISHED:
                 tk->finished++;
                 if (t->lat) {                             /* FULL: resolve this handle's latency */
-                    int j;
+                    int j, found = 0;
                     for (j = 0; j < t->lat_cap; ++j)
-                        if (t->lat[j].h == ev->handle) {
+                        if (t->lat[j].h == ev->handle && !t->lat[j].done) {
                             uint64_t l = (ev->ts_ms >= t->lat[j].ts) ? ev->ts_ms - t->lat[j].ts : 0;
                             tk->lat_sum_ms += l; tk->lat_n++;
                             if (l > tk->lat_max_ms) tk->lat_max_ms = l;
                             t->lat[j].h = 0;              /* consume */
+                            found = 1;
                             break;
                         }
+                    /* No entry: this FINISHED outran its own QUEUED. Leave the finish time
+                     * behind so the late QUEUED can complete the sample, instead of losing
+                     * it - these are the FASTEST items, so dropping them skews avg ms up. */
+                    if (!found) {
+                        if (t->lat[t->lat_head].done && t->lat[t->lat_head].h) --t->lat_tomb;
+                        t->lat[t->lat_head].h = ev->handle;
+                        t->lat[t->lat_head].ts = ev->ts_ms;
+                        t->lat[t->lat_head].done = 1;
+                        t->lat_head = (t->lat_head + 1) % t->lat_cap;
+                        ++t->lat_tomb;
+                    }
                 }
                 break;
             case GPTPS_EV_FAILED:        tk->failed++;   break;
@@ -190,7 +254,7 @@ static void tui_on_event(const gptps_event *ev, void *ud)
 }
 
 static const char *kpi_str(int k)
-{ return k == GPTPS_TUI_KPI_MINIMAL ? "minimal" : k == GPTPS_TUI_KPI_NORMAL ? "normal" : "full"; }
+{ return k == GPTPS_TUI_KPI_OFF ? "off" : k == GPTPS_TUI_KPI_MINIMAL ? "minimal" : k == GPTPS_TUI_KPI_NORMAL ? "normal" : "full"; }
 static const char *mode_str(int m)
 { return m == GPTPS_TUI_CONTINUOUS ? "realtime" : m == GPTPS_TUI_ON_DEMAND ? "on-demand" : "paused"; }
 
@@ -1022,13 +1086,15 @@ void gptps_tui_run(gptps_tui *t)
 }
 
 /* ---- settings registry bindings (target = the gptps_tui) ---- */
-static const char *const TUI_KPI_CHOICES[]  = { "minimal", "normal", "full", 0 };
+static const char *const TUI_KPI_CHOICES[]  = { "off", "minimal", "normal", "full", 0 };
 static const char *const TUI_MODE_CHOICES[] = { "realtime", "on-demand", "paused", 0 };
 
 static size_t ts_rd_refresh(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; unsigned ms; mu_lock(&t->mu); ms = t->cfg.refresh_ms; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%u", ms); }
 static gptps_status ts_wr_refresh(void *p, const char *v) { return gptps_tui_set_refresh((gptps_tui *)p, (uint32_t)strtoul(v, NULL, 10)); }
 static size_t ts_rd_kpi(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int k; mu_lock(&t->mu); k = t->kpi; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", kpi_str(k)); }
-static gptps_status ts_wr_kpi(void *p, const char *v) { int k = (strcmp(v, "minimal") == 0) ? GPTPS_TUI_KPI_MINIMAL : (strcmp(v, "normal") == 0) ? GPTPS_TUI_KPI_NORMAL : GPTPS_TUI_KPI_FULL; return gptps_tui_set_kpi((gptps_tui *)p, (gptps_tui_kpi)k); }
+static gptps_status ts_wr_kpi(void *p, const char *v) { int k = (strcmp(v, "off") == 0) ? GPTPS_TUI_KPI_OFF : (strcmp(v, "minimal") == 0) ? GPTPS_TUI_KPI_MINIMAL : (strcmp(v, "normal") == 0) ? GPTPS_TUI_KPI_NORMAL : GPTPS_TUI_KPI_FULL; return gptps_tui_set_kpi((gptps_tui *)p, (gptps_tui_kpi)k); }
+static size_t ts_rd_latwin(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->lat_cap; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
+static gptps_status ts_wr_latwin(void *p, const char *v) { return gptps_tui_set_latency_window((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
 static size_t ts_rd_mode(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int m; mu_lock(&t->mu); m = t->mode; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", mode_str(m)); }
 static gptps_status ts_wr_mode(void *p, const char *v) { int m = (strcmp(v, "realtime") == 0) ? GPTPS_TUI_CONTINUOUS : (strcmp(v, "on-demand") == 0) ? GPTPS_TUI_ON_DEMAND : GPTPS_TUI_PAUSED; return gptps_tui_set_mode((gptps_tui *)p, (gptps_tui_mode)m); }
 
@@ -1041,6 +1107,8 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
     d.key = "tui.kpi"; d.type = GPTPS_SETTING_ENUM; d.desc = "KPI detail level"; d.choices = TUI_KPI_CHOICES; d.read = ts_rd_kpi; d.write = ts_wr_kpi;
     gptps_register_setting(e, &d);
     d.key = "tui.mode"; d.type = GPTPS_SETTING_ENUM; d.desc = "redraw cadence"; d.choices = TUI_MODE_CHOICES; d.read = ts_rd_mode; d.write = ts_wr_mode;
+    gptps_register_setting(e, &d);
+    d.key = "tui.latency_window"; d.type = GPTPS_SETTING_UINT; d.desc = "handles tracked for latency at FULL"; d.choices = NULL; d.read = ts_rd_latwin; d.write = ts_wr_latwin;
     gptps_register_setting(e, &d);
 }
 
@@ -1066,11 +1134,18 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     if (max > 64) max = 64;
     t->cfg.max_recent = max;
     t->rcap = max;
-    t->recent = (tui_event *)calloc((size_t)max, sizeof(tui_event));
-    if (!t->recent) { mu_destroy(&t->mu); free(t); return NULL; }
     t->kpi = (t->cfg.kpi == GPTPS_TUI_KPI_DEFAULT) ? GPTPS_TUI_KPI_FULL : t->cfg.kpi;
-    if (t->kpi < GPTPS_TUI_KPI_MINIMAL) t->kpi = GPTPS_TUI_KPI_MINIMAL;
-    if (t->kpi > GPTPS_TUI_KPI_FULL)    t->kpi = GPTPS_TUI_KPI_FULL;
+    if (t->kpi < GPTPS_TUI_KPI_OFF) t->kpi = GPTPS_TUI_KPI_OFF;
+    if (t->kpi > GPTPS_TUI_KPI_FULL) t->kpi = GPTPS_TUI_KPI_FULL;
+    t->off = (t->kpi == GPTPS_TUI_KPI_OFF);
+    /* Resolved BEFORE either ring is sized, because installing straight at OFF must hold
+     * no per-event memory - the same state gptps_tui_set_kpi(OFF) reclaims down to. Both
+     * rings are built on the way up, so raising the tier later costs only the calloc. */
+    t->recent = NULL;
+    if (!t->off) {
+        t->recent = (tui_event *)calloc((size_t)max, sizeof(tui_event));
+        if (!t->recent) { mu_destroy(&t->mu); free(t); return NULL; }
+    }
     t->mode = t->cfg.mode;
     if (t->mode < GPTPS_TUI_CONTINUOUS || t->mode > GPTPS_TUI_PAUSED) t->mode = GPTPS_TUI_CONTINUOUS;
     t->lat_cap = (t->cfg.latency_window > 0) ? t->cfg.latency_window : 1024;
@@ -1102,21 +1177,56 @@ void gptps_tui_close(gptps_tui *t)
 }
 
 /* ---- runtime reconfiguration ---- */
-/* caller holds mu: make the latency ring match the current KPI level */
+/* caller holds mu: make the allocations and the off-path flag match the KPI level.
+ * The latency ring exists only at FULL; the recent-event ring only above OFF, which
+ * is the tier that exists to hold no per-event memory at all. Both are rebuilt on the
+ * way back up, so raising the tier again is an allocation and nothing more. */
 static void lat_apply(gptps_tui *t)
 {
     if (t->kpi == GPTPS_TUI_KPI_FULL) {
         if (!t->lat) { t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat); t->lat_head = 0; }
     } else if (t->lat) {
-        free(t->lat); t->lat = NULL; t->lat_head = 0;   /* reclaim the RAM */
+        free(t->lat); t->lat = NULL; t->lat_head = 0; t->lat_tomb = 0;   /* reclaim the RAM */
     }
+    if (t->kpi == GPTPS_TUI_KPI_OFF) {
+        if (t->recent) { free(t->recent); t->recent = NULL; t->rn = t->rhead = 0; }
+    } else if (!t->recent && t->rcap > 0) {
+        t->recent = (tui_event *)calloc((size_t)t->rcap, sizeof(tui_event));
+        if (!t->recent) t->rcap = 0;      /* out of memory: run without the log, not without the dashboard */
+    }
+    /* Published LAST: tui_on_event reads this without the lock, so everything it
+     * guards must already be consistent before the event path is allowed back in. */
+    t->off = (t->kpi == GPTPS_TUI_KPI_OFF);
+}
+
+/* Resize the latency ring at runtime. The old contents are dropped rather than
+ * copied: every entry is an in-flight handle awaiting its FINISHED, and a resize is
+ * an admission that the window was wrong, so carrying a window's worth of samples
+ * that were already being lost buys nothing. Samples resume on the next QUEUED. */
+gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
+{
+    if (!t || handles < 0) return GPTPS_E_INVAL;
+    if (handles == 0)          handles = 1024;
+    if (handles > (1 << 20))   handles = (1 << 20);
+    mu_lock(&t->mu);
+    if (handles != t->lat_cap) {
+        t->lat_cap = handles;
+        if (t->lat) {                       /* rebuild at the new size; FULL only */
+            free(t->lat);
+            t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
+            t->lat_head = 0; t->lat_tomb = 0;
+        }
+        t->dirty = 1;
+    }
+    mu_unlock(&t->mu);
+    return GPTPS_OK;
 }
 
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
 {
     if (!t) return GPTPS_E_INVAL;
     if (level == GPTPS_TUI_KPI_DEFAULT) level = GPTPS_TUI_KPI_FULL;
-    if (level < GPTPS_TUI_KPI_MINIMAL || level > GPTPS_TUI_KPI_FULL) return GPTPS_E_INVAL;
+    if (level < GPTPS_TUI_KPI_OFF || level > GPTPS_TUI_KPI_FULL) return GPTPS_E_INVAL;
     mu_lock(&t->mu);
     t->kpi = level;
     lat_apply(t);            /* allocate at FULL, free below FULL */

@@ -23,6 +23,20 @@ static void count_obs(const gptps_event *ev, void *ud)
 
 static gptps_status task_ok(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_OK; }
 
+/* what the DASHBOARD thinks it has seen, read the only way a caller can - out of a
+ * rendered frame ("finished N" on the counters line). Paired with c_done, which the
+ * independent observer keeps, this separates "no work happened" from "work happened
+ * and the dashboard ignored it" - the whole point of the OFF tier. */
+static unsigned frame_finished(gptps_tui *t, char *buf, size_t n)
+{
+    const char *p;
+    unsigned v = 0;
+    gptps_tui_render(t, buf, n);
+    p = strstr(buf, "finished ");
+    if (p) sscanf(p + 9, "%u", &v);
+    return v;
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -111,7 +125,41 @@ int main(void)
         gptps_tui_render(t, frame, sizeof frame);
         CHECK(strstr(frame, "kpi:minimal") != NULL && strstr(frame, "TASKS") == NULL);
         CHECK(gptps_settings_set(e, "tui.kpi", "bogus") == GPTPS_E_CONFIG);   /* enum validated */
+        CHECK(gptps_settings_set(e, "tui.kpi", "off") == GPTPS_OK);           /* the OFF tier */
+        CHECK(gptps_settings_get(e, "tui.kpi", b, sizeof b) == GPTPS_OK && strcmp(b, "off") == 0);
         CHECK(gptps_settings_set(e, "tui.kpi", "full") == GPTPS_OK);          /* restore */
+
+        /* latency_window is a runtime knob, not install-time only: it is the lever for
+         * the one distortion the tombstone fix does NOT cure (a ring too small for the
+         * in-flight depth silently loses the shortest waits first). */
+        CHECK(gptps_settings_get(e, "tui.latency_window", b, sizeof b) == GPTPS_OK);
+        CHECK(gptps_settings_set(e, "tui.latency_window", "4096") == GPTPS_OK);
+        CHECK(gptps_settings_get(e, "tui.latency_window", b, sizeof b) == GPTPS_OK && strcmp(b, "4096") == 0);
+        CHECK(gptps_tui_set_latency_window(t, -1) == GPTPS_E_INVAL);
+        CHECK(gptps_tui_set_latency_window(t, 0) == GPTPS_OK);                /* 0 => the 1024 default */
+        CHECK(gptps_settings_get(e, "tui.latency_window", b, sizeof b) == GPTPS_OK && strcmp(b, "1024") == 0);
+    }
+
+    /* KPI OFF: installed, but off the event path entirely. Counters must not move,
+     * and the tier must be reversible with nothing lost but the events it skipped. */
+    {
+        unsigned before, after;
+        int seen;
+        CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_OFF) == GPTPS_OK);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "kpi:off") != NULL);
+        CHECK(strstr(frame, "TASKS")   == NULL);      /* no per-task table below NORMAL */
+        before = frame_finished(t, frame, sizeof frame);
+        seen   = get(&c_done);
+        for (i = 0; i < 4; ++i) CHECK(gptps_submit(e, "echo", NULL, 0, &h) == GPTPS_OK);
+        { uint64_t start = gptps_now_ms(NULL);        /* the ENGINE still runs them */
+          while (get(&c_done) < seen + 4 && gptps_now_ms(NULL) - start < 2000) { } }
+        CHECK(get(&c_done) == seen + 4);              /* the independent observer saw all four */
+        after = frame_finished(t, frame, sizeof frame);
+        CHECK(after == before);                       /* the dashboard saw none of them */
+        CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "kpi:full") != NULL && strstr(frame, "avg ms") != NULL);
     }
 
     /* mode + refresh, reflected live in the status line */

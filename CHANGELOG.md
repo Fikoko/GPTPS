@@ -5,6 +5,51 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Fixed — the observer contract, and what it cost two add-ons
+
+- **`include/gptps.h` never said event order is not guaranteed.** `QUEUED` is emitted by
+  the submitting thread after the engine lock is dropped, and the dispatcher was signalled
+  while it was still held, so a task that runs in under a microsecond reports `STARTED` —
+  or `FINISHED` — before its own `QUEUED` callback. Measured on `gptps_demo` through a
+  terminal: 73 inversions per 1,000 items; pinned to one CPU, whole runs invert. A second
+  inversion was found and is now documented too: with `retry_backoff_seconds = 0` the next
+  attempt's `STARTED` can precede the `RETRIED` that announced it, on the dispatcher's own
+  thread. The EVENTS block now states both, says what *is* ordered, and points at
+  `gptps_stats` as the worked example. The emit order itself is deliberately unchanged —
+  moving the dispatcher signal only halves the window (73 → 52 per 1,000, measured), and
+  the one reorder that closes it is the under-lock emit that was removed for stalling all
+  admission behind a slow observer.
+
+- **`gptps_tui` and `gptps_stats` both dropped the queue-wait sample on that inversion.**
+  A terminal event that outran its `QUEUED` found nothing to resolve against, so its
+  latency was silently discarded — and never neutrally: those are by construction the
+  items that waited *least*, so the reported average was pulled **up**. Both add-ons now
+  recover the sample with a tombstone the late `QUEUED` clears. Measured on a 5,000-item
+  instant burst at `latency_window` 65536: 10–13% of samples lost before, 0% after;
+  `gptps_stats` now reports `wait_samples == started` exactly. `tests/test_stats.c` had
+  the loss written into it as a tolerated range and now asserts the exact count, because a
+  range cannot fail when the fix regresses.
+
+### Added — a tier that costs nothing
+
+- **`GPTPS_TUI_KPI_OFF`.** `MINIMAL` was documented as "~no per-event work", but it still
+  takes one global mutex per event, on every worker, the dispatcher and every submitting
+  thread. `OFF` returns before that lock and frees both rings, so an event costs one
+  predictable branch — for leaving the dashboard installed after you have stopped looking
+  at it, with the handle, settings and per-task labels all still valid. Counters do not
+  advance while off. The KPI enum is renumbered to keep it a monotonic scale (`OFF` = 1);
+  every in-tree reference is symbolic, and `tui.kpi` takes `"off"` as a fourth choice. The
+  `m` hotkey cycles `MINIMAL`→`NORMAL`→`FULL` and never *into* `OFF`.
+
+- **`gptps_tui_set_latency_window()` / `tui.latency_window`.** The latency ring was
+  install-time only. It is the lever for the distortion the tombstone fix does *not* cure:
+  an entry lives from `QUEUED` to `FINISHED`, so a burst deeper than the window overwrites
+  live entries before they resolve, with the same upward skew — measured at +44% on a
+  workload backing up past the default 1024. Sizing that is the caller's call, so it is
+  now a runtime knob rather than a number fixed at install.
+
 ## [1.2.1] - 2026-09-24
 
 A release-metadata correction. No API, ABI or behaviour change to the core; ABI stays 2.1.
