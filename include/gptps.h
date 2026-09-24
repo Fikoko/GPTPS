@@ -72,9 +72,13 @@ extern "C" {
  * management, generic global + per-task settings; 1.9 added per-item constraint
  * context, cancel-by-handle, bounded intake, submit_ex overrides, the log sink,
  * child_setup and EV_DROPPED; 1.10 the generic named-resource budgets; 1.11
- * SERVICE tasks; 1.12 the pluggable scheduler seam. */
+ * SERVICE tasks; 1.12 the pluggable scheduler seam.
+ *
+ * 2.x: 2.1 the plug-in tier seams; 2.2 appends `flags` to gptps_task_info, so a
+ * caller can finally see whether a registered type is a SERVICE. Additive, and the
+ * loader compares MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 1u
+#define GPTPS_ABI_VERSION_MINOR 2u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -491,6 +495,14 @@ typedef struct {
     uint32_t             queued;         /* items waiting (intake + backoff) for this type */
     uint32_t             running;        /* items admitted / in-flight for this type */
     uint32_t             dead;           /* dead-lettered items retained for this type */
+    /* ABI 2.2: OR of GPTPS_TASK_* flags, as registered (0 = an ordinary one-shot).
+     * Read only if your struct_size covers it - this getter validates against a
+     * FROZEN floor, not sizeof, so a caller built against an older header keeps
+     * working and simply does not receive this field. It exists because a caller
+     * could see a type's exec, policy and counters but not whether it was a
+     * SERVICE, and the difference decides whether a handle ends once or once per
+     * run; gptps_balance refuses a service for exactly that reason. */
+    uint64_t             flags;
 } gptps_task_info;
 
 /* Number of registered task types (includes types that are draining toward removal). */

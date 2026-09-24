@@ -2320,7 +2320,10 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
 {
     gptps_reg *r; size_t i = 0;
     if (!e || !out) return GPTPS_E_INVAL;
-    if (out->struct_size < sizeof *out) return GPTPS_E_INVAL;   /* ABI: reject undersized struct */
+    /* Frozen 1.0.0 floor, NOT sizeof: validating against sizeof would pin this struct
+     * to today's size, so appending `flags` in ABI 2.2 would have started returning
+     * E_INVAL to every caller already compiled. See gptps_internal.h. */
+    if (out->struct_size < GPTPS_TASK_INFO_MIN_SIZE) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
     for (r = e->registry; r && i < index; r = r->next) ++i;
@@ -2331,6 +2334,9 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
     out->queued  = fifo_count_reg(&e->intake, r) + fifo_count_reg(&e->delayed, r);
     out->running = fifo_count_reg(&e->ready, r) + fifo_count_reg(&e->running_items, r) + fifo_count_reg(&e->done, r);
     out->dead    = fifo_count_reg(&e->dead_letter, r);
+    /* appended past the floor: only write it if the caller's struct actually has it */
+    if (GPTPS_STRUCT_HAS(gptps_task_info, out, flags))
+        out->flags = GPTPS_STRUCT_HAS(gptps_task_def, &r->def, flags) ? r->def.flags : 0u;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
 }

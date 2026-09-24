@@ -60,9 +60,22 @@ typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flag
  * reason: validating it with `< sizeof *out` would pin it to today's size, so the
  * day a field is appended every already-compiled caller starts getting E_INVAL. That
  * is exactly the trap this whole section exists to avoid, and it is free to avoid
- * only while the struct is unreleased. (gptps_task_info and gptps_setting_info carry
- * the older `< sizeof` check; those shipped in 1.0.0 and are frozen as they are.) */
+ * only while the struct is unreleased.
+ *
+ * gptps_task_info shipped in 1.0.0 with the older `< sizeof` check and was left that
+ * way until ABI 2.2 needed to append `flags` to it - at which point the old check WAS
+ * the trap, and would have started returning E_INVAL to every caller already compiled.
+ * Retrofitting the floor is strictly more permissive (anyone passing sizeof still
+ * passes), so it breaks nobody and unblocks the append. Its floor is frozen at the
+ * 1.0.0 layout, which ends at `dead`. gptps_setting_info still carries the old check;
+ * it can be retrofitted the same way the day something needs to grow it. */
 #define GPTPS_ADDON_INFO_MIN_SIZE     GPTPS_LAST_FIELD_END(gptps_addon_info, enabled)
+#define GPTPS_TASK_INFO_MIN_SIZE      GPTPS_LAST_FIELD_END(gptps_task_info, dead)
+/* Same tail-padding hazard as gptps_task_def above, same remedy: `flags` must stay the
+ * widest member so offsetof(flags) lands exactly on the pre-2.2 padded sizeof and can
+ * never hide inside old trailing padding - otherwise a 1.0.0 struct_size could be
+ * misread as "has flags". C99 negative-array-size assertion. */
+typedef char gptps__task_info_flags_is_widest[(sizeof(((gptps_task_info *)0)->flags) == 8u) ? 1 : -1];
 
 /* --- core allocator seam (alloc.c) ---
  * Every CORE allocation goes through these; they default to the C library and
