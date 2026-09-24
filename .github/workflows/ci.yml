@@ -225,6 +225,16 @@ jobs:
           cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
              amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o test_amalg
           ./test_amalg
+          # The release-version contract, held against the AMALGAMATED header rather
+          # than include/gptps.h. CMake asserts the two version macro sets agree, but
+          # CMake never runs for the drop-in form - which is the form most people
+          # actually consume - so the check that catches version drift has to run on
+          # the generated header too. Its own link, not another file on the line
+          # above: test_engine.c and test_version.c each define main(), and two of
+          # those in one link is a duplicate-symbol error, not a bigger test.
+          cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
+             amalgamation/gptps.c tests/test_version.c -lpthread -ldl -o test_amalg_version
+          ./test_amalg_version
 
   # Windows build + test on a real runner (Win32 HAL: src/hal_win.c) via mingw-w64
   # gcc (native PE binaries, __atomic support, full <windows.h>). POSIX-only tests

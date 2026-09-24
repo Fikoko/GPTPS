@@ -72,6 +72,14 @@ jobs:
           cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
              amalgamation/gptps.c tests/test_engine.c -lpthread -ldl -o amalg_check
           ./amalg_check
+          # The release-version contract, re-checked against the AMALGAMATED header.
+          # The tag/source guard above reads include/gptps.h; this compiles the header
+          # that actually ships in the artifact, so a generator that mangled the
+          # version block could not slip a mislabelled drop-in past us. Its own link,
+          # because test_engine.c and test_version.c both define main().
+          cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
+             amalgamation/gptps.c tests/test_version.c -lpthread -ldl -o amalg_version_check
+          ./amalg_version_check
           # An ADD-ON artifact, likewise - and running its real test, so a broken
           # amalgamated add-on cannot ship as "it compiled".
           cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
