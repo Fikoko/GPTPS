@@ -626,6 +626,46 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
 
 /* ============================================================================
  * EVENTS (observer surface; the core never aggregates - that's an add-on)
+ *
+ * EVENT ORDER IS NOT GUARANTEED ACROSS THREADS. The kinds below are emitted by
+ * three different threads (see THREADING & REENTRANCY above) and nothing
+ * serializes them against each other, so an observer must key on the handle's
+ * CURRENT STATE and never on the order events arrive in. Two inversions are
+ * real and reproducible today, not theoretical:
+ *   - QUEUED is emitted by the SUBMITTING thread AFTER the engine lock is
+ *     dropped, and the dispatcher was already signalled while that lock was
+ *     still held. A short task can therefore report STARTED - or even
+ *     FINISHED - before its own QUEUED callback runs. The off-lock emit is
+ *     deliberate: holding the engine lock across an observer let one slow
+ *     sink stall all admission and dispatch, a far worse bargain than a late
+ *     QUEUED.
+ *   - RETRIED is emitted by the DISPATCHER only after its pass ends, but the
+ *     item it re-queued can be re-admitted and picked up within that same
+ *     pass, so with retry_backoff_seconds = 0 the next attempt's STARTED can
+ *     arrive before the RETRIED that announced it.
+ * Both are RARE - each needs the task to finish inside the emit window - and
+ * that is precisely why they must be designed for rather than discovered in
+ * production: an observer that assumes order passes every test you write and
+ * then loses your fastest items under load.
+ *
+ * WHAT IS ORDERED. Within one attempt, STARTED always precedes that attempt's
+ * FINISHED or FAILED: the same worker thread emits both, in sequence. A FAILED
+ * also precedes the RETRIED / DEAD_LETTERED / DROPPED the dispatcher derives
+ * from it, because the worker finishes that emit before it hands the item to
+ * the dispatcher's done queue.
+ *
+ * MANUAL mode is the exception: a host that submits and pumps gptps_step() on
+ * ONE thread sees the full per-handle order, since the QUEUED emit completes
+ * inside gptps_submit before any step can admit the item.
+ *
+ * So read QUEUED as "this handle exists", not as "this handle is new", and let
+ * an event that arrives first stand until its QUEUED catches up.
+ * addons/gptps_stats.c is the worked example - a terminal event that outruns
+ * QUEUED leaves a tombstone the late QUEUED then clears - and the one visible
+ * cost there is that such an item has no queue-wait sample. An observer that
+ * keeps latency must ACCOUNT for that rather than quietly drop it: the samples
+ * lost this way are by construction the shortest waits, so dropping them pulls
+ * the reported average up.
  * ==========================================================================*/
 typedef enum {
     GPTPS_EV_QUEUED, GPTPS_EV_STARTED, GPTPS_EV_FINISHED,
