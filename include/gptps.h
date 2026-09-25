@@ -854,7 +854,21 @@ GPTPS_API gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gpt
  * the bare leaf. GPTPS_OK on success; GPTPS_E_NOTFOUND if no such per-task setting;
  * GPTPS_E_INVAL for a bad arg or when the value does not parse as the requested
  * type. Available only to in-process (INPROC) tasks - an OOP/PROGRAM body runs in a
- * separate process with no live engine handle and gets GPTPS_E_INVAL. */
+ * separate process with no live engine handle and gets GPTPS_E_INVAL.
+ *
+ * SIZE buf AT GPTPS_SETTINGS_VALUE_MAX. Nothing this registry renders can
+ * exceed that cap, so a buffer of that size can never come back short - which is
+ * why there is no truncation status to check, and why gptps_task_setting_int
+ * sizes its own scratch buffer the same way. A SMALLER buffer is not rejected:
+ * the value is truncated to fit, stays NUL-terminated, and GPTPS_OK is still
+ * returned, so an under-sized read is indistinguishable from a complete one.
+ * That is a real edge to walk off - a path or a socket name cut mid-string and
+ * then used - and the cap above is the whole defence, which is why it is stated
+ * here rather than left to be discovered. An error would be the right call for a
+ * NEW api; it is the wrong one here, because it would start failing callers that
+ * work today, for a case a caller who follows this paragraph cannot reach.
+ * gptps_settings_get behaves identically, by design: a reader should not have to
+ * remember which of the two is in hand. */
 GPTPS_API gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out);
 GPTPS_API gptps_status gptps_task_setting_str(gptps_ctx *ctx, const char *key, char *buf, size_t cap);
 
@@ -863,7 +877,10 @@ GPTPS_API size_t       gptps_settings_count(gptps *e);
 GPTPS_API gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_setting_info *out);
 
 /* String get/set by key. set() validates then applies; GPTPS_E_NOTFOUND for an
- * unknown key, GPTPS_E_CONFIG for an invalid value. */
+ * unknown key, GPTPS_E_CONFIG for an invalid value. get() takes the same buffer
+ * contract as gptps_task_setting_str above, and for the same reason: size `buf`
+ * at GPTPS_SETTINGS_VALUE_MAX and it can never come back short; a smaller one
+ * truncates, stays NUL-terminated, and still returns GPTPS_OK. */
 GPTPS_API gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap);
 GPTPS_API gptps_status gptps_settings_set(gptps *e, const char *key, const char *value);
 
