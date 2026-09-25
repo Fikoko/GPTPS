@@ -1,6 +1,6 @@
 # GPTPS — General Purpose Task Processing System
 
-**An embeddable, in-process C99 task processor (Control Plane) aimed for modularity, portability, and scalability — the "General Purpose Task Processing System"**
+**An embeddable C99 task-processing library with resource-aware scheduling.**
 Link one library, register a task, submit work. GPTPS runs it on a worker pool under
 declared resource budgets, with retries / timeouts / dead-letter, and gives you the
 result back — plus an optional **live terminal dashboard** to watch and steer it. No
