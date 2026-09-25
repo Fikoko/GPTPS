@@ -118,6 +118,113 @@ static void test_range_and_escape(void)
     gptps_shutdown(e);
 }
 
+/* Exercise the same contract through the global registry, the task's registry
+ * entry, and the in-task getter. Manual mode keeps the callback deterministic. */
+typedef struct buffer_case {
+    gptps *engine;
+    const char *expected;
+    int calls;
+} buffer_case;
+
+static void check_string_buffers(gptps *e, gptps_ctx *ctx, const char *key,
+                                 const char *expected)
+{
+    size_t len = strlen(expected), i, j;
+    size_t caps[] = {0, 1, 3, len, len + 1, GPTPS_SETTINGS_VALUE_MAX};
+    char scratch[GPTPS_SETTINGS_VALUE_MAX];
+    if (ctx) {
+        CHECK(gptps_task_setting_str(NULL, key, scratch, sizeof scratch) == GPTPS_E_INVAL);
+        CHECK(gptps_task_setting_str(ctx, NULL, scratch, sizeof scratch) == GPTPS_E_INVAL);
+        CHECK(gptps_task_setting_str(ctx, key, NULL, sizeof scratch) == GPTPS_E_INVAL);
+        CHECK(gptps_task_setting_str(ctx, "missing", scratch, sizeof scratch) == GPTPS_E_NOTFOUND);
+    } else {
+        CHECK(gptps_settings_get(NULL, key, scratch, sizeof scratch) == GPTPS_E_INVAL);
+        CHECK(gptps_settings_get(e, NULL, scratch, sizeof scratch) == GPTPS_E_INVAL);
+        CHECK(gptps_settings_get(e, key, NULL, sizeof scratch) == GPTPS_E_INVAL);
+        CHECK(gptps_settings_get(e, "missing", scratch, sizeof scratch) == GPTPS_E_NOTFOUND);
+    }
+    for (i = 0; i < sizeof caps / sizeof caps[0]; ++i) {
+        unsigned char guarded[GPTPS_SETTINGS_VALUE_MAX + 2];
+        char *buf = (char *)guarded + 1;
+        size_t cap = caps[i], copied = cap ? cap - 1 : 0;
+        gptps_status st;
+        memset(guarded, 0xa5, sizeof guarded);
+        st = ctx ? gptps_task_setting_str(ctx, key, buf, cap)
+                 : gptps_settings_get(e, key, buf, cap);
+        CHECK(st == (cap ? GPTPS_OK : GPTPS_E_INVAL));
+        CHECK(guarded[0] == 0xa5);
+        for (j = cap + 1; j < sizeof guarded; ++j)
+            CHECK(guarded[j] == 0xa5);
+        if (cap) {
+            if (copied > len) copied = len;
+            CHECK(memcmp(buf, expected, copied) == 0);
+            CHECK(buf[copied] == '\0');
+        }
+    }
+}
+
+static gptps_status read_string_buffers(gptps_ctx *ctx, void *ud)
+{
+    buffer_case *c = (buffer_case *)ud;
+    ++c->calls;
+    check_string_buffers(c->engine, ctx, "label", c->expected);
+    return GPTPS_OK;
+}
+
+static void test_string_buffers(void)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    gptps_task_def def;
+    buffer_case c;
+    char longest[GPTPS_SETTINGS_VALUE_MAX];
+    char oversized[GPTPS_SETTINGS_VALUE_MAX + 1];
+    const char *values[4];
+    size_t i;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_MANUAL;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    for (i = 0; i < sizeof longest - 1; ++i)
+        longest[i] = (char)('a' + i % 26);
+    longest[sizeof longest - 1] = '\0';
+    memset(oversized, 'x', sizeof oversized - 1);
+    oversized[sizeof oversized - 1] = '\0';
+    CHECK(gptps_define_global(e, "app.label", GPTPS_SETTING_STRING, longest, NULL, 0) == GPTPS_OK);
+    CHECK(gptps_define_task_setting(e, "label", GPTPS_SETTING_STRING, longest, NULL, 0) == GPTPS_OK);
+    CHECK(gptps_define_global(e, "app.too_long", GPTPS_SETTING_STRING, oversized, NULL, 0) == GPTPS_E_CONFIG);
+    CHECK(gptps_define_task_setting(e, "too_long", GPTPS_SETTING_STRING, oversized, NULL, 0) == GPTPS_E_CONFIG);
+    memset(&def, 0, sizeof def);
+    def.struct_size = sizeof def; def.name = "buffer_reader";
+    def.run = read_string_buffers; def.exec = GPTPS_EXEC_INPROC;
+    def.user_data = &c;
+    def.default_cost.struct_size = sizeof def.default_cost;
+    def.default_policy.struct_size = sizeof def.default_policy;
+    CHECK(gptps_register_task(e, &def) == GPTPS_OK);
+    values[0] = longest; values[1] = "abcdef"; values[2] = "";
+    values[3] = longest; /* Also cover the maximum-length set path. */
+    c.engine = e; c.calls = 0;
+    for (i = 0; i < sizeof values / sizeof values[0]; ++i) {
+        gptps_handle handle;
+        size_t ran = 0;
+        c.expected = values[i];
+        /* First iteration checks the maximum-length defaults; later ones set. */
+        if (i) {
+            CHECK(gptps_settings_set(e, "app.label", values[i]) == GPTPS_OK);
+            CHECK(gptps_settings_set(e, "tasks.buffer_reader.label", values[i]) == GPTPS_OK);
+        }
+        CHECK(gptps_settings_set(e, "app.label", oversized) == GPTPS_E_CONFIG);
+        CHECK(gptps_settings_set(e, "tasks.buffer_reader.label", oversized) == GPTPS_E_CONFIG);
+        check_string_buffers(e, NULL, "app.label", values[i]);
+        check_string_buffers(e, NULL, "tasks.buffer_reader.label", values[i]);
+        CHECK(gptps_submit(e, "buffer_reader", NULL, 0, &handle) == GPTPS_OK);
+        CHECK(gptps_step(e, &ran) == GPTPS_OK);
+        CHECK(c.calls == (int)i + 1);
+    }
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -239,6 +346,7 @@ int main(void)
     }
 
     test_range_and_escape();
+    test_string_buffers();
 
     if (fails) { printf("%d settings check(s) FAILED\n", fails); return 1; }
     printf("all settings checks passed\n");
