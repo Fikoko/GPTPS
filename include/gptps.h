@@ -821,6 +821,10 @@ GPTPS_API gptps_status gptps_register_setting(gptps *e, const gptps_setting_def 
  * The two helpers below let you declare arbitrary typed knobs that the engine
  * stores and validates for you - so a host (or a control plane) can grow the
  * configuration surface at runtime without per-key code.
+ * Defaults and updates for these engine-owned settings must contain fewer than
+ * GPTPS_SETTINGS_VALUE_MAX bytes (excluding NUL), for every type. Longer textual
+ * representations are rejected with GPTPS_E_CONFIG, not shortened. A rejected
+ * update leaves that setting's current value unchanged.
  *
  *   `constraint` shapes validation by type:
  *     numeric  -> "min..max"  (e.g. "0..4096"); NULL for unbounded

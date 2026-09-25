@@ -341,6 +341,7 @@ gptps_status gptps_settings_apply_toml(gptps_settings *r, const gptps_toml *t)
     for (e = r->head; e; e = e->next) {
         size_t sl; const char *leaf = leaf_of(e->key, &sl);
         char sec[256], val[GPTPS_SETTINGS_VALUE_MAX];
+        const char *value = val;
         gptps_status st = GPTPS_OK;
         int have = 0;
         if (sl >= sizeof sec) continue;
@@ -363,11 +364,13 @@ gptps_status gptps_settings_apply_toml(gptps_settings *r, const gptps_toml *t)
             }
             case GPTPS_SETTING_ENUM: case GPTPS_SETTING_STRING: {
                 const char *s = gptps_toml_str(t, sec, leaf);
-                if (s) { snprintf(val, sizeof val, "%s", s); have = 1; }
+                /* Validate the original text: shortening it first can turn an
+                 * invalid string or enum into an accepted, different value. */
+                if (s) { value = s; have = 1; }
                 break;
             }
         }
-        if (have) st = apply_entry(e, val);   /* validated + applied */
+        if (have) st = apply_entry(e, value);   /* validated + applied */
         if (st != GPTPS_OK && first == GPTPS_OK) first = st;
     }
     gptps_mutex_unlock(r->m);

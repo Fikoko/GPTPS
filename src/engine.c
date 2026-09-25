@@ -1467,7 +1467,9 @@ static int gval_ok(gptps_setting_type type, int has_range, double mn, double mx,
                    const char *const *choices, const char *v)
 {
     char *end;
-    if (!v) return 0;
+    /* Every engine-owned type stores its textual representation in one fixed
+     * cell, not just STRING. Reject input loss before accepting a default. */
+    if (!v || strlen(v) >= GPTPS_SETTINGS_VALUE_MAX) return 0;
     switch (type) {
         /* errno, not just the end pointer: strtoll/strtoull SATURATE at their
          * limits and report it only through ERANGE, so without this a nonsense
@@ -1574,12 +1576,26 @@ static void free_choices(char **arr)
  * Accessed only through the registry (under settings->m), so the cell needs no
  * lock of its own. */
 static size_t       os_rd(void *t, char *b, size_t c) { gptps_owned_setting *o = (gptps_owned_setting *)t; return (size_t)snprintf(b, c, "%s", o->value); }
-static gptps_status os_wr(void *t, const char *v) { gptps_owned_setting *o = (gptps_owned_setting *)t; snprintf(o->value, sizeof o->value, "%s", v); return GPTPS_OK; }
+static gptps_status os_wr(void *t, const char *v)
+{
+    gptps_owned_setting *o = (gptps_owned_setting *)t;
+    if (strlen(v) >= sizeof o->value) return GPTPS_E_CONFIG;
+    snprintf(o->value, sizeof o->value, "%s", v);
+    return GPTPS_OK;
+}
 
 /* ---- generic PER-TASK setting instance (target = gptps_task_local*) ----
  * Locks the engine mutex (consistent with the built-in per-task knobs). */
 static size_t       stl_rd(void *t, char *b, size_t c) { gptps_task_local *L = (gptps_task_local *)t; size_t n; gptps_mutex_lock(L->reg->engine->m); n = (size_t)snprintf(b, c, "%s", L->value); gptps_mutex_unlock(L->reg->engine->m); return n; }
-static gptps_status stl_wr(void *t, const char *v) { gptps_task_local *L = (gptps_task_local *)t; gptps_mutex_lock(L->reg->engine->m); snprintf(L->value, sizeof L->value, "%s", v); gptps_mutex_unlock(L->reg->engine->m); return GPTPS_OK; }
+static gptps_status stl_wr(void *t, const char *v)
+{
+    gptps_task_local *L = (gptps_task_local *)t;
+    if (strlen(v) >= sizeof L->value) return GPTPS_E_CONFIG;
+    gptps_mutex_lock(L->reg->engine->m);
+    snprintf(L->value, sizeof L->value, "%s", v);
+    gptps_mutex_unlock(L->reg->engine->m);
+    return GPTPS_OK;
+}
 
 /* Materialize one generic per-task schema as tasks.<r->name>.<schema->leaf>,
  * bound to a fresh owned value cell. Called with e->m NOT held (settings add

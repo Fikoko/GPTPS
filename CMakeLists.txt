@@ -369,6 +369,11 @@ target_link_libraries(test_settings PRIVATE gptps)
 add_test(NAME settings COMMAND test_settings)
 set_tests_properties(settings PROPERTIES TIMEOUT 30)
 
+add_executable(test_settings_length tests/test_settings_length.c)
+target_link_libraries(test_settings_length PRIVATE gptps)
+add_test(NAME settings_length COMMAND test_settings_length)
+set_tests_properties(settings_length PROPERTIES TIMEOUT 30)
+
 add_executable(test_taskmgmt tests/test_taskmgmt.c) # runtime task management + generic settings
 target_include_directories(test_taskmgmt
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
