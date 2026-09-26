@@ -7,6 +7,20 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — bounded retries publish RETRIED before readmission
+
+- A bounded retry now reaches every callback and observer as `RETRIED` before
+  its next attempt can be admitted, including with zero backoff. Newly decided
+  retries skip the current pass's promotion scan; unrelated work can still be
+  admitted. Due retries retain a best-effort slot/memory reservation against
+  lower-priority work until the following pass. This is not a global event-order
+  guarantee: cancellation can still overtake RETRIED for later observers.
+- Regression tests cover notification ordering, cancellation with and without
+  backoff, priority preservation and pending-event buffer overflow. Keep the
+  parked attempt's state intact for the existing terminal-event accounting:
+  a body returning `GPTPS_E_CANCELLED`, retried and then removed from its RETRIED
+  callback, must not receive a second cancellation terminal event.
+
 ### Fixed — routing a service through a balancer was a use-after-free
 
 - **`gptps_balance` now refuses a `GPTPS_TASK_SERVICE` at submit (`GPTPS_E_INVAL`).**
@@ -90,10 +104,11 @@ the release version and is documented in `include/gptps.h`.
   while it was still held, so a task that runs in under a microsecond reports `STARTED` —
   or `FINISHED` — before its own `QUEUED` callback. Measured on `gptps_demo` through a
   terminal: 73 inversions per 1,000 items; pinned to one CPU, whole runs invert. A second
-  inversion was found and is now documented too: with `retry_backoff_seconds = 0` the next
-  attempt's `STARTED` can precede the `RETRIED` that announced it, on the dispatcher's own
-  thread. The EVENTS block now states both, says what *is* ordered, and points at
-  `gptps_stats` as the worked example. The emit order itself is deliberately unchanged —
+  inversion was found on bounded retries: the next attempt's `STARTED` could precede
+  its `RETRIED`. That inversion is fixed by "bounded retries publish RETRIED before
+  readmission" above. The EVENTS block documents the remaining cancellation inversion,
+  says what *is* ordered, and points at `gptps_stats` as the worked example.
+  The QUEUED emit order itself is deliberately unchanged —
   moving the dispatcher signal only halves the window (73 → 52 per 1,000, measured), and
   the one reorder that closes it is the under-lock emit that was removed for stalling all
   admission behind a slow observer.

@@ -925,8 +925,13 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
     uint64_t now = gptps_hal_monotonic_ms();
     uint64_t next_wake = 0; /* 0 = none */
     int npend = 0;
-    int more = 0;           /* pend[] filled up: work is still owed, re-run at once */
+    int more = 0;           /* work is still owed, re-run at once: pend[] filled up, or
+                             * a zero-backoff retry is due once its RETRIED is out (2b) */
     gptps_item *it;
+    gptps_fifo announced = { NULL, NULL, 0 };   /* retries decided this pass: see 2b */
+    uint32_t held = 0;      /* DUE retries 2b parked: step 4 keeps a slot free for each */
+    uint64_t held_mem = 0;  /* ... and their memory (a saturating sum) from any work */
+    int64_t held_score = 0; /* ... the highest of them outranks (its sched_score) */
 
         /* 1) drain completed: release budget, then retry / terminal decision.
          * Bounded by the event buffer: an item left in `done` is picked up by the
@@ -1026,7 +1031,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
-                fifo_push(&e->delayed, it);
+                fifo_push(&announced, it);   /* joins `delayed` after step 2's scan */
             } else {
                 switch (it->policy.on_failure) {
                     case GPTPS_ON_FAILURE_REQUEUE:
@@ -1112,6 +1117,29 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     prev = cur;
                 }
                 cur = nxt;
+            }
+        }
+        /* 2b) park the retries step 1 decided - only now, AFTER the promotion scan.
+         * Their RETRIED sits in pend[], which is emitted with the lock released once
+         * this pass returns, and both pumps (dispatcher_main, gptps_step) finish that
+         * emit before they run another pass. So a retry is never promotable in the
+         * pass that announced it, and with retry_backoff_seconds = 0 its next
+         * attempt can no longer be admitted, started and reported ahead of the
+         * RETRIED. A retry already due sets `more`, so the next pass promotes it at
+         * once - that is what keeps gptps_step's pass B admitting it within the
+         * same step, exactly as when it was promoted in this pass. Promoted here
+         * it would also have been admitted in this pass, ahead of everything it
+         * outranks, taking a slot and its memory: the due ones are tallied so
+         * step 4 can keep back just that much and refill every other slot freed. */
+        while ((it = fifo_pop(&announced)) != NULL) {
+            fifo_push(&e->delayed, it);
+            if (it->not_before_ms <= now) {                  /* zero backoff: due next pass */
+                if (!held || it->sched_score > held_score) held_score = it->sched_score;
+                held_mem = (it->cost.mem_bytes > UINT64_MAX - held_mem)
+                         ? UINT64_MAX : held_mem + it->cost.mem_bytes;
+                held += 1; more = 1;                         /* <= GPTPS_PENDING_CAP (step 1) */
+            } else {
+                next_wake = min_nonzero(next_wake, it->not_before_ms);
             }
         }
 
@@ -1234,6 +1262,35 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
             }
 
             if (!best) break;                            /* nothing fits the live budget now */
+            /* Keep back for 2b's due retries what they would have taken had they
+             * been promoted in this pass. In intake they would sit ahead of every
+             * item they outrank (intake_insert puts an item after all of score >=
+             * its own) and be admitted first, a slot and their memory each. So work
+             * at or above the top retry's score goes ahead unconditionally - it was
+             * queued in front of the retry anyway - and work below it goes ahead
+             * while it still fits BESIDE them: the lower work that would have
+             * started now either way. Only when it does not fit does admission
+             * stop, and only for this pass: the next one runs as soon as the
+             * RETRIED is out (`more`) and decides with the retries back in intake.
+             * MANUAL mode always stops: nothing runs until gptps_step's pass loop
+             * is over, so no slot can idle through the emit, and the next pass
+             * then admits the retries ahead of the work they outrank - the order
+             * the step runs `ready` in, as on a pass that promoted them itself.
+             *   Best effort, and any error lasts one pass (`held` is rebuilt from
+             * zero every pass). Conservative: every held retry is reserved against
+             * anything the TOP one outranks, even one that would have queued behind
+             * `best`; and a retry is reserved for even where it would not have been
+             * admitted now (budget taken by work above it, a runtime budget cut, a
+             * constraint hook that would DEFER or DENY it). Permissive: named
+             * resource budgets are not reserved, so `best` can take units a retry
+             * needs and delay it. The key is the retries' last-stamped score, exact
+             * for the built-in priority ordering; a scheduler hook rescores them
+             * next pass. The memory test is headroom, not a sum: `best` fits, so
+             * reserved_mem + its bytes <= the budget and the subtraction cannot wrap. */
+            if (held && best->sched_score < held_score &&
+                (e->manual || held >= e->limits.max_concurrent_tasks - e->running ||
+                 held_mem > e->limits.max_memory_bytes - e->reserved_mem - best->cost.mem_bytes))
+                break;
             if (best != top && top->skips >= e->reserve_after_skips)
                 break;                                   /* reserve for `top`: drain, admit nothing */
 

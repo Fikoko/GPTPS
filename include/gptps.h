@@ -671,10 +671,11 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
  * EVENTS (observer surface; the core never aggregates - that's an add-on)
  *
  * EVENT ORDER IS NOT GUARANTEED ACROSS THREADS. The kinds below are emitted by
- * three different threads (see THREADING & REENTRANCY above) and nothing
- * serializes them against each other, so an observer must key on the handle's
- * CURRENT STATE and never on the order events arrive in. Two inversions are
- * real and reproducible today, not theoretical:
+ * the threads listed under THREADING & REENTRANCY above - plus whichever
+ * thread cancels a handle - and nothing serializes them against each other,
+ * so an observer must key on the handle's CURRENT STATE and never on the
+ * order events arrive in. Two inversions are real and reproducible today,
+ * not theoretical:
  *   - QUEUED is emitted by the SUBMITTING thread AFTER the engine lock is
  *     dropped, and the dispatcher was already signalled while that lock was
  *     still held. A short task can therefore report STARTED - or even
@@ -682,24 +683,34 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
  *     deliberate: holding the engine lock across an observer let one slow
  *     sink stall all admission and dispatch, a far worse bargain than a late
  *     QUEUED.
- *   - RETRIED is emitted by the DISPATCHER only after its pass ends, but the
- *     item it re-queued can be re-admitted and picked up within that same
- *     pass, so with retry_backoff_seconds = 0 the next attempt's STARTED can
- *     arrive before the RETRIED that announced it.
- * Both are RARE - each needs the task to finish inside the emit window - and
- * that is precisely why they must be designed for rather than discovered in
- * production: an observer that assumes order passes every test you write and
- * then loses your fastest items under load.
+ *   - A retry waits, unadmitted, while its RETRIED is delivered. A
+ *     gptps_cancel() that lands in that window emits the handle's terminal
+ *     FAILED / GPTPS_E_CANCELLED at once, on the calling thread, and so does
+ *     a GPTPS_REMOVE_CANCEL unregister in MANUAL mode, or in THREADED mode
+ *     when nothing else of that type is in flight. An observer still to see
+ *     the RETRIED can therefore see the terminal event first. From another
+ *     thread that is a race; a gptps_cancel() from a callback reacting to
+ *     that very RETRIED makes it happen every time.
+ * The races are RARE - each needs something to land inside an emit window -
+ * and that is precisely why they must be designed for rather than discovered
+ * in production: an observer that assumes order passes every test you write
+ * and then loses your fastest items under load.
  *
  * WHAT IS ORDERED. Within one attempt, STARTED always precedes that attempt's
  * FINISHED or FAILED: the same worker thread emits both, in sequence. A FAILED
  * also precedes the RETRIED / DEAD_LETTERED / DROPPED the dispatcher derives
  * from it, because the worker finishes that emit before it hands the item to
- * the dispatcher's done queue.
+ * the dispatcher's done queue. A bounded retry's RETRIED reaches every callback
+ * and observer before that retry can be admitted, even with zero backoff, so the
+ * next attempt's STARTED cannot overtake it. (Only a bounded retry emits RETRIED;
+ * a REQUEUE cycle and a SERVICE restart re-admit without one.)
  *
  * MANUAL mode is the exception: a host that submits and pumps gptps_step() on
  * ONE thread sees the full per-handle order, since the QUEUED emit completes
- * inside gptps_submit before any step can admit the item.
+ * inside gptps_submit before any step can admit the item - except that cancelling,
+ * from inside a callback, a handle that is still queued or waiting to retry emits
+ * its FAILED / GPTPS_E_CANCELLED at once, ahead of the triggering event for every
+ * observer still to see that event.
  *
  * So read QUEUED as "this handle exists", not as "this handle is new", and let
  * an event that arrives first stand until its QUEUED catches up.
