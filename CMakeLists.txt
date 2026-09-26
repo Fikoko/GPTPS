@@ -652,6 +652,13 @@ add_test(NAME stats COMMAND test_stats)
 set_tests_properties(stats PROPERTIES TIMEOUT 30)
 endif()
 
+if(TARGET gptps_stats)
+add_executable(test_retry_order tests/test_retry_order.c)
+target_link_libraries(test_retry_order PRIVATE gptps_stats)
+add_test(NAME retry_order COMMAND test_retry_order)
+set_tests_properties(retry_order PROPERTIES TIMEOUT 30)
+endif()
+
 if(TARGET gptps_balance AND TARGET gptps_stats)
 add_executable(test_balance tests/test_balance.c)     # late-binding router above pool; distribution checked with stats
 target_include_directories(test_balance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)

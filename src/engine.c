@@ -923,6 +923,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
     uint64_t now = gptps_hal_monotonic_ms();
     uint64_t next_wake = 0; /* 0 = none */
     int npend = 0;
+    int retry_pending = 0; /* this pass owes a notification before retry admission */
     int more = 0;           /* pend[] filled up: work is still owed, re-run at once */
     gptps_item *it;
 
@@ -1025,6 +1026,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                 }
                 fifo_push(&e->delayed, it);
+                retry_pending = 1;
             } else {
                 switch (it->policy.on_failure) {
                     case GPTPS_ON_FAILURE_REQUEUE:
@@ -1082,8 +1084,16 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
         }
         if (e->done.head) more = 1;      /* buffer filled before the queue emptied */
 
-        /* (pending events from step 1 + admission below are emitted together,
-         * after the admit step, with the lock released — see step 5) */
+        /* Publish retry decisions before promoting/admitting retries. The
+         * caller emits off-lock and immediately re-runs the pass (also in MANUAL
+         * mode). No item pointer is retained across callbacks: cancellation or
+         * removal may have consumed a delayed item before the next pass. */
+        if (retry_pending) {
+            *out_npend = npend;
+            *out_next_wake = 0;
+            if (out_more) *out_more = 1;
+            return;
+        }
 
         /* 2) move backoff-ready delayed items back to intake (single scan) */
         {
