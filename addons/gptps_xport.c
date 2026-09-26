@@ -364,6 +364,9 @@ static void fail_all(gptps_xport *xp, size_t idx)
     pending *p, *async_list = NULL;
     apx_mutex_lock(&w->pmu);
     w->dead = 1;
+    /* Publish retirement before a blocking submitter can observe completion.
+     * cursor_lock is never held while acquiring pmu, so this order is safe. */
+    mark_dead(xp, idx);
     /* Split under the lock. A BLOCKING record lives on its submitter's stack and is
      * gone the moment that thread sees done=1, so it must not be touched after the
      * unlock; only the heap-allocated async records survive to the callback loop. */
@@ -375,7 +378,6 @@ static void fail_all(gptps_xport *xp, size_t idx)
     w->npend = 0;
     apx_cond_broadcast(&w->pcv);
     apx_mutex_unlock(&w->pmu);
-    mark_dead(xp, idx);
     while (async_list) {                            /* callbacks, no lock held */
         pending *n = async_list->next;
         async_list->cb(async_list->id, GPTPS_E_IO, GPTPS_E_IO, NULL, 0, async_list->ud);
