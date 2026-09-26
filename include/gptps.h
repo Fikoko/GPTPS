@@ -652,8 +652,7 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
  * EVENT ORDER IS NOT GUARANTEED ACROSS THREADS. The kinds below are emitted by
  * three different threads (see THREADING & REENTRANCY above) and nothing
  * serializes them against each other, so an observer must key on the handle's
- * CURRENT STATE and never on the order events arrive in. Two inversions are
- * real and reproducible today, not theoretical:
+ * CURRENT STATE rather than assuming a total event order. In particular:
  *   - QUEUED is emitted by the SUBMITTING thread AFTER the engine lock is
  *     dropped, and the dispatcher was already signalled while that lock was
  *     still held. A short task can therefore report STARTED - or even
@@ -661,20 +660,17 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
  *     deliberate: holding the engine lock across an observer let one slow
  *     sink stall all admission and dispatch, a far worse bargain than a late
  *     QUEUED.
- *   - RETRIED is emitted by the DISPATCHER only after its pass ends, but the
- *     item it re-queued can be re-admitted and picked up within that same
- *     pass, so with retry_backoff_seconds = 0 the next attempt's STARTED can
- *     arrive before the RETRIED that announced it.
- * Both are RARE - each needs the task to finish inside the emit window - and
- * that is precisely why they must be designed for rather than discovered in
- * production: an observer that assumes order passes every test you write and
- * then loses your fastest items under load.
+ * This can be rare, but observers must handle it rather than relying on the
+ * relative scheduling of the submitting thread and worker threads.
  *
  * WHAT IS ORDERED. Within one attempt, STARTED always precedes that attempt's
  * FINISHED or FAILED: the same worker thread emits both, in sequence. A FAILED
  * also precedes the RETRIED / DEAD_LETTERED / DROPPED the dispatcher derives
  * from it, because the worker finishes that emit before it hands the item to
- * the dispatcher's done queue.
+ * the dispatcher's done queue. RETRIED callbacks and observers complete before
+ * that retry can be admitted, even with zero backoff, so its STARTED cannot
+ * overtake RETRIED. This is not a general serialization of callbacks: a callback
+ * that cancels a handle may synchronously emit a cancellation event.
  *
  * MANUAL mode is the exception: a host that submits and pumps gptps_step() on
  * ONE thread sees the full per-handle order, since the QUEUED emit completes
