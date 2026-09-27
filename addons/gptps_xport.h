@@ -138,8 +138,15 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 void **out_result, size_t *out_len,
                                 gptps_status *out_task_status);
 
-/* Same routing and backpressure, but returns as soon as the request is on the wire;
- * `cb` gets the reply (or E_IO). *out_request_id (may be NULL) identifies it. */
+/* Same routing and backpressure, but returns once the request is on the wire (or its
+ * link has already failed it - see below); `cb` gets the reply (or E_IO).
+ * *out_request_id (may be NULL) identifies it.
+ * Every call has exactly ONE outcome: a non-OK return and no callback, or GPTPS_OK
+ * and exactly one callback. A link that dies while this request is being written
+ * can surface either way - as GPTPS_E_IO here, or as GPTPS_OK with the callback
+ * carrying io == GPTPS_E_IO, possibly before this call returns - never both. A
+ * GPTPS_E_IO return means the request never reached a worker; an E_IO callback
+ * does not say whether it ran. */
 gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
                                       const void *payload, size_t len,
                                       gptps_xport_reply_fn cb, void *user_data,

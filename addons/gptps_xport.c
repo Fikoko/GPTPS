@@ -523,15 +523,18 @@ size_t gptps_xport_in_flight(gptps_xport *xp)
 }
 
 /* Common path: validate, pick a worker, register `p` (bounded), write the frame.
- * On return GPTPS_OK, `p` is on the wire and owned by the link until completed. */
+ * On return GPTPS_OK, `p` is owned by the link until completed: normally it is on
+ * the wire; if the write failed and the reader's fail_all() claimed `p` before we
+ * could take it back, the reader completes it with E_IO instead. Either way the
+ * caller gets exactly one outcome - a non-OK return here, or one completion. */
 static gptps_status send_request(gptps_xport *xp, const char *task, const void *payload,
                                  size_t len, pending *p, xport_worker **out_w, uint64_t *out_id)
 {
     xport_worker *w;
     size_t tl, wi;
     uint32_t tlen;
-    uint64_t plen;
-    int ok;
+    uint64_t plen, id;
+    int ok, is_async;
 
     if (!xp || !task) return GPTPS_E_INVAL;
     if (len && !payload) return GPTPS_E_INVAL;   /* would send() from a NULL buffer */
@@ -546,9 +549,15 @@ static gptps_status send_request(gptps_xport *xp, const char *task, const void *
     wi = next_rr(xp);
     if (wi == (size_t)-1) return GPTPS_E_IO;      /* every worker has been retired */
     w = &xp->w[wi];
-    p->id = new_id(xp);
-    *out_id = p->id;        /* copy out NOW: once registered, `p` may be completed and
-                             * (if async) freed by the reader before we return */
+    /* Copy out NOW everything needed after registration. Once `p` is on the list
+     * the reader may complete it - and, if it is async, free it - at any moment:
+     * a worker that dies before reading this frame puts the reader in fail_all(),
+     * and that can run before the first byte below is written. So nothing after
+     * the unlock reads `p`, not even to write its id. */
+    id = new_id(xp);
+    p->id = id;
+    *out_id = id;
+    is_async = p->is_async;
 
     /* Register BEFORE writing: the reply can only be matched to a record that
      * already exists, and a fast worker can answer before write returns. */
@@ -559,7 +568,7 @@ static gptps_status send_request(gptps_xport *xp, const char *task, const void *
     apx_mutex_unlock(&w->pmu);
 
     apx_mutex_lock(&w->wmu);
-    ok = sock_write_all(w->fd, &p->id, sizeof p->id) == 0 &&
+    ok = sock_write_all(w->fd, &id, sizeof id) == 0 &&
          sock_write_all(w->fd, &tlen, sizeof tlen) == 0 &&
          sock_write_all(w->fd, task, tlen) == 0 &&
          sock_write_all(w->fd, &plen, sizeof plen) == 0 &&
@@ -568,12 +577,22 @@ static gptps_status send_request(gptps_xport *xp, const char *task, const void *
     apx_mutex_unlock(&w->wmu);
 
     if (!ok) {
-        /* Take our record back if the reader has not already failed it. The reader
-         * sees the shutdown as EOF and retires the link for everyone else. */
+        /* The reader sees the shutdown as EOF and retires the link for everyone
+         * else. Who reports THIS request is settled by one fact: whether its record
+         * is still on the list. Take it back by id, never through `p`. If the
+         * reader's fail_all() got there first it has already unlinked the record,
+         * and an async one is then the reader's to report and free - its callback
+         * may already have run. This used to read p->done here and return E_IO, so
+         * submit_async freed the record too: a use-after-free and a double free in
+         * whichever order the two threads got there, and the caller heard of one
+         * failure twice. */
+        pending *mine;
         apx_mutex_lock(&w->pmu);
-        if (!p->done) pend_take(w, p->id);
+        mine = pend_take(w, id);
         apx_mutex_unlock(&w->pmu);
-        return GPTPS_E_IO;
+        if (mine || !is_async) return GPTPS_E_IO; /* ours again, or a blocking waiter's */
+        /* Claimed by the reader: the callback carries the E_IO, so the submit itself
+         * succeeded - reporting it here too would be a second outcome. */
     }
     *out_w = w;
     return GPTPS_OK;

@@ -100,6 +100,25 @@ the release version and is documented in `include/gptps.h`.
   test pinned to two CPUs, every run with a sleep forced into the gap, and none of either
   with the fix. Found and fixed by @kuntakinte7270 in #9.
 
+- **`gptps_xport`: an async submit whose frame write failed as its worker died could be
+  freed twice.** Since engine mode (1.2.0), `submit_async` registered its record, then
+  wrote the frame. A worker dying under that write woke two threads at once: the
+  submitter, whose `send()` failed, and the reader, which saw EOF and ran `fail_all()` -
+  unlinking the record, reporting `GPTPS_E_IO` through the callback and freeing it. When
+  the reader got there first, the submitter read the record's `done` flag anyway,
+  returned `GPTPS_E_IO`, and `submit_async` freed it again: one failure reported twice,
+  and a use-after-free plus a double free in whichever order the two threads ran. A
+  Release build aborted on heap corruption; ASan reported the heap-use-after-free in
+  `send_request` or in `fail_all`'s callback loop. The frame header was also written
+  from the record itself, one more read of memory the reader may already have freed.
+  The submitter now copies what it needs before registering and settles ownership by
+  id: a record it takes back fails the submit with `GPTPS_E_IO`; one the reader
+  claimed is reported by the callback alone, so `submit_async` returns `GPTPS_OK`.
+  `gptps_xport.h` now states the contract that was always implied - exactly one
+  outcome per call - and that a `GPTPS_E_IO` return means the request never reached a
+  worker. `tests/test_xport.c` races the two threads at least 40 times per run; against
+  the old code every run failed.
+
 ### Added — a tier that costs nothing
 
 - **`GPTPS_TUI_KPI_OFF`.** `MINIMAL` was documented as "~no per-event work", but it still
