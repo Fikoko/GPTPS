@@ -109,12 +109,16 @@ without deadlock or re-entrancy under the lock.
 ### The dispatch loop (one pass)
 
 1. **Drain `done`** — release each finished item's budget, then decide its fate
-   (ok → free; failed with retries left → `delayed`; failed & exhausted →
-   `on_failure`).
-2. **Promote `delayed`** — move backoff-ready items back to `intake`.
+   (ok → free; failed with retries left → a pass-local list, its `RETRIED` buffered;
+   failed & exhausted → `on_failure`).
+2. **Promote `delayed`** — move backoff-ready items back to `intake`. Then **2b.**
+   step 1's retries join `delayed`, only now, so none is promotable in the pass that
+   announced it: its `RETRIED` goes out (step 5) before any pass can admit it, even at
+   zero backoff. One already due sets `more`, so the next pass runs at once.
 3. **Enforce deadlines** — flip the cancel flag on any running task past its
    deadline (cooperative for in-process; the OOP path hard-kills separately).
-4. **Admit** — priority-ordered, skip-to-fit, with reservation (see §5).
+4. **Admit** — priority-ordered, skip-to-fit, with reservation, holding a slot for
+   each due retry from 2b (see §5).
 5. **Emit** buffered events with the lock released, then `continue` (re-runs the
    loop so a signal arriving during the emit window can't be lost).
 6. **Shutdown** check — when fully drained, wake workers to exit and break. The
@@ -208,6 +212,11 @@ Then:
   running tasks until `top` fits. This bounds starvation to at most
   `reserve_after_skips` backfills. Since over-budget submits are rejected up
   front, a reserved task is always eventually admittable.
+- **A due retry announced this pass** (step 2b, zero backoff) is not in `intake` yet.
+  Work at or above its priority is admitted as usual; lower work only while it still
+  fits beside every due retry, a slot and its declared memory each. MANUAL mode admits
+  nothing it outranks until the next pass, since nothing runs before the step's passes
+  end. Named resource budgets are not held.
 
 Priority is per task type, set via `gptps_set_task_priority()` or config
 (`[task_defaults]` / `[tasks.<name>]`). Default-0 priorities reduce the scan to
@@ -224,7 +233,8 @@ Per-task `gptps_failure_policy`: `timeout_seconds`, `max_retries`,
   (in-process tasks must poll `gptps_is_cancelled`); the OOP/PROGRAM paths
   hard-kill the child.
 - **Retry** — a failed attempt with retries remaining goes to `delayed` and is
-  re-admitted after `retry_backoff_seconds` (emitting `RETRIED`).
+  re-admitted after `retry_backoff_seconds`; its `RETRIED` is delivered before it can
+  be, even at zero backoff (step 2b above).
 - **`on_failure`** when retries are exhausted:
   - `dead_letter` (default, safe) — retained in the in-memory dead-letter list,
     emits `DEAD_LETTERED`. The list is CAPPED (`limits.max_dead_letters`, default

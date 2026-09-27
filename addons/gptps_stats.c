@@ -188,10 +188,12 @@ static void sample_run(gptps_stats *s, gptps_stats_counters *t, uint64_t ms)
  *   - QUEUED comes from the submitting thread, so a fast task can report STARTED -
  *     or even FINISHED - before its own QUEUED. A terminal event that outruns QUEUED
  *     leaves a ST_DONE tombstone that the late QUEUED then clears.
- *   - RETRIED comes from the dispatcher, and attempt N can start, finish, fail - or
- *     be cancelled - before the RETRIED announcing it arrives: a zero-backoff retry
- *     re-admitted in the same pass, or a cancel landing while the RETRIED is still
- *     being delivered. Taken on arrival order, that late RETRIED reopened a handle
+ *   - RETRIED comes from the dispatcher, and attempt N can be cancelled - its
+ *     terminal FAILED/E_CANCELLED emitted at once, on the cancelling thread - while
+ *     the RETRIED announcing it is still being delivered. (An older engine could
+ *     also re-admit a zero-backoff retry in the same pass, so attempt N could even
+ *     start, finish or fail first; the engine no longer does, and nothing below
+ *     depends on which.) Taken on arrival order, that late RETRIED reopened a handle
  *     already running or already over as PENDING, and the gauges never came back:
  *     pending and in_flight stuck above zero, a run sample lost, and after a
  *     terminal event a fresh slot leaked as well. So a RETRIED for an attempt this

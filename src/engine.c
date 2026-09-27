@@ -3668,8 +3668,10 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
     e->step_tid = gptps_hal_thread_id();
 
     /* pass A: complete any prior work, promote backoff-ready retries, admit.
-     * Repeat while the pass reports it could not buffer every terminal event it
-     * owed - a single gptps_step must not leave a handle without one. */
+     * Repeat while the pass reports work still owed: a terminal event it could not
+     * buffer (a single gptps_step must not leave a handle without one), or a
+     * zero-backoff retry it announced, which the next pass promotes and admits once
+     * its RETRIED is out (engine_pass 2b). */
     do {
         engine_pass(e, pend, &npend, &next_wake, &more);
         flush_pending(e, pend, &npend);

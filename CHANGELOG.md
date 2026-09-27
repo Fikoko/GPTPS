@@ -7,19 +7,69 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
-### Fixed — bounded retries publish RETRIED before readmission
+### Fixed — a retry could start before its `RETRIED` was delivered
 
-- A bounded retry now reaches every callback and observer as `RETRIED` before
-  its next attempt can be admitted, including with zero backoff. Newly decided
-  retries skip the current pass's promotion scan; unrelated work can still be
-  admitted. Due retries retain a best-effort slot/memory reservation against
-  lower-priority work until the following pass. This is not a global event-order
-  guarantee: cancellation can still overtake RETRIED for later observers.
-- Regression tests cover notification ordering, cancellation with and without
-  backoff, priority preservation and pending-event buffer overflow. Keep the
-  parked attempt's state intact for the existing terminal-event accounting:
-  a body returning `GPTPS_E_CANCELLED`, retried and then removed from its RETRIED
-  callback, must not receive a second cancellation terminal event.
+- **A bounded retry's `RETRIED` now reaches every callback and observer before the
+  retry can be admitted, even with `retry_backoff_seconds = 0`.** The dispatcher parked
+  a retry in `delayed` in step 1 of its pass, and step 2 of the same pass promoted
+  whatever was due — so a zero-backoff retry went straight back to `intake`, was
+  admitted, and a worker could report its next attempt's `STARTED`, even its
+  `FINISHED`, while the `RETRIED` announcing it was still waiting to be emitted after
+  the pass. Counted through `gptps_stats` as it was before its late-`RETRIED` fix
+  (under "Fixed — add-ons" below): with near-empty bodies almost every run of 20,000
+  once-failing tasks hit it; with real work stats alone saw none, but a 20 µs observer
+  registered ahead of it brought it back at 3–4 per 5,000 retries (200 µs bodies, 16
+  workers). A retry
+  now joins `delayed` only after that pass's promotion scan, and both pumps finish
+  emitting before they run another pass, so it cannot be admitted until its `RETRIED`
+  is out; one already due makes the next pass run at once, so `gptps_step` admits it
+  in the same step it always did, and a MANUAL host whose callbacks do not submit or
+  cancel in reaction to `RETRIED` sees the same event order as before.
+  Only the retry waits, not the pass: every other slot the pass freed is refilled as
+  before. So that lower-priority work cannot take the place the retry would have had,
+  admission keeps back a slot and the retry's declared memory for each due retry from
+  work it outranks; work at or above its priority goes first, as it was queued ahead
+  of it anyway. MANUAL mode admits nothing the retry outranks until the next pass, so
+  a priority-10 retry with three priority-0 tasks behind it still runs ahead of every
+  one it can: `hi#1 hi#2 lo lo lo` on one slot, `hi#1 lo hi#2 lo lo` on two. Named
+  resource budgets are not held. Measured (Release,
+  medians of 7 interleaved runs, 8 slots, an observer that sleeps 5 ms on `RETRIED`):
+  2,000 5 ms tasks, a quarter of them failing once, take 3,092 ms (3,117 ms before;
+  holding the whole pass, as this change first did, took 4,105 ms, +32%); arriving
+  one every 2 ms, the tasks that never fail start after a median 1.8 ms (1.7 ms
+  before, 53 ms holding the pass). With no observer, 200,000 no-op tasks that all
+  fail once on 4 slots take 599 ms against 582 ms, inside that row's −3% to +9%
+  run-to-run spread. `tests/test_retry_order.c` holds the first callback on `RETRIED`
+  until the next attempt has started (or finished) — against the old engine both
+  THREADED scenarios fail on every run — and checks THREADED admission while it is
+  delivered: equal- or higher-priority work runs, lower-priority work cannot take the
+  retry's slot or its memory but can use room beside it. It also pins both orders,
+  and runs 300 retries through the 256-event buffer in one step. Fixed by @kuntakinte7270 in #10, who also showed what the
+  inversion cost `gptps_stats`.
+
+- **A cancel can overtake a `RETRIED` — now also at zero backoff — and `gptps.h` names
+  that inversion in place of the one above.** The retry waits in `delayed` while its
+  `RETRIED` is delivered, and a `gptps_cancel` — or a `REMOVE_CANCEL` with nothing else
+  of the type in flight — ends a parked handle at once, on the calling thread, ahead of
+  the `RETRIED` for every observer still to see it. From a callback reacting to that
+  `RETRIED` it happens every time, MANUAL mode included, and the EVENT ORDER block now
+  says so. Because the retry is parked rather than admitted while its `RETRIED` is
+  delivered, a callback that re-enters the engine at that moment sees four things
+  change, in both modes: work it submits at or above the retry's priority now runs
+  before the retry, which is not queued yet; a `gptps_cancel` of the retried handle at
+  zero backoff now emits `FAILED`/`GPTPS_E_CANCELLED` at once, ahead of the `RETRIED`,
+  where it used to follow it; a THREADED `REMOVE_CANCEL` of its own type now completes
+  at zero backoff — there is nothing admitted to wait for — where it returned
+  `GPTPS_E_BUSY`; and a MANUAL `REMOVE_CANCEL` no longer emits a second
+  `FAILED`/`GPTPS_E_CANCELLED` for a handle whose body returned `GPTPS_E_CANCELLED`
+  itself — the parked retry is freed without one, as it already was with a backoff.
+  That last shape is still not clean: the `RETRIED` announcing attempt 2 follows the
+  body's own terminal event and nothing closes it, so `gptps_stats` ends such a handle
+  with `pending` at 1 at any backoff; the engine retrying an attempt whose body
+  reported itself cancelled is the open question behind it. `tests/test_retry_order.c`
+  counts terminal events itself for the MANUAL removal — a body that failed and one
+  that returned `GPTPS_E_CANCELLED`, with and without backoff — and for the THREADED
+  one.
 
 ### Fixed — routing a service through a balancer was a use-after-free
 
@@ -104,11 +154,13 @@ the release version and is documented in `include/gptps.h`.
   while it was still held, so a task that runs in under a microsecond reports `STARTED` —
   or `FINISHED` — before its own `QUEUED` callback. Measured on `gptps_demo` through a
   terminal: 73 inversions per 1,000 items; pinned to one CPU, whole runs invert. A second
-  inversion was found on bounded retries: the next attempt's `STARTED` could precede
-  its `RETRIED`. That inversion is fixed by "bounded retries publish RETRIED before
-  readmission" above. The EVENTS block documents the remaining cancellation inversion,
-  says what *is* ordered, and points at `gptps_stats` as the worked example.
-  The QUEUED emit order itself is deliberately unchanged —
+  inversion was found and documented too: with `retry_backoff_seconds = 0` the next
+  attempt's `STARTED` could precede the `RETRIED` that announced it, on the dispatcher's
+  own thread — fixed since, by "a retry could start before its `RETRIED` was delivered"
+  above. The EVENTS block now states the `QUEUED` inversion and the one that remains on
+  the retry side (a cancel that overtakes a `RETRIED`), says what *is* ordered, and
+  points at `gptps_stats` as the worked example. The `QUEUED` emit order itself is
+  deliberately unchanged —
   moving the dispatcher signal only halves the window (73 → 52 per 1,000, measured), and
   the one reorder that closes it is the under-lock emit that was removed for stalling all
   admission behind a slow observer.
@@ -212,9 +264,10 @@ the release version and is documented in `include/gptps.h`.
 
 - **`gptps_stats`: a `RETRIED` that arrived late left the gauges stuck.** The RETRIED arm
   set a handle back to `PENDING` whatever state it was in. But `RETRIED` comes from the
-  dispatcher, and the attempt it announces can start, finish, fail — or be cancelled —
-  before it arrives: a zero-backoff retry re-admitted in the same pass, or a
-  `gptps_cancel` landing while the `RETRIED` was still being delivered. The late event
+  dispatcher, and the attempt it announces could start, finish, fail — or be cancelled —
+  before it arrived: a zero-backoff retry re-admitted in the same pass (the engine no
+  longer does that; see the `RETRIED` entry above), or a `gptps_cancel` landing while
+  the `RETRIED` was still being delivered, which still happens. The late event
   then reopened a running handle as pending (`pending` and `in_flight` both stuck at 1,
   its run sample lost), or, after the handle's terminal event, a fresh slot that never
   closed. Measured on the old code: 20,000 near-empty tasks that each fail once left

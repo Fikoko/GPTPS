@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /* Reject input loss before engine-owned settings are stored. */
 #include "gptps.h"
 #include <stdio.h>

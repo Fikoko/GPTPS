@@ -370,10 +370,14 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *      QUEUED                  -> the thread that called gptps_submit;
  *      STARTED/FINISHED/FAILED -> a worker thread;
  *      RETRIED/DEAD_LETTERED/DROPPED -> the dispatcher thread;
- *      FAILED/GPTPS_E_CANCELLED for an item that never started -> the dispatcher,
- *        or, for one still queued, the thread that called gptps_cancel /
- *        gptps_unregister_task.
- *    In MANUAL mode every callback fires on the thread that called gptps_step().
+ *      FAILED/GPTPS_E_CANCELLED for an item that is not running -> the dispatcher,
+ *        or, for one still queued or parked between attempts (a retry in
+ *        backoff, a REQUEUE, a service restart), the thread that called
+ *        gptps_cancel / gptps_unregister_task - and, for a queued or restarting
+ *        service instance, gptps_shutdown.
+ *    In MANUAL mode every callback fires on the thread that called gptps_step(),
+ *    except the terminal events gptps_cancel, gptps_unregister_task and
+ *    gptps_shutdown emit on their caller's thread.
  *  - Event callbacks (gptps_event_cb, observers) and the dead-letter drain
  *    callback ALWAYS run with the engine lock RELEASED, so they MAY call back
  *    into the engine (e.g. gptps_submit to retry) without deadlock. Keep them
@@ -715,11 +719,12 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
  * So read QUEUED as "this handle exists", not as "this handle is new", and let
  * an event that arrives first stand until its QUEUED catches up.
  * addons/gptps_stats.c is the worked example - a terminal event that outruns
- * QUEUED leaves a tombstone the late QUEUED then clears - and the one visible
- * cost there is that such an item has no queue-wait sample. An observer that
- * keeps latency must ACCOUNT for that rather than quietly drop it: the samples
- * lost this way are by construction the shortest waits, so dropping them pulls
- * the reported average up.
+ * QUEUED, or the RETRIED it is owed, leaves a tombstone the late event then
+ * clears, and a STARTED that outruns its QUEUED has its queue-wait sample
+ * taken when that QUEUED arrives, as a lower bound. An observer that keeps
+ * latency must ACCOUNT for such items rather than quietly drop them: they are
+ * by construction the shortest waits, so dropping them pulls the reported
+ * average up.
  * ==========================================================================*/
 typedef enum {
     GPTPS_EV_QUEUED, GPTPS_EV_STARTED, GPTPS_EV_FINISHED,

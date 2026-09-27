@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /* Retry notifications must reach observers before the next attempt starts.
  * Exercise a bounded slow callback and real stats, plus pending-buffer overflow.
  * The gate amplifies the scheduling window; it does not measure race frequency. */
