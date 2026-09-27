@@ -87,6 +87,19 @@ the release version and is documented in `include/gptps.h`.
   the loss written into it as a tolerated range and now asserts the exact count, because a
   range cannot fail when the fix regresses.
 
+### Fixed — add-ons
+
+- **`gptps_xport`: a blocking submit could return `GPTPS_E_IO` for a retired worker while
+  `gptps_xport_live()` still counted it.** The reader published the failure - `done` set,
+  waiters woken - and only then took the worker out of the rotation, so a submitter woken
+  in that gap could return and read the old count; a concurrent submit that found the link
+  `dead` got the same stale answer. `fail_all()` now retires the worker inside the `pmu`
+  critical section that publishes the failure. That nests `cursor_lock` under `pmu` for the
+  first time, which is safe because nothing is ever acquired while `cursor_lock` is held.
+  `tests/test_xport.c:119` caught it intermittently under load: 0.4-1.9% of runs with the
+  test pinned to two CPUs, every run with a sleep forced into the gap, and none of either
+  with the fix. Found and fixed by @kuntakinte7270 in #9.
+
 ### Added — a tier that costs nothing
 
 - **`GPTPS_TUI_KPI_OFF`.** `MINIMAL` was documented as "~no per-event work", but it still
