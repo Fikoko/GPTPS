@@ -1371,7 +1371,7 @@ const char *gptps_strerror(gptps_status s)
         case GPTPS_E_TASK:      return "task error";
         case GPTPS_E_SHUTDOWN:  return "engine shutting down";
         case GPTPS_E_DENIED:    return "admission denied by a constraint";
-        case GPTPS_E_BUSY:      return "task busy: work is queued or in-flight";
+        case GPTPS_E_BUSY:      return "busy: refused rather than wait (work is outstanding, or the wait would need the calling thread)";
         default:                return "unknown error";
     }
 }

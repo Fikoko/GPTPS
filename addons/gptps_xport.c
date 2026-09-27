@@ -598,6 +598,26 @@ static gptps_status send_request(gptps_xport *xp, const char *task, const void *
     return GPTPS_OK;
 }
 
+/* Is the caller the reader of one of this transport's LIVE links - that is, inside a
+ * reply callback that a blocking submit could deadlock? Every reader is started, and
+ * its id stored, before open returns, and a callback runs only for a request
+ * submitted after that, so the ids are in place.
+ *   A dead link's reader is exempt. Its callbacks are fail_all()'s E_IO ones, and by
+ * then nothing can be waiting on it: its blocking waiters are already completed and
+ * send_request() refuses the link. A blocking submit from there can only land on a
+ * live link, whose reader never blocks on the transport, so no cycle can form - and
+ * "retry synchronously on E_IO" keeps working. It reads `dead` without the lock:
+ * the flag was set by this very thread, in fail_all(). */
+static int on_reader_thread(const gptps_xport *xp)
+{
+    size_t i;
+    pthread_t self = pthread_self();
+    for (i = 0; i < xp->n; ++i)
+        if (xp->w[i].reader_started && pthread_equal(self, xp->w[i].reader))
+            return !xp->w[i].dead;
+    return 0;
+}
+
 gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 const void *payload, size_t len,
                                 void **out_result, size_t *out_len,
@@ -611,6 +631,12 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     if (out_result) *out_result = NULL;
     if (out_len) *out_len = 0;
     if (out_task_status) *out_task_status = GPTPS_E_IO;
+    /* From a reply callback this would wait for a reply that only a reader thread
+     * can complete: this very one whenever round-robin picks the callback's own link
+     * - every time, with one worker - or another reader that may itself be waiting
+     * here on this one. Refuse rather than hang (submit_async is the way in, for a
+     * small request - see gptps_xport_reply_fn). */
+    if (xp && on_reader_thread(xp)) return GPTPS_E_BUSY;
 
     memset(&p, 0, sizeof p);
     st = send_request(xp, task, payload, len, &p, &w, &id);

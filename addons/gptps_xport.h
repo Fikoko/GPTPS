@@ -28,7 +28,8 @@
  *
  * Both blocking and asynchronous submission share that path:
  *   gptps_xport_submit()        blocks the caller until the reply
- *   gptps_xport_submit_async()  returns at once; the reply arrives on a callback
+ *   gptps_xport_submit_async()  returns once the request is written; the reply
+ *                               arrives on a callback
  *
  * What it still is not:
  *   - Not cross-host. Parent and child are the SAME forked binary, so the frames are
@@ -79,8 +80,18 @@ typedef gptps_status (*gptps_xport_run_fn)(const char *task, const void *payload
  *   io == GPTPS_OK   : the worker answered; task_status / res / len are the answer.
  *   io == GPTPS_E_IO : the link died first; task_status / res / len are unset.
  * `res` is valid only for the duration of the callback - copy it if you keep it.
- * The callback may call gptps_xport_submit_async (or _submit) but must not call
- * gptps_xport_close, which joins the very thread the callback is running on. */
+ * The callback runs on a thread the transport needs, so it must not wait on the
+ * transport. The blocking gptps_xport_submit returns GPTPS_E_BUSY here, because the
+ * reply it would wait for can only be delivered by a reader thread - this one,
+ * whenever the request lands on the callback's own link - except in an io ==
+ * GPTPS_E_IO callback, whose link is already dead and so cannot be waited on (a
+ * synchronous retry there is fine). gptps_xport_submit_async is allowed, but it
+ * writes the request on this thread: keep it small, since a request larger than the
+ * socket buffer can block while this link's worker is itself blocked sending a reply
+ * that only this thread would read - hand large follow-ups to a thread of your own.
+ * gptps_xport_close must not be called here at all: it joins this very thread. The
+ * check covers this transport's own readers only; a callback that blocks on ANOTHER
+ * transport whose callback blocks on this one can still deadlock. */
 typedef void (*gptps_xport_reply_fn)(uint64_t request_id, gptps_status io,
                                      gptps_status task_status, const void *res, size_t len,
                                      void *user_data);
@@ -132,7 +143,8 @@ size_t gptps_xport_in_flight(gptps_xport *xp);
  * Returns GPTPS_OK when the worker answered (then *out_task_status is the task's
  * own status, *out_result the malloc'd result or NULL - free it), GPTPS_E_IO when
  * the link broke first, GPTPS_E_FULL when that worker already has max_in_flight
- * outstanding, GPTPS_E_INVAL for a bad argument. */
+ * outstanding, GPTPS_E_INVAL for a bad argument, GPTPS_E_BUSY from a reply callback
+ * (see gptps_xport_reply_fn). */
 gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
                                 const void *payload, size_t len,
                                 void **out_result, size_t *out_len,

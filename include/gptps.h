@@ -133,10 +133,11 @@ typedef enum {
     GPTPS_E_TASK,         /* task returned a non-OK application error */
     GPTPS_E_SHUTDOWN,     /* engine is shutting down */
     GPTPS_E_DENIED,       /* a constraint hook rejected admission */
-    GPTPS_E_BUSY          /* refused rather than wait on or re-enter the engine: a task
-                           * removal with work outstanding (REJECT_IF_BUSY; DRAIN in MANUAL
-                           * mode; any removal that would wait, from a task body or a
-                           * callback), or gptps_shutdown / gptps_step from one */
+    GPTPS_E_BUSY          /* refused rather than wait, e.g. a task removal with work
+                           * outstanding (REJECT_IF_BUSY; DRAIN in MANUAL mode; any removal
+                           * that would wait, from a task body or a callback), gptps_shutdown
+                           * / gptps_step from one, or an add-on's call that would wait on
+                           * its own callback thread (gptps_xport_submit) */
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);

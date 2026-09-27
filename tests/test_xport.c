@@ -28,6 +28,36 @@ static void count_reply(uint64_t id, gptps_status io, gptps_status ts, const voi
     __atomic_add_fetch(&r->calls, 1, __ATOMIC_SEQ_CST);
 }
 static int load(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static void store(int *p, int v) { __atomic_store_n(p, v, __ATOMIC_SEQ_CST); }
+
+/* A reply callback that re-enters the transport, both ways. */
+static gptps_xport *reenter_xp;
+static int reenter_blocking = -1, reenter_async = -1, reenter_done;
+static replies nested = {0, 0};
+static void reenter_reply(uint64_t id, gptps_status io, gptps_status ts, const void *res,
+                          size_t len, void *u)
+{
+    void *r = NULL; size_t rl = 0; gptps_status t = GPTPS_OK;
+    (void)id; (void)io; (void)ts; (void)res; (void)len; (void)u;
+    store(&reenter_blocking, (int)gptps_xport_submit(reenter_xp, "upper", "b", 1, &r, &rl, &t));
+    free(r);
+    store(&reenter_async, (int)gptps_xport_submit_async(reenter_xp, "upper", "c", 1,
+                                                         count_reply, &nested, NULL));
+    store(&reenter_done, 1);
+}
+
+/* An E_IO callback that retries synchronously. */
+static int dead_io = -1, dead_retry = -1;
+static void retry_on_io(uint64_t id, gptps_status io, gptps_status ts, const void *res,
+                        size_t len, void *u)
+{
+    void *r = NULL; size_t rl = 0; gptps_status t = GPTPS_E_IO;
+    (void)id; (void)ts; (void)res; (void)len; (void)u;
+    store(&dead_io, (int)io);
+    store(&dead_retry, (int)gptps_xport_submit(reenter_xp, "upper", "d", 1, &r, &rl, &t));
+    free(r);
+    store(&reenter_done, 1);
+}
 
 /* handler run IN THE WORKER PROCESS:
  *   "upper" -> [int32 worker-pid][payload upper-cased]   (proves separate process)
@@ -203,6 +233,55 @@ int main(void)
             printf("note: the reader never won in %d rounds; the formerly crashing side went unexercised\n", round);
         printf("write-failure race: %d/%d reported by submit_async, %d by the callback\n",
                by_submit, round, by_reader);
+    }
+
+    /* A reply callback runs on its link's reader thread, and only that thread can
+     * complete the link's requests. A BLOCKING submit from the callback that lands on
+     * the same link - always, with one worker - waited for a reply only it could
+     * deliver, and never returned; the header used to invite exactly that call. It is
+     * refused now, and submit_async still works from there. Before the fix the
+     * callback never comes back, and close() then hangs joining its thread. */
+    {
+        fflush(stdout);                 /* the fork below must not inherit unwritten output */
+        reenter_xp = gptps_xport_open(1, xrun, NULL);
+        CHECK(reenter_xp != NULL);
+        if (reenter_xp) {
+            struct timespec ts = {0, 1000000L};   /* 1 ms */
+            int spins = 0;
+            CHECK(gptps_xport_submit_async(reenter_xp, "upper", "a", 1, reenter_reply, NULL, NULL) == GPTPS_OK);
+            while (!load(&reenter_done) && spins++ < 5000) nanosleep(&ts, NULL);
+            CHECK(load(&reenter_done) == 1);
+            CHECK(load(&reenter_blocking) == GPTPS_E_BUSY);
+            CHECK(load(&reenter_async) == GPTPS_OK);
+            if (!load(&reenter_done)) {         /* the callback is stuck: close would hang */
+                printf("FAIL the reply callback never returned\n");
+                fflush(stdout);
+                return 1;
+            }
+            gptps_xport_close(reenter_xp);          /* drains: the nested reply lands */
+            CHECK(load(&nested.calls) == 1 && load(&nested.io_errs) == 0);
+        }
+    }
+
+    /* ...except from an E_IO callback: its link is already dead, so nothing can be
+     * waiting on this reader, and a synchronous retry there lands on a live link. That
+     * worked before the refusal existed and must keep working. */
+    {
+        fflush(stdout);
+        reenter_xp = gptps_xport_open(2, xrun, NULL);
+        CHECK(reenter_xp != NULL);
+        if (reenter_xp) {
+            struct timespec ts = {0, 1000000L};
+            int spins = 0;
+            store(&reenter_done, 0); store(&dead_io, -1); store(&dead_retry, -1);
+            CHECK(gptps_xport_submit_async(reenter_xp, "die", NULL, 0, retry_on_io, NULL, NULL) == GPTPS_OK);
+            while (!load(&reenter_done) && spins++ < 5000) nanosleep(&ts, NULL);
+            CHECK(load(&reenter_done) == 1);
+            CHECK(load(&dead_io) == GPTPS_E_IO);
+            CHECK(load(&dead_retry) == GPTPS_OK);   /* retried on the live worker */
+            if (!load(&reenter_done)) { printf("FAIL the E_IO callback never returned\n"); fflush(stdout); return 1; }
+            gptps_xport_close(reenter_xp);
+        }
     }
 
     if (fails) { printf("%d xport check(s) FAILED\n", fails); return 1; }
