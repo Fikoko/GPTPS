@@ -77,12 +77,14 @@ typedef struct gptps_item {
     gptps_flag           *cancel;
     gptps_status          outcome;   /* effective status of the last attempt */
     int                   cancelled; /* gptps_cancel(handle) requested: never retry/dead-letter */
-    int                   started;   /* 1 once execute() ran for this item, so a STARTED and a
-                                      * FINISHED/FAILED event have already been emitted for the
-                                      * current attempt. The done-drain uses this to decide whether
-                                      * a terminal event still owes the observer, instead of
-                                      * inferring it from `outcome` (which no longer distinguishes
-                                      * never-ran from cancelled-while-running). */
+    int                   started;   /* 1 once execute() ran this item's most recent attempt, so
+                                      * a STARTED and a FINISHED/FAILED were emitted for it. While
+                                      * the item is parked in `delayed` that is the PREVIOUS
+                                      * attempt (cleared when step 2 promotes it). It says an
+                                      * attempt ran, not how it ended: whether the handle is
+                                      * already closed is terminal_reported(), which also reads
+                                      * `outcome` (never-ran vs cancelled-while-running is this
+                                      * flag's half of that question). */
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
     uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed+NULLed at release (done-drain), else at item_free */
     size_t                res_n;
@@ -2226,19 +2228,39 @@ static unsigned fifo_detach_reg_admitted(gptps *e, gptps_fifo *q, const gptps_re
     return n;
 }
 
-/* Emit a terminal cancelled event for every item in `q` and free it. Caller must
- * NOT hold e->m (observers may re-enter the engine), and must call this while the
- * items' reg is still alive so item_name() stays valid.
- * An item whose attempt already ran (`started`) has had its terminal event emitted
- * by execute(); emitting another here would break the exactly-one-terminal-event
- * invariant, so it is freed silently - the same rule engine_pass's cancelling path
- * uses. */
+/* Has this handle already had the terminal event that closes it? Only if its current
+ * attempt RAN and execute() reported that attempt as one: a FAILED stamped
+ * GPTPS_E_CANCELLED, or a FINISHED - which closes a one-shot, but only one RUN of an
+ * always-up service, whose instance is closed by the FAILED/E_CANCELLED its stop
+ * produces (see GPTPS_TASK_SERVICE in gptps.h). A plain FAILED is per attempt: the
+ * retry / dead-letter decision that would have closed the handle never came.
+ *   `started` alone is not the test. It records that execute() ran the attempt, not
+ * how that attempt ended, and it is cleared only when an item leaves `delayed`, so
+ * a bounded retry, a REQUEUE or a service restart parked there still carries the
+ * last attempt's 1. Testing `started` alone freed every such item in silence - a
+ * REMOVE_CANCEL of a type with a retry in backoff, a service in restart backoff at
+ * shutdown, a MANUAL host's teardown with a retry parked - and every observer
+ * reconciling terminal events leaked that handle for good. The item's reg must be
+ * alive (the caller's contract below). */
+static int terminal_reported(const gptps_item *it)
+{
+    if (!it->started) return 0;                          /* this attempt never ran */
+    if (it->outcome == GPTPS_E_CANCELLED) return 1;
+    if (it->outcome != GPTPS_OK) return 0;               /* a plain, per-attempt FAILED */
+    return !(it->reg && it->reg->service && !it->reg->retire_on_ok);
+}
+
+/* Emit a terminal cancelled event for every item in `q` that is still owed one, and
+ * free it. Caller must NOT hold e->m (observers may re-enter the engine), and must
+ * call this while the items' reg is still alive so item_name() stays valid.
+ * An item that terminal_reported() says is already closed is freed silently:
+ * emitting another would break the exactly-one-terminal-event invariant. */
 static void drain_cancelled(gptps *e, gptps_fifo *q, gptps_event_cb cb, void *ud)
 {
     gptps_item *it;
     while ((it = fifo_pop(q)) != NULL) {
         gptps_pending_ev p;
-        if (it->started) { item_free(it); continue; }
+        if (terminal_reported(it)) { item_free(it); continue; }
         p.kind = GPTPS_EV_FAILED; p.handle = it->handle;
         ev_set_name(p.name, item_name(it));
         p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
@@ -3644,7 +3666,7 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
  * delayed queue non-empty. Running/ready instances (budget reserved) are marked
  * cancelled + flagged so they exit / are discarded through the normal `done` path
  * (which releases their budget); queued + backing-off instances (no budget) are
- * freed outright.
+ * detached into `out`, and the caller gives each its terminal event.
  * Non-service in-flight work is left alone HERE so it drains gracefully - but it is
  * no longer left alone forever: gptps_shutdown arms e->stop_deadline_ms, and once
  * that grace elapses the dispatcher cancels whatever is still running (engine_pass
@@ -3714,8 +3736,9 @@ gptps_status gptps_shutdown(gptps *e)
      * expired. This MUST run before the add-on teardown below: that loop calls
      * gptps_dl_close(), and an observer registered by an add-on lives in the very
      * .so being unmapped, so emitting afterwards would jump into freed code.
-     * drain_cancelled skips items whose attempt already ran - execute() reported
-     * those - so nothing is double-counted. */
+     * drain_cancelled skips only items whose terminal event execute() already
+     * reported, so nothing is double-counted - and nothing parked between attempts
+     * is dropped. */
     gptps_mutex_lock(e->m);
     while ((it = fifo_pop(&e->intake))        != NULL) fifo_push(&dropped, it);
     intake_forget(e);

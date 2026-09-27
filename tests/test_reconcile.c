@@ -5,8 +5,10 @@
  * event. The two opt-in shapes outside that rule - GPTPS_ON_FAILURE_REQUEUE, which
  * stays open while it requeues, and GPTPS_TASK_SERVICE, which emits one per run -
  * are documented in Readme.md and gptps.h. Both still have to CLOSE when the engine
- * does, and the last two cases here pin exactly that: whatever a policy does while
- * the engine runs, teardown owes every live handle a terminal event.
+ * does, and test_queued_service_reports_a_terminal_event and
+ * test_requeue_is_closed_by_the_drain pin exactly that: whatever a policy does while
+ * the engine runs, teardown owes every live handle a terminal event. The cases after
+ * them pin the same for work parked BETWEEN attempts.
  *
  * The core deliberately never aggregates: observers are the only completion
  * channel, so an item that vanishes without a terminal event makes every add-on
@@ -30,7 +32,7 @@ static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
 
 static int n_queued, n_terminal, n_started;
-static int n_cancelled, n_timeout;
+static int n_cancelled, n_timeout, n_retried, n_failed;
 
 /* Which events CLOSE a handle:
  *   FINISHED                     - success, always terminal
@@ -45,11 +47,13 @@ static void obs(const gptps_event *ev, void *ud)
     switch (ev->kind) {
         case GPTPS_EV_QUEUED:  inc(&n_queued); break;
         case GPTPS_EV_STARTED: inc(&n_started); break;
+        case GPTPS_EV_RETRIED: inc(&n_retried); break;
         case GPTPS_EV_FINISHED:
         case GPTPS_EV_DROPPED:
         case GPTPS_EV_DEAD_LETTERED:
             inc(&n_terminal); break;
         case GPTPS_EV_FAILED:
+            inc(&n_failed);
             if (ev->status == GPTPS_E_CANCELLED) { inc(&n_cancelled); inc(&n_terminal); }
             if (ev->status == GPTPS_E_TIMEOUT)   inc(&n_timeout);
             break;
@@ -64,6 +68,8 @@ static void reset(void)
     __atomic_store_n(&n_started, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&n_cancelled, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&n_timeout, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&n_retried, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&n_failed, 0, __ATOMIC_SEQ_CST);
 }
 
 static gptps_status task_block(gptps_ctx *c, void *u)
@@ -304,6 +310,220 @@ static void test_requeue_is_closed_by_the_drain(void)
     CHECK(get(&n_timeout) == 0);        /* a drain is not a deadline breach */
 }
 
+/* ------------------ work parked BETWEEN attempts, then removed or torn down */
+
+/* An item waiting in backoff - a bounded retry, a REQUEUE, a service restart - still
+ * carries `started` from the attempt before, and the one path that terminates such an
+ * item without running it, drain_cancelled(), read `started` as "execute() already
+ * reported this handle closed". So REMOVE_CANCEL, and teardown, freed it in silence:
+ * its last event was a plain per-attempt FAILED (or, for a service, the FINISHED of
+ * one run), and nothing ever closed it. The same test freed an item whose attempt had
+ * merely FAILED and was awaiting its retry decision in `done`. A 60 s backoff keeps
+ * every item parked for the whole case. */
+
+static void reg_parked(gptps *e, const char *name, gptps_run_fn fn, gptps_on_failure onfail,
+                       uint32_t retries, uint64_t flags)
+{
+    gptps_task_def d; memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = name; d.run = fn; d.exec = GPTPS_EXEC_INPROC;
+    d.flags = flags;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.on_failure = onfail;
+    d.default_policy.max_retries = retries;
+    d.default_policy.retry_backoff_seconds = 60;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+}
+
+/* Until `name`'s one item has run at least once and now waits in backoff with
+ * nothing admitted - i.e. it is parked in `delayed`. `ended` counts an event the
+ * engine emits only once the attempt is over (FAILED/FINISHED from execute(), or
+ * the dispatcher's RETRIED), and it is read BEFORE the snapshot: a snapshot taken
+ * first could show the item still waiting in intake, before its attempt started. */
+static int wait_parked(gptps *e, const char *name, int *ended)
+{
+    uint64_t t0 = gptps_now_ms(NULL);
+    for (;;) {
+        size_t i, n = gptps_task_count(e);
+        for (i = 0; i < n; ++i) {
+            gptps_task_info ti; int over = get(ended) >= 1;
+            memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+            if (over && gptps_task_get_info(e, i, &ti) == GPTPS_OK && strcmp(ti.name, name) == 0 &&
+                ti.queued == 1 && ti.running == 0) return 1;
+        }
+        if (gptps_now_ms(NULL) - t0 > 3000) return 0;
+    }
+}
+
+static gptps *open_manual(uint32_t slots)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_MANUAL;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = slots;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (e) gptps_register_observer(e, obs, NULL);
+    return e;
+}
+
+static void test_cancel_reports_a_retry_in_backoff(void)
+{
+    gptps *e = open1();
+    if (!e) return;
+    reset();
+    reg_parked(e, "flaky", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER, 1, 0);
+    CHECK(gptps_submit(e, "flaky", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_parked(e, "flaky", &n_retried));   /* RETRIED is emitted after the park */
+    CHECK(get(&n_retried) == 1 && get(&n_terminal) == 0);
+    CHECK(gptps_unregister_task(e, "flaky", GPTPS_REMOVE_CANCEL) == GPTPS_OK);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 1);       /* was 0 */
+    CHECK(get(&n_cancelled) == 1);
+}
+
+static void test_cancel_reports_a_requeue_in_backoff(void)
+{
+    gptps *e = open1();
+    if (!e) return;
+    reset();
+    reg_parked(e, "rq", task_fail, GPTPS_ON_FAILURE_REQUEUE, 0, 0);
+    CHECK(gptps_submit(e, "rq", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_parked(e, "rq", &n_failed));
+    CHECK(gptps_unregister_task(e, "rq", GPTPS_REMOVE_CANCEL) == GPTPS_OK);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 1);       /* was 0 */
+    CHECK(get(&n_cancelled) == 1);
+}
+
+/* A clean exit closes one RUN of an always-up service, not the instance: gptps.h
+ * promises the instance exactly one FAILED/E_CANCELLED when it is stopped. */
+static void test_shutdown_stops_a_service_in_restart_backoff(void)
+{
+    gptps *e = open1();
+    if (!e) return;
+    reset();
+    reg_parked(e, "svc", task_ok, GPTPS_ON_FAILURE_REQUEUE, 0, GPTPS_TASK_SERVICE);
+    CHECK(gptps_submit(e, "svc", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_parked(e, "svc", &n_terminal));   /* ran once, exited cleanly (FINISHED), waits to restart */
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&n_cancelled) == 1);      /* was 0: the instance was never closed */
+    CHECK(get(&n_terminal) == 2);       /* the run's FINISHED + the stop */
+}
+
+static void test_manual_teardown_and_cancel_report_a_parked_retry(void)
+{
+    gptps *e;
+    size_t ran = 0;
+    /* a MANUAL host that stops stepping with a retry parked, then shuts down */
+    e = open_manual(1);
+    if (!e) return;
+    reset();
+    reg_parked(e, "flaky", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER, 1, 0);
+    CHECK(gptps_submit(e, "flaky", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1 && get(&n_retried) == 1);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 1);       /* was 0 */
+    /* ...and one that removes the type instead */
+    e = open_manual(1);
+    if (!e) return;
+    reset();
+    reg_parked(e, "flaky", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER, 1, 0);
+    CHECK(gptps_submit(e, "flaky", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1 && get(&n_retried) == 1);
+    CHECK(gptps_unregister_task(e, "flaky", GPTPS_REMOVE_CANCEL) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 1);       /* was 0 */
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
+/* MANUAL: an attempt that FAILED sits in `done` until the step's accounting pass
+ * decides retry or dead-letter. Removing its type in between - here from the next
+ * item's STARTED callback, inside the same step - must still close it. */
+static gptps *manual_e;
+static int st_remove_u = -1;
+static void remove_u_on_t_start(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_STARTED && strcmp(ev->task_name, "t") == 0)
+        st_remove_u = (int)gptps_unregister_task(manual_e, "u", GPTPS_REMOVE_CANCEL);
+}
+static void test_manual_cancel_reports_a_failed_attempt_awaiting_accounting(void)
+{
+    size_t ran = 0;
+    manual_e = open_manual(2);
+    if (!manual_e) return;
+    reset();
+    reg(manual_e, "u", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER);
+    reg(manual_e, "t", task_ok, GPTPS_ON_FAILURE_DEAD_LETTER);
+    CHECK(gptps_set_event_cb(manual_e, remove_u_on_t_start, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "u", NULL, 0, NULL) == GPTPS_OK);   /* runs first, fails */
+    CHECK(gptps_submit(manual_e, "t", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_step(manual_e, &ran) == GPTPS_OK && ran == 2);
+    CHECK(st_remove_u == GPTPS_OK);
+    CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 2);       /* t's FINISHED + u's cancel; was 1 */
+    CHECK(get(&n_cancelled) == 1);
+}
+
+/* ...and the converse: an attempt that was cancelled while it ran has ALREADY been
+ * closed by its FAILED/E_CANCELLED, so removing its type before the accounting pass
+ * must not report it a second time. */
+static gptps_status task_until_cancelled(gptps_ctx *c, void *u)
+{ (void)u; return gptps_is_cancelled(c) ? GPTPS_E_CANCELLED : GPTPS_OK; }
+static void cancel_c_then_remove_it(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind != GPTPS_EV_STARTED) return;
+    if (strcmp(ev->task_name, "c") == 0) (void)gptps_cancel(manual_e, ev->handle);   /* running */
+    if (strcmp(ev->task_name, "t") == 0)
+        st_remove_u = (int)gptps_unregister_task(manual_e, "c", GPTPS_REMOVE_CANCEL);
+}
+static void test_manual_cancel_does_not_repeat_a_reported_cancel(void)
+{
+    size_t ran = 0;
+    manual_e = open_manual(2);
+    if (!manual_e) return;
+    reset();
+    st_remove_u = -1;
+    reg(manual_e, "c", task_until_cancelled, GPTPS_ON_FAILURE_DEAD_LETTER);
+    reg(manual_e, "t", task_ok, GPTPS_ON_FAILURE_DEAD_LETTER);
+    CHECK(gptps_set_event_cb(manual_e, cancel_c_then_remove_it, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "c", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "t", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_step(manual_e, &ran) == GPTPS_OK && ran == 2);
+    CHECK(st_remove_u == GPTPS_OK);
+    CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+    CHECK(get(&n_cancelled) == 1);      /* c's own, once */
+    CHECK(get(&n_terminal) == 2);       /* + t's FINISHED */
+}
+
+/* ...and a one-shot whose attempt FINISHED is closed by that event: removing its type
+ * before the accounting pass must not report it again. */
+static void remove_a_on_t_start(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_STARTED && strcmp(ev->task_name, "t") == 0)
+        st_remove_u = (int)gptps_unregister_task(manual_e, "a", GPTPS_REMOVE_CANCEL);
+}
+static void test_manual_cancel_does_not_repeat_a_finished_one_shot(void)
+{
+    size_t ran = 0;
+    manual_e = open_manual(2);
+    if (!manual_e) return;
+    reset();
+    st_remove_u = -1;
+    reg(manual_e, "a", task_ok, GPTPS_ON_FAILURE_DEAD_LETTER);
+    reg(manual_e, "t", task_ok, GPTPS_ON_FAILURE_DEAD_LETTER);
+    CHECK(gptps_set_event_cb(manual_e, remove_a_on_t_start, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "a", NULL, 0, NULL) == GPTPS_OK);   /* runs first, finishes */
+    CHECK(gptps_submit(manual_e, "t", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_step(manual_e, &ran) == GPTPS_OK && ran == 2);
+    CHECK(st_remove_u == GPTPS_OK);
+    CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 2);       /* a's FINISHED + t's, and nothing more */
+    CHECK(get(&n_cancelled) == 0);
+}
+
 int main(void)
 {
     test_unregister_cancel_reports_every_item();
@@ -313,6 +533,13 @@ int main(void)
     test_deny_over_event_buffer_reports_every_item();
     test_queued_service_reports_a_terminal_event();
     test_requeue_is_closed_by_the_drain();
+    test_cancel_reports_a_retry_in_backoff();
+    test_cancel_reports_a_requeue_in_backoff();
+    test_shutdown_stops_a_service_in_restart_backoff();
+    test_manual_teardown_and_cancel_report_a_parked_retry();
+    test_manual_cancel_reports_a_failed_attempt_awaiting_accounting();
+    test_manual_cancel_does_not_repeat_a_reported_cancel();
+    test_manual_cancel_does_not_repeat_a_finished_one_shot();
 
     if (fails) { printf("%d reconcile check(s) FAILED\n", fails); return 1; }
     printf("all reconcile checks passed\n");

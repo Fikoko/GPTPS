@@ -46,6 +46,26 @@ the release version and is documented in `include/gptps.h`.
   `tests/test_reconcile.c` now pins it — the file the Readme cites as proof of the
   invariant previously had no case for this path, and the new one fails without the fix.
 
+- **An item parked between attempts could be cancelled, removed or torn down without a
+  terminal event.** The one path that ends queued or parked work without running it —
+  `REMOVE_CANCEL`, the stop of a service at shutdown, and a MANUAL host's teardown —
+  freed an item in silence whenever its `started` flag was set, reading it as
+  "`execute()` already reported this handle closed". But `started` records that an
+  attempt ran, not how it ended, and an item waiting in backoff still carries it from
+  the attempt before. So a bounded retry, a `REQUEUE` item or a restarting service
+  parked there vanished with only a per-attempt `FAILED` (or, for a service, one run's
+  `FINISHED`) to its name, and `gptps_await` on it never returned; the same happened to
+  an attempt that had merely failed and was awaiting its retry decision when a MANUAL
+  removal took it. That path now asks the real question — did this attempt run *and* end
+  in a terminal event: a `FAILED` stamped `GPTPS_E_CANCELLED`, or a `FINISHED` for
+  anything but an always-up service, whose instance `gptps.h` says is closed by the
+  `FAILED`/`GPTPS_E_CANCELLED` its stop produces — and emits `FAILED`/`GPTPS_E_CANCELLED`
+  otherwise. So a `REQUEUE` item taken by `REMOVE_CANCEL` or a MANUAL teardown now
+  closes with that event; a THREADED shutdown still dead-letters it. `CONTRIBUTING.md`'s
+  rule now spells out both halves, and eight new cases in `tests/test_reconcile.c` cover
+  each path: six ended with a terminal event missing before the fix, and two pin that
+  an attempt already cancelled, or already finished, is not reported twice.
+
 - **"Every submitted handle reaches exactly one terminal event" was stated
   unconditionally in eleven places, and is false for two opt-in shapes.** A REQUEUE item
   stays open for as long as its body keeps failing — that is the policy working as

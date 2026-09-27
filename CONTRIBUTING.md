@@ -61,12 +61,16 @@ every add-on built on it depend on this. If you add a path that removes, drops, 
 or cancels an item, that path owes a terminal event — unless `execute()` already emitted
 a **terminal** one for it: a `FINISHED`, or a `FAILED` it stamped `GPTPS_E_CANCELLED`.
 A plain `FAILED` is per-**attempt** and does NOT close the handle, so `it->started`
-alone is not the test — an item whose attempt merely failed is still owed one.
-`tests/test_reconcile.c` enforces it.
+alone is not the test — an item whose attempt merely failed is still owed one, and so
+is one parked in `delayed`, whose `started` describes the attempt before. For an
+always-up `GPTPS_TASK_SERVICE` a `FINISHED` closes one run, not the instance, which is
+still owed the `FAILED`/`GPTPS_E_CANCELLED` its stop produces. `terminal_reported()` in
+`src/engine.c` is that rule in code; `tests/test_reconcile.c` enforces it.
 
 The two documented exceptions are opt-in policies, not licence to add more: a
-`GPTPS_ON_FAILURE_REQUEUE` item stays open while it requeues (shutdown closes it with
-`DEAD_LETTERED`), and a `GPTPS_TASK_SERVICE` handle emits one terminal event per run.
+`GPTPS_ON_FAILURE_REQUEUE` item stays open while it requeues (a THREADED shutdown closes
+it with `DEAD_LETTERED`; a `REMOVE_CANCEL` or a MANUAL teardown with `FAILED`/
+`GPTPS_E_CANCELLED`), and a `GPTPS_TASK_SERVICE` handle emits one terminal event per run.
 If you are adding a third, it belongs in the Readme's guarantee list and in this rule
 before it belongs in the engine.
 
