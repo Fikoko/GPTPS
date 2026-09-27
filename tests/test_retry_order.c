@@ -268,13 +268,63 @@ static void manual_case(int remove_on_retry, unsigned backoff, unsigned slots)
         CHECK(p.terminals == 1); CHECK(p.cancelled == 1);
         CHECK(p.terminal_before_retry == 1);
     } else {
-        const int expected[] = { 1, 2, 0, 0, 0 };
+        /* One slot: the retry reclaims it ahead of every lo. Two: hi#1 and a lo
+         * share the first step, then hi#2 still runs ahead of the next lo - which
+         * only MANUAL mode's full stop in the parking pass guarantees. */
+        const int one_slot[] = { 1, 2, 0, 0, 0 }, two_slots[] = { 1, 0, 2, 0, 0 };
+        const int *expected = slots == 1 ? one_slot : two_slots;
         CHECK(p.calls == 2); CHECK(p.starts == 5);
         CHECK(p.terminals == 4); CHECK(p.cancelled == 0);
-        CHECK(memcmp(p.order, expected, sizeof expected) == 0);
+        CHECK(memcmp(p.order, expected, sizeof one_slot) == 0);
     }
     printf("manual remove=%d backoff=%u slots=%u starts=%d terminals=%d\n",
            remove_on_retry, backoff, slots, p.starts, p.terminals);
+}
+
+/* THREADED: the same removal from a RETRIED callback, on the dispatcher. The retry
+ * is parked, not admitted, while its RETRIED is delivered, so there is nothing to
+ * wait for and the removal completes - the old engine had already admitted a
+ * zero-backoff retry by then, and the removal was refused with GPTPS_E_BUSY. */
+static int threaded_removed;
+static void remove_retry_threaded(const gptps_event *ev, void *ud)
+{
+    remove_retry(ev, ud);
+    if (ev->kind == GPTPS_EV_RETRIED) __atomic_store_n(&threaded_removed, 1, __ATOMIC_SEQ_CST);
+}
+
+static void threaded_remove_case(void)
+{
+    manual_probe p;
+    gptps_config cfg;
+    gptps_task_def d;
+    gptps_handle h;
+    uint64_t t0;
+    memset(&p, 0, sizeof p); memset(&cfg, 0, sizeof cfg); memset(&d, 0, sizeof d);
+    p.remove_on_retry = 1; p.remove_status = GPTPS_E_TASK;
+    cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_THREADED;
+    cfg.limits.struct_size = sizeof cfg.limits; cfg.limits.max_concurrent_tasks = 1;
+    CHECK(gptps_open_ex(&cfg, &p.e) == GPTPS_OK);
+    if (!p.e) return;
+    CHECK(gptps_set_event_cb(p.e, remove_retry_threaded, &p) == GPTPS_OK);
+    CHECK(gptps_register_observer(p.e, manual_observe, &p) == GPTPS_OK);
+    d.struct_size = sizeof d; d.name = "hi"; d.run = manual_task;
+    d.exec = GPTPS_EXEC_INPROC; d.user_data = &p;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.max_retries = 1;              /* zero backoff */
+    CHECK(gptps_register_task(p.e, &d) == GPTPS_OK);
+    CHECK(gptps_submit(p.e, "hi", NULL, 0, &h) == GPTPS_OK);
+    /* shutdown would refuse the removal (E_SHUTDOWN): let the callback run first */
+    t0 = gptps_hal_monotonic_ms();
+    while (!__atomic_load_n(&threaded_removed, __ATOMIC_SEQ_CST) &&
+           gptps_hal_monotonic_ms() - t0 < 5000) { }
+    CHECK(__atomic_load_n(&threaded_removed, __ATOMIC_SEQ_CST) == 1);
+    CHECK(gptps_shutdown(p.e) == GPTPS_OK);   /* joins every thread: p is quiescent */
+    CHECK(p.remove_status == GPTPS_OK);
+    CHECK(p.calls == 1); CHECK(p.starts == 1); CHECK(p.retries == 1);
+    CHECK(p.terminals == 1); CHECK(p.cancelled == 1);
+    CHECK(p.terminal_before_retry == 1);
+    printf("threaded remove: status=%d terminals=%d\n", (int)p.remove_status, p.terminals);
 }
 
 typedef struct {
@@ -326,7 +376,7 @@ static void admission_event(const gptps_event *ev, void *ud)
     gptps_mutex_unlock(p->sync.mu);
 }
 
-static void admission_case(int priority, unsigned slots, int expect_progress)
+static void admission_case_mem(int priority, unsigned slots, uint64_t mem, int expect_progress)
 {
     admission_probe p;
     gptps_config cfg;
@@ -339,7 +389,7 @@ static void admission_case(int priority, unsigned slots, int expect_progress)
     if (!p.sync.mu || !p.sync.cv) return;
     cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_THREADED;
     cfg.limits.struct_size = sizeof cfg.limits;
-    cfg.limits.max_concurrent_tasks = slots; cfg.limits.max_memory_bytes = 2;
+    cfg.limits.max_concurrent_tasks = slots; cfg.limits.max_memory_bytes = mem;
     CHECK(gptps_open_ex(&cfg, &p.e) == GPTPS_OK);
     if (!p.e) return;
     CHECK(gptps_set_event_cb(p.e, admission_event, &p) == GPTPS_OK);
@@ -363,9 +413,15 @@ static void admission_case(int priority, unsigned slots, int expect_progress)
     CHECK(p.sync.calls == 2); CHECK(p.retries == 1); CHECK(p.low_done == 1);
     CHECK(p.low_during_retry == expect_progress);
     CHECK(p.sync.gate_timeouts == !expect_progress);
-    printf("admission priority=%d slots=%u independent_progress=%d expected=%d\n",
-           priority, slots, p.low_during_retry, expect_progress);
+    printf("admission priority=%d slots=%u mem=%llu independent_progress=%d expected=%d\n",
+           priority, slots, (unsigned long long)mem, p.low_during_retry, expect_progress);
     gptps_cond_destroy(p.sync.cv); gptps_mutex_destroy(p.sync.mu);
+}
+
+/* The retry costs 2 bytes: a 2-byte budget leaves nothing beside it. */
+static void admission_case(int priority, unsigned slots, int expect_progress)
+{
+    admission_case_mem(priority, slots, 2, expect_progress);
 }
 
 int main(void)
@@ -379,9 +435,16 @@ int main(void)
     manual_case(2, 0, 1); /* self-returned E_CANCELLED must not close twice */
     manual_case(2, 1, 1);
     manual_case(0, 0, 1);
+    threaded_remove_case();
+    manual_case(0, 0, 2);     /* spare slot: only MANUAL's full stop keeps hi#2 first */
     admission_case(0, 1, 1);  /* equal score, already queued: do not stall it */
     admission_case(-10, 1, 1); /* higher-score unrelated work goes first */
-    admission_case(10, 1, 0); /* reserve the only slot for the higher retry */
+    admission_case(10, 1, 0); /* the only slot and the whole budget are the retry's */
     admission_case(10, 2, 0); /* spare slot, but retry needs the memory budget */
+    admission_case_mem(10, 1, 1u << 20, 0); /* memory to spare: only the slot is held */
+    /* Room for both: lower work fits BESIDE the held retry and must start. A correct
+     * engine always passes this; a hold that stops all lower work usually fails it,
+     * since the retry's own slot is freed in the same pass that parks it. */
+    admission_case_mem(10, 2, 1u << 20, 1);
     return fails ? 1 : 0;
 }
