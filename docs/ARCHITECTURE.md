@@ -431,8 +431,10 @@ needed). Removal is therefore **tombstone + drain**:
   cancel flag on in-flight items, and marks `cancelling` so they are *discarded* (not
   dead-lettered) when they finish; DRAIN lets queued+in-flight finish. In THREADED
   mode the caller then blocks on `cv_drain` (broadcast by the dispatcher after each
-  pass) until no live item references the reg; MANUAL mode never has in-flight work
-  between steps. Teardown detaches retained dead-letter items (they take an owned
+  pass) until no live item references the reg - unless the caller is one of the
+  engine's own threads (`engine_is_reentrant`), which gets `E_BUSY` instead whenever
+  there is anything to wait for, since the drain may need that very thread; MANUAL
+  mode never has in-flight work between steps. Teardown detaches retained dead-letter items (they take an owned
   name copy and sever the reg pointer), unlinks the reg, removes its `tasks.<name>.*`
   settings (with `e->m` released — lock order), then frees it.
 - `gptps_clone_task` deep-copies a reg's def under a new name (sharing the run fn);

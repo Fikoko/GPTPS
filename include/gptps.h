@@ -133,7 +133,10 @@ typedef enum {
     GPTPS_E_TASK,         /* task returned a non-OK application error */
     GPTPS_E_SHUTDOWN,     /* engine is shutting down */
     GPTPS_E_DENIED,       /* a constraint hook rejected admission */
-    GPTPS_E_BUSY          /* task removal refused while work is queued / in-flight (REJECT_IF_BUSY, or DRAIN in MANUAL mode) */
+    GPTPS_E_BUSY          /* refused rather than wait on or re-enter the engine: a task
+                           * removal with work outstanding (REJECT_IF_BUSY; DRAIN in MANUAL
+                           * mode; any removal that would wait, from a task body or a
+                           * callback), or gptps_shutdown / gptps_step from one */
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);
@@ -365,7 +368,10 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *  - Which thread a callback fires on (THREADED mode):
  *      QUEUED                  -> the thread that called gptps_submit;
  *      STARTED/FINISHED/FAILED -> a worker thread;
- *      RETRIED/DEAD_LETTERED   -> the dispatcher thread.
+ *      RETRIED/DEAD_LETTERED/DROPPED -> the dispatcher thread;
+ *      FAILED/GPTPS_E_CANCELLED for an item that never started -> the dispatcher,
+ *        or, for one still queued, the thread that called gptps_cancel /
+ *        gptps_unregister_task.
  *    In MANUAL mode every callback fires on the thread that called gptps_step().
  *  - Event callbacks (gptps_event_cb, observers) and the dead-letter drain
  *    callback ALWAYS run with the engine lock RELEASED, so they MAY call back
@@ -382,7 +388,9 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *  - gptps_shutdown() and gptps_step() are the exceptions to "callbacks may
  *    re-enter": both return GPTPS_E_BUSY when called from a task body or a
  *    callback, since either would tear down / recurse into the caller's own
- *    thread. Signal your main thread instead.
+ *    thread. gptps_unregister_task() does the same whenever the removal would
+ *    have to wait for work of that type, which may need the caller's thread.
+ *    Signal your main thread instead.
  *  - FORK: an engine must not be used in a child of fork(). Its mutex may be held
  *    by a thread that did not survive, so the child would deadlock; every entry
  *    point therefore returns GPTPS_E_SHUTDOWN on an engine created before the
@@ -529,7 +537,18 @@ GPTPS_API gptps_status gptps_clone_task(gptps *e, const char *src_name, const ch
  * successful return the type is gone: its name is free to re-register and its
  * tasks.<name>.* settings are torn down. Dead-lettered items for the type are
  * retained (they carry the name as data) and remain drainable. GPTPS_E_NOTFOUND if
- * unknown, GPTPS_E_BUSY (REJECT_IF_BUSY only) if work is outstanding.
+ * unknown; GPTPS_E_BUSY if work is outstanding under REJECT_IF_BUSY, or from a task
+ * body or callback as described below - the type is then left untouched.
+ *
+ * Called from one of the engine's own threads - a task body, or an event callback
+ * on a worker or the dispatcher - a removal that would have to wait returns
+ * GPTPS_E_BUSY instead of waiting: the work it would wait for may need that very
+ * thread (the dispatcher accounts every completion; a worker's own item may be of
+ * this type), so it would never return. That holds even where the wait could have
+ * ended - a task body removing a different type whose work runs on other workers -
+ * because two such waits can wait on each other. A removal with nothing to wait for
+ * - an idle type, or a CANCEL of work that is only queued - still completes there.
+ * To remove a busy type from a callback, signal a thread of your own to do it.
  *
  * THREADED mode blocks until the drain/cancel completes. DRAIN waits for queued +
  * in-flight work to finish, so it can block indefinitely if that work cannot make
@@ -537,10 +556,11 @@ GPTPS_API gptps_status gptps_clone_task(gptps *e, const char *src_name, const ch
  * use CANCEL to force removal in that case. In MANUAL mode there is no in-flight
  * work between gptps_step calls, so DRAIN/REJECT_IF_BUSY refuse with GPTPS_E_BUSY
  * when work is still queued (drain it by stepping first); CANCEL drops the queued
- * backlog and removes immediately. NOTE: a CANCEL/DRAIN of an in-flight in-process
- * task that never polls gptps_is_cancelled() blocks until it returns (same
- * cooperative limit as timeouts). Do not register/re-register the same name
- * concurrently with its removal (registration is a setup-time operation). */
+ * backlog and removes immediately - except from inside gptps_step while an instance
+ * of the type is running, which is refused with GPTPS_E_BUSY. NOTE: a CANCEL/DRAIN
+ * of an in-flight in-process task that never polls gptps_is_cancelled() blocks until
+ * it returns (same cooperative limit as timeouts). Do not register/re-register the
+ * same name concurrently with its removal (registration is a setup-time operation). */
 GPTPS_API gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned flags);
 
 /* Load a dynamic add-on (shared library) via the host-table ABI below. The

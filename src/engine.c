@@ -2476,6 +2476,28 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
             gptps_mutex_unlock(e->m);
             return GPTPS_E_BUSY;
         }
+        /* ...unless this IS one of the threads the drain needs. Every completion is
+         * accounted by a dispatcher pass and every admitted item is run by a worker,
+         * so a removal that has to wait, called from the dispatcher (an event
+         * callback for RETRIED / DEAD_LETTERED / DROPPED), waits for a pass it is
+         * itself holding up; called from a worker (a task body, or the STARTED /
+         * FINISHED / FAILED callback it emits) it waits for the very item that
+         * worker is running whenever that item is of this type. Neither ever
+         * returns. Refuse, exactly as a re-entrant gptps_shutdown does, before
+         * anything is changed, so the caller can retry from a thread of its own.
+         * The rule is "an engine thread never waits on the engine", not "only where
+         * it would deadlock": a worker removing another type whose work runs
+         * elsewhere could finish, but two workers each removing the other's type
+         * would wait on each other, and nothing here could tell. A removal with
+         * nothing to wait for - an idle type, or a CANCEL of work that is only
+         * queued, which it detaches below - still completes here. */
+        if (engine_is_reentrant(e, gptps_hal_thread_id())) {
+            unsigned owed = fifo_count_reg(&e->ready, r) + fifo_count_reg(&e->done, r)
+                          + fifo_count_reg(&e->running_items, r);
+            if (mode != GPTPS_REMOVE_CANCEL)
+                owed += fifo_count_reg(&e->intake, r) + fifo_count_reg(&e->delayed, r);
+            if (owed > 0) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
+        }
         r->removed = true;               /* reject new submits + stop retries (bounded drain) */
         if (mode == GPTPS_REMOVE_CANCEL) {
             gptps_item *it;

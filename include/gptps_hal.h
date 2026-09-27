@@ -78,9 +78,10 @@ void          gptps_thread_join(gptps_thread *t);               /* joins, then f
 
 /* An opaque, comparable id for the CALLING thread, stable for its lifetime and
  * distinct from every other live thread's. The core uses it for ONE purpose:
- * detecting re-entrancy - gptps_shutdown() or gptps_step() called from inside a
- * task body or an event callback, which would otherwise join (or free) the very
- * thread making the call. Never used for scheduling, indexing, or storage.
+ * detecting re-entrancy - gptps_shutdown(), gptps_step() or a gptps_unregister_task()
+ * that would have to wait, called from inside a task body or an event callback,
+ * which would otherwise join, free or wait on the very thread making the call.
+ * Never used for scheduling, indexing, or storage.
  * A single-threaded HAL may return any constant. */
 uint64_t gptps_hal_thread_id(void);
 

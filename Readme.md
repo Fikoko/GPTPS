@@ -768,7 +768,9 @@ hang it hangs your host's exit path — so these are contractual, and
   `limits.shutdown_grace_ms` (default 30s; `0` opts back into waiting forever), then
   gets cancelled — an external child with no timeout of its own cannot wedge teardown.
 - `gptps_shutdown` / `gptps_step` return `GPTPS_E_BUSY` rather than deadlocking when
-  called from a task body or an event callback.
+  called from a task body or an event callback, and so does a `gptps_unregister_task`
+  there that would have to wait for work of that type
+  ([`tests/test_unregister_reentry.c`](tests/test_unregister_reentry.c)).
 - The engine's growable state is bounded, with one deliberate exception. The
   dead-letter list (`limits.max_dead_letters`, default 1024) and the bytes an
   out-of-process child can make the parent buffer (16 MiB) are capped, and truncation

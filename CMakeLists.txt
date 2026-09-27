@@ -382,6 +382,12 @@ target_link_libraries(test_taskmgmt PRIVATE gptps)
 add_test(NAME taskmgmt COMMAND test_taskmgmt)
 set_tests_properties(taskmgmt PROPERTIES TIMEOUT 30)
 
+add_executable(test_unregister_reentry tests/test_unregister_reentry.c) # unregister from the engine's own threads refuses, not hangs
+target_include_directories(test_unregister_reentry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_unregister_reentry PRIVATE gptps)
+add_test(NAME unregister_reentry COMMAND test_unregister_reentry)
+set_tests_properties(unregister_reentry PROPERTIES TIMEOUT 30)
+
 add_executable(test_step tests/test_step.c) # MANUAL single-threaded pump (gptps_step)
 target_include_directories(test_step
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

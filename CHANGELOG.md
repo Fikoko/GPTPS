@@ -87,6 +87,37 @@ the release version and is documented in `include/gptps.h`.
   the loss written into it as a tolerated range and now asserts the exact count, because a
   range cannot fail when the fix regresses.
 
+### Fixed — an unregister that waited for itself
+
+- **`gptps_unregister_task` called from a task body or an event callback no longer
+  hangs the engine.** In THREADED mode a removal marks the type and then waits for its
+  live work to drain. That drain needs the engine's own threads: every completion is
+  accounted by a dispatcher pass, and every admitted item runs on a worker. Called from
+  the dispatcher - a `RETRIED`, `DEAD_LETTERED` or `DROPPED` callback, the natural place
+  for a circuit breaker - it waited for a pass it was itself holding up whenever any
+  item of the type was still live: queued, waiting out a retry backoff, ready, running
+  or awaiting accounting. That includes the commonest shape of all, a `RETRIED` callback
+  draining its own type with nothing else in flight, because the item just retried is
+  live. Called from a worker - a task body, or the `STARTED` / `FINISHED` / `FAILED`
+  callback it emits - it waited for the very item that worker was running whenever
+  that item was of the type being removed. Neither returned, and the engine stopped
+  with them; the header only ever named `gptps_shutdown` and `gptps_step` as calls to
+  keep out of callbacks. A removal that would have to wait now returns `GPTPS_E_BUSY`
+  when called from one of the engine's own threads, before anything is changed - the
+  refusal `gptps_shutdown` already gives, and the one MANUAL mode already gave for a
+  running instance. A removal with nothing to wait for (an idle type, or a CANCEL of
+  work that is only queued) still completes there.
+  **This refuses some calls that used to succeed.** A task body that removed a
+  *different* type whose work ran on other workers used to wait and return
+  `GPTPS_OK`; it now gets `GPTPS_E_BUSY` and the type stays registered. The rule is that
+  an engine thread never waits on the engine - two workers each removing the other's
+  type would wait on each other, and nothing could tell that call from the safe one.
+  Make such removals from a thread of your own, and check the result: a caller that
+  ignores it now keeps the type. `tests/test_unregister_reentry.c` puts the type's work
+  in each place a drain waits on, from the dispatcher and from a worker; before the fix
+  it did not fail, it hung, and each of six mutants of the new check makes it fail or
+  hang again.
+
 ### Fixed — add-ons
 
 - **`gptps_xport`: a blocking submit could return `GPTPS_E_IO` for a retired worker while
