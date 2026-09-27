@@ -39,12 +39,13 @@ the release version and is documented in `include/gptps.h`.
 - **A `GPTPS_ON_FAILURE_REQUEUE` item reached shutdown without a terminal event.** The
   drain refuses to re-admit it — an always-failing requeue would hang shutdown forever —
   and dead-letters it instead, but it never emitted the `DEAD_LETTERED` that says so. It
-  was the one shape that could reach shutdown and close in silence: `gptps_await` on such
-  a handle never returned, and every add-on that reconciles terminal events leaked a slot
-  per item. Measured before: 8 of 8 handles ended with zero terminal events after
-  `gptps_shutdown` returned; after: 8 of 8 close with `DEAD_LETTERED`.
-  `tests/test_reconcile.c` now pins it — the file the Readme cites as proof of the
-  invariant previously had no case for this path, and the new one fails without the fix.
+  was one shape that could reach shutdown and close in silence (the parked-item entry
+  below closes the others): `gptps_await` on such a handle never returned, and every
+  add-on that reconciles terminal events leaked a slot per item. Measured before: 8 of 8
+  handles ended with zero terminal events after `gptps_shutdown` returned; after: 8 of 8
+  close with `DEAD_LETTERED`. `tests/test_reconcile.c` now pins it — the file the Readme
+  cites as proof of the invariant previously had no case for this path, and the new one
+  fails without the fix.
 
 - **An item parked between attempts could be cancelled, removed or torn down without a
   terminal event.** The one path that ends queued or parked work without running it —
@@ -113,24 +114,24 @@ the release version and is documented in `include/gptps.h`.
   hangs the engine.** In THREADED mode a removal marks the type and then waits for its
   live work to drain. That drain needs the engine's own threads: every completion is
   accounted by a dispatcher pass, and every admitted item runs on a worker. Called from
-  the dispatcher - a `RETRIED`, `DEAD_LETTERED` or `DROPPED` callback, the natural place
-  for a circuit breaker - it waited for a pass it was itself holding up whenever any
+  the dispatcher — a `RETRIED`, `DEAD_LETTERED` or `DROPPED` callback, the natural place
+  for a circuit breaker — it waited for a pass it was itself holding up whenever any
   item of the type was still live: queued, waiting out a retry backoff, ready, running
   or awaiting accounting. That includes the commonest shape of all, a `RETRIED` callback
   draining its own type with nothing else in flight, because the item just retried is
-  live. Called from a worker - a task body, or the `STARTED` / `FINISHED` / `FAILED`
-  callback it emits - it waited for the very item that worker was running whenever
+  live. Called from a worker — a task body, or the `STARTED` / `FINISHED` / `FAILED`
+  callback it emits — it waited for the very item that worker was running whenever
   that item was of the type being removed. Neither returned, and the engine stopped
   with them; the header only ever named `gptps_shutdown` and `gptps_step` as calls to
   keep out of callbacks. A removal that would have to wait now returns `GPTPS_E_BUSY`
-  when called from one of the engine's own threads, before anything is changed - the
+  when called from one of the engine's own threads, before anything is changed — the
   refusal `gptps_shutdown` already gives, and the one MANUAL mode already gave for a
   running instance. A removal with nothing to wait for (an idle type, or a CANCEL of
   work that is only queued) still completes there.
   **This refuses some calls that used to succeed.** A task body that removed a
   *different* type whose work ran on other workers used to wait and return
   `GPTPS_OK`; it now gets `GPTPS_E_BUSY` and the type stays registered. The rule is that
-  an engine thread never waits on the engine - two workers each removing the other's
+  an engine thread never waits on the engine — two workers each removing the other's
   type would wait on each other, and nothing could tell that call from the safe one.
   Make such removals from a thread of your own, and check the result: a caller that
   ignores it now keeps the type. `tests/test_unregister_reentry.c` puts the type's work
@@ -138,23 +139,47 @@ the release version and is documented in `include/gptps.h`.
   it did not fail, it hung, and each of six mutants of the new check makes it fail or
   hang again.
 
+### Fixed — settings
+
+- **An engine-owned setting could accept a value and store a different one.** Every
+  engine-owned value — a `gptps_define_global` or `gptps_define_task_setting` knob, of any
+  type — lives in one fixed `GPTPS_SETTINGS_VALUE_MAX` cell, but only STRING values were
+  length-checked. An INT, UINT, DOUBLE or ENUM value too long for the cell parsed,
+  validated, and was then cut short on store: 255 zeros followed by `1` was accepted and
+  kept without its last digit. And a config reload copied STRING/ENUM text into a
+  256-byte buffer *before* validating it, so an over-long string passed as its 255-byte
+  prefix, and an invalid enum became a valid choice whenever that prefix happened to
+  match one. Over-long input is now rejected with `GPTPS_E_CONFIG` before it is stored
+  (per key: a reload still applies its other keys), a rejected update leaves the current
+  value in place, and reload validates the parser's original text.
+  `tests/test_settings_length.c` covers INT, UINT, DOUBLE and ENUM defaults and updates,
+  and STRING and ENUM reloads, at the 255/256-byte boundary; 48 of its assertions fail
+  against the code before the fix. Found and fixed by @kuntakinte7270 in #7.
+- **The string getters' buffer contract is written down.** `gptps_task_setting_str` and
+  `gptps_settings_get` return `GPTPS_OK` whether or not the value fit the caller's buffer.
+  One of `GPTPS_SETTINGS_VALUE_MAX` bytes can never truncate, and the header now says so;
+  before, neither getter mentioned the cap, buffers or truncation. A smaller buffer still
+  truncates and still returns `GPTPS_OK` — documented, not changed. Reported by
+  @kuntakinte7270, who added the boundary tests that hold both getters to it in #6.
+
 ### Fixed — add-ons
 
-- **`gptps_xport`: a blocking submit could return `GPTPS_E_IO` for a retired worker while
-  `gptps_xport_live()` still counted it.** The reader published the failure - `done` set,
-  waiters woken - and only then took the worker out of the rotation, so a submitter woken
-  in that gap could return and read the old count; a concurrent submit that found the link
-  `dead` got the same stale answer. `fail_all()` now retires the worker inside the `pmu`
-  critical section that publishes the failure. That nests `cursor_lock` under `pmu` for the
-  first time, which is safe because nothing is ever acquired while `cursor_lock` is held.
-  `tests/test_xport.c:119` caught it intermittently under load: 0.4-1.9% of runs with the
-  test pinned to two CPUs, every run with a sleep forced into the gap, and none of either
-  with the fix. Found and fixed by @kuntakinte7270 in #9.
+- **`gptps_xport`: a blocking submit could return `GPTPS_E_IO` for a retired worker
+  while `gptps_xport_live()` still counted it.** The reader published the failure —
+  `done` set, waiters woken — and only then took the worker out of the rotation, so a
+  submitter woken in that gap could return and read the old count; a concurrent submit
+  that found the link `dead` got the same stale answer. `fail_all()` now retires the
+  worker inside the `pmu` critical section that publishes the failure. That nests
+  `cursor_lock` under `pmu` for the first time, which is safe because nothing is ever
+  acquired while `cursor_lock` is held. The `gptps_xport_live(xd) == 3` check in
+  `tests/test_xport.c` caught it intermittently under load: 0.4-1.9% of runs with the
+  test pinned to two CPUs, every run with a sleep forced into the gap, and none of
+  either with the fix. Found and fixed by @kuntakinte7270 in #9.
 
 - **`gptps_xport`: an async submit whose frame write failed as its worker died could be
   freed twice.** Since engine mode (1.2.0), `submit_async` registered its record, then
   wrote the frame. A worker dying under that write woke two threads at once: the
-  submitter, whose `send()` failed, and the reader, which saw EOF and ran `fail_all()` -
+  submitter, whose `send()` failed, and the reader, which saw EOF and ran `fail_all()` —
   unlinking the record, reporting `GPTPS_E_IO` through the callback and freeing it. When
   the reader got there first, the submitter read the record's `done` flag anyway,
   returned `GPTPS_E_IO`, and `submit_async` freed it again: one failure reported twice,
@@ -165,14 +190,14 @@ the release version and is documented in `include/gptps.h`.
   The submitter now copies what it needs before registering and settles ownership by
   id: a record it takes back fails the submit with `GPTPS_E_IO`; one the reader
   claimed is reported by the callback alone, so `submit_async` returns `GPTPS_OK`.
-  `gptps_xport.h` now states the contract that was always implied - exactly one
-  outcome per call - and that a `GPTPS_E_IO` return means the request never reached a
+  `gptps_xport.h` now states the contract that was always implied — exactly one
+  outcome per call — and that a `GPTPS_E_IO` return means the request never reached a
   worker. `tests/test_xport.c` races the two threads at least 40 times per run; against
   the old code every run failed.
 
 - **`gptps_stats`: a `RETRIED` that arrived late left the gauges stuck.** The RETRIED arm
   set a handle back to `PENDING` whatever state it was in. But `RETRIED` comes from the
-  dispatcher, and the attempt it announces can start, finish, fail - or be cancelled -
+  dispatcher, and the attempt it announces can start, finish, fail — or be cancelled —
   before it arrives: a zero-backoff retry re-admitted in the same pass, or a
   `gptps_cancel` landing while the `RETRIED` was still being delivered. The late event
   then reopened a running handle as pending (`pending` and `in_flight` both stuck at 1,
@@ -181,15 +206,33 @@ the release version and is documented in `include/gptps.h`.
   `pending` anywhere up to several hundred after shutdown, on 8 workers, in almost every
   run. Each slot now tracks the attempts it has seen run and the attempts a `RETRIED` has
   announced: a `RETRIED` for an attempt that already started or ended moves nothing, and a
-  handle that ends before the `RETRIED` owed to it waits for it as a tombstone - the
+  handle that ends before the `RETRIED` owed to it waits for it as a tombstone — the
   shape the late `QUEUED` already had. The wait sample such an attempt carried off is
   taken from the late `RETRIED`, a `QUEUED` that outlives a whole attempt no longer
   loses attempt 1's, and an event that arrives in order but stamped earlier than the
   one before it (two threads' clocks) gives a wait of 0 instead of none.
   `addons/README.md` called stats order-independent; now it is. `tests/test_stats_order.c`
-  feeds the observer every order 15 handle lifecycles can arrive in - 372 in all, 273 of
-  which broke the old code - and `tests/test_stats.c` reproduces the cancel case on a
+  feeds the observer every order 15 handle lifecycles can arrive in — 372 in all, 273 of
+  which broke the old code — and `tests/test_stats.c` reproduces the cancel case on a
   real engine: the old code ended with `pending == 1`.
+
+- **`gptps_xport`: a blocking submit from a reply callback waited for itself.** A reply
+  callback runs on its link's reader thread, and only that thread completes the link's
+  requests. `gptps_xport.h` said the callback "may call `gptps_xport_submit_async` (or
+  `_submit`)", but a blocking `_submit` that round-robins onto the callback's own link —
+  every time, with one worker — waited for a reply only the waiting thread could
+  deliver, and never returned; `gptps_xport_close` then hung joining it. Two links whose
+  callbacks submit to each other could wait on each other the same way. From one of that
+  transport's live readers the blocking submit now returns `GPTPS_E_BUSY` before sending
+  anything. **This refuses some calls that used to succeed:** on a pool of more than one
+  worker, a blocking submit from a callback that landed on another live link used to
+  return its reply. An `io == GPTPS_E_IO` callback is exempt — its link is already dead,
+  so nothing can be waiting on it, and a synchronous retry from there still works.
+  `submit_async` is allowed from a callback, and the header now says what it costs: it
+  writes the request on the reader thread, so a request larger than the socket buffer
+  can block while that link's worker is itself blocked sending a reply only this thread
+  would read. `tests/test_xport.c` makes both calls from a callback on a one-worker pool,
+  and retries synchronously from an E_IO callback; before the fix it hung.
 
 ### Added — a tier that costs nothing
 
