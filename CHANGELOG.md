@@ -119,6 +119,27 @@ the release version and is documented in `include/gptps.h`.
   worker. `tests/test_xport.c` races the two threads at least 40 times per run; against
   the old code every run failed.
 
+- **`gptps_stats`: a `RETRIED` that arrived late left the gauges stuck.** The RETRIED arm
+  set a handle back to `PENDING` whatever state it was in. But `RETRIED` comes from the
+  dispatcher, and the attempt it announces can start, finish, fail - or be cancelled -
+  before it arrives: a zero-backoff retry re-admitted in the same pass, or a
+  `gptps_cancel` landing while the `RETRIED` was still being delivered. The late event
+  then reopened a running handle as pending (`pending` and `in_flight` both stuck at 1,
+  its run sample lost), or, after the handle's terminal event, a fresh slot that never
+  closed. Measured on the old code: 20,000 near-empty tasks that each fail once left
+  `pending` anywhere up to several hundred after shutdown, on 8 workers, in almost every
+  run. Each slot now tracks the attempts it has seen run and the attempts a `RETRIED` has
+  announced: a `RETRIED` for an attempt that already started or ended moves nothing, and a
+  handle that ends before the `RETRIED` owed to it waits for it as a tombstone - the
+  shape the late `QUEUED` already had. The wait sample such an attempt carried off is
+  taken from the late `RETRIED`, a `QUEUED` that outlives a whole attempt no longer
+  loses attempt 1's, and an event that arrives in order but stamped earlier than the
+  one before it (two threads' clocks) gives a wait of 0 instead of none.
+  `addons/README.md` called stats order-independent; now it is. `tests/test_stats_order.c`
+  feeds the observer every order 15 handle lifecycles can arrive in - 372 in all, 273 of
+  which broke the old code - and `tests/test_stats.c` reproduces the cancel case on a
+  real engine: the old code ended with `pending == 1`.
+
 ### Added — a tier that costs nothing
 
 - **`GPTPS_TUI_KPI_OFF`.** `MINIMAL` was documented as "~no per-event work", but it still

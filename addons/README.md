@@ -372,11 +372,17 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   `gptps_pool_shard(p, i)` and fold them with `gptps_stats_merge()` — the sum is the pool.
   With `gptps_xport` in engine mode, install it from the `child_init` hook; each worker
   process then has its own.
-- **Order-independent:** `QUEUED` is emitted on the submitting thread and everything
-  else on the dispatcher, so a fast task can report `STARTED` (or `FINISHED`) before its
-  own `QUEUED`. Every transition is keyed on the handle's current state, not on arrival
-  order; the one visible effect is that a `STARTED` that outruns its `QUEUED` has no
-  queue-wait sample.
+- **Order-independent:** events come from several threads, and beyond the per-attempt
+  order `gptps.h` documents nothing orders them. So a fast task can report `STARTED`
+  (or `FINISHED`) before its own `QUEUED`, a retried attempt can start, end or be
+  cancelled before the `RETRIED` that announced it, and a cancel can overtake a
+  `RETRIED` still being delivered. Every transition is keyed on the handle's current
+  state and on the attempt an event names, never on arrival order: a `RETRIED` for an
+  attempt that already started or ended moves nothing, and a handle that ends early
+  waits for the event still owed to it before it is forgotten. A wait sample carried
+  off by an out-of-order event is taken from the late one instead, as a lower bound.
+  `tests/test_stats_order.c` runs 15 handle lifecycles - retries, cancels, REQUEUE
+  cycles - through every order their events can arrive in.
 - **Cost:** one lock and one hash lookup per event. The handle table is bounded by the
   engine's own queue.
 - **Not settings.** The counters are deliberately not registered in the settings

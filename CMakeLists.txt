@@ -644,6 +644,14 @@ add_test(NAME pool COMMAND test_pool)
 set_tests_properties(pool PROPERTIES TIMEOUT 30)
 endif()
 
+if(TARGET gptps_stats)
+add_executable(test_stats_order tests/test_stats_order.c) # stats vs every order one handle's events can arrive in (compiles the add-on in)
+target_include_directories(test_stats_order PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_stats_order PRIVATE gptps)
+add_test(NAME stats_order COMMAND test_stats_order)
+set_tests_properties(stats_order PROPERTIES TIMEOUT 30)
+endif()
+
 if(TARGET gptps_stats AND TARGET gptps_pool)
 add_executable(test_stats tests/test_stats.c)         # observer-seam counters; merged across pool shards
 target_include_directories(test_stats PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)

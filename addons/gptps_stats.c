@@ -18,6 +18,8 @@
  *                                        started: cancelled in queue)  run sample
  *                     ...unless status == CANCELLED, which is terminal
  *   RETRIED        -> PENDING            pending++   (re-stamps the queue time)
+ *                     ...unless the attempt it announces already started or ended:
+ *                     a LATE RETRIED moves nothing (see "Event ORDER" below)
  *   DEAD_LETTERED  -> terminal           pending-- if still PENDING (denied /
  *   DROPPED                              shutdown-terminated in queue), else none
  *
@@ -54,7 +56,19 @@ typedef struct {
     uint8_t      have_queued_ms, have_started_ms;
     uint64_t     queued_ms;  /* last QUEUED / RETRIED */
     uint64_t     started_ms; /* last STARTED */
+    /* Retry bookkeeping, so a RETRIED is judged by the attempt it announces rather
+     * than by when it arrives (see "Event ORDER" above stats_observe). */
+    uint32_t     att;        /* highest attempt started or ended in this cycle; an
+                              * attempt-1 STARTED (a REQUEUE) resets it */
+    uint32_t     ann;        /* highest attempt a RETRIED has announced, this cycle */
+    uint32_t     owe_r;      /* attempt whose STARTED outran its RETRIED: wait owed */
+    uint8_t      owe_q;      /* attempt 1's STARTED outran QUEUED: wait owed ... */
+    uint64_t     q_started_ms; /* ... measured from here */
 } stats_slot;
+
+/* An event of attempt N > 1 has arrived and the RETRIED announcing attempt N has not:
+ * it is still on its way, so the slot must outlive a terminal event to meet it. */
+#define OWES_RETRIED(sl) ((sl)->att > 1 && (sl)->ann < (sl)->att)
 
 typedef struct {
     char                *name;
@@ -168,17 +182,33 @@ static void sample_run(gptps_stats *s, gptps_stats_counters *t, uint64_t ms)
     if (t) { t->run_samples += 1; t->run_ms_sum += ms; if (ms > t->run_ms_max) t->run_ms_max = ms; }
 }
 
-/* Event ORDER is not guaranteed across threads: QUEUED is emitted on the submitting
- * thread, everything else on the dispatcher, so a fast task can report STARTED - or
- * even FINISHED - before its own QUEUED callback runs. Every transition below is
- * therefore keyed on the slot's current state, not on the order it "should" arrive
- * in, and a terminal event that outruns QUEUED leaves a ST_DONE tombstone that the
- * late QUEUED then clears. (Work submitted before attach never sends its QUEUED, so
- * it leaves one small tombstone each - the price of installing late.) */
+/* Event ORDER is not guaranteed across threads (see EVENT ORDER in gptps.h). Two
+ * inversions reach this observer, and every transition below is keyed on the slot's
+ * state and on the attempt an event names - never on the order events arrive in:
+ *   - QUEUED comes from the submitting thread, so a fast task can report STARTED -
+ *     or even FINISHED - before its own QUEUED. A terminal event that outruns QUEUED
+ *     leaves a ST_DONE tombstone that the late QUEUED then clears.
+ *   - RETRIED comes from the dispatcher, and attempt N can start, finish, fail - or
+ *     be cancelled - before the RETRIED announcing it arrives: a zero-backoff retry
+ *     re-admitted in the same pass, or a cancel landing while the RETRIED is still
+ *     being delivered. Taken on arrival order, that late RETRIED reopened a handle
+ *     already running or already over as PENDING, and the gauges never came back:
+ *     pending and in_flight stuck above zero, a run sample lost, and after a
+ *     terminal event a fresh slot leaked as well. So a RETRIED for an attempt this
+ *     handle has already started or ended moves nothing, and a terminal event that
+ *     outruns the RETRIED it is owed leaves a tombstone for that RETRIED to clear.
+ * An attempt that starts before the event that queued it carries off its wait
+ * sample, and that sample is taken when the late event arrives. (Work submitted
+ * before attach never sends its QUEUED, so it leaves one small tombstone each - the
+ * price of installing late.) */
 static void finish_slot(gptps_stats *s, stats_slot *slot)
 {
-    if (slot->seen_queued) tab_del(s, slot);
-    else slot->state = ST_DONE;                /* wait for the late QUEUED */
+    if (slot->seen_queued && !OWES_RETRIED(slot)) tab_del(s, slot);
+    else slot->state = ST_DONE;                /* wait for the late QUEUED / RETRIED */
+}
+static void note_attempt(stats_slot *slot, uint32_t attempt)
+{
+    if (attempt > slot->att) slot->att = attempt;
 }
 
 static void stats_observe(const gptps_event *ev, void *ud)
@@ -204,19 +234,25 @@ static void stats_observe(const gptps_event *ev, void *ud)
         BUMP(queued);
         if (slot) {
             slot->seen_queued = 1;
-            /* A STARTED that outran this QUEUED carried off the wait sample: the STARTED
-             * arm below samples only when the queue time is already known, and out of
-             * order it is not. Recover it here rather than drop it. This event's ts was
-             * stamped when the submitting thread finally reached the emit, at or after
-             * the real enqueue, so started - this is a LOWER bound on the true wait; when
-             * even that inverts, the item started before its own notification left the
-             * submitter and 0 is the only honest answer. Dropping the sample instead
-             * biases the reported mean UP, because the items that lose this race are
-             * exactly the ones that waited least. Placement is load-bearing: tab_del()
-             * backward-shifts and invalidates `slot`, so the sample must be taken first. */
-            if (!slot->have_queued_ms && slot->have_started_ms)
-                sample_wait(s, t, (slot->started_ms > ev->ts_ms) ? slot->started_ms - ev->ts_ms : 0);
-            if (slot->state == ST_DONE) { tab_del(s, slot); break; }   /* already over */
+            /* A STARTED that outran this QUEUED left its wait sample owed here: the
+             * queue time was not known yet, so the STARTED arm below kept when it
+             * started instead (owe_q). Take the sample now rather than drop it. This
+             * event's ts was stamped when the submitting thread finally reached the
+             * emit, at or after the real enqueue, so started - this is a LOWER bound on
+             * the true wait; when even that inverts, the item started before its own
+             * notification left the submitter and 0 is the only honest answer. Dropping
+             * the sample instead biases the reported mean UP, because the items that
+             * lose this race are exactly the ones that waited least. Placement is
+             * load-bearing: tab_del() backward-shifts and invalidates `slot`, so the
+             * sample must be taken first. */
+            if (slot->owe_q) {
+                sample_wait(s, t, (slot->q_started_ms > ev->ts_ms) ? slot->q_started_ms - ev->ts_ms : 0);
+                slot->owe_q = 0;
+            }
+            if (slot->state == ST_DONE) {                               /* already over */
+                if (!OWES_RETRIED(slot)) tab_del(s, slot);
+                break;
+            }
             if (slot->state == ST_NONE) { slot->state = ST_PENDING; GAUGE(pending, 1); }
             if (!slot->have_queued_ms) { slot->queued_ms = ev->ts_ms; slot->have_queued_ms = 1; }
         }
@@ -225,15 +261,25 @@ static void stats_observe(const gptps_event *ev, void *ud)
         BUMP(started);
         if (slot) {
             if (slot->state == ST_PENDING) GAUGE(pending, -1);
+            if (ev->attempt <= 1) { slot->ann = 0; slot->owe_r = 0; }  /* a new cycle: REQUEUE */
+            slot->att = ev->attempt;
             slot->state = ST_RUNNING; slot->started_ms = ev->ts_ms; slot->have_started_ms = 1;
             GAUGE(in_flight, 1);
-            if (slot->have_queued_ms && ev->ts_ms >= slot->queued_ms)
-                sample_wait(s, t, ev->ts_ms - slot->queued_ms);
+            /* The wait is measured from the event that queued THIS attempt. If that
+             * event has not arrived yet, the sample is owed to it instead. */
+            if (ev->attempt > 1 && slot->ann < ev->attempt) {
+                slot->owe_r = ev->attempt;                 /* outran its RETRIED */
+            } else if (!slot->have_queued_ms) {
+                slot->owe_q = 1; slot->q_started_ms = ev->ts_ms;   /* outran its QUEUED */
+            } else {    /* in order, but two threads' stamps can still invert: 0 */
+                sample_wait(s, t, (ev->ts_ms > slot->queued_ms) ? ev->ts_ms - slot->queued_ms : 0);
+            }
         }
         break;
     case GPTPS_EV_FINISHED:
         BUMP(finished); BUMP(terminal);
         if (slot) {
+            note_attempt(slot, ev->attempt);
             if (slot->state == ST_RUNNING) {
                 GAUGE(in_flight, -1);
                 if (slot->have_started_ms && ev->ts_ms >= slot->started_ms)
@@ -246,6 +292,7 @@ static void stats_observe(const gptps_event *ev, void *ud)
         BUMP(failed);
         if (ev->status == GPTPS_E_CANCELLED) { BUMP(cancelled); BUMP(terminal); }
         if (slot) {
+            note_attempt(slot, ev->attempt);
             if (slot->state == ST_RUNNING) {
                 GAUGE(in_flight, -1);
                 if (slot->have_started_ms && ev->ts_ms >= slot->started_ms)
@@ -260,6 +307,19 @@ static void stats_observe(const gptps_event *ev, void *ud)
     case GPTPS_EV_RETRIED:
         BUMP(retried);
         if (slot) {
+            if (ev->attempt > slot->ann) slot->ann = ev->attempt;
+            if (slot->owe_r && slot->owe_r == ev->attempt) {   /* its STARTED outran it */
+                sample_wait(s, t, (slot->started_ms > ev->ts_ms) ? slot->started_ms - ev->ts_ms : 0);
+                slot->owe_r = 0;
+            }
+            /* LATE: the attempt it announces has already started or ended, or the
+             * handle is over. It moves no state - reopening the slot as PENDING is
+             * what used to leave the gauges stuck - and it clears the tombstone a
+             * terminal event left waiting for it (tab_del invalidates `slot`). */
+            if (slot->att >= ev->attempt || slot->state == ST_DONE) {
+                if (slot->state == ST_DONE && slot->seen_queued) tab_del(s, slot);
+                break;
+            }
             if (slot->state != ST_PENDING) GAUGE(pending, 1);
             slot->state = ST_PENDING; slot->queued_ms = ev->ts_ms; slot->have_queued_ms = 1;
         }
@@ -269,6 +329,7 @@ static void stats_observe(const gptps_event *ev, void *ud)
         if (ev->kind == GPTPS_EV_DEAD_LETTERED) BUMP(dead_lettered); else BUMP(dropped);
         BUMP(terminal);
         if (slot) {
+            note_attempt(slot, ev->attempt);
             if (slot->state == ST_PENDING) GAUGE(pending, -1);
             else if (slot->state == ST_RUNNING) GAUGE(in_flight, -1);   /* defensive */
             finish_slot(s, slot);

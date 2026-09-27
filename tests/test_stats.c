@@ -131,6 +131,50 @@ static void test_gauges(void)
     gptps_stats_close(s);
 }
 
+/* A cancel that lands while a RETRIED is still being delivered reaches every observer
+ * after the canceller FIRST: the retry is parked in the delayed queue, and gptps_cancel
+ * ends a parked handle at once, on the cancelling thread. The event callback runs
+ * before any observer, so cancelling from it on RETRIED makes stats see attempt 2's
+ * terminal FAILED/E_CANCELLED, and only then the RETRIED that announced attempt 2.
+ * Taken on arrival order, that RETRIED reopened the finished handle as PENDING in a
+ * fresh slot - pending stuck at 1 for good. MANUAL mode and a nonzero backoff make
+ * the order the same on every run. */
+static void cancel_on_retried(const gptps_event *ev, void *ud)
+{
+    if (ev->kind == GPTPS_EV_RETRIED) (void)gptps_cancel((gptps *)ud, ev->handle);
+}
+
+static void test_cancel_overtakes_retried(void)
+{
+    gptps *e = NULL; gptps_handle h; gptps_stats_counters c; gptps_stats *s; size_t ran = 0;
+    gptps_config cfg; gptps_task_def d;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_MANUAL;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 1024;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK && e);
+    if (!e) return;
+    s = gptps_stats_install(e);
+    CHECK(s != NULL);
+    CHECK(gptps_set_event_cb(e, cancel_on_retried, e) == GPTPS_OK);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "dead"; d.run = task_dead; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.max_retries = 1; d.default_policy.retry_backoff_seconds = 1;   /* parked */
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    CHECK(gptps_submit(e, "dead", NULL, 0, &h) == GPTPS_OK);
+    CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1);   /* fails, RETRIED, cancelled */
+
+    CHECK(gptps_stats_total(s, &c) == GPTPS_OK);
+    CHECK(c.queued == 1 && c.started == 1 && c.failed == 2 && c.retried == 1);
+    CHECK(c.cancelled == 1 && c.terminal == 1);
+    CHECK(c.pending == 0 && c.in_flight == 0);            /* was pending == 1 */
+    CHECK(c.run_samples == 1 && c.wait_samples == 1);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    gptps_stats_close(s);
+}
+
 static void test_pool_merge(void)
 {
     gptps_pool *p; gptps_stats *s[3]; gptps_stats_counters sum, c; size_t i; int k;
@@ -162,6 +206,7 @@ int main(void)
 {
     test_totals_and_latency();
     test_gauges();
+    test_cancel_overtakes_retried();
     test_pool_merge();
     if (fails) { printf("%d stats check(s) FAILED\n", fails); return 1; }
     printf("all stats checks passed\n");
