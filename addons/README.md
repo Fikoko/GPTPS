@@ -272,7 +272,10 @@ than in the dispatcher.
 - **What counts as terminal:** `FINISHED`, `DROPPED`, `DEAD_LETTERED`, or `FAILED`
   carrying `GPTPS_E_CANCELLED`. A plain `FAILED` is **not** terminal — it is emitted
   after every failed *attempt*, and a dependency that merely retries must not release
-  your gate.
+  your gate. Terminal is not success: a dependency that dead-letters or is dropped
+  releases the gate too. A step that may run only after its prerequisite succeeded is
+  gated in the host, on that handle's own `FINISHED`; see
+  [`examples/success_gate.c`](../examples/success_gate.c).
 - **Two shapes do not terminate like a one-shot**, and they fail in opposite
   directions. A task type with `GPTPS_ON_FAILURE_REQUEUE` never terminates while it
   keeps failing, so a gate on it waits — correctly — until shutdown dead-letters it.

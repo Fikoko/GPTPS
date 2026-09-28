@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: MIT */
+/* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
- * A success-only dependency belongs to the host: orch_after releases on ANY
- * terminal outcome, not just success. This example needs only the core API.
+ * success_gate.c - a success-only dependency belongs to the host:
+ * gptps_orch_after releases on ANY terminal outcome, not just success. This
+ * example needs only the core API.
  *
  * MANUAL mode keeps the host state on one thread. The prerequisite models an
  * acknowledged operation: return OK only after the acknowledgement, not merely
@@ -11,6 +13,8 @@
  * Observe FINISHED, then submit from the host loop, outside the callback. A
  * failed submission is an error here, not a released dependency. In production
  * the host must retain unsubmitted work and choose a retry/abort policy.
+ *
+ *   cc success_gate.c gptps.c -lpthread -ldl   (amalgamation; macOS: drop -ldl)
  */
 #include "gptps.h"
 #include <stdio.h>

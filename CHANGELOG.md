@@ -76,6 +76,16 @@ the release version and is documented in `include/gptps.h`.
   It comes under a separate
   commercial license that never restricts GPTPS itself. GPTPS stays MIT, and no
   release is certified today.
+- **`examples/success_gate.c`: a success-only dependency lives in the host.**
+  `gptps_orch_after` releases its gate on any terminal outcome, a dead letter or a drop
+  included, so it cannot express "run this only if that succeeded". The example shows
+  the host-side rule, in MANUAL mode with the core API only. The host opens its gate on
+  the prerequisite's own `FINISHED` and submits the dependent from its loop, outside the
+  callback. It runs both branches and exits non-zero if the gate misbehaves. When the
+  prerequisite succeeds on its retry, the dependent runs once. When it exhausts its
+  retry, the dependent is never submitted, and independent work still completes. It is
+  registered as a test, and `addons/README.md` points to it from orch's definition of
+  terminal. Contributed by @kuntakinte7270 in #11.
 
 ## [1.3.0] - 2026-09-28
 

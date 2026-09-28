@@ -719,8 +719,8 @@ gptps/
 │   ├── gptps_gpu_quota_plugin.c  the same quota policy as a dlopen BINARY plug-in
 │   └── CMakeLists.txt   one library + header + .pc per add-on
 ├── templates/plugin/    ← a complete, copyable binary plug-in (built out-of-tree by CI)
-├── examples/            ← runnable examples (demo, config_file, task_control, external_program, dashboard,
-│                          embedded, wasm_program, bench_pool)
+├── examples/            ← runnable examples (demo, config_file, task_control, success_gate, external_program,
+│                          dashboard, embedded, wasm_program, bench_pool, bench_balance)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/
 │   ├── ARCHITECTURE.md  how it works inside
@@ -843,7 +843,7 @@ go in the **core**, so that the answer is decided once instead of re-argued per 
 | **Persistence of the queue** | An engine that survives a crash needs a storage format, a fsync policy, and a recovery protocol — three commitments the core cannot make portably. `addons/gptps_durable_queue` already does it on the public API. |
 | **A metrics format** (Prometheus, statsd, OTel) | The core emits events and never aggregates. Binding a wire format into it dates the library to whatever was fashionable. Aggregate in an observer add-on — `addons/gptps_stats` **is** that add-on (totals, gauges, latency; no format) — and export from its snapshot in your host. If something genuinely cannot be observed from the seam, that is an argument for a specific *accessor*, not a format. |
 | **Futures / promises / async in the engine** | Result delivery is an event. A blocking `wait(handle)` does not need to be in the mechanism — and this row no longer asks you to take that on faith: `addons/gptps_await` **is** those lines, on the observer seam, with no core change. The core already supplies the one guarantee such a wait needs — a one-shot handle reaches exactly one terminal event (`tests/test_reconcile`) — so nothing was missing. The two shapes outside that guarantee are the two you would not await anyway: a `GPTPS_ON_FAILURE_REQUEUE` item has not finished while it is still requeueing, and a `GPTPS_TASK_SERVICE` handle is an uptime, not a result, so a wait on it returns once per run rather than once ever. Chaining and dependencies are `addons/gptps_orch`'s job, not a future's. |
-| **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. (Note what "terminal" means there: `GPTPS_EV_FAILED` is emitted per *attempt*, so a dependency that merely retries must not release a gate.) |
+| **Task graphs / DAG semantics** | Dependencies are policy over submission order. `addons/gptps_orch` holds this; a DAG belongs in its handle space, not the dispatcher's. (Note what "terminal" means there: `GPTPS_EV_FAILED` is emitted per *attempt*, so a dependency that merely retries must not release a gate. Terminal is not success either: a dependency that dead-letters releases it too, so a success-only rule lives in the host, as `examples/success_gate.c` shows.) |
 | **A logging framework** | `gptps_set_log_sink` is one function pointer. Anything more is your host's job. |
 | **More executor kinds** | Three (in-process, forked, external program) span the trust and isolation axes. A fourth is nearly always "an existing one plus a runtime" — which is what `addons/gptps_wasm_exec` is. The enum is also now *closed in code* - `gptps_register_task` rejects a kind it does not know, so an older core meeting a newer add-on refuses the work rather than silently running it as something else. |
 | **Convenience wrappers over the C API** | Bindings and sugar belong in their own repos where they can move at their own pace. |
