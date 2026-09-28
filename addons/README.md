@@ -168,8 +168,9 @@ gptps_balance_submit_ex(b, "resize", buf, len, /*priority*/ 5, &h);
 `gptps_durable_queue.c` / `gptps_durable_queue.h`. Submit through `gptps_dq_submit()`
 instead of `gptps_submit()`: the `(task, payload)` is written to an append-only journal
 and `fsync`'d **before** the task is enqueued, so a crash afterward is recoverable. The
-module registers an observer to mark a record complete once its task reaches a terminal
-state; `gptps_dq_recover()` re-submits anything a prior run left unfinished.
+module registers an observer that closes a record when its task finishes or is dropped,
+and quarantines it when the task is dead-lettered; `gptps_dq_recover()` re-submits
+anything a prior run left pending.
 
 - **Guarantee:** at-least-once — task bodies must be idempotent.
 - **Quarantine drains are at-least-once too.** `gptps_dq_drain_quarantine()` compacts
@@ -178,6 +179,23 @@ state; `gptps_dq_recover()` re-submits anything a prior run left unfinished.
   idempotent callback, not fine for one that bills or emails — use
   `gptps_dq_drain_quarantine_ex()`, which reports the compaction status separately from
   the drained count.
+- **Cancelling:** `gptps_cancel()` stops the current execution only. The record stays
+  pending, and the next run's `gptps_dq_recover()` re-submits it. To withdraw the work
+  itself, call `gptps_dq_cancel(dq, handle)`: it makes the retraction durable, then
+  cancels.
+- **Shutdown is not a verdict.** Work the engine gives up on at teardown stays pending
+  rather than being quarantined or dropped: whatever a MANUAL host leaves unstepped,
+  running work the grace cancels, work still in backoff when `limits.shutdown_grace_ms`
+  expires, and a requeue item the drain will not start again. The next run recovers it.
+  A body that itself returns `GPTPS_E_SHUTDOWN` is still judged by its failure policy
+  when that status ends its last attempt: quarantined under `dead_letter`, closed under
+  `drop`. Under `requeue` the queue cannot tell a cycle the body ended that way from
+  teardown's refusal, so a teardown dead letter quarantines the item if the latest
+  attempt to return it ended a cycle rather than being retried, however later cycles
+  failed: retained, not lost. A teardown that cancels it leaves it pending.
+- **Not for services that exit cleanly.** A `GPTPS_TASK_SERVICE` without
+  `GPTPS_TASK_RETIRE_ON_OK` reports `FINISHED` each time its `run()` returns `GPTPS_OK`,
+  so its first clean exit closes the record. One that runs until stopped keeps it.
 - **Ordering:** call `gptps_dq_close()` **after** `gptps_shutdown()`.
 - **Portability:** Linux/macOS/Windows (via the `addon_compat` mutex + fsync shim).
 

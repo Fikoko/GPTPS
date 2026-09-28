@@ -1036,20 +1036,34 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                 switch (it->policy.on_failure) {
                     case GPTPS_ON_FAILURE_REQUEUE:
                         if (e->stopping) {
-                            /* never re-admit during drain: an always-failing
-                             * REQUEUE task would otherwise hang shutdown forever.
+                            /* never schedule another cycle during drain: an always-
+                             * failing REQUEUE task would otherwise hang shutdown
+                             * forever. (A cycle already parked in `delayed` is not
+                             * touched here: it runs if its backoff ends before the
+                             * grace does - or at all, with the grace off - and step
+                             * 3b ends it otherwise.)
                              *
                              * The handle is still owed its terminal event. What
                              * happens here IS the dead-letter disposition, reached by
-                             * a different road, and an observer reconciling handles
-                             * cannot tell the two apart and should not have to. Until
-                             * this emit existed a REQUEUE item was the one shape that
-                             * could reach shutdown and close in silence: gptps_await
-                             * on it never returned, and every add-on that counts
-                             * terminal events leaked a slot per item. */
+                             * a different road: an observer that only reconciles
+                             * handles sees an ordinary DEAD_LETTERED and need not
+                             * tell the two apart. Until this emit existed a REQUEUE
+                             * item was the one shape that could reach shutdown and
+                             * close in silence: gptps_await on it never returned, and
+                             * every add-on that counts terminal events leaked a slot
+                             * per item.
+                             *
+                             * Its status - on the event and the retained dead
+                             * letter - is GPTPS_E_SHUTDOWN, as in step 3b, not the
+                             * attempt's own: its FAILED already reported that, and
+                             * what ends the item HERE is teardown refusing another
+                             * cycle, not the policy running out. An observer that
+                             * keeps work for the next run (durable_queue does) has
+                             * to be able to tell this from a dead letter. */
+                            it->outcome = GPTPS_E_SHUTDOWN;
                             if (npend < GPTPS_PENDING_CAP) {
                                 pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
-                                ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
+                                ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_SHUTDOWN;
                                 pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                                 pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
                             }

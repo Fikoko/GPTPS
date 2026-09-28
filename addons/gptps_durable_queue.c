@@ -1,16 +1,20 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
- * durable_queue.c - crash-durable submission for GPTPS (see durable_queue.h).
+ * gptps_durable_queue.c - crash-durable submission for GPTPS (see the .h).
  *
  * Append-only binary journal, no external dependency:
  *   file header : [u32 magic "GDQ1"][u32 version]
- *   record      : [u32 magic "DQR1"][u8 type 'P'|'D'][u8 pad][u16 name_len]
+ *   record      : [u32 magic "DQR1"][u8 type 'P'|'D'|'Q'][u8 pad][u16 name_len]
  *                 [u32 payload_len][u64 seq][name][payload][u32 fnv1a]
- * A 'P'(ending) record is fsync'd on write (durability); a 'D'(one) record is
- * only buffered (losing it on a crash just replays a completed task - harmless
- * under the at-least-once contract). Replay stops at the first torn/short/bad-
- * checksum record (a crash mid-write), so a partial tail never corrupts state.
+ * A 'P'(ending) record is fsync'd on write (durability); a 'D'(one) or
+ * 'Q'(uarantined) marker is flushed but not fsync'd. Losing one to a crash replays
+ * the record - a completed task runs again, a dead-lettered one runs again (and is
+ * quarantined again only if it is dead-lettered again), a refused submit is offered
+ * to the engine again - which the at-least-once contract allows. The exception is
+ * the 'D' gptps_dq_cancel writes, which is fsync'd: losing THAT one would re-run
+ * work the caller retracted. Replay stops at the first torn/short/bad-checksum
+ * record (a crash mid-write), so a partial tail never corrupts state.
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
@@ -38,8 +42,9 @@ typedef struct {
     char        *name;
     void        *payload;
     size_t       len;
-    int          done;        /* terminal + discarded (finished or dropped) */
+    int          done;        /* closed: finished, dropped, refused, retracted or drained */
     int          quarantined; /* terminal + RETAINED (dead-lettered): poison kept for inspection */
+    int          own_shutdown;/* latest FAILED/RETRIED carrying GPTPS_E_SHUTDOWN was a FAILED */
 } dq_rec;
 
 struct gptps_dq {
@@ -351,17 +356,58 @@ static gptps_status do_rewrite(gptps_dq *dq)
     return GPTPS_OK;
 }
 
-/* ---- observer: mark a record done when its task terminates ---- */
+/* ---- observer: mark a record done when its task terminates ----
+ *
+ * A DEAD_LETTERED or DROPPED carrying GPTPS_E_SHUTDOWN is normally teardown's: the
+ * grace expired on work waiting in backoff, or the drain refused a REQUEUE item
+ * another cycle (see gptps_shutdown). Neither is a verdict on the work -
+ * quarantining it would file healthy work as poison, and closing it would lose it -
+ * so the record stays pending and the next run's gptps_dq_recover re-submits it,
+ * like everything else shutdown abandons (which the engine reports as FAILED /
+ * GPTPS_E_CANCELLED, an event this observer never counts as terminal).
+ *
+ * But the engine does not reserve that status. A body may return it - forwarding a
+ * remote worker's shutdown, say - and its dead letter or drop then carries it too.
+ * That one IS the verdict, and kept pending it would re-run on every restart. The
+ * attempt's own FAILED tells them apart: it is emitted before the dispatcher sees
+ * the item, so it reaches this observer first. own_shutdown notes that it carried
+ * GPTPS_E_SHUTDOWN, and a RETRIED carrying it clears the flag again, since a retry
+ * parked after such an attempt is teardown's to end. Only events carrying the
+ * status take the lock for this.
+ *
+ * One case is quarantined rather than kept, by design: a REQUEUE item that teardown
+ * dead-letters (the drain's refusal, or the grace expiring on its backoff) after
+ * the latest of its attempts to return the status ended a cycle rather than being
+ * retried - whatever its later cycles returned. That FAILED set the flag exactly as
+ * a dead_letter item's own verdict does, a cycle restarts without the RETRIED that
+ * would clear it, events carrying another status leave it alone, and events do not
+ * carry the policy. A teardown that cancels the item keeps it pending, as above.
+ * Reading the policy instead was tried and rejected: the registry walk was
+ * quadratic and read a borrowed name, and a by-name settings read saw the type's
+ * live policy rather than the item's and put the dispatcher on the settings lock.
+ * Quarantine retains the record, so nothing is lost. */
 static void dq_on_event(const gptps_event *ev, void *ud)
 {
     gptps_dq *dq = (gptps_dq *)ud;
     size_t i;
-    if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DROPPED &&
-        ev->kind != GPTPS_EV_DEAD_LETTERED) return;
+    int note = (ev->kind == GPTPS_EV_FAILED || ev->kind == GPTPS_EV_RETRIED);
+    if (note) {
+        if (ev->status != GPTPS_E_SHUTDOWN) return;
+    } else if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DROPPED &&
+               ev->kind != GPTPS_EV_DEAD_LETTERED) {
+        return;
+    }
     apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
         if (dq->recs[i].done || dq->recs[i].quarantined) continue;
         if (dq->recs[i].handle != ev->handle) continue;
+        if (note) {
+            dq->recs[i].own_shutdown = (ev->kind == GPTPS_EV_FAILED);
+            break;
+        }
+        if (ev->kind != GPTPS_EV_FINISHED && ev->status == GPTPS_E_SHUTDOWN &&
+            !dq->recs[i].own_shutdown)
+            break;   /* teardown's: stays pending */
         if (ev->kind == GPTPS_EV_DEAD_LETTERED) {
             /* dead-lettered: RETAIN the poison payload (quarantine), don't drop it */
             dq->recs[i].quarantined = 1;
@@ -486,6 +532,36 @@ size_t gptps_dq_recover(gptps_dq *dq)
     }
     apx_mutex_unlock(&dq->mu);
     return count;
+}
+
+gptps_status gptps_dq_cancel(gptps_dq *dq, gptps_handle h)
+{
+    size_t i;
+    if (!dq || h == 0) return GPTPS_E_INVAL;   /* 0: a record not yet (re)submitted */
+    apx_mutex_lock(&dq->mu);
+    for (i = 0; i < dq->n; ++i)
+        if (!dq->recs[i].done && !dq->recs[i].quarantined && dq->recs[i].handle == h) break;
+    if (i == dq->n) { apx_mutex_unlock(&dq->mu); return GPTPS_E_NOTFOUND; }
+    /* Durable, unlike the observer's markers, and BEFORE the engine is told: a
+     * retraction lost to a crash would have the next gptps_dq_recover re-run work
+     * the caller withdrew. If it cannot be made durable the record stays open and
+     * the execution is left running; append_durable rolls the journal back, as far
+     * as the file system lets it truncate. */
+    if (append_durable(dq->fp, 'D', dq->recs[i].seq, "", NULL, 0) != 0) {
+        apx_mutex_unlock(&dq->mu);
+        return GPTPS_E_IO;
+    }
+    dq->recs[i].done = 1;
+    if (dq->pending) dq->pending -= 1;
+    apx_mutex_unlock(&dq->mu);
+    /* Outside dq->mu: gptps_cancel delivers the terminal event on this thread for
+     * an item still queued or between attempts, and a callback reacting to it may
+     * call back into this queue. The retraction stands whatever it returns.
+     * NOTFOUND is still OK - the execution had already ended (an earlier
+     * gptps_cancel, or a terminal event in the window since the lock was released),
+     * so nothing is left to stop. GPTPS_E_SHUTDOWN is passed on: the engine is
+     * tearing down and did not stop the execution, which may yet run. */
+    return gptps_cancel(dq->e, h) == GPTPS_E_SHUTDOWN ? GPTPS_E_SHUTDOWN : GPTPS_OK;
 }
 
 size_t gptps_dq_pending(gptps_dq *dq)

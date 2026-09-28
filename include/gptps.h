@@ -664,6 +664,16 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * (absent) deadline would hang the HOST's exit path forever and be orphaned when
  * the supervisor gave up. An in-process body that never polls
  * gptps_is_cancelled() still cannot be preempted - nothing in-process can be.
+ * Work still waiting in backoff when the grace expires - a retry, an item between
+ * REQUEUE cycles, or one a constraint DEFERred, which may never have run - is
+ * ended at once by its policy: GPTPS_EV_DEAD_LETTERED, or GPTPS_EV_DROPPED under
+ * on_failure = drop, with status GPTPS_E_SHUTDOWN. So is a REQUEUE item that runs
+ * out of retries during the drain, which never schedules another cycle - a
+ * GPTPS_EV_DEAD_LETTERED, while the attempt's own status stays on its FAILED. The
+ * dead letters both paths retain (gptps_dead_letter_drain) carry that status too.
+ * The engine does not reserve it: a task body may return GPTPS_E_SHUTDOWN
+ * too, and when that return ends the item its DEAD_LETTERED / DROPPED carries it,
+ * preceded by a FAILED that does.
  *
  * NOT RE-ENTRANT: returns GPTPS_E_BUSY if called from a task body or an event
  * callback, because it would join the very thread making the call (THREADED) or

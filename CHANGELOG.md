@@ -101,7 +101,7 @@ the release version and is documented in `include/gptps.h`.
 ### Fixed — a handle that closed in silence, and the guarantee that oversold itself
 
 - **A `GPTPS_ON_FAILURE_REQUEUE` item reached shutdown without a terminal event.** The
-  drain refuses to re-admit it — an always-failing requeue would hang shutdown forever —
+  drain refuses it a new cycle — an always-failing requeue would hang shutdown forever —
   and dead-letters it instead, but it never emitted the `DEAD_LETTERED` that says so. It
   was one shape that could reach shutdown and close in silence (the parked-item entry
   below closes the others): `gptps_await` on such a handle never returned, and every
@@ -109,7 +109,11 @@ the release version and is documented in `include/gptps.h`.
   handles ended with zero terminal events after `gptps_shutdown` returned; after: 8 of 8
   close with `DEAD_LETTERED`. `tests/test_reconcile.c` now pins it — the file the Readme
   cites as proof of the invariant previously had no case for this path, and the new one
-  fails without the fix.
+  fails without the fix. The event carries `GPTPS_E_SHUTDOWN`, as the grace expiry's do,
+  and so does the retained dead letter `gptps_dead_letter_drain` returns, where 1.2.x
+  kept the attempt's status, which its `FAILED` still reports. What ends the item is
+  teardown refusing another cycle, and an observer that keeps work for the next run
+  (see `durable_queue` below) has to be able to tell that from the task failing.
 
 - **An item parked between attempts could be cancelled, removed or torn down without a
   terminal event.** The one path that ends queued or parked work without running it —
@@ -301,6 +305,61 @@ the release version and is documented in `include/gptps.h`.
   can block while that link's worker is itself blocked sending a reply only this thread
   would read. `tests/test_xport.c` makes both calls from a callback on a one-worker pool,
   and retries synchronously from an E_IO callback; before the fix it hung.
+
+### Fixed — `durable_queue`: what a cancel or a shutdown leaves in the journal
+
+- **`gptps_dq_cancel()` retracts a durable submit; `gptps_cancel` still does not.**
+  `gptps_cancel` on a handle from `gptps_dq_submit` stopped that execution and left its
+  journal record pending, so the next process's `gptps_dq_recover` ran the work anyway,
+  and `gptps_durable_queue.h` never mentioned cancellation. That behaviour is kept, and
+  now documented: the engine reports an operator's cancel with the same `FAILED` /
+  `GPTPS_E_CANCELLED` as the running and unstepped work a teardown cancels, so an
+  observer that closed the record on it would also discard that work.
+  `gptps_dq_cancel(dq, handle)` is the explicit form. It fsyncs a done marker for the
+  record before telling the engine, so the retraction survives a crash, then cancels the
+  execution. It returns `GPTPS_OK` once the record is retracted, including for work an
+  earlier `gptps_cancel` already stopped; `GPTPS_E_SHUTDOWN` when the engine is tearing
+  down, which retracts the record but cannot stop the execution; `GPTPS_E_IO`, leaving
+  the record open and the execution untouched, if the marker cannot be made durable; and
+  `GPTPS_E_NOTFOUND` when the queue holds no open record for the handle. Raised by
+  @kuntakinte7270 in #10, with a MANUAL-mode reproduction under Windows GCC and MSVC.
+
+- **Work that shutdown gave up on was quarantined, or lost.** When the grace expires the
+  engine ends everything still waiting in backoff — a retry, an item between requeue
+  cycles, one a constraint deferred — by its policy, with status `GPTPS_E_SHUTDOWN`:
+  `DEAD_LETTERED`, or `DROPPED` under `on_failure = drop`. The queue's observer took the
+  first for poison and quarantined it, which `gptps_dq_recover` skips, and the second
+  for done, so the work was gone. Both now stay pending, like the running work the grace
+  cancels, and the next run recovers them. So does a requeue item the drain refuses,
+  whose new `DEAD_LETTERED` (above) carries the same status. The engine does not reserve
+  that status, though: a body can return it too, forwarding a remote worker's shutdown
+  for instance. Under `dead_letter` or `drop` that is the task's own verdict, and kept
+  pending it would re-run on every restart; the observer tells it apart by the attempt's
+  own `FAILED`, which precedes the terminal event and carries the body's status. That
+  test cannot see a policy, so a requeue item that teardown dead-letters is quarantined
+  if the latest attempt to return `GPTPS_E_SHUTDOWN` ended a cycle rather than being
+  retried: retained, not lost. `gptps_shutdown`'s contract in `include/gptps.h` now
+  states the engine's side of this, including that the status is not reserved.
+
+- The header also claimed `on_failure = drop` failures are unobservable and stay in the
+  journal. That was true through 0.2.0, whose engine emitted no event for a drop, but
+  `GPTPS_EV_DROPPED` and the observer's handling of it both landed before 1.0.0, so the
+  claim was wrong in every 1.x release. It now also says that a `GPTPS_TASK_SERVICE`
+  without `GPTPS_TASK_RETIRE_ON_OK` whose `run()` returns `GPTPS_OK` is not a fit: the
+  `FINISHED` of its first clean exit closes the record while the service keeps
+  restarting. `tests/test_durable.c` covers:
+  - both kinds of cancel, a retraction surviving a reopen, the `GPTPS_E_IO` path (POSIX)
+    and a `gptps_dq_cancel` made during teardown;
+  - both policies at grace expiry, and a requeue refused by the drain: kept pending when
+    its body failed with `GPTPS_E_TASK`, quarantined when it returned
+    `GPTPS_E_SHUTDOWN`;
+  - a body that returns `GPTPS_E_SHUTDOWN`, on a live engine and with its retry parked
+    at teardown;
+  - a MANUAL engine shut down without ever being stepped.
+
+  Against the old observer the grace cases fail on both policies, and so does the
+  requeue case whose body fails with `GPTPS_E_TASK`; against the old engine that
+  requeue case fails too.
 
 ### Added — a tier that costs nothing
 

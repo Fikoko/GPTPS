@@ -1,20 +1,52 @@
 /* SPDX-License-Identifier: MIT */
 /* Copyright (c) 2026 Fikoko. See LICENSE for the full text. */
 /*
- * durable_queue.h - crash-durable submission for GPTPS (optional add-on).
+ * gptps_durable_queue.h - crash-durable submission for GPTPS (optional add-on).
  *
- * A thin durability layer built ONLY on the public GPTPS API (gptps_submit +
- * the observer seam) plus POSIX file I/O. Submit work through gptps_dq_submit()
+ * A thin durability layer built ONLY on the public GPTPS API (gptps_submit,
+ * gptps_cancel + the observer seam) plus C stdio and the platform's mutex, fsync,
+ * truncate and rename. Submit work through gptps_dq_submit()
  * instead of gptps_submit(): the (task, payload) is written to an append-only
  * journal and fsync'd BEFORE the task is enqueued, so a crash after the call
- * returns is recoverable. The add-on observes lifecycle events and marks a
- * record complete when its task FINISHES or is DEAD_LETTERED.
+ * returns is recoverable.
  *
  * Guarantee: AT-LEAST-ONCE. After a crash, gptps_dq_recover() re-submits every
  * record that was persisted but never completed, so task bodies MUST be
- * idempotent (same contract as on_failure = requeue). Tasks using
- * on_failure = drop are not observable as terminal, so a dropped failure stays
- * in the journal and will be replayed on recover.
+ * idempotent (same contract as on_failure = requeue).
+ *
+ * How a record ends. The add-on's observer closes a record when its task FINISHES
+ * or is DROPPED, and quarantines it when the task is DEAD_LETTERED (see
+ * gptps_dq_quarantined) - unless teardown ended it, below. gptps_dq_cancel closes
+ * one on request, and gptps_dq_submit
+ * closes the record of a submit the engine refused, returning you its error.
+ * Everything else leaves the record pending, and the next run's gptps_dq_recover
+ * re-submits it:
+ *   - gptps_cancel(e, handle) stops the current execution only. The engine
+ *     reports it as FAILED / GPTPS_E_CANCELLED, which is also how it reports
+ *     running work the grace cancels, stopped services and work a MANUAL host
+ *     leaves unstepped, so this add-on cannot tell an operator's cancel from a
+ *     teardown's and treats both as "not done". The record stays
+ *     pending - and counted by gptps_dq_pending - for the rest of this run,
+ *     unless gptps_dq_cancel retracts it or the execution FINISHED before the
+ *     cancel reached it. To withdraw the work, use gptps_dq_cancel.
+ *   - Work that shutdown gives up on: whatever a MANUAL host leaves unstepped,
+ *     running work the grace cancels and stopped services (FAILED /
+ *     GPTPS_E_CANCELLED); work still in backoff when limits.shutdown_grace_ms
+ *     expires, and a REQUEUE item the drain will not start again (DEAD_LETTERED,
+ *     or DROPPED under on_failure = drop, with status GPTPS_E_SHUTDOWN - see
+ *     gptps_shutdown). Teardown ending work is not a verdict on it, so it is
+ *     neither quarantined nor lost.
+ *   A body that itself returns GPTPS_E_SHUTDOWN is still judged by its policy:
+ *   that status on the attempt's own FAILED marks the dead letter or drop that
+ *   follows as the task's own verdict. The observer cannot see the policy, so a
+ *   teardown dead letter for an on_failure = requeue item is quarantined if the
+ *   latest attempt that returned GPTPS_E_SHUTDOWN ended a cycle rather than being
+ *   retried, however later cycles failed - retained, not lost; drain it with
+ *   gptps_dq_drain_quarantine. A teardown that cancels the item keeps it pending.
+ * Not for services that exit cleanly: a GPTPS_TASK_SERVICE without
+ * GPTPS_TASK_RETIRE_ON_OK emits FINISHED each time its run() returns GPTPS_OK and
+ * is restarted, so its first clean exit closes the record and a later crash does
+ * not bring the service back. One that runs until it is stopped keeps its record.
  *
  * Lifecycle (ordering matters):
  *     dq = gptps_dq_open(e, "queue.journal");   // replays + compacts
@@ -23,10 +55,21 @@
  *     gptps_shutdown(e);                         // drain + join (no more events)
  *     gptps_dq_close(dq);                        // AFTER shutdown
  *
- * gptps_dq_close MUST be called after gptps_shutdown: the engine has no
- * unregister-observer call, so the queue must outlive event delivery.
+ * gptps_dq_close MUST be called after gptps_shutdown: gptps_unregister_observer
+ * is a setup-time call, unsafe while the engine may still emit, so the queue must
+ * outlive event delivery. gptps_dq_submit, gptps_dq_recover and gptps_dq_cancel
+ * call into the engine and must not be called once gptps_shutdown has returned: it
+ * frees the engine.
  *
- * Portable (Linux/macOS/Windows) via the addon_compat shim. Build: cc ... durable_queue.c addons/addon_compat.h is header-only
+ * Re-entrancy: gptps_dq_submit and gptps_dq_recover hold the queue's lock while
+ * they call gptps_submit, which delivers the item's QUEUED event on the calling
+ * thread. A callback must not call into this queue for THAT event: it would
+ * re-enter a lock its own thread holds - a self-deadlock on POSIX, and on Windows,
+ * where the lock is a recursive CRITICAL_SECTION, a nested call that can
+ * reallocate the record table under the outer one. Any other event is fine.
+ *
+ * Portable (Linux/macOS/Windows) via the header-only addons/addon_compat.h shim.
+ * Build: cc ... gptps_durable_queue.c
  */
 #ifndef GPTPS_DURABLE_QUEUE_H
 #define GPTPS_DURABLE_QUEUE_H
@@ -61,12 +104,35 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
  * bodies required (at-least-once). Safe to call once after open. */
 size_t gptps_dq_recover(gptps_dq *dq);
 
+/* Retract a durable submit: close the record for `h` so no later gptps_dq_recover
+ * re-submits it, then gptps_cancel(e, h) the execution. `h` is an engine handle
+ * from THIS run: one gptps_dq_submit returned, or one the engine gave a record
+ * gptps_dq_recover re-submitted (gptps_dq_recover returns only a count, so that
+ * handle is known only from the engine's events). The retraction is fsync'd
+ * before the engine is told, so it survives a crash; if it cannot be made durable
+ * the call returns GPTPS_E_IO, leaving the record open and the execution alone.
+ *
+ * Returns GPTPS_OK once the record is retracted - including for work an earlier
+ * gptps_cancel already stopped. A still-live item then ends as gptps_cancel
+ * describes; work already completing may still FINISH, as it may under
+ * gptps_cancel, but it is never re-submitted.
+ * GPTPS_E_SHUTDOWN if the engine is tearing down (a call from an event callback
+ * while gptps_shutdown drains): the record is retracted all the same, but the
+ * execution was not stopped and may still run.
+ * GPTPS_E_NOTFOUND if this queue holds no open record for `h`: unknown, closed
+ * already, or quarantined (drain those instead).
+ * GPTPS_E_INVAL for a NULL dq or h == 0. */
+gptps_status gptps_dq_cancel(gptps_dq *dq, gptps_handle h);
+
 /* Number of records currently persisted-but-not-completed. */
 size_t gptps_dq_pending(gptps_dq *dq);
 
-/* Quarantine: a task that exhausts its retries under the dead_letter policy is
+/* Quarantine: a record whose task is DEAD_LETTERED - it exhausted its retries under
+ * the dead_letter policy, admission refused it outright, or it failed under any
+ * policy but drop while its type was being removed with GPTPS_REMOVE_DRAIN - is
  * RETAINED in the journal (its poison payload survives a crash) rather than
- * silently dropped. Inspect / recover these out-of-band. */
+ * silently dropped. Teardown's dead letters stay pending instead, except the
+ * requeue case above. Inspect / recover these out-of-band. */
 size_t gptps_dq_quarantined(gptps_dq *dq);   /* count of retained dead-lettered records */
 
 /* Drain quarantined records: `cb` is called for each (payload valid only for the
