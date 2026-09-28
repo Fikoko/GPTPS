@@ -758,6 +758,13 @@ target_link_libraries(example_task_control PRIVATE gptps)
 add_test(NAME example_task_control COMMAND example_task_control)
 set_tests_properties(example_task_control PROPERTIES TIMEOUT 20)
 
+# Host-owned success-only dependency; core only (no orch or durable queue).
+add_executable(example_success_gate examples/success_gate.c)
+target_include_directories(example_success_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(example_success_gate PRIVATE gptps)
+add_test(NAME example_success_gate COMMAND example_success_gate)
+set_tests_properties(example_success_gate PROPERTIES TIMEOUT 20)
+
 # single-thread + static memory pool (no worker threads, no libc heap)
 add_executable(example_embedded examples/embedded.c)
 target_include_directories(example_embedded PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
