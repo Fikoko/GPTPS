@@ -347,6 +347,7 @@ without recompiling or restarting:
 size_t n = gptps_task_count(e);                       /* enumerate for a UI ... */
 gptps_task_info ti = { .struct_size = sizeof ti };
 gptps_task_get_info(e, 0, &ti);                       /* name, exec, prio, queued/running/dead */
+uint64_t fl; gptps_task_flags(e, "resize", &fl);      /* GPTPS_TASK_* by name, race-free */
 
 gptps_set_task_enabled(e, "resize", 0);               /* pause: reject new submits, reversibly */
 gptps_clone_task(e, "resize", "resize_hi");           /* duplicate, then retune the copy */
@@ -356,8 +357,9 @@ gptps_unregister_task(e, "resize", GPTPS_REMOVE_DRAIN);   /* finish in-flight wo
 - **Removal policy** (the `flags`): `GPTPS_REMOVE_REJECT_IF_BUSY` (default — refuse with
   `GPTPS_E_BUSY` while work is outstanding), `GPTPS_REMOVE_DRAIN` (stop new submits, let
   queued + in-flight finish, then free), or `GPTPS_REMOVE_CANCEL` (drop queued, cancel
-  in-flight, then free). A removed name is free to re-register; its `tasks.<name>.*` settings
-  are torn down; retained dead-letter items survive and stay drainable.
+  in-flight, then free). A removed name is free to re-register; its own `tasks.<name>.*`
+  settings are torn down (not a sibling's such as `tasks.<name>.big.*`); retained
+  dead-letter items survive and stay drainable.
 - **Behavior still arrives in code.** These calls own *configuration and lifecycle*. New
   in-process logic comes from a `run` fn (code or an add-on); a `GPTPS_EXEC_PROGRAM` task,
   though, is fully creatable at runtime (and from the TUI) since its behavior is an external
@@ -722,7 +724,7 @@ gptps/
 │   ├── PLUGINS.md       writing an add-on: which tier, the ABI contract, proving it
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
 │   └── SECURITY.md      trust boundary and non-guarantees
-├── tests/               ← CTest suite (51 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tests/               ← CTest suite (65 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
 │   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
@@ -755,10 +757,10 @@ single-file amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **55** public functions · **ABI 2.1** (append-only; 2.0 was the first and, by
-design, the last breaking change) · **11** add-on modules + 1 example binary plug-in ·
-**60** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way matrix), every one
-required to pass.
+At a glance: **56** public functions · **ABI 2.2** (append-only; 2.0 was the first
+and, by design, the last breaking change) · **11** add-on modules + 1 example binary
+plug-in · **65** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
+matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
 hang it hangs your host's exit path — so these are contractual, and

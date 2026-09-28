@@ -85,10 +85,15 @@ the release version and is documented in `include/gptps.h`.
   no bookkeeping fix for a lifetime the module was never told about, so it is refused
   at the boundary. `tests/test_balance.c` pins it — without the refusal that test does
   not merely fail, it crashes. Start services on the shards directly; a balancer is
-  for work items.
+  for work items. The check asks `gptps_task_flags` (below). As first written (never
+  released) it walked `gptps_task_get_info` and compared against the returned `name`,
+  which is borrowed only until the registry next changes, so an unregister on another
+  thread could free it mid-compare; `tests/test_balance.c` reproduces that under ASan
+  in every run of the old code.
 
-- **ABI 2.2: `gptps_task_info` gained `flags`.** Nothing could introspect whether a
-  registered type was a `GPTPS_TASK_SERVICE` — a caller could see its executor, policy
+- **ABI 2.2: `gptps_task_info` gained `flags`, and `gptps_task_flags` reads them by
+  name.** Nothing could introspect whether a registered type was a
+  `GPTPS_TASK_SERVICE` — a caller could see its executor, policy
   and counters but not the one property that decides whether its handle ends once or
   once per run, which is exactly what `gptps_balance` needed. Additive, and the loader
   compares ABI MAJOR only, so no add-on is refused. `gptps_task_get_info` now validates
@@ -96,7 +101,11 @@ the release version and is documented in `include/gptps.h`.
   the caller's `struct_size` covers it — without that, appending would have started
   returning `GPTPS_E_INVAL` to every already-compiled caller, which is the trap
   `src/gptps_internal.h` exists to prevent. Verified: a caller passing the pre-2.2
-  `struct_size` still gets `GPTPS_OK`.
+  `struct_size` still gets `GPTPS_OK`. `gptps_task_flags(e, name, &flags)` answers the
+  same question by name, copying the flags under the engine lock: safe while another
+  thread unregisters a type, which matching a name by walking `gptps_task_get_info` is
+  not, and without the scan of every item the engine holds that each call in that walk
+  pays to fill its counters.
 
 ### Fixed — a handle that closed in silence, and the guarantee that oversold itself
 
@@ -254,8 +263,38 @@ the release version and is documented in `include/gptps.h`.
   before, neither getter mentioned the cap, buffers or truncation. A smaller buffer still
   truncates and still returns `GPTPS_OK` — documented, not changed. Reported by
   @kuntakinte7270, who added the boundary tests that hold both getters to it in #6.
+- **Unregistering a task type took a sibling's settings.** Removal deleted every setting
+  under `tasks.<name>.`, and a type named `<name>.<more>` keeps its keys under the same
+  prefix, so unregistering `resize` left a live `resize.big` with none of its per-task
+  settings. A key's shape cannot settle it either: a namespaced add-on leaf such as
+  `gpuq.units` also adds a dot. Each per-task setting now records the type that owns it,
+  and removal is by owner; a key a host registered under the prefix is still removed
+  with its type, unless it lies under a live sibling's own prefix. Every release since
+  1.0.0 had the bug. `tests/test_taskmgmt.c` removes `x` next to a live `x.y` and checks
+  that the sibling's built-in, defined and host-registered settings survive; before the
+  fix all were gone. A `gptps_define_task_setting` that had already taken its list of
+  types when the removal began could still add a setting to the departing type after
+  its settings were torn down, bound to memory the removal then freed; the owned
+  settings are now swept once more after in-flight defines finish.
 
 ### Fixed — add-ons
+
+- **`gptps_balance`: submit and cancel read an item another thread could free.** Once
+  the router's lock is released, a queued item is reachable from its heap: a shard
+  worker finishing earlier work pops it, submits it, and frees it when it ends — or at
+  once, if it was cancelled. `gptps_balance_submit_ex` still read the item after
+  unlocking, for the caller's handle and the `QUEUED` event, and `gptps_balance_cancel`
+  read a still-queued item for its `FAILED` / `GPTPS_E_CANCELLED` event. Both were
+  heap-use-after-frees on the hot path, needing nothing more than concurrent submits or
+  cancels against work that completes; both shipped in 1.2.0 and 1.2.1. They now take
+  what they need under the lock. When the late `QUEUED` arrives is unchanged — as in
+  1.2.x, and as the engine's own off-lock `QUEUED` may, it can follow the item's
+  `STARTED` or even its `FINISHED` — but it now carries the real handle and name.
+  An out-of-memory path in dispatch could also deadlock: it cancelled an item it had
+  failed to track while holding the router's lock, and the cancel's own event re-entered
+  that lock; it now cancels after unlocking. `tests/test_balance.c`
+  submits and cancels top-priority items while the shard keeps dispatching; under ASan
+  the old cancel path failed in most runs and the old submit path in some.
 
 - **`gptps_xport`: a blocking submit could return `GPTPS_E_IO` for a retired worker
   while `gptps_xport_live()` still counted it.** The reader published the failure —

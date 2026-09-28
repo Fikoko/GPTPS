@@ -136,6 +136,10 @@ typedef struct gptps_settings gptps_settings;
 gptps_settings *gptps_settings_create(void);
 void            gptps_settings_destroy(gptps_settings *r);
 gptps_status    gptps_settings_add(gptps_settings *r, const gptps_setting_def *def);
+/* As gptps_settings_add, recording `owner` (a task type's reg) for
+ * gptps_settings_remove_task. */
+gptps_status    gptps_settings_add_owned(gptps_settings *r, const gptps_setting_def *def,
+                                         const void *owner);
 size_t          gptps_settings_size(gptps_settings *r);
 gptps_status    gptps_settings_get_by(gptps_settings *r, const char *key, char *buf, size_t cap);
 gptps_status    gptps_settings_set_by(gptps_settings *r, const char *key, const char *value);
@@ -143,11 +147,18 @@ gptps_status    gptps_settings_info_at(gptps_settings *r, size_t index, gptps_se
 gptps_status    gptps_settings_save_to(gptps_settings *r, const char *path);
 gptps_status    gptps_settings_apply_toml(gptps_settings *r, const gptps_toml *t);
 gptps_status    gptps_settings_watch_add(gptps_settings *r, gptps_settings_cb cb, void *ud);
-/* Remove every entry whose key begins with `prefix` (e.g. "tasks.resize."); used
- * to tear down a task type's settings when it is unregistered. Returns the count
- * removed. Takes only the settings lock (never the engine lock), so callers must
- * NOT hold the engine lock (preserve the settings->m -> engine->m order). */
-size_t          gptps_settings_remove_prefix(gptps_settings *r, const char *prefix);
+/* Tear down an unregistered task type's settings: every entry added with this
+ * `owner` (the engine's per-task knobs and defined leaves), and - when `prefix` is
+ * given - every UNOWNED entry under it (a host's gptps_register_setting key under
+ * "tasks.<name>.", removed at unregister as it always was) unless it also lies
+ * under one of the `keep` prefixes. By owner, not by prefix alone: a prefix removal
+ * of "tasks.resize." also took the keys of a live type named "resize.big", and a
+ * namespaced leaf such as "gpuq.units" means a key's shape cannot tell them apart;
+ * `keep` holds the live siblings' "tasks.<sibling>." prefixes for the host keys.
+ * Returns the count removed. Takes only the settings lock (never the engine lock),
+ * so callers must NOT hold the engine lock (preserve settings->m -> engine->m). */
+size_t          gptps_settings_remove_task(gptps_settings *r, const void *owner, const char *prefix,
+                                           const char *const *keep, size_t nkeep);
 
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the

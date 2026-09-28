@@ -235,12 +235,106 @@ static void test_service_is_refused(void)
     gptps_balance_close(b); gptps_pool_close(p);
 }
 
+/* 5) the service check reads nothing another thread can free. It walked
+ *    gptps_task_get_info and strcmp'd the returned `name`, which is borrowed only
+ *    until the registry next changes: an unregister on another thread (reg_destroy
+ *    runs after the engine lock is dropped) freed it mid-compare. Types registered
+ *    later are walked FIRST, so churning 16 of them on shard 0 while submitting a type
+ *    registered before them puts every compare before the match on a name that may
+ *    be going away. The churn registers at runtime, which the header calls setup-time
+ *    work; the engine's locks support it, and nothing else keeps the frees coming.
+ *    ASan/TSan only - a plain build reads the freed bytes without noticing. Before the
+ *    fix: heap-use-after-free in task_is_service in every run. The churn runs on a
+ *    worker of a separate engine, so the test needs no raw threads. */
+static int churn_stop;
+static gptps_status t_nop(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
+static gptps_status t_churn(gptps_ctx *c, void *u)
+{
+    gptps *e0 = (gptps *)u; char names[16][40]; int i;
+    for (i = 0; i < 16; ++i) snprintf(names[i], sizeof names[i], "churn%02d_abcdefghijklmnop", i);
+    while (!get(&churn_stop) && !gptps_is_cancelled(c)) {
+        gptps_task_def d;
+        for (i = 0; i < 16; ++i) {
+            memset(&d, 0, sizeof d);
+            d.struct_size = sizeof d; d.name = names[i]; d.run = t_nop; d.exec = GPTPS_EXEC_INPROC;
+            d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
+            d.default_policy.struct_size = sizeof d.default_policy;
+            gptps_register_task(e0, &d);
+        }
+        for (i = 0; i < 16; ++i) gptps_unregister_task(e0, names[i], GPTPS_REMOVE_CANCEL);
+    }
+    return GPTPS_OK;
+}
+static void test_service_check_vs_unregister(void)
+{
+    gptps_pool *p = open_pool(1); gptps_balance *b; gptps *ec = NULL; gptps_task_def d;
+    gptps_balance_handle h; uint64_t t0; unsigned long n = 0;
+    reset_log();
+    reg(p, "plain", t_nop, NULL);                   /* registered first: walked last */
+    b = gptps_balance_open(p, NULL);
+    CHECK(b != NULL);
+    CHECK(gptps_open(NULL, &ec) == GPTPS_OK);
+    if (!b || !ec) { if (ec) gptps_shutdown(ec); gptps_pool_close(p); gptps_balance_close(b); return; }
+    gptps_balance_set_event_cb(b, on_ev, NULL);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "churn"; d.run = t_churn; d.user_data = gptps_pool_shard(p, 0);
+    d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    CHECK(gptps_register_task(ec, &d) == GPTPS_OK);
+    __atomic_store_n(&churn_stop, 0, __ATOMIC_SEQ_CST);
+    CHECK(gptps_submit(ec, "churn", NULL, 0, NULL) == GPTPS_OK);
+
+    t0 = gptps_now_ms(NULL);
+    while (gptps_now_ms(NULL) - t0 < 1000) {
+        if (gptps_balance_queued(b) > 1000) continue;   /* keep the router queue bounded */
+        CHECK(gptps_balance_submit(b, "plain", NULL, 0, &h) == GPTPS_OK);
+        ++n;
+    }
+    __atomic_store_n(&churn_stop, 1, __ATOMIC_SEQ_CST);
+    gptps_shutdown(ec);
+    CHECK(n > 0);
+    gptps_pool_close(p); gptps_balance_close(b);    /* the documented order */
+}
+
+/* 6) submit and cancel read nothing after the lock that another thread may free.
+ *    Once b->mu drops, a queued item is reachable from the heap: a shard worker
+ *    finishing earlier work runs dispatch_locked, which can pop it and - once it ends,
+ *    or at once if it was cancelled - free it. submit_ex then read the item for the
+ *    caller's handle and the QUEUED event, and cancel read it for the FAILED /
+ *    CANCELLED one. Here the main thread submits and cancels top-priority items
+ *    while the shard's own worker keeps dispatching filler work. ASan/TSan only.
+ *    Before the fix: heap-use-after-free in gptps_balance_cancel or submit_ex. */
+static void test_submit_and_cancel_read_nothing_freed(void)
+{
+    gptps_pool *p = open_pool(1); gptps_balance *b; gptps_balance_handle h;
+    uint64_t t0; unsigned long cancelled_q = 0;
+    reset_log();
+    reg(p, "t", t_nop, NULL);
+    b = gptps_balance_open(p, NULL);
+    CHECK(b != NULL);
+    if (!b) { gptps_pool_close(p); return; }
+    gptps_balance_set_event_cb(b, on_ev, NULL);
+    t0 = gptps_now_ms(NULL);
+    while (gptps_now_ms(NULL) - t0 < 1000) {
+        if (gptps_balance_queued(b) < 64)
+            CHECK(gptps_balance_submit(b, "t", NULL, 0, &h) == GPTPS_OK);   /* filler */
+        h = 0;
+        if (gptps_balance_submit_ex(b, "t", NULL, 0, 100, &h) == GPTPS_OK && h &&
+            gptps_balance_cancel(b, h) == GPTPS_OK) ++cancelled_q;
+    }
+    CHECK(cancelled_q > 0);
+    gptps_pool_close(p); gptps_balance_close(b);    /* the documented order */
+}
+
 int main(void)
 {
     test_distribution();
     test_order_and_cancel();
     test_dispatched_cancel_and_close();
     test_service_is_refused();
+    test_service_check_vs_unregister();
+    test_submit_and_cancel_read_nothing_freed();
     if (fails) { printf("%d balance check(s) FAILED\n", fails); return 1; }
     printf("all balance checks passed\n");
     return 0;

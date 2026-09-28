@@ -1534,7 +1534,7 @@ static void reg_task_setting(gptps *e, gptps_reg *r, const char *leaf, gptps_set
     snprintf(key, sizeof key, "tasks.%s.%s", r->name, leaf);
     d.struct_size = sizeof d; d.key = key; d.type = type; d.hot = 1; d.desc = "per-task policy";
     d.choices = choices; d.target = r; d.read = rd; d.write = wr;
-    gptps_settings_add(e->settings, &d);   /* key is copied by add() */
+    gptps_settings_add_owned(e->settings, &d, r);   /* key is copied by add() */
 }
 
 /* register the six per-task knobs for a freshly-registered task (after e->m unlocked) */
@@ -1706,7 +1706,7 @@ static void materialize_task_local(gptps *e, gptps_reg *r, const gptps_task_sche
     d.has_range = sc->has_range; d.min = sc->min; d.max = sc->max;
     d.choices = (const char *const *)sc->choices;
     d.target = L; d.read = stl_rd; d.write = stl_wr;
-    if (gptps_settings_add(e->settings, &d) == GPTPS_OK) {
+    if (gptps_settings_add_owned(e->settings, &d, r) == GPTPS_OK) {
         gptps_mutex_lock(e->m); L->next = r->locals; r->locals = L; gptps_mutex_unlock(e->m);
     } else {
         gptps_free(L);   /* duplicate leaf or OOM: not bound */
@@ -2468,6 +2468,20 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
     return GPTPS_OK;
 }
 
+gptps_status gptps_task_flags(gptps *e, const char *task_name, uint64_t *out_flags)
+{
+    gptps_reg *r; uint64_t f = 0;
+    if (!e || !task_name || !out_flags) return GPTPS_E_INVAL;
+    GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
+    gptps_mutex_lock(e->m);
+    r = registry_find(e, task_name);          /* skips draining types */
+    if (r) f = GPTPS_STRUCT_HAS(gptps_task_def, &r->def, flags) ? r->def.flags : 0u;
+    gptps_mutex_unlock(e->m);
+    if (!r) return GPTPS_E_NOTFOUND;
+    *out_flags = f;
+    return GPTPS_OK;
+}
+
 int gptps_task_exists(gptps *e, const char *task_name)
 {
     gptps_reg *r; int yes;
@@ -2528,12 +2542,11 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
 {
     gptps_reg *r;
     unsigned mode = flags & GPTPS_REMOVE_MODE_MASK;
-    char prefix[320];
     gptps_fifo dropped;              /* items cancelled by the removal, freed after unlock */
     gptps_event_cb cb; void *ud;
 
     if (!e || !task_name) return GPTPS_E_INVAL;
-    if (strlen(task_name) > sizeof prefix - 8) return GPTPS_E_INVAL;
+    if (strlen(task_name) > GPTPS_TASK_NAME_MAX) return GPTPS_E_INVAL;   /* never registrable */
 
     dropped.head = dropped.tail = NULL; dropped.count = 0;
 
@@ -2634,18 +2647,46 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
      * too: a live, submittable task type with no tunable settings at all.
      *
      * Removing them here shrinks that window from "the whole drain" to the few
-     * instructions between the tombstone and this unlock. Closing it entirely means
-     * scoping settings ownership to the reg rather than to the key prefix, which is
-     * a settings-registry change; noted rather than pretended away.
+     * instructions between the tombstone and this unlock. The engine's own entries
+     * go by owner - this reg - not by the "tasks.<name>." prefix, which took a
+     * successor's keys and a sibling's: a type named "<name>.x" lives under the same
+     * prefix. A host's unowned keys under the prefix still go, as they always did,
+     * except those under a live sibling's own "tasks.<sibling>." prefix. What is left
+     * of the window is a re-registration between the tombstone and this call, whose
+     * settings are rejected as duplicates of the predecessor's.
      *
      * The lock order is settings->m -> e->m (see include/gptps.h), so e->m must be
      * released across the call. Re-acquiring is safe without re-resolving `r`: only
      * this function frees a reg, and a concurrent unregister of the same name cannot
      * have found it - the tombstone hides it from registry_find. */
-    gptps_mutex_unlock(e->m);
-    snprintf(prefix, sizeof prefix, "tasks.%s.", task_name);
-    gptps_settings_remove_prefix(e->settings, prefix);
-    gptps_mutex_lock(e->m);
+    {
+        char prefix[GPTPS_TASK_NAME_MAX + 8];
+        char **keep = NULL; size_t nkeep = 0, cap = 0, nl = strlen(task_name), i;
+        gptps_reg *s;
+        snprintf(prefix, sizeof prefix, "tasks.%s.", task_name);
+        for (s = e->registry; s; s = s->next) {
+            char **grown;
+            if (s->removed || strncmp(s->name, task_name, nl) != 0 || s->name[nl] != '.') continue;
+            if (nkeep == cap) {
+                cap = cap ? cap * 2 : 4;
+                grown = (char **)gptps_realloc(keep, cap * sizeof *keep);
+                if (!grown) break;               /* OOM: keep what we have; see below */
+                keep = grown;
+            }
+            keep[nkeep] = (char *)gptps_malloc(strlen(s->name) + 8);
+            if (!keep[nkeep]) break;
+            snprintf(keep[nkeep], strlen(s->name) + 8, "tasks.%s.", s->name);
+            ++nkeep;
+        }
+        gptps_mutex_unlock(e->m);
+        /* On OOM the sibling list may be short. A sibling left off it then loses its
+         * host keys, as every sibling did before - but no host key of THIS type is
+         * left bound to state its host may now free. */
+        gptps_settings_remove_task(e->settings, r, prefix, (const char *const *)keep, nkeep);
+        for (i = 0; i < nkeep; ++i) gptps_free(keep[i]);
+        gptps_free(keep);
+        gptps_mutex_lock(e->m);
+    }
 
     if (!e->manual)                           /* THREADED: block until the type drains */
         while (reg_live_refs(e, r) > 0)
@@ -2656,6 +2697,14 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
      * define broadcasts cv_drain on completion, so this terminates even in MANUAL). */
     while (e->active_defines > 0)
         gptps_cond_wait(e->cv_drain, e->m);
+    /* ...and such a define may have materialized onto this reg AFTER the removal
+     * above - it snapshotted the reg before the tombstone - leaving an entry owned by
+     * it whose target is a task-local cell reg_destroy is about to free. Sweep the
+     * owned entries once more. No define started now can add another: it skips a
+     * tombstoned reg. */
+    gptps_mutex_unlock(e->m);
+    gptps_settings_remove_task(e->settings, r, NULL, NULL, 0);
+    gptps_mutex_lock(e->m);
 
     /* teardown (still holding e->m): make any retained dead-letter items self-owning,
      * then unlink the slot from the registry. */

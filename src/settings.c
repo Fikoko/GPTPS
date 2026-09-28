@@ -29,6 +29,7 @@ typedef struct gptps_setting_entry {
     double               min, max;
     const char *const   *choices;   /* borrowed (must be static / outlive engine) */
     void                *target;
+    const void          *owner;     /* reg whose unregister removes it, or NULL */
     size_t             (*read)(void *, char *, size_t);
     gptps_status       (*write)(void *, const char *);
     int                  mark;      /* transient, used while serializing */
@@ -91,6 +92,12 @@ static gptps_setting_entry *setting_find(gptps_settings *r, const char *key)
 
 gptps_status gptps_settings_add(gptps_settings *r, const gptps_setting_def *def)
 {
+    return gptps_settings_add_owned(r, def, NULL);
+}
+
+gptps_status gptps_settings_add_owned(gptps_settings *r, const gptps_setting_def *def,
+                                      const void *owner)
+{
     gptps_setting_entry *e;
     if (!r || !def || !def->key || !def->read || !def->write) return GPTPS_E_INVAL;
     gptps_mutex_lock(r->m);
@@ -105,6 +112,7 @@ gptps_status gptps_settings_add(gptps_settings *r, const gptps_setting_def *def)
     e->type = def->type; e->hot = def->hot; e->has_range = def->has_range;
     e->min = def->min; e->max = def->max; e->choices = def->choices;
     e->target = def->target; e->read = def->read; e->write = def->write;
+    e->owner = owner;
     e->defval[0] = 0;
     e->read(e->target, e->defval, GPTPS_SETTINGS_VALUE_MAX);   /* snapshot the default */
     if (r->tail) r->tail->next = e; else r->head = e;
@@ -121,17 +129,25 @@ size_t gptps_settings_size(gptps_settings *r)
     return n;
 }
 
-size_t gptps_settings_remove_prefix(gptps_settings *r, const char *prefix)
+static int has_prefix(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
+
+size_t gptps_settings_remove_task(gptps_settings *r, const void *owner, const char *prefix,
+                                  const char *const *keep, size_t nkeep)
 {
     gptps_setting_entry *e, *prev = NULL;
-    size_t plen, removed = 0;
-    if (!r || !prefix) return 0;
-    plen = strlen(prefix);
+    size_t removed = 0, k;
+    if (!r || !owner) return 0;
     gptps_mutex_lock(r->m);
     e = r->head;
     while (e) {
         gptps_setting_entry *next = e->next;
-        if (strncmp(e->key, prefix, plen) == 0) {
+        int drop = (e->owner == owner);
+        if (!drop && !e->owner && prefix && has_prefix(e->key, prefix)) {
+            drop = 1;                       /* a host's key under this type's prefix */
+            for (k = 0; k < nkeep && drop; ++k)
+                if (has_prefix(e->key, keep[k])) drop = 0;   /* ...or a live sibling's */
+        }
+        if (drop) {
             if (prev) prev->next = next; else r->head = next;
             if (r->tail == e) r->tail = prev;
             gptps_free(e->key); gptps_free(e->desc); gptps_free(e->defval); gptps_free(e);

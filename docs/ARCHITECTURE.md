@@ -444,12 +444,17 @@ needed). Removal is therefore **tombstone + drain**:
   pass) until no live item references the reg - unless the caller is one of the
   engine's own threads (`engine_is_reentrant`), which gets `E_BUSY` instead whenever
   there is anything to wait for, since the drain may need that very thread; MANUAL
-  mode never has in-flight work between steps. Teardown detaches retained dead-letter items (they take an owned
-  name copy and sever the reg pointer), unlinks the reg, removes its `tasks.<name>.*`
-  settings (with `e->m` released — lock order), then frees it.
+  mode never has in-flight work between steps. Its `tasks.<name>.*` settings go right
+  after the tombstone, before the drain (with `e->m` released — lock order): the ones
+  the engine created by owner, not by prefix, so a live `<name>.<more>` sibling keeps
+  its own, and host-registered keys under the prefix except a live sibling's. A second
+  owned sweep runs once in-flight `gptps_define_task_setting` calls finish. Teardown
+  then detaches retained dead-letter items (they take an owned name copy and sever the
+  reg pointer), unlinks the reg, and frees it.
 - `gptps_clone_task` deep-copies a reg's def under a new name (sharing the run fn);
   `gptps_set_task_enabled` flips a reversible `enabled` flag; `gptps_task_count/
-  get_info/exists` enumerate (including draining types, with live queue counts).
+  get_info` enumerate (including draining types, with live queue counts), while
+  `gptps_task_exists` and `gptps_task_flags` look a name up and skip them.
 - The `tui` add-on's **tasks** and **dead-letter** panes are thin views over these
   calls; deleting from the TUI uses DRAIN (cancel-force on demand).
 

@@ -92,6 +92,19 @@ static int has_setting(gptps *e, const char *key)
     return gptps_settings_get(e, key, b, sizeof b) == GPTPS_OK;
 }
 
+/* a host-registered setting: gptps_register_setting, no owner */
+static char host_cell[GPTPS_SETTINGS_VALUE_MAX] = "1";
+static size_t host_rd(void *t, char *b, size_t c) { (void)t; return (size_t)snprintf(b, c, "%s", host_cell); }
+static gptps_status host_wr(void *t, const char *v) { (void)t; snprintf(host_cell, sizeof host_cell, "%s", v); return GPTPS_OK; }
+static gptps_status host_setting(gptps *e, const char *key)
+{
+    gptps_setting_def d;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = key; d.type = GPTPS_SETTING_STRING; d.hot = 1;
+    d.desc = "host"; d.read = host_rd; d.write = host_wr;
+    return gptps_register_setting(e, &d);
+}
+
 static void wait_started(int target)
 {
     uint64_t s = gptps_now_ms(NULL);
@@ -336,6 +349,42 @@ int main(void)
             while (gptps_step(em, &ran) == GPTPS_OK && ran) { }
             CHECK(gptps_unregister_task(em, "m2", GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);
             gptps_shutdown(em);
+        }
+    }
+
+    /* ---- removal takes a type's own settings, not a sibling's ----
+     * A type named "x.y" keeps its keys under "tasks.x.", the same prefix as type
+     * "x"'s, and removing "x" used to delete every key with that prefix: the live
+     * sibling was left with no tunable settings at all. Removal is now by owner. */
+    {
+        gptps *es = NULL;
+        uint64_t fl = 99;
+        CHECK(gptps_open(NULL, &es) == GPTPS_OK);
+        if (es) {
+            reg(es, "x", task_fast);
+            reg(es, "x.y", task_fast);
+            CHECK(gptps_define_task_setting(es, "lim", GPTPS_SETTING_UINT, "5", NULL, 0) == GPTPS_OK);
+            CHECK(host_setting(es, "tasks.x.hostk") == GPTPS_OK);     /* a host's own keys */
+            CHECK(host_setting(es, "tasks.x.y.hostk") == GPTPS_OK);
+            CHECK(has_setting(es, "tasks.x.max_retries") && has_setting(es, "tasks.x.lim"));
+            CHECK(has_setting(es, "tasks.x.y.max_retries") && has_setting(es, "tasks.x.y.lim"));
+            CHECK(gptps_unregister_task(es, "x", GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);
+            CHECK(!has_setting(es, "tasks.x.max_retries") && !has_setting(es, "tasks.x.lim"));
+            CHECK(!has_setting(es, "tasks.x.hostk"));           /* still removed with "x" */
+            CHECK(has_setting(es, "tasks.x.y.max_retries"));   /* was deleted with "x" */
+            CHECK(has_setting(es, "tasks.x.y.lim"));
+            CHECK(has_setting(es, "tasks.x.y.hostk"));         /* the sibling's host key too */
+            reg(es, "x", task_fast);                            /* a successor gets its own */
+            CHECK(has_setting(es, "tasks.x.max_retries") && has_setting(es, "tasks.x.lim"));
+
+            /* gptps_task_flags: by name, copied under the lock */
+            CHECK(gptps_task_flags(es, "x.y", &fl) == GPTPS_OK && fl == 0);
+            CHECK(gptps_task_flags(es, "nope", &fl) == GPTPS_E_NOTFOUND);
+            CHECK(gptps_task_flags(es, NULL, &fl) == GPTPS_E_INVAL);
+            CHECK(gptps_task_flags(es, "x.y", NULL) == GPTPS_E_INVAL);
+            CHECK(gptps_unregister_task(es, "x.y", GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);
+            CHECK(gptps_task_flags(es, "x.y", &fl) == GPTPS_E_NOTFOUND);
+            gptps_shutdown(es);
         }
     }
 

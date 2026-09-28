@@ -74,9 +74,10 @@ extern "C" {
  * child_setup and EV_DROPPED; 1.10 the generic named-resource budgets; 1.11
  * SERVICE tasks; 1.12 the pluggable scheduler seam.
  *
- * 2.x: 2.1 the plug-in tier seams; 2.2 appends `flags` to gptps_task_info, so a
- * caller can finally see whether a registered type is a SERVICE. Additive, and the
- * loader compares MAJOR only, so no existing add-on is refused. */
+ * 2.x: 2.1 the plug-in tier seams; 2.2 appends `flags` to gptps_task_info and adds
+ * gptps_task_flags, so a caller can finally see whether a registered type is a
+ * SERVICE. Additive, and the loader compares MAJOR only, so no existing add-on is
+ * refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 2u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
@@ -525,6 +526,15 @@ GPTPS_API size_t       gptps_task_count(gptps *e);
 GPTPS_API gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out);
 /* 1 if a task of this name is registered AND accepting submits (enabled, not draining). */
 GPTPS_API int          gptps_task_exists(gptps *e, const char *task_name);
+/* ABI 2.2: the GPTPS_TASK_* flags of the registered type `task_name`, as registered
+ * (0 = an ordinary one-shot). Matched by name and copied under the engine lock, so -
+ * unlike walking gptps_task_get_info, whose `name` is borrowed until the registry
+ * next changes - it is safe while other threads register or unregister types, and
+ * it scans no queue, where each gptps_task_get_info call walks every item the engine
+ * holds to fill its counters. A paused type still answers. GPTPS_E_NOTFOUND if no
+ * such type is registered (a type draining toward removal included), GPTPS_E_INVAL
+ * for a NULL argument. */
+GPTPS_API gptps_status gptps_task_flags(gptps *e, const char *task_name, uint64_t *out_flags);
 
 /* Pause / resume a task type without removing it: a disabled type keeps its config
  * and stats but rejects new gptps_submit (GPTPS_E_NOTFOUND), reversibly. */
@@ -540,10 +550,14 @@ GPTPS_API gptps_status gptps_clone_task(gptps *e, const char *src_name, const ch
 
 /* Remove a task type. `flags` selects the policy (GPTPS_REMOVE_* above). On a
  * successful return the type is gone: its name is free to re-register and its
- * tasks.<name>.* settings are torn down. Dead-lettered items for the type are
- * retained (they carry the name as data) and remain drainable. GPTPS_E_NOTFOUND if
- * unknown; GPTPS_E_BUSY if work is outstanding under REJECT_IF_BUSY, or from a task
- * body or callback as described below - the type is then left untouched.
+ * tasks.<name>.* settings are torn down - the engine's per-task knobs and defined
+ * leaves, and any key a host registered under that prefix - but not those of a live
+ * type named "<name>.<more>", which share the prefix. Dead-lettered items for the
+ * type are retained (they carry the name as data) and remain drainable.
+ * GPTPS_E_NOTFOUND if unknown; GPTPS_E_INVAL for a NULL name, or one longer than
+ * GPTPS_TASK_NAME_MAX (never registrable); GPTPS_E_BUSY if work is outstanding under
+ * REJECT_IF_BUSY, or from a task body or callback as described below - the type is
+ * then left untouched.
  *
  * Called from one of the engine's own threads - a task body, or an event callback
  * on a worker or the dispatcher - a removal that would have to wait returns

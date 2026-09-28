@@ -14,8 +14,9 @@
  * the CALLING thread, and dispatch calls gptps_submit while holding this module's
  * lock. So the observer must ignore QUEUED before it takes the lock - which is fine,
  * because this module emits its own QUEUED at balance_submit time, when the item was
- * actually queued (here). Every other engine event comes from a dispatcher thread and
- * simply waits for the lock. Host callbacks always run with the lock released.
+ * actually queued (here). Every other engine event comes from a shard's worker or
+ * dispatcher thread and simply waits for the lock. Host callbacks always run with the
+ * lock released.
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
@@ -155,14 +156,25 @@ struct gptps_balance {
 static void item_free(bitem *it)
 { if (it) { free(it->task); free(it->payload); free(it); } }
 
-static void emit_own(gptps_balance *b, const bitem *it, gptps_event_kind kind, gptps_status st)
+static void emit_as(gptps_balance *b, gptps_balance_handle bh, const char *task,
+                    gptps_event_kind kind, gptps_status st)
 {
     gptps_event ev;
     if (!b->cb) return;
     memset(&ev, 0, sizeof ev);
-    ev.struct_size = sizeof ev; ev.kind = kind; ev.handle = it->bh;
-    ev.task_name = it->task; ev.ts_ms = gptps_now_ms(NULL); ev.status = st;
+    ev.struct_size = sizeof ev; ev.kind = kind; ev.handle = bh;
+    ev.task_name = task; ev.ts_ms = gptps_now_ms(NULL); ev.status = st;
     b->cb(&ev, b->cb_ud);
+}
+
+/* Only for an item no other thread can reach any more: off the heap and out of the
+ * dispatch tables, or anything at close, when nothing else may call in. Once b->mu
+ * drops, an item still in the heap can be dispatched by a shard worker's observe(),
+ * run, and freed, so it must not be read after unlocking: callers capture what they
+ * need under the lock and use emit_as. */
+static void emit_own(gptps_balance *b, const bitem *it, gptps_event_kind kind, gptps_status st)
+{
+    emit_as(b, it->bh, it->task, kind, st);
 }
 
 /* Hand queued work to shards with room. b->mu HELD. Items that could not be
@@ -199,9 +211,12 @@ static bitem *dispatch_locked(gptps_balance *b)
             continue;
         }
         /* Refused (E_SHUTDOWN, E_BUDGET, E_FULL...) or no memory to track it: this
-         * item is terminal here. (If the engine did accept it and we failed to track
-         * it, cancel it so its own terminal event cannot leak past us.) */
-        if (st == GPTPS_OK) gptps_cancel(b->sh[best].e, it->eh);
+         * item is terminal here. If the engine did accept it and we failed to track
+         * it, emit_fails cancels it (it->eh != 0), so its own terminal event cannot
+         * leak past us - NOT here: a still-queued item's FAILED / E_CANCELLED is
+         * emitted on the cancelling thread, and observe() would take b->mu, which this
+         * thread holds. Untracked, observe() ignores that event. */
+        if (st != GPTPS_OK) it->eh = 0;
         b->sh[best].load -= 1;
         hm_del(&b->by_bh, it->bh);
         it->fail = (st == GPTPS_OK) ? GPTPS_E_NOMEM : st;
@@ -213,6 +228,7 @@ static void emit_fails(gptps_balance *b, bitem *fails)
 {
     while (fails) {
         bitem *n = fails->next;
+        if (fails->eh) gptps_cancel(b->sh[fails->shard].e, fails->eh);   /* accepted, untracked */
         emit_own(b, fails, GPTPS_EV_DEAD_LETTERED, fails->fail);
         item_free(fails);
         fails = n;
@@ -226,7 +242,7 @@ static int is_terminal(const gptps_event *ev)
     return ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED;
 }
 
-/* Observer on one shard (its dispatcher thread; QUEUED also on submitters). */
+/* Observer on one shard (its worker and dispatcher threads; QUEUED also on submitters). */
 static void observe(const gptps_event *ev, void *ud)
 {
     bshard *s = (bshard *)ud;
@@ -327,20 +343,16 @@ gptps_status gptps_balance_set_event_cb(gptps_balance *b, gptps_event_cb cb, voi
  * terminal event. That is precisely why the defect had to be refused at the boundary
  * instead of detected downstream - by the time it shows, the evidence is gone.
  *
- * O(task types) per submit, with the same shape as the gptps_task_exists check
- * above; types are registered at setup and are few. `flags` needs ABI 2.2. */
+ * By name, through gptps_task_flags: O(task types) per submit, like the
+ * gptps_task_exists check it follows. Walking gptps_task_get_info instead - as this
+ * first did - compared against a `name` that is borrowed only until the registry
+ * next changes, so an unregister on another thread could free it mid-strcmp
+ * (tests/test_balance.c case 5), and each call also scanned every item the engine
+ * held to fill its counters. Needs ABI 2.2. */
 static int task_is_service(gptps *e, const char *name)
 {
-    gptps_task_info ti;
-    size_t n = gptps_task_count(e), i;
-    for (i = 0; i < n; ++i) {
-        memset(&ti, 0, sizeof ti);
-        ti.struct_size = sizeof ti;
-        if (gptps_task_get_info(e, i, &ti) != GPTPS_OK) continue;
-        if (ti.name && strcmp(ti.name, name) == 0)
-            return (ti.flags & GPTPS_TASK_SERVICE) != 0;
-    }
-    return 0;
+    uint64_t flags = 0;
+    return gptps_task_flags(e, name, &flags) == GPTPS_OK && (flags & GPTPS_TASK_SERVICE) != 0;
 }
 
 gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
@@ -348,6 +360,7 @@ gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
                                      gptps_balance_handle *out)
 {
     bitem *it, *fails;
+    gptps_balance_handle bh;
     if (out) *out = 0;
     if (!b || !task || !*task) return GPTPS_E_INVAL;
     if (len && !payload) return GPTPS_E_INVAL;
@@ -373,10 +386,16 @@ gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
         apx_mutex_unlock(&b->mu); item_free(it); return GPTPS_E_NOMEM;
     }
     b->queued += 1;
+    bh = it->bh;             /* `it` is reachable by other threads from here on */
     apx_mutex_unlock(&b->mu);
 
-    if (out) *out = it->bh;
-    emit_own(b, it, GPTPS_EV_QUEUED, GPTPS_OK);      /* queued HERE; lock released */
+    /* Not `it` from here: a shard worker finishing earlier work runs dispatch_locked,
+     * which can pop this item, submit it and - once it ends - free it, all before this
+     * thread gets here. So QUEUED is emitted from the captured handle and the caller's
+     * name, and may arrive after the item's STARTED or FINISHED, as the engine's own
+     * off-lock QUEUED may (see gptps.h, EVENT ORDER). */
+    if (out) *out = bh;
+    emit_as(b, bh, task, GPTPS_EV_QUEUED, GPTPS_OK);
 
     apx_mutex_lock(&b->mu);
     fails = dispatch_locked(b);
@@ -398,12 +417,17 @@ gptps_status gptps_balance_cancel(gptps_balance *b, gptps_balance_handle h)
     if (!it) { apx_mutex_unlock(&b->mu); return GPTPS_E_NOTFOUND; }
     if (it->state == IT_QUEUED) {
         /* Stays in the heap (lazily skipped and freed on pop); leaves the handle
-         * table now so a second cancel is NOTFOUND, and gets its one terminal event. */
-        it->state = IT_CANCELLED;
+         * table now so a second cancel is NOTFOUND, and gets its one terminal event.
+         * Any dispatch_locked may pop and free it the moment b->mu drops, so the name
+         * is handed to this thread first: nothing reads a cancelled item's `task`, and
+         * item_free's free(NULL) is a no-op. */
+        char *name = it->task;
+        it->state = IT_CANCELLED; it->task = NULL;
         b->queued -= 1;
-        hm_del(&b->by_bh, it->bh);
+        hm_del(&b->by_bh, h);
         apx_mutex_unlock(&b->mu);
-        emit_own(b, it, GPTPS_EV_FAILED, GPTPS_E_CANCELLED);
+        emit_as(b, h, name, GPTPS_EV_FAILED, GPTPS_E_CANCELLED);
+        free(name);
         return GPTPS_OK;
     }
     e = b->sh[it->shard].e; eh = it->eh;
