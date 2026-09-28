@@ -480,19 +480,23 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
 
     apx_mutex_lock(&dq->mu);
     seq = dq->next_seq;
+    /* Reserve the in-memory slot BEFORE journaling, for the reason nm and pl are
+     * duplicated first: the reverse order has no rollback. A push_rec that failed
+     * after the 'P' was fsync'd returned GPTPS_E_NOMEM - "not submitted" - for a
+     * record the next gptps_dq_recover then ran anyway. */
+    rc = push_rec(dq);
+    if (!rc) { apx_mutex_unlock(&dq->mu); free(nm); free(pl); return GPTPS_E_NOMEM; }
     /* Durable before we enqueue: a swallowed fsync error would be a false
      * durability claim. On failure the journal is rolled back to its previous
      * length, so a transient full disk costs this one submit rather than every
      * submit for the rest of the process's life. */
     if (append_durable(dq->fp, 'P', seq, task_name, payload, len) != 0) {
+        dq->n -= 1;                     /* un-reserve: no one saw it, we hold dq->mu */
         apx_mutex_unlock(&dq->mu);
         free(nm); free(pl);
         return GPTPS_E_IO;
     }
     dq->next_seq = seq + 1;
-
-    rc = push_rec(dq);
-    if (!rc) { apx_mutex_unlock(&dq->mu); free(nm); free(pl); return GPTPS_E_NOMEM; }
     rc->seq = seq; rc->done = 0; rc->handle = 0; rc->len = len;
     rc->name = nm;
     rc->payload = pl;

@@ -383,6 +383,15 @@ the release version and is documented in `include/gptps.h`.
   requeue case whose body fails with `GPTPS_E_TASK`; against the old engine that
   requeue case fails too.
 
+- **`gptps_dq_submit` could return `GPTPS_E_NOMEM` for work it had already made
+  durable.** The in-memory record table grew after the `'P'` record was fsync'd, so when
+  that allocation failed the caller was told the work was not submitted while the
+  journal held it, and - unless a compaction ran first - the next run's
+  `gptps_dq_recover` ran it anyway. The table now
+  grows first, so a failed allocation writes nothing. `tests/test_durable_oom.c`
+  compiles the add-on with `realloc` redirected to fail once; before the fix the
+  refused submit was recovered and ran in the next run.
+
 ### Added — a tier that costs nothing
 
 - **`GPTPS_TUI_KPI_OFF`.** `MINIMAL` was documented as "~no per-event work", but it still

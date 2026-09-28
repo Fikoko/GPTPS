@@ -602,6 +602,12 @@ target_include_directories(test_durable PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(test_durable PRIVATE gptps_durable_queue)
 add_test(NAME durable COMMAND test_durable)
 set_tests_properties(durable PROPERTIES TIMEOUT 30)
+# compiles the add-on in with realloc redirected, so it links the core only
+add_executable(test_durable_oom tests/test_durable_oom.c)
+target_include_directories(test_durable_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable_oom PRIVATE gptps)
+add_test(NAME durable_oom COMMAND test_durable_oom)
+set_tests_properties(durable_oom PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_orch)
