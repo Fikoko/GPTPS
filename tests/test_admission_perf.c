@@ -35,14 +35,14 @@ static int fails = 0;
 static gptps_status noop(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 
 /* queue `n` items, then drain them, and return the milliseconds that took */
-static double drain(int n)
+static double drain(int n, int reps)
 {
     gptps_config cfg;
     gptps *e = NULL;
     gptps_task_def d;
     uint64_t t0;
     size_t ran;
-    int i;
+    int i, r;
 
     memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
     cfg.limits.struct_size = sizeof cfg.limits;
@@ -57,32 +57,53 @@ static double drain(int n)
     d.default_policy.struct_size = sizeof d.default_policy;
     if (gptps_register_task(e, &d) != GPTPS_OK) { ++fails; gptps_shutdown(e); return 0.0; }
 
+    /* `reps` fills and drains the queue that many times in one timed interval, so a
+     * coarse clock (a ~16ms tick on Windows) can be outgrown without growing the
+     * queue past what the test means to measure. */
     t0 = gptps_hal_monotonic_ms();
-    for (i = 0; i < n; ++i)
-        if (gptps_submit(e, "n", NULL, 0, NULL) != GPTPS_OK) { ++fails; break; }
-    while (gptps_step(e, &ran) == GPTPS_OK && ran) { /* drain from full depth */ }
+    for (r = 0; r < reps && !fails; ++r) {
+        for (i = 0; i < n; ++i)
+            if (gptps_submit(e, "n", NULL, 0, NULL) != GPTPS_OK) { ++fails; break; }
+        while (gptps_step(e, &ran) == GPTPS_OK && ran) { /* drain from full depth */ }
+    }
     { double dt = (double)(gptps_hal_monotonic_ms() - t0); gptps_shutdown(e); return dt; }
 }
 
 int main(void)
 {
-    int n = 20000;
+    int n = 20000, reps = 1, i;
     double a, b, ratio;
 
     /* Grow n until the smaller run is long enough that clock noise cannot dominate
      * the ratio. Bounded so a very slow machine still terminates. */
     for (;;) {
-        a = drain(n);
+        a = drain(n, reps);
         if (fails) { printf("test_admission_perf: FAILED (engine error)\n"); return 1; }
-        if (a >= 50.0 || n >= 160000) break;   /* 50ms: enough for a ms clock to be exact */
-        n *= 2;
+        /* 100ms for this sizing run: at least six ticks of a ~16ms clock. The best of
+         * three below can come in lower when this first run was slowed by load. Past
+         * 160000 items, repeat instead of growing. */
+        if (a >= 100.0) break;
+        if (n < 160000) n *= 2; else if (reps < 32) reps *= 2; else break;
     }
-    b = drain(2 * n);
+    b = drain(2 * n, reps);
+    if (fails) { printf("test_admission_perf: FAILED (engine error)\n"); return 1; }
+    /* Best of three per size. One run is at the mercy of a shared machine: a CI
+     * runner or a sanitizer build under parallel ctest can stall either drain long
+     * enough to push a linear ratio past MAX_RATIO (seen: 3.21 on macOS CI). A
+     * quadratic admission path is slow in EVERY run, so the minimum still shows it. */
+    for (i = 0; i < 2; ++i) {
+        double a2 = drain(n, reps), b2;
+        if (fails) break;
+        b2 = drain(2 * n, reps);
+        if (fails) break;
+        if (a2 < a) a = a2;
+        if (b2 < b) b = b2;
+    }
     if (fails) { printf("test_admission_perf: FAILED (engine error)\n"); return 1; }
 
     ratio = (a > 0.0) ? b / a : 0.0;
-    printf("drain %d: %.0fms | drain %d: %.0fms | ratio %.2f (linear ~2.0, quadratic ~4.0)\n",
-           n, a, 2 * n, b, ratio);
+    printf("drain %d x%d: %.0fms | drain %d x%d: %.0fms | ratio %.2f (linear ~2.0, quadratic ~4.0)\n",
+           n, reps, a, 2 * n, reps, b, ratio);
     CHECK(ratio < MAX_RATIO);
     if (ratio >= MAX_RATIO)
         printf("       admission looks super-linear in queue depth - see \"intake ordering\" in src/engine.c\n");

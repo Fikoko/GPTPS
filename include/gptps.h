@@ -76,10 +76,10 @@ extern "C" {
  *
  * 2.x: 2.1 the plug-in tier seams; 2.2 appends `flags` to gptps_task_info and adds
  * gptps_task_flags, so a caller can finally see whether a registered type is a
- * SERVICE. Additive, and the loader compares MAJOR only, so no existing add-on is
- * refused. */
+ * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*). Additive, and the
+ * loader compares MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 2u
+#define GPTPS_ABI_VERSION_MINOR 3u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -224,6 +224,8 @@ GPTPS_API gptps_status gptps_result_set_nocopy(gptps_ctx *ctx, void *bytes, size
  *   run():  do the work. Read input via gptps_payload(); deliver output via
  *           gptps_result_set[_nocopy](); poll gptps_is_cancelled(). Return
  *           GPTPS_OK on success or GPTPS_E_TASK (or a specific code) on failure.
+ *           Returning GPTPS_E_CANCELLED ends the item as a cancel does: one
+ *           terminal FAILED carrying it, never a retry or a dead letter.
  *   cost(): OPTIONAL. Fill *out from the payload for dynamic per-item cost.
  *           If NULL, `default_cost` is used (config may override).
  * ==========================================================================*/
@@ -235,7 +237,9 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
 /* SERVICE: a long-running, supervised instance rather than a one-shot task. Its
  * run() is expected to loop until told to stop (poll gptps_is_cancelled()); when
  * it returns for any reason OTHER than a stop request it is automatically
- * RESTARTED after retry_backoff_seconds (crash-restart supervision). The engine
+ * RESTARTED after retry_backoff_seconds (crash-restart supervision) - except a
+ * run() that itself returns GPTPS_E_CANCELLED, which ends the instance for good as
+ * a stop does (see run() above). The engine
  * normalizes the failure policy for you (on_failure = REQUEUE, max_retries = 0,
  * no timeout). Start an instance with gptps_submit (start several for a pool); the
  * returned handle stays valid across restarts, so gptps_cancel(handle) stops that
@@ -249,8 +253,9 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * default always-up policy a clean exit emits FINISHED and then restarts - a service
  * up for one second can emit a dozen. The single terminal event a service emits
  * exactly once is the FAILED carrying GPTPS_E_CANCELLED that gptps_cancel,
- * gptps_unregister_task or gptps_shutdown produces; that is the one to wait for if
- * you want "until this service stops". GPTPS_TASK_RETIRE_ON_OK is the exception: it
+ * gptps_unregister_task or gptps_shutdown produces - or the body itself, returning
+ * that status; that is the one to wait for if you want "until this service
+ * stops". GPTPS_TASK_RETIRE_ON_OK is the exception: it
  * retires on a clean exit, so such a handle emits exactly one terminal event like
  * any other task.
  * v1 restrictions (rejected at registration with GPTPS_E_INVAL): INPROC executor
@@ -261,7 +266,8 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a
  * clean GPTPS_OK return. Set this to instead RESTART ONLY ON FAILURE: a run() that
  * returns GPTPS_OK (uncancelled) terminally retires that instance (its handle
- * becomes unknown), while a non-OK return still restarts it. This is the
+ * becomes unknown), while a non-OK return other than GPTPS_E_CANCELLED still
+ * restarts it. This is the
  * "Restart=on-failure" semantic; the default is "Restart=always". */
 #define GPTPS_TASK_RETIRE_ON_OK 0x2u
 
@@ -691,9 +697,9 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * out of retries during the drain, which never schedules another cycle - a
  * GPTPS_EV_DEAD_LETTERED, while the attempt's own status stays on its FAILED. The
  * dead letters both paths retain (gptps_dead_letter_drain) carry that status too.
- * The engine does not reserve it: a task body may return GPTPS_E_SHUTDOWN
- * too, and when that return ends the item its DEAD_LETTERED / DROPPED carries it,
- * preceded by a FAILED that does.
+ * Both events carry GPTPS_EV_FLAG_SHUTDOWN (ABI 2.3). The engine does not reserve
+ * the status: a task body may return GPTPS_E_SHUTDOWN too, and when that return ends
+ * the item its DEAD_LETTERED / DROPPED carries the status but not the flag.
  *
  * NOT RE-ENTRANT: returns GPTPS_E_BUSY if called from a task body or an event
  * callback, because it would join the very thread making the call (THREADED) or
@@ -783,7 +789,28 @@ typedef struct {
      * Valid only for the duration of the callback - copy it if you need it. */
     const void      *result;
     size_t           result_len;
+    /* ABI 2.3: OR of GPTPS_EV_FLAG_*. Read it only if struct_size covers it
+     * (offsetof(gptps_event, flags) + sizeof(uint32_t) <= struct_size): an engine
+     * older than 2.3 hands you a shorter struct, and so, even on a newer engine,
+     * does a binary add-on built against an older header that emits through the
+     * host table's emit_event - its struct reaches the event callback as is. */
+    uint32_t         flags;
 } gptps_event;
+
+/* On a GPTPS_EV_DEAD_LETTERED or GPTPS_EV_DROPPED: teardown imposed this disposition
+ * - the shutdown grace expired on work waiting in backoff, or the drain refused a
+ * REQUEUE item another cycle (see gptps_shutdown) - rather than the item's failure
+ * policy running its course. Such an event's status is GPTPS_E_SHUTDOWN. A task
+ * body may return GPTPS_E_SHUTDOWN too, and its disposition then carries that status
+ * WITHOUT this flag: the flag, not the status, is what says teardown ended the
+ * item. Never set on any other kind of event. */
+#define GPTPS_EV_FLAG_SHUTDOWN 0x1u
+/* On a GPTPS_EV_FAILED carrying GPTPS_E_CANCELLED: the task body (or its child
+ * process) returned that status itself - no gptps_cancel, removal or shutdown
+ * stopped it - and so ended its item (see run()). Without the flag, a stop from
+ * outside was requested by the time the attempt ended - even if the body had
+ * already returned the status on its own. Never set on any other kind of event. */
+#define GPTPS_EV_FLAG_SELF_CANCELLED 0x2u
 
 typedef void (*gptps_event_cb)(const gptps_event *ev, void *user_data);
 GPTPS_API gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data);

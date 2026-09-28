@@ -32,7 +32,7 @@ static gptps_status t_block(gptps_ctx *c, void *u)
 #define MAXH 64
 static int  terminals[MAXH];
 static int  started_order[MAXH], nstarted;
-static int  dead_shutdown, dropped_shutdown, cancelled;
+static int  dead_shutdown, dropped_shutdown, cancelled, shutdown_flagged;
 static void on_ev(const gptps_event *ev, void *u)
 {
     (void)u;
@@ -44,9 +44,10 @@ static void on_ev(const gptps_event *ev, void *u)
     }
     if (ev->kind == GPTPS_EV_DEAD_LETTERED && ev->status == GPTPS_E_SHUTDOWN) __atomic_add_fetch(&dead_shutdown, 1, __ATOMIC_SEQ_CST);
     if (ev->kind == GPTPS_EV_DROPPED && ev->status == GPTPS_E_SHUTDOWN) __atomic_add_fetch(&dropped_shutdown, 1, __ATOMIC_SEQ_CST);
+    if (ev->flags & GPTPS_EV_FLAG_SHUTDOWN) __atomic_add_fetch(&shutdown_flagged, 1, __ATOMIC_SEQ_CST);
     if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED) __atomic_add_fetch(&cancelled, 1, __ATOMIC_SEQ_CST);
 }
-static void reset_log(void) { memset(terminals, 0, sizeof terminals); nstarted = 0; dead_shutdown = dropped_shutdown = cancelled = 0; }
+static void reset_log(void) { memset(terminals, 0, sizeof terminals); nstarted = 0; dead_shutdown = dropped_shutdown = cancelled = shutdown_flagged = 0; }
 static int terminal_total(void) { int i, n = 0; for (i = 0; i < MAXH; ++i) n += get(&terminals[i]); return n; }
 static void wait_terminals(int n)
 { uint64_t s = gptps_now_ms(NULL); while (terminal_total() < n && gptps_now_ms(NULL) - s < 5000) { } }
@@ -189,6 +190,7 @@ static void test_dispatched_cancel_and_close(void)
     gptps_balance_close(b);
     CHECK(terminal_total() == 5);
     CHECK(get(&dead_shutdown) + get(&dropped_shutdown) == 4);
+    CHECK(get(&shutdown_flagged) == 4);   /* this module's own: each refused dispatch */
     CHECK(get(&terminals[hb]) == 1);                             /* exactly one each */
     for (i = 0; i < 4; ++i) CHECK(get(&terminals[hs[i]]) == 1);
 }

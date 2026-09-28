@@ -80,7 +80,7 @@ int main(void)
         CHECK(gptps_set_allocator(NULL) == GPTPS_OK);   /* reset process-wide allocator */
     }
 
-    /* The two ABI invariants a binary plugin's survival rests on. These are compile-
+    /* The ABI invariants a binary plugin's survival rests on. The first two are compile-
      * time, because a runtime check would come too late: the failure they guard
      * against is "the header changed and every already-built .so stopped loading",
      * and by the time anyone runs a test the .so in question is somebody else's. */
@@ -106,6 +106,12 @@ int main(void)
         /* And the 2.1 additions really are additions, not a reshuffle. */
         CHECK(sizeof(gptps_api_routines) > offsetof(gptps_api_routines, is_cancelled));
         CHECK(offsetof(gptps_api_routines, set_scheduler) < offsetof(gptps_api_routines, is_cancelled));
+        /* 3) gptps_event: struct_size first, and 2.3's `flags` APPENDED after the 2.2
+         *    tail (result_len), so an observer's `struct_size` guard can tell an older
+         *    engine's shorter struct apart. */
+        CHECK(offsetof(gptps_event, struct_size) == 0);
+        CHECK(offsetof(gptps_event, flags) >= offsetof(gptps_event, result_len) + sizeof(size_t));
+        CHECK(sizeof(gptps_event) >= offsetof(gptps_event, flags) + sizeof(uint32_t));
     }
 
     if (fails) { printf("%d abi check(s) FAILED\n", fails); return 1; }

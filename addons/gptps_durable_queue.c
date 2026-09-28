@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #define DQ_FILE_MAGIC 0x47445131u /* "GDQ1" */
 #define DQ_REC_MAGIC  0x44515231u /* "DQR1" */
@@ -44,7 +45,6 @@ typedef struct {
     size_t       len;
     int          done;        /* closed: finished, dropped, refused, retracted or drained */
     int          quarantined; /* terminal + RETAINED (dead-lettered): poison kept for inspection */
-    int          own_shutdown;/* latest FAILED/RETRIED carrying GPTPS_E_SHUTDOWN was a FAILED */
 } dq_rec;
 
 struct gptps_dq {
@@ -358,62 +358,53 @@ static gptps_status do_rewrite(gptps_dq *dq)
 
 /* ---- observer: mark a record done when its task terminates ----
  *
- * A DEAD_LETTERED or DROPPED carrying GPTPS_E_SHUTDOWN is normally teardown's: the
- * grace expired on work waiting in backoff, or the drain refused a REQUEUE item
- * another cycle (see gptps_shutdown). Neither is a verdict on the work -
- * quarantining it would file healthy work as poison, and closing it would lose it -
+ * A DEAD_LETTERED or DROPPED that teardown imposed - the grace expired on work
+ * waiting in backoff, or the drain refused a REQUEUE item another cycle - carries
+ * GPTPS_EV_FLAG_SHUTDOWN (see gptps_shutdown). Neither is a verdict on the work:
+ * quarantining it would file healthy work as poison, and closing it would lose it,
  * so the record stays pending and the next run's gptps_dq_recover re-submits it,
  * like everything else shutdown abandons (which the engine reports as FAILED /
- * GPTPS_E_CANCELLED, an event this observer never counts as terminal).
+ * GPTPS_E_CANCELLED without GPTPS_EV_FLAG_SELF_CANCELLED, an event this observer
+ * never counts as terminal).
  *
- * But the engine does not reserve that status. A body may return it - forwarding a
- * remote worker's shutdown, say - and its dead letter or drop then carries it too.
- * That one IS the verdict, and kept pending it would re-run on every restart. The
- * attempt's own FAILED tells them apart: it is emitted before the dispatcher sees
- * the item, so it reaches this observer first. own_shutdown notes that it carried
- * GPTPS_E_SHUTDOWN, and a RETRIED carrying it clears the flag again, since a retry
- * parked after such an attempt is teardown's to end. Only events carrying the
- * status take the lock for this.
+ * The flag, not the status, decides. Those events carry GPTPS_E_SHUTDOWN, but so
+ * does the disposition of a body that itself returned it - forwarding a remote
+ * worker's shutdown, say - and that one IS the verdict: kept pending, it would re-run
+ * on every restart. It carries the status without the flag, and is judged by its
+ * policy like any other failure.
  *
- * One case is quarantined rather than kept, by design: a REQUEUE item that teardown
- * dead-letters (the drain's refusal, or the grace expiring on its backoff) after
- * the latest of its attempts to return the status ended a cycle rather than being
- * retried - whatever its later cycles returned. That FAILED set the flag exactly as
- * a dead_letter item's own verdict does, a cycle restarts without the RETRIED that
- * would clear it, events carrying another status leave it alone, and events do not
- * carry the policy. A teardown that cancels the item keeps it pending, as above.
- * Reading the policy instead was tried and rejected: the registry walk was
- * quadratic and read a borrowed name, and a by-name settings read saw the type's
- * live policy rather than the item's and put the dispatcher on the settings lock.
- * Quarantine retains the record, so nothing is lost. */
+ * A body that returns GPTPS_E_CANCELLED itself ends its item (GPTPS_EV_FLAG_SELF_
+ * CANCELLED on its FAILED). That is the work's own outcome too, not a stop from
+ * outside, so the record closes as on FINISHED or DROPPED - not quarantined, since a
+ * cancel is not a failure to retain. Kept pending, a body that always cancels itself
+ * would re-run on every restart. A FAILED / GPTPS_E_CANCELLED without the flag - a
+ * gptps_cancel, a removal, a teardown - still leaves the record pending. */
+static int has_flag(const gptps_event *ev, uint32_t f)
+{
+    return ev->struct_size >= offsetof(gptps_event, flags) + sizeof ev->flags &&
+           (ev->flags & f) != 0;
+}
+
 static void dq_on_event(const gptps_event *ev, void *ud)
 {
     gptps_dq *dq = (gptps_dq *)ud;
     size_t i;
-    int note = (ev->kind == GPTPS_EV_FAILED || ev->kind == GPTPS_EV_RETRIED);
-    if (note) {
-        if (ev->status != GPTPS_E_SHUTDOWN) return;
-    } else if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DROPPED &&
-               ev->kind != GPTPS_EV_DEAD_LETTERED) {
-        return;
-    }
+    int self_cancel = (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED &&
+                       has_flag(ev, GPTPS_EV_FLAG_SELF_CANCELLED));
+    if (!self_cancel && ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_DROPPED &&
+        ev->kind != GPTPS_EV_DEAD_LETTERED) return;
+    if ((ev->kind == GPTPS_EV_DROPPED || ev->kind == GPTPS_EV_DEAD_LETTERED) &&
+        has_flag(ev, GPTPS_EV_FLAG_SHUTDOWN)) return;   /* teardown's: stays pending */
     apx_mutex_lock(&dq->mu);
     for (i = 0; i < dq->n; ++i) {
         if (dq->recs[i].done || dq->recs[i].quarantined) continue;
         if (dq->recs[i].handle != ev->handle) continue;
-        if (note) {
-            dq->recs[i].own_shutdown = (ev->kind == GPTPS_EV_FAILED);
-            break;
-        }
-        if (ev->kind != GPTPS_EV_FINISHED && ev->status == GPTPS_E_SHUTDOWN &&
-            !dq->recs[i].own_shutdown)
-            break;   /* teardown's: stays pending */
         if (ev->kind == GPTPS_EV_DEAD_LETTERED) {
             /* dead-lettered: RETAIN the poison payload (quarantine), don't drop it */
             dq->recs[i].quarantined = 1;
             append_marker(dq->fp, 'Q', dq->recs[i].seq);
         } else {
-            /* finished or dropped: terminally gone, discard */
+            /* finished, dropped, or cancelled by its own body: terminally gone, discard */
             dq->recs[i].done = 1;
             append_marker(dq->fp, 'D', dq->recs[i].seq);
         }

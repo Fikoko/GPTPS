@@ -177,6 +177,7 @@ typedef struct {
     uint64_t         mem;
     const void      *result;
     size_t           result_len;
+    uint32_t         flags;         /* GPTPS_EV_FLAG_* */
 } gptps_pending_ev;
 
 static void ev_set_name(char *dst, const char *src)
@@ -536,6 +537,7 @@ static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_
     ev.ts_ms = gptps_hal_monotonic_ms(); ev.status = p->status;
     ev.attempt = p->attempt; ev.mem_bytes = p->mem;
     ev.result = p->result; ev.result_len = p->result_len;
+    ev.flags = p->flags;
     if (cb) cb(&ev, ud);
     for (o = e->observers; o; o = o->next) o->fn(&ev, o->ud); /* extra sinks */
 }
@@ -647,9 +649,10 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     void *oop_res = NULL;
     size_t oop_len = 0;
     bool inproc = (it->def->exec == GPTPS_EXEC_INPROC);
+    bool raised = false;           /* the cancel flag, read ONCE after the attempt */
 
     p.handle = it->handle; ev_set_name(p.name, item_name(it)); p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-    p.result = NULL; p.result_len = 0;
+    p.result = NULL; p.result_len = 0; p.flags = 0;
     p.kind = GPTPS_EV_STARTED; p.status = GPTPS_OK; emit_now(e, cb, ud, &p);
 
     if (inproc) {
@@ -659,7 +662,8 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         ctx.payload = it->payload; ctx.payload_len = it->payload_len;
         ctx.deadline_ms = it->deadline_ms; ctx.cancel = it->cancel;
         st = it->def->run(&ctx, it->def->user_data);
-        if (gptps_flag_get(it->cancel)) {
+        raised = gptps_flag_get(it->cancel);
+        if (raised) {
             /* Tell a deadline breach apart from an explicit stop. The dispatcher's
              * watchdog raises this flag only once the deadline has passed, so a flag
              * raised with no deadline at all - or before it - came from gptps_cancel,
@@ -696,6 +700,15 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
 
     /* deliver the result on the FINISHED event (valid for the callback's duration) */
     p.kind = (st == GPTPS_OK) ? GPTPS_EV_FINISHED : GPTPS_EV_FAILED; p.status = st;
+    /* A GPTPS_E_CANCELLED with the flag down is the body's own (or the child's):
+     * nothing stopped it. One read decides both this and the TIMEOUT/CANCELLED split
+     * above - a second read could see the flag the deadline watchdog raised in
+     * between, and report a body's own cancel as neither. A stop that raises the flag
+     * after the body returned counts as a stop, the conservative reading for a
+     * consumer that keeps stopped work. */
+    if (!inproc) raised = gptps_flag_get(it->cancel);
+    if (st == GPTPS_E_CANCELLED && !raised)
+        p.flags = GPTPS_EV_FLAG_SELF_CANCELLED;
     if (st == GPTPS_OK) {
         if (inproc) { if (ctx.result_set) { p.result = ctx.result; p.result_len = ctx.result_len; } }
         else        { p.result = oop_res; p.result_len = oop_len; }
@@ -978,7 +991,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
                         ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                        pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                     }
                     item_free(it);
                 }
@@ -997,8 +1010,21 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
                     ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                 }
+                item_free(it);
+                continue;
+            }
+            if (it->started && it->outcome == GPTPS_E_CANCELLED) {
+                /* The attempt ended with GPTPS_E_CANCELLED without a per-handle cancel
+                 * (it->cancelled, above): the body returned it, or a REMOVE_CANCEL
+                 * raised the flag mid-run and execute() reported the stop. Either way
+                 * its FAILED carried that status, which observers reconciling handles
+                 * count as terminal, so the item ends here as a cancel would: no retry,
+                 * no dead letter, no requeue. Retrying reopened a handle they had closed.
+                 * (`started` matters: an item a REMOVE_CANCEL discarded before it ran
+                 * has the same outcome and no event at all - the removal branch below
+                 * owes it one.) */
                 item_free(it);
                 continue;
             }
@@ -1025,7 +1051,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         ev_set_name(pend[npend].name, item_name(it));
                         pend[npend].status = it->reg->cancelling ? GPTPS_E_CANCELLED : it->outcome;
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                        pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                     }
                     item_free(it);
                 } else {
@@ -1033,7 +1059,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                         ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                        pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                     }
                     dead_letter_push(e, it);
                 }
@@ -1047,7 +1073,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_RETRIED; pend[npend].handle = it->handle;
                     ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                 }
                 fifo_push(&announced, it);   /* joins `delayed` after step 2's scan */
             } else {
@@ -1083,7 +1109,8 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                                 pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                                 ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_SHUTDOWN;
                                 pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                                pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                                pend[npend].result = NULL; pend[npend].result_len = 0;
+                                pend[npend].flags = GPTPS_EV_FLAG_SHUTDOWN; ++npend;
                             }
                             dead_letter_push(e, it);
                         } else {
@@ -1102,7 +1129,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                             pend[npend].kind = GPTPS_EV_DROPPED; pend[npend].handle = it->handle;
                             ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                            pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                            pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                         }
                         item_free(it);
                         break;
@@ -1112,7 +1139,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                             pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                             ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                         }
                         dead_letter_push(e, it);
                         break;
@@ -1208,7 +1235,8 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     ev_set_name(pend[npend].name, item_name(it));
                     pend[npend].status = GPTPS_E_SHUTDOWN;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0;
+                    pend[npend].flags = GPTPS_EV_FLAG_SHUTDOWN; ++npend;
                     if (drop) item_free(it); else dead_letter_push(e, it);
                 }
                 if (e->delayed.head) more = 1;
@@ -1287,7 +1315,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = stranded->handle;
                     ev_set_name(pend[npend].name, item_name(stranded)); pend[npend].status = GPTPS_E_BUDGET;
                     pend[npend].attempt = stranded->attempt; pend[npend].mem = stranded->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                     dead_letter_push(e, stranded);
                     continue;                            /* rescan: the head may have changed */
                 }
@@ -1345,7 +1373,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = best->handle;
                     ev_set_name(pend[npend].name, item_name(best)); pend[npend].status = GPTPS_E_DENIED;
                     pend[npend].attempt = best->attempt; pend[npend].mem = best->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                 }
                 dead_letter_push(e, best);               /* denied -> retained */
                 continue;
@@ -2353,7 +2381,7 @@ static void drain_cancelled(gptps *e, gptps_fifo *q, gptps_event_cb cb, void *ud
         p.kind = GPTPS_EV_FAILED; p.handle = it->handle;
         ev_set_name(p.name, item_name(it));
         p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-        p.result = NULL; p.result_len = 0;
+        p.result = NULL; p.result_len = 0; p.flags = 0;
         emit_now(e, cb, ud, &p);
         item_free(it);
     }
@@ -3439,7 +3467,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         uint64_t mem = cost.mem_bytes;
         p.kind = GPTPS_EV_QUEUED; p.handle = h; ev_set_name(p.name, r->def.name);
         p.status = GPTPS_OK; p.attempt = 0; p.mem = mem;
-        p.result = NULL; p.result_len = 0;
+        p.result = NULL; p.result_len = 0; p.flags = 0;
         gptps_mutex_unlock(e->m);
         emit_now(e, cb, ud, &p);
     }
@@ -3512,7 +3540,7 @@ gptps_status gptps_cancel(gptps *e, gptps_handle h)
                 if (queues[qi] == &e->intake) intake_forget(e);  /* may have been a cached run tail */
                 p.kind = GPTPS_EV_FAILED; p.handle = h; ev_set_name(p.name, item_name(it));
                 p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-                p.result = NULL; p.result_len = 0;
+                p.result = NULL; p.result_len = 0; p.flags = 0;
                 cb = e->ev_cb; ud = e->ev_ud;
                 item_free(it);
                 /* This can be the last live reference to a draining task type, and

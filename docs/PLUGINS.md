@@ -79,6 +79,16 @@ symbols live in the host executable behind its own `gptps_`/`gptps__` namespacin
 which exists precisely so an add-on cannot capture them. Going through the table is
 what lets one `.so` work against a static, shared or amalgamated host alike.
 
+**Events grow the same way.** An observer you register gets a `gptps_event` whose
+`struct_size` says how much of it this host filled in. `flags` (ABI 2.3) is appended,
+and an older 2.x core — which the loader accepts, since it compares MAJOR only — hands
+you a shorter struct, so guard it:
+
+```c
+uint32_t fl = (ev->struct_size >= offsetof(gptps_event, flags) + sizeof ev->flags)
+            ? ev->flags : 0u;
+```
+
 Routines by the version that introduced them: v1.0 `register_task`, `emit_event`,
 `log`, `result_set`, `payload` · v1.1 `register_constraint`, `register_observer` ·
 v1.4 `register_setting` · v1.8 `unregister_task`, `task_exists`, `define_global`,

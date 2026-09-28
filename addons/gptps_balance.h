@@ -33,9 +33,11 @@
  * with `handle` rewritten to the balance handle - plus a QUEUED emitted by this
  * module at submit time (the item queued HERE), and a terminal DEAD_LETTERED /
  * DROPPED for an item this module could not dispatch (unknown task, shard refused
- * the submit, close with work still queued). Every balance handle reaches exactly
- * one terminal event, the same guarantee the core gives. Work submitted straight to
- * a shard (gptps_pool_submit, gptps_submit) is not seen here and not counted.
+ * the submit, close with work still queued); those that teardown caused carry
+ * GPTPS_E_SHUTDOWN and GPTPS_EV_FLAG_SHUTDOWN, like the shards'. Every balance
+ * handle reaches exactly one terminal event, the same guarantee the core gives. Work
+ * submitted straight to a shard (gptps_pool_submit, gptps_submit) is not seen here
+ * and not counted.
  *
  * What it costs: one lock and one hash lookup per event, and a copy of the payload
  * while the item waits in the router (the engine copies again at dispatch).

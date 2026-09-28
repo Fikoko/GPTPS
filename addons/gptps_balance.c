@@ -164,6 +164,11 @@ static void emit_as(gptps_balance *b, gptps_balance_handle bh, const char *task,
     memset(&ev, 0, sizeof ev);
     ev.struct_size = sizeof ev; ev.kind = kind; ev.handle = bh;
     ev.task_name = task; ev.ts_ms = gptps_now_ms(NULL); ev.status = st;
+    /* This module's own DEAD_LETTERED / DROPPED with E_SHUTDOWN are always teardown's:
+     * a stopping shard refused the dispatch, or close found the item still queued. A
+     * body's own E_SHUTDOWN arrives forwarded, with the shard's flags. */
+    if ((kind == GPTPS_EV_DEAD_LETTERED || kind == GPTPS_EV_DROPPED) && st == GPTPS_E_SHUTDOWN)
+        ev.flags = GPTPS_EV_FLAG_SHUTDOWN;
     b->cb(&ev, b->cb_ud);
 }
 

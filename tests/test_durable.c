@@ -11,8 +11,10 @@
  *      intent for the next run; gptps_dq_cancel retracts the intent itself.
  *   D) shutdown abandonment: work the engine gives up on at teardown stays
  *      pending - not quarantined, not lost - and the next run recovers it; a
- *      body that itself returns GPTPS_E_SHUTDOWN is still judged by its policy
- *      (under requeue, quarantined: the documented residue).
+ *      body that itself returns GPTPS_E_SHUTDOWN is still judged by its policy,
+ *      and one that returns GPTPS_E_CANCELLED closes its record.
+ *   E) recovery under backpressure: gptps_dq_recover can be called again,
+ *      re-submitting what an intake of two refused.
  *
  * Phase A fully shuts down (joining all engine threads) before the fork, so the
  * fork happens from a single-threaded process.
@@ -279,18 +281,19 @@ static void test_cancel(void)
  * with FAILED / GPTPS_E_CANCELLED. Neither is a verdict on the work, so both stay
  * pending and run 2 recovers them. The dead-lettered retry used to be quarantined
  * as poison, and the dropped one marked done - lost with a retry still owed.
- * Run once more with flaky's attempt returning GPTPS_E_SHUTDOWN itself: that
- * attempt's verdict is followed by a RETRIED, so the parked retry is still
- * teardown's to end. */
+ * Run once more with flaky's attempt returning GPTPS_E_SHUTDOWN itself: the retry
+ * is parked all the same, and the grace ends it with GPTPS_EV_FLAG_SHUTDOWN, so it
+ * is still teardown's. */
 static int          g_ok;               /* run 2: every body succeeds at once */
 static gptps_status g_flaky_fail;       /* what flaky's run-1 attempt returns */
-static int g_flaky_runs, g_spin_runs, g_retried, g_shutdown_ev;
+static int g_flaky_runs, g_spin_runs, g_retried, g_shutdown_ev, g_flagged;
 static void shutdown_obs(const gptps_event *ev, void *ud)
 {
     (void)ud;
     if (ev->kind == GPTPS_EV_RETRIED) inc(&g_retried);
     if ((ev->kind == GPTPS_EV_DEAD_LETTERED || ev->kind == GPTPS_EV_DROPPED) &&
         ev->status == GPTPS_E_SHUTDOWN) inc(&g_shutdown_ev);
+    if (ev->flags & GPTPS_EV_FLAG_SHUTDOWN) inc(&g_flagged);   /* only on those kinds */
 }
 static gptps_status task_flaky(gptps_ctx *ctx, void *ud)
 {
@@ -333,6 +336,7 @@ static void test_shutdown_abandon(gptps_on_failure on_failure, gptps_status fail
     __atomic_store_n(&g_spin_runs, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_retried, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_shutdown_ev, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_flagged, 0, __ATOMIC_SEQ_CST);
 
     /* ---- run 1 ---- */
     e = open_engine(2); CHECK(e != NULL); if (!e) return;
@@ -347,6 +351,7 @@ static void test_shutdown_abandon(gptps_on_failure on_failure, gptps_status fail
     CHECK(wait_for(&g_spin_runs, 1));                   /* spin is running */
     gptps_shutdown(e);
     CHECK(get(&g_shutdown_ev) == 1);                    /* the path under test ran */
+    CHECK(get(&g_flagged) == 1);                        /* marked as teardown's */
     CHECK(get(&g_flaky_runs) == 1);
     CHECK(gptps_dq_quarantined(dq) == 0);               /* not filed as poison */
     CHECK(gptps_dq_pending(dq) == 2);                   /* not lost */
@@ -370,13 +375,12 @@ static void test_shutdown_abandon(gptps_on_failure on_failure, gptps_status fail
 }
 
 /* The drain never schedules a requeue item another cycle; one whose retries run
- * out there is dead-lettered - teardown's doing, so the engine reports
- * GPTPS_E_SHUTDOWN and the record stays pending. With the attempt's own status on
- * that event it was quarantined: work whose policy was to keep trying, filed as
- * poison. Run again with the body itself returning GPTPS_E_SHUTDOWN: its FAILED
- * then looks exactly like a dead_letter item's own verdict, and the observer
- * cannot see the policy, so the record is quarantined - the documented residue,
- * pinned here so the header cannot drift from it. Retained, not lost. */
+ * out there is dead-lettered - teardown's doing, marked GPTPS_EV_FLAG_SHUTDOWN, so
+ * the record stays pending. With the attempt's own status on that event it was
+ * quarantined: work whose policy was to keep trying, filed as poison. Run again
+ * with the body itself returning GPTPS_E_SHUTDOWN: its FAILED then looks exactly
+ * like a dead_letter item's own verdict, and before the flag the queue quarantined
+ * it; the flag says teardown ended it, so it stays pending too. */
 static void reg_requeue(gptps *e)
 {
     gptps_task_def d;
@@ -395,6 +399,7 @@ static void test_requeue_drain(gptps_status fail)
     __atomic_store_n(&g_ok, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_flaky_runs, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_shutdown_ev, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_flagged, 0, __ATOMIC_SEQ_CST);
 
     e = open_engine(1); CHECK(e != NULL); if (!e) return;
     reg_requeue(e);
@@ -405,13 +410,7 @@ static void test_requeue_drain(gptps_status fail)
     CHECK(wait_for(&g_flaky_runs, 2));                  /* really cycling */
     gptps_shutdown(e);
     CHECK(get(&g_shutdown_ev) == 1);                    /* DEAD_LETTERED, E_SHUTDOWN */
-    if (fail == GPTPS_E_SHUTDOWN) {
-        CHECK(gptps_dq_quarantined(dq) == 1);           /* the residue: retained */
-        CHECK(gptps_dq_pending(dq) == 0);
-        gptps_dq_close(dq);
-        remove(JOURNAL_A);
-        return;
-    }
+    CHECK(get(&g_flagged) == 1);                        /* ...and marked as teardown's */
     CHECK(gptps_dq_quarantined(dq) == 0);
     CHECK(gptps_dq_pending(dq) == 1);
     gptps_dq_close(dq);
@@ -459,6 +458,7 @@ static void test_body_shutdown(gptps_on_failure on_failure)
     remove(JOURNAL_A);
     __atomic_store_n(&g_says_runs, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_shutdown_ev, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_flagged, 0, __ATOMIC_SEQ_CST);
 
     e = open_engine(1); CHECK(e != NULL); if (!e) return;
     reg_says(e, on_failure);
@@ -471,6 +471,7 @@ static void test_body_shutdown(gptps_on_failure on_failure)
     CHECK(gptps_dq_quarantined(dq) == want_q);
     gptps_shutdown(e);
     CHECK(get(&g_shutdown_ev) == 1);                    /* its terminal event carried it */
+    CHECK(get(&g_flagged) == 0);                        /* but not as teardown's */
     gptps_dq_close(dq);
 
     e = open_engine(1); CHECK(e != NULL); if (!e) return;
@@ -483,6 +484,45 @@ static void test_body_shutdown(gptps_on_failure on_failure)
     gptps_shutdown(e);
     CHECK(get(&g_says_runs) == 1);                      /* never again */
     gptps_dq_close(dq);
+    remove(JOURNAL_A);
+}
+
+/* A body that returns GPTPS_E_CANCELLED itself ends its item (no retry, no dead
+ * letter), and its FAILED is marked GPTPS_EV_FLAG_SELF_CANCELLED: the work's own
+ * outcome, so the record closes. Without that, nothing ever closed it - it stayed
+ * pending and re-ran on every restart. An outside cancel still leaves it pending
+ * (test_cancel). */
+static int g_selfc_runs;
+static gptps_status task_self_cancels(gptps_ctx *ctx, void *ud)
+{ (void)ctx; (void)ud; inc(&g_selfc_runs); return GPTPS_E_CANCELLED; }
+static void test_body_cancels_itself(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; gptps_task_def d; int run;
+    remove(JOURNAL_A);
+    __atomic_store_n(&g_selfc_runs, 0, __ATOMIC_SEQ_CST);
+    for (run = 0; run < 2; ++run) {
+        e = open_engine(1); CHECK(e != NULL); if (!e) return;
+        memset(&d, 0, sizeof d);
+        d.struct_size = sizeof d; d.exec = GPTPS_EXEC_INPROC; d.name = "selfc"; d.run = task_self_cancels;
+        d.default_cost.struct_size = sizeof d.default_cost;
+        d.default_policy.struct_size = sizeof d.default_policy;
+        d.default_policy.max_retries = 1;
+        gptps_register_task(e, &d);
+        dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+        if (!dq) { gptps_shutdown(e); return; }
+        if (run == 0) {
+            CHECK(gptps_dq_submit(dq, "selfc", "x", 1, &h) == GPTPS_OK);
+            { time_t t0 = time(NULL); while (gptps_dq_pending(dq) != 0 && time(NULL) - t0 < 10) nap(); }
+            CHECK(gptps_dq_pending(dq) == 0);           /* closed by its own cancel */
+            CHECK(gptps_dq_quarantined(dq) == 0);       /* a cancel is not poison */
+        } else {
+            CHECK(gptps_dq_pending(dq) == 0);
+            CHECK(gptps_dq_recover(dq) == 0);           /* never re-run */
+        }
+        gptps_shutdown(e);
+        gptps_dq_close(dq);
+    }
+    CHECK(get(&g_selfc_runs) == 1);
     remove(JOURNAL_A);
 }
 
@@ -538,6 +578,56 @@ static void test_shutdown_manual(void)
     CHECK(get(&g_ran[5]) == 1);
     CHECK(get(&g_ran[6]) == 0);
     CHECK(gptps_dq_pending(dq) == 0);
+    gptps_dq_close(dq);
+    remove(JOURNAL_A);
+}
+
+/* E) recovery under backpressure. With limits.max_intake_depth = 2, one
+ * gptps_dq_recover re-submits what fits and leaves the rest pending - the engine
+ * refuses them with GPTPS_E_FULL - and calling it again once work has drained offers
+ * the rest. The header used to say "safe to call once after open", which read as if
+ * the leftover record could only come back in another process. */
+static gptps *open_manual_depth(uint32_t depth)
+{
+    gptps_config cfg; gptps *e = NULL;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 64u << 20;
+    cfg.limits.max_intake_depth = depth;
+    cfg.mode = GPTPS_RUN_MANUAL;
+    if (gptps_open_ex(&cfg, &e) != GPTPS_OK) return NULL;
+    reg_work(e);
+    return e;
+}
+static void test_recover_again(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; size_t ran = 0; unsigned char b;
+    remove(JOURNAL_A);
+    __atomic_store_n(&g_block, 0, __ATOMIC_SEQ_CST);
+    reset_ran();
+
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;   /* run 1: persist three */
+    dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    for (b = 1; b <= 3; ++b) CHECK(gptps_dq_submit(dq, "work", &b, 1, &h) == GPTPS_OK);
+    gptps_shutdown(e);                                  /* never stepped: all pending */
+    CHECK(gptps_dq_pending(dq) == 3);
+    gptps_dq_close(dq);
+
+    e = open_manual_depth(2); CHECK(e != NULL); if (!e) return;   /* run 2: intake of 2 */
+    dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    CHECK(gptps_dq_pending(dq) == 3);
+    CHECK(gptps_dq_recover(dq) == 2);                   /* the third does not fit */
+    CHECK(gptps_dq_recover(dq) == 0);                   /* still full: nothing new */
+    while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+    CHECK(gptps_dq_pending(dq) == 1);                   /* two done, one waiting */
+    CHECK(gptps_dq_recover(dq) == 1);                   /* room again: the rest */
+    while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+    CHECK(gptps_dq_pending(dq) == 0);
+    CHECK(gptps_dq_recover(dq) == 0);                   /* and nothing twice */
+    CHECK(get(&g_ran[1]) == 1 && get(&g_ran[2]) == 1 && get(&g_ran[3]) == 1);
+    gptps_shutdown(e);
     gptps_dq_close(dq);
     remove(JOURNAL_A);
 }
@@ -699,7 +789,9 @@ int main(void)
     test_requeue_drain(GPTPS_E_SHUTDOWN);
     test_body_shutdown(GPTPS_ON_FAILURE_DEAD_LETTER);
     test_body_shutdown(GPTPS_ON_FAILURE_DROP);
+    test_body_cancels_itself();
     test_shutdown_manual();
+    test_recover_again();
 #if defined(TEST_DURABLE_FORK)
     test_cancel_io();  /* POSIX: the E_IO path, by swapping the journal's fd */
     test_recovery();   /* crash-recovery via fork (POSIX) */

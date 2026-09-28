@@ -5,6 +5,69 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Added — the event says who ended an item (ABI 2.3)
+
+- **`gptps_event.flags`, with `GPTPS_EV_FLAG_SHUTDOWN` and
+  `GPTPS_EV_FLAG_SELF_CANCELLED`.** Two statuses could not say who ended an item.
+  `GPTPS_E_SHUTDOWN` sits on the `DEAD_LETTERED` / `DROPPED` teardown imposes (the grace
+  expiring on work in backoff, the drain refusing a requeue item another cycle), but a
+  task body may return it too. `GPTPS_E_CANCELLED` sits on every cancel, whether a
+  `gptps_cancel`, a removal or a shutdown stopped the item or its body returned it
+  (see Changed, below). The flags say which: `GPTPS_EV_FLAG_SHUTDOWN` on teardown's
+  dispositions, `GPTPS_EV_FLAG_SELF_CANCELLED` on a `FAILED` whose `GPTPS_E_CANCELLED`
+  the body returned itself. Statuses are unchanged. The field is appended; read it
+  only when `struct_size` covers it, since an engine older than 2.3 hands you a
+  shorter struct (`docs/PLUGINS.md` shows the guard). `gptps_balance` sets
+  `GPTPS_EV_FLAG_SHUTDOWN` on its own teardown dispositions too.
+  `durable_queue` now decides by the flags. The one case 1.3.0 quarantined by design —
+  a requeue item whose body had returned `GPTPS_E_SHUTDOWN` to end a cycle, then
+  dead-lettered by teardown — stays pending and is recovered like every other kind of
+  work teardown abandons. The per-record inference from the attempt's own `FAILED`
+  that the flag replaces is gone.
+
+### Changed — a task body that returns `GPTPS_E_CANCELLED` ends its item
+
+- **It is final: no retry, no dead letter, no requeue.** Its attempt's `FAILED` carries
+  `GPTPS_E_CANCELLED`, which observers reconciling handles count as terminal, yet the
+  engine retried it. The retries reopened a handle observers had closed: more
+  `STARTED`s after the terminal event, `gptps_stats` ending with `pending` 1, and a
+  `gptps_await` that had already returned. Now the item ends as a cancel would, and an
+  always-up service whose body returns it ends too; the `FAILED` carries
+  `GPTPS_EV_FLAG_SELF_CANCELLED`.
+  `durable_queue` closes such a record, since the body ended its own work. Kept
+  pending, it would re-run on every restart; a cancel from outside still leaves the
+  record pending. **A body that returned `GPTPS_E_CANCELLED` to ask for a retry must
+  return `GPTPS_E_TASK` (or its own failure code) instead.** `tests/test_reconcile.c`
+  pins it: with two retries and no backoff, three attempts and a dead letter before,
+  one attempt now. `tests/test_retry_order.c`'s case for that return now expects no
+  `RETRIED`, and `tests/test_durable.c` checks the record closes and is never re-run.
+
+### Fixed — `durable_queue`: recovering under backpressure
+
+- **`gptps_dq_recover` may be called again, and the header says how.** It said "safe to
+  call once after open". With `limits.max_intake_depth` set, a call re-submits what
+  fits, and the engine refuses the rest with `GPTPS_E_FULL`. Those records stay
+  pending, and a later call in the same run offers them again — the supported way to
+  recover a backlog larger than the intake. A record whose type is not registered is
+  refused every time, so the header also says when to stop: when a call re-submits
+  nothing although the engine has drained. `tests/test_durable.c` recovers three
+  records through an intake of two. Raised by @kuntakinte7270 in #10.
+
+### Fixed — tests
+
+- **`test_admission_perf` is steadier on shared machines and coarse clocks.** It now
+  grows the drain until its first run takes at least 100ms — past 160000 items by
+  repeating it, up to 32 times — then takes the best of three runs per size. Before, it
+  stopped at 50ms or at 160000 items, whichever came first: about 30ms on a fast
+  machine. A single timing on a shared machine could push a linear ratio past its
+  bound: it failed once on the macOS runner for the 1.3.0 release commit (3.21 against
+  3.0), and under parallel sanitizer builds. Under a ~16ms clock tick, as on Windows, a
+  30ms interval is about two ticks, where quantization alone moves a linear ratio a long
+  way toward the bound. A quadratic admission path is slow in every run, so the minimum
+  still shows it.
+
 ## [1.3.0] - 2026-09-28
 
 ### Fixed — a retry could start before its `RETRIED` was delivered

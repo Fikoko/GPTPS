@@ -14,13 +14,13 @@
  * record that was persisted but never completed, so task bodies MUST be
  * idempotent (same contract as on_failure = requeue).
  *
- * How a record ends. The add-on's observer closes a record when its task FINISHES
- * or is DROPPED, and quarantines it when the task is DEAD_LETTERED (see
- * gptps_dq_quarantined) - unless teardown ended it, below. gptps_dq_cancel closes
- * one on request, and gptps_dq_submit
- * closes the record of a submit the engine refused, returning you its error.
- * Everything else leaves the record pending, and the next run's gptps_dq_recover
- * re-submits it:
+ * How a record ends. The add-on's observer closes a record when its task FINISHES,
+ * is DROPPED, or its body cancels itself (a FAILED / GPTPS_E_CANCELLED marked
+ * GPTPS_EV_FLAG_SELF_CANCELLED), and quarantines it when the task is DEAD_LETTERED
+ * (see gptps_dq_quarantined) - unless teardown ended it, below. gptps_dq_cancel
+ * closes one on request, and gptps_dq_submit closes the record of a submit the
+ * engine refused, returning you its error. Everything else leaves the record
+ * pending, and the next run's gptps_dq_recover re-submits it:
  *   - gptps_cancel(e, handle) stops the current execution only. The engine
  *     reports it as FAILED / GPTPS_E_CANCELLED, which is also how it reports
  *     running work the grace cancels, stopped services and work a MANUAL host
@@ -33,16 +33,12 @@
  *     running work the grace cancels and stopped services (FAILED /
  *     GPTPS_E_CANCELLED); work still in backoff when limits.shutdown_grace_ms
  *     expires, and a REQUEUE item the drain will not start again (DEAD_LETTERED,
- *     or DROPPED under on_failure = drop, with status GPTPS_E_SHUTDOWN - see
+ *     or DROPPED under on_failure = drop, marked GPTPS_EV_FLAG_SHUTDOWN - see
  *     gptps_shutdown). Teardown ending work is not a verdict on it, so it is
  *     neither quarantined nor lost.
  *   A body that itself returns GPTPS_E_SHUTDOWN is still judged by its policy:
- *   that status on the attempt's own FAILED marks the dead letter or drop that
- *   follows as the task's own verdict. The observer cannot see the policy, so a
- *   teardown dead letter for an on_failure = requeue item is quarantined if the
- *   latest attempt that returned GPTPS_E_SHUTDOWN ended a cycle rather than being
- *   retried, however later cycles failed - retained, not lost; drain it with
- *   gptps_dq_drain_quarantine. A teardown that cancels the item keeps it pending.
+ *   its dead letter or drop carries that status but not the flag, so it is
+ *   quarantined or closed like any other failure.
  * Not for services that exit cleanly: a GPTPS_TASK_SERVICE without
  * GPTPS_TASK_RETIRE_ON_OK emits FINISHED each time its run() returns GPTPS_OK and
  * is restarted, so its first clean exit closes the record and a later crash does
@@ -101,7 +97,16 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
  * never completed). Quarantined (dead-lettered) records are terminal-but-retained,
  * NOT incomplete: they are skipped here - recover them out-of-band via
  * gptps_dq_drain_quarantine. Returns the count re-submitted. Idempotent task
- * bodies required (at-least-once). Safe to call once after open. */
+ * bodies required (at-least-once).
+ *
+ * May be called again: each call offers the engine only the records that have no
+ * execution in this run yet, and a record the engine refuses stays pending for the
+ * next call. That is how to recover under backpressure - with
+ * limits.max_intake_depth set, a call re-submits what fits (the rest is refused with
+ * GPTPS_E_FULL), and calling again once work has drained offers the rest. A
+ * record whose type is not registered in this run is refused every time, so bound
+ * the retries: stop when a call re-submits nothing although the engine has
+ * drained. */
 size_t gptps_dq_recover(gptps_dq *dq);
 
 /* Retract a durable submit: close the record for `h` so no later gptps_dq_recover
@@ -131,8 +136,8 @@ size_t gptps_dq_pending(gptps_dq *dq);
  * the dead_letter policy, admission refused it outright, or it failed under any
  * policy but drop while its type was being removed with GPTPS_REMOVE_DRAIN - is
  * RETAINED in the journal (its poison payload survives a crash) rather than
- * silently dropped. Teardown's dead letters stay pending instead, except the
- * requeue case above. Inspect / recover these out-of-band. */
+ * silently dropped. Teardown's dead letters (GPTPS_EV_FLAG_SHUTDOWN) stay pending
+ * instead. Inspect / recover these out-of-band. */
 size_t gptps_dq_quarantined(gptps_dq *dq);   /* count of retained dead-lettered records */
 
 /* Drain quarantined records: `cb` is called for each (payload valid only for the

@@ -32,7 +32,7 @@ static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
 
 static int n_queued, n_terminal, n_started;
-static int n_cancelled, n_timeout, n_retried, n_failed;
+static int n_cancelled, n_timeout, n_retried, n_failed, n_selfcancel;
 
 /* Which events CLOSE a handle:
  *   FINISHED                     - success, always terminal
@@ -55,6 +55,7 @@ static void obs(const gptps_event *ev, void *ud)
         case GPTPS_EV_FAILED:
             inc(&n_failed);
             if (ev->status == GPTPS_E_CANCELLED) { inc(&n_cancelled); inc(&n_terminal); }
+            if (ev->flags & GPTPS_EV_FLAG_SELF_CANCELLED) inc(&n_selfcancel);
             if (ev->status == GPTPS_E_TIMEOUT)   inc(&n_timeout);
             break;
         default: break;
@@ -70,6 +71,7 @@ static void reset(void)
     __atomic_store_n(&n_timeout, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&n_retried, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&n_failed, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&n_selfcancel, 0, __ATOMIC_SEQ_CST);
 }
 
 static gptps_status task_block(gptps_ctx *c, void *u)
@@ -160,6 +162,7 @@ static void test_running_cancel_is_not_double_counted(void)
     CHECK(get(&n_terminal) == 1);       /* exactly one, not zero and not two */
     CHECK(get(&n_cancelled) == 1);      /* and it says CANCELLED, not TIMEOUT */
     CHECK(get(&n_timeout) == 0);
+    CHECK(get(&n_selfcancel) == 0);     /* stopped from outside, not by its body */
 }
 
 /* The other half of the distinction: a real deadline still reports E_TIMEOUT. */
@@ -664,6 +667,38 @@ static void test_service_cancel_after_a_run_finished(void)
     CHECK(get(&n_started) == 1);        /* and it did not restart after the stop */
 }
 
+/* A body that returns GPTPS_E_CANCELLED itself - not cancelled by anyone - ends its
+ * item as a cancel would. Its FAILED / GPTPS_E_CANCELLED is what observers
+ * reconciling handles count as terminal, and the engine used to retry it anyway:
+ * with two retries and no backoff, three attempts, two RETRIEDs and a dead letter,
+ * all after observers had closed the handle. Its FAILED says the cancel was the
+ * body's own. */
+static gptps_status task_says_cancelled(gptps_ctx *c, void *u)
+{ (void)c; (void)u; return GPTPS_E_CANCELLED; }
+static void test_body_returning_cancelled_is_final(void)
+{
+    gptps *e = open1();
+    gptps_task_def d;
+    uint64_t t0;
+    if (!e) return;
+    reset();
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "sc"; d.run = task_says_cancelled; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.max_retries = 2;                   /* no backoff: a retry would show */
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    CHECK(gptps_submit(e, "sc", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (get(&n_terminal) < 1 && gptps_now_ms(NULL) - t0 < 3000) { }
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&n_started) == 1);        /* was 3: retried twice */
+    CHECK(get(&n_retried) == 0);        /* was 2 */
+    CHECK(get(&n_terminal) == 1);       /* its own FAILED / E_CANCELLED, once; was 4 */
+    CHECK(get(&n_cancelled) == 1);
+    CHECK(get(&n_selfcancel) == 1);     /* and marked as the body's own */
+}
+
 int main(void)
 {
     test_unregister_cancel_reports_every_item();
@@ -684,6 +719,7 @@ int main(void)
     test_remove_after_a_failed_attempt_reported();
     test_threaded_cancel_after_a_failed_attempt_reported();
     test_service_cancel_after_a_run_finished();
+    test_body_returning_cancelled_is_final();
 
     if (fails) { printf("%d reconcile check(s) FAILED\n", fails); return 1; }
     printf("all reconcile checks passed\n");

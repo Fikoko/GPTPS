@@ -391,7 +391,8 @@ gptps_submit(e, "metrics", NULL, 0, &h);   /* start one instance (submit N for a
 ```
 
 - **Supervised restart.** When the loop exits, the engine restarts the instance after
-  `retry_backoff_seconds` — crash-restart supervision, for free. The failure policy is
+  `retry_backoff_seconds` — crash-restart supervision, for free — unless `run()`
+  returned `GPTPS_E_CANCELLED`, which ends it like a stop. The failure policy is
   normalized (restart-on-exit, no timeout) so a config or settings edit can't un-service it.
 - **Stop it.** The submit handle stays valid across restarts, so `gptps_cancel(e, h)`
   stops that one instance for good; `gptps_unregister_task` stops the whole type; and
@@ -399,7 +400,8 @@ gptps_submit(e, "metrics", NULL, 0, &h);   /* start one instance (submit N for a
   resident service never hangs teardown. Non-service in-flight work still drains gracefully.
 - **Restart-always vs. on-failure.** By default a service is "always up" (even a clean
   `GPTPS_OK` return restarts it). Add `GPTPS_TASK_RETIRE_ON_OK` for the `Restart=on-failure`
-  semantic: a clean return retires the instance; only a failure restarts it.
+  semantic: a clean return retires the instance; only a failure other than
+  `GPTPS_E_CANCELLED` restarts it.
 - v1 services are `GPTPS_EXEC_INPROC`, `GPTPS_RUN_THREADED`, and have no timeout.
 
 ## Scaling (opt-in, by composition)
@@ -757,7 +759,7 @@ single-file amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **56** public functions · **ABI 2.2** (append-only; 2.0 was the first
+At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
 plug-in · **65** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.

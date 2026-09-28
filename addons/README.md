@@ -187,12 +187,16 @@ anything a prior run left pending.
   rather than being quarantined or dropped: whatever a MANUAL host leaves unstepped,
   running work the grace cancels, work still in backoff when `limits.shutdown_grace_ms`
   expires, and a requeue item the drain will not start again. The next run recovers it.
-  A body that itself returns `GPTPS_E_SHUTDOWN` is still judged by its failure policy
-  when that status ends its last attempt: quarantined under `dead_letter`, closed under
-  `drop`. Under `requeue` the queue cannot tell a cycle the body ended that way from
-  teardown's refusal, so a teardown dead letter quarantines the item if the latest
-  attempt to return it ended a cycle rather than being retried, however later cycles
-  failed: retained, not lost. A teardown that cancels it leaves it pending.
+  Teardown's dead letters and drops are marked `GPTPS_EV_FLAG_SHUTDOWN`; a body that
+  itself returns `GPTPS_E_SHUTDOWN` gets that status without the flag, and is judged by
+  its failure policy like any other failure. A body that returns `GPTPS_E_CANCELLED`
+  itself (`GPTPS_EV_FLAG_SELF_CANCELLED`) ended its own work: its record closes.
+- **Recovering under backpressure.** `gptps_dq_recover()` may be called again: each call
+  offers only the records with no execution in this run yet, so with
+  `limits.max_intake_depth` set it re-submits what fits and a later call offers the
+  rest.
+  Stop when a call re-submits nothing although the engine has drained — a record whose
+  type is not registered is refused every time.
 - **Not for services that exit cleanly.** A `GPTPS_TASK_SERVICE` without
   `GPTPS_TASK_RETIRE_ON_OK` reports `FINISHED` each time its `run()` returns `GPTPS_OK`,
   so its first clean exit closes the record. One that runs until stopped keeps it.

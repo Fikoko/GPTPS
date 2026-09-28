@@ -185,8 +185,8 @@ static gptps_status manual_task(gptps_ctx *ctx, void *ud)
     manual_probe *p = ud;
     (void)ctx;
     if (++p->calls != 1) return GPTPS_OK;
-    /* Returning E_CANCELLED is distinct from calling gptps_cancel: the engine
-     * may retry it, but its FAILED/E_CANCELLED has already been observed. */
+    /* Returning E_CANCELLED ends the item as a cancel does: its FAILED /
+     * E_CANCELLED is terminal, so the engine must not retry it (mode 2). */
     return p->remove_on_retry == 2 ? GPTPS_E_CANCELLED : GPTPS_E_TASK;
 }
 
@@ -255,7 +255,7 @@ static void manual_case(int remove_on_retry, unsigned backoff, unsigned slots)
     for (i = 0; i < 8; ++i) {
         size_t ran;
         CHECK(gptps_step(p.e, &ran) == GPTPS_OK);
-        if (i == 0 && remove_on_retry) {
+        if (i == 0 && remove_on_retry == 1) {
             CHECK(p.remove_status == GPTPS_OK);
             CHECK(p.terminals == 1);
             CHECK(!gptps_task_exists(p.e, "hi"));
@@ -263,6 +263,16 @@ static void manual_case(int remove_on_retry, unsigned backoff, unsigned slots)
     }
     CHECK(gptps_shutdown(p.e) == GPTPS_OK);
     CHECK(!p.overflow);
+    if (remove_on_retry == 2) {
+        /* No RETRIED, so the removal never runs: the body's own FAILED /
+         * E_CANCELLED closed the handle, once, and shutdown adds nothing. Before,
+         * the engine retried it, reopening a handle observers had closed. */
+        CHECK(p.retries == 0);
+        CHECK(p.calls == 1); CHECK(p.starts == 1);
+        CHECK(p.terminals == 1); CHECK(p.cancelled == 1);
+        CHECK(p.remove_status == GPTPS_E_TASK);   /* untouched */
+        return;
+    }
     CHECK(p.retries == 1);
     if (remove_on_retry) {
         CHECK(p.calls == 1); CHECK(p.starts == 1);
@@ -433,7 +443,7 @@ int main(void)
     CHECK(errors == 0);
     manual_case(1, 0, 1);
     manual_case(1, 1, 1);
-    manual_case(2, 0, 1); /* self-returned E_CANCELLED must not close twice */
+    manual_case(2, 0, 1); /* self-returned E_CANCELLED ends the item: no retry */
     manual_case(2, 1, 1);
     manual_case(0, 0, 1);
     threaded_remove_case();

@@ -93,8 +93,9 @@ gptps_await *gptps_await_install_ex(gptps *e, size_t cap);
  * its own terminal event, so successive waits on the same service handle each return
  * GPTPS_OK, once per run, rather than once ever. That is the observer seam reporting
  * honestly, not a bug here - but if you wanted "wait until this service stops", wait
- * for the FAILED/GPTPS_E_CANCELLED that a cancel, an unregister or shutdown produces,
- * which is the one terminal event a service emits exactly once. */
+ * for the FAILED/GPTPS_E_CANCELLED that a cancel, an unregister or shutdown produces
+ * - or the body itself, returning that status - which is the one terminal event a
+ * service emits exactly once. */
 gptps_status gptps_await_wait(gptps_await *aw, gptps_handle h, unsigned timeout_ms,
                               void **out_result, size_t *out_len,
                               gptps_status *out_status);
