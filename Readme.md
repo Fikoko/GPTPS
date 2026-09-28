@@ -23,7 +23,8 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
-- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md)
+- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
+- [Safety artifacts (commercial)](#safety-artifacts-commercial) · [License](#license)
 
 ## Quick start
 
@@ -725,6 +726,7 @@ gptps/
 │   ├── ARCHITECTURE.md  how it works inside
 │   ├── PLUGINS.md       writing an add-on: which tier, the ABI contract, proving it
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
+│   ├── SAFETY.md        the planned commercial safety-artifacts package and how it is licensed
 │   └── SECURITY.md      trust boundary and non-guarantees
 ├── tests/               ← CTest suite (65 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
@@ -860,7 +862,19 @@ add-on first and report which accessor was missing. ABI 2.1 is what that looks l
 it happens: a binary plug-in could not poll for cancellation, so it could not honour a
 timeout or a cancel — not a preference, an impossibility.
 
+## Safety artifacts (commercial)
+
+GPTPS itself is MIT and stays MIT. For teams building it into a product that needs
+functional-safety certification, a **GPTPS Safety Artifacts Package** is being prepared
+under a separate commercial license, the GPTPS Safety Artifacts License. Each package
+will cover one specific GPTPS release and is planned to hold the safety manual,
+requirements traceability, verification evidence and related artifacts. It is never
+part of this repository, it never restricts use of GPTPS itself, and no GPTPS release is
+certified today. [docs/SAFETY.md](docs/SAFETY.md) describes what it will cover, how it
+is licensed, and what it does not claim.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). No third-party code is vendored; the TOML parser, journal, and
-all add-ons are first-party.
+all add-ons are first-party. The Safety Artifacts Package is not part of this repository
+and not covered by the MIT license; see [docs/SAFETY.md](docs/SAFETY.md).

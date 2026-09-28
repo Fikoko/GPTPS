@@ -68,6 +68,15 @@ the release version and is documented in `include/gptps.h`.
   way toward the bound. A quadratic admission path is slow in every run, so the minimum
   still shows it.
 
+### Documentation
+
+- **Safety artifacts.** `docs/SAFETY.md` and a Readme section describe the planned GPTPS
+  Safety Artifacts Package. Each package will hold the GPTPS-level evidence a product
+  team typically needs when certifying a product built on one specific GPTPS release.
+  It comes under a separate
+  commercial license that never restricts GPTPS itself. GPTPS stays MIT, and no
+  release is certified today.
+
 ## [1.3.0] - 2026-09-28
 
 ### Fixed — a retry could start before its `RETRIED` was delivered
