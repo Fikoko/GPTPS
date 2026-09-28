@@ -638,8 +638,14 @@ GPTPS_API gptps_status gptps_submit_ex(gptps *e, const char *task_name,
  * are hard-killed within ~200ms even with no deadline set). The item ends terminal:
  * exactly one GPTPS_EV_FAILED carrying GPTPS_E_CANCELLED - never a retry or a
  * dead-letter, and never GPTPS_E_TIMEOUT, so an operator's cancel stays
- * distinguishable from a deadline breach. Returns GPTPS_OK if a matching item was found and cancelled,
- * GPTPS_E_NOTFOUND if the handle is unknown or already terminal (cancel-after-
+ * distinguishable from a deadline breach. A cancel can also reach an attempt that
+ * is over but not yet accounted for - from that attempt's own FAILED or FINISHED
+ * callback, say. It returns GPTPS_OK either way. If the attempt's own event did not
+ * close the handle, a FAILED / GPTPS_E_CANCELLED follows it; if it did - a FINISHED
+ * of a one-shot or of a GPTPS_TASK_RETIRE_ON_OK service, or a FAILED that already
+ * carried GPTPS_E_CANCELLED - nothing more is emitted and the handle stays closed.
+ * Otherwise returns GPTPS_OK if a matching item was found and cancelled,
+ * GPTPS_E_NOTFOUND if the handle is unknown or already accounted for (cancel-after-
  * completion is a harmless no-op), GPTPS_E_SHUTDOWN during teardown. Safe to call
  * from any thread, including from inside an event callback. */
 GPTPS_API gptps_status gptps_cancel(gptps *e, gptps_handle h);

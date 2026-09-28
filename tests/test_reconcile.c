@@ -524,6 +524,146 @@ static void test_manual_cancel_does_not_repeat_a_finished_one_shot(void)
     CHECK(get(&n_cancelled) == 0);
 }
 
+/* ------------- a stop that lands after the attempt read its cancel flag */
+
+/* execute() reads the cancel flag once, when the body returns. A gptps_cancel that
+ * lands after that read - from the attempt's own FAILED or FINISHED callback,
+ * deterministically, or from another thread in that window - or a REMOVE_CANCEL
+ * from another thread in that window (from the callback itself it is refused with
+ * GPTPS_E_BUSY) finds the item not yet accounted for and stops it, but the attempt
+ * has already reported its own outcome. For a failing one-shot that was a
+ * per-attempt FAILED, and for an always-up service the FINISHED of one run: neither
+ * is terminal. The done-drain then freed the item with no terminal event: it read
+ * `started` alone as "closed" for the failed attempt, and did not check the
+ * service's OK run at all. Measured before: cancelled 0 in every case below, and
+ * terminal 0 in the one-shot ones. The attempt's own events are sent in full first,
+ * so the terminal FAILED / GPTPS_E_CANCELLED follows them. */
+static gptps_status own_stop_st;
+static int          own_stop_calls;
+static void cancel_self_on_failed(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_TASK) {
+        own_stop_st = gptps_cancel(manual_e, ev->handle);
+        inc(&own_stop_calls);
+    }
+}
+/* Holds the worker in the attempt's FAILED callback until the main thread's
+ * REMOVE_CANCEL has tombstoned the type (the callback itself may not unregister:
+ * that would wait on its own attempt, so it is refused with GPTPS_E_BUSY). */
+static int u_removed(void)
+{
+    size_t i, n = gptps_task_count(manual_e);
+    for (i = 0; i < n; ++i) {
+        gptps_task_info ti;
+        memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+        if (gptps_task_get_info(manual_e, i, &ti) == GPTPS_OK && strcmp(ti.name, "u") == 0)
+            return ti.removed;
+    }
+    return 1;                           /* already gone */
+}
+static void hold_failed_until_removed(const gptps_event *ev, void *ud)
+{
+    uint64_t t0;
+    (void)ud;
+    if (ev->kind != GPTPS_EV_FAILED || ev->status != GPTPS_E_TASK) return;
+    inc(&own_stop_calls);
+    t0 = gptps_now_ms(NULL);
+    while (!u_removed() && gptps_now_ms(NULL) - t0 < 3000) { }
+}
+static void cancel_self_on_finished(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_FINISHED && get(&own_stop_calls) == 0) {
+        own_stop_st = gptps_cancel(manual_e, ev->handle);
+        inc(&own_stop_calls);
+    }
+}
+static void reset_own_stop(void)
+{
+    own_stop_st = GPTPS_E_INVAL;
+    __atomic_store_n(&own_stop_calls, 0, __ATOMIC_SEQ_CST);
+}
+
+/* MANUAL, cancel: with and without a retry left - the cancel must stop the retry too */
+static void test_manual_cancel_after_a_failed_attempt_reported(void)
+{
+    uint32_t retries;
+    for (retries = 0; retries <= 1; ++retries) {
+        size_t ran = 0;
+        manual_e = open_manual(1);
+        if (!manual_e) return;
+        reset(); reset_own_stop();
+        reg_parked(manual_e, "u", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER, retries, 0);
+        CHECK(gptps_set_event_cb(manual_e, cancel_self_on_failed, NULL) == GPTPS_OK);
+        CHECK(gptps_submit(manual_e, "u", NULL, 0, NULL) == GPTPS_OK);
+        CHECK(gptps_step(manual_e, &ran) == GPTPS_OK && ran == 1);
+        CHECK(get(&own_stop_calls) == 1 && own_stop_st == GPTPS_OK);
+        CHECK(get(&n_terminal) == 1);   /* was 0 */
+        CHECK(get(&n_cancelled) == 1);
+        CHECK(get(&n_retried) == 0);    /* cancelled, so never retried */
+        CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+        CHECK(get(&n_terminal) == 1);   /* and teardown adds nothing */
+    }
+}
+
+/* THREADED, REMOVE_CANCEL of the type while its attempt's FAILED is being delivered */
+static void test_remove_after_a_failed_attempt_reported(void)
+{
+    uint64_t t0;
+    manual_e = open1();
+    if (!manual_e) return;
+    reset(); reset_own_stop();
+    reg(manual_e, "u", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER);
+    CHECK(gptps_set_event_cb(manual_e, hold_failed_until_removed, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "u", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (get(&own_stop_calls) < 1 && gptps_now_ms(NULL) - t0 < 3000) { }
+    CHECK(get(&own_stop_calls) == 1);   /* the attempt has reported its own FAILED */
+    CHECK(gptps_unregister_task(manual_e, "u", GPTPS_REMOVE_CANCEL) == GPTPS_OK);
+    CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+    CHECK(get(&n_terminal) == 1);       /* was 0 */
+    CHECK(get(&n_cancelled) == 1);
+}
+
+/* THREADED: the same cancel, from the callback on the worker that ran the attempt */
+static void test_threaded_cancel_after_a_failed_attempt_reported(void)
+{
+    uint64_t t0;
+    manual_e = open1();                 /* named for MANUAL; the callbacks just need `e` */
+    if (!manual_e) return;
+    reset(); reset_own_stop();
+    reg(manual_e, "u", task_fail, GPTPS_ON_FAILURE_DEAD_LETTER);
+    CHECK(gptps_set_event_cb(manual_e, cancel_self_on_failed, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "u", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (get(&n_terminal) < 1 && gptps_now_ms(NULL) - t0 < 3000) { }
+    CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+    CHECK(get(&own_stop_calls) == 1 && own_stop_st == GPTPS_OK);
+    CHECK(get(&n_terminal) == 1);       /* was 0: not dead-lettered, not closed at all */
+    CHECK(get(&n_cancelled) == 1);
+}
+
+/* THREADED service: cancelled from the FINISHED of its first run. That FINISHED ends
+ * the run; the stop must still close the handle, exactly once. */
+static void test_service_cancel_after_a_run_finished(void)
+{
+    uint64_t t0;
+    manual_e = open1();
+    if (!manual_e) return;
+    reset(); reset_own_stop();
+    reg_service(manual_e, "svc", task_ok);          /* every run returns OK at once */
+    CHECK(gptps_set_event_cb(manual_e, cancel_self_on_finished, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(manual_e, "svc", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (get(&n_cancelled) < 1 && gptps_now_ms(NULL) - t0 < 3000) { }
+    CHECK(gptps_shutdown(manual_e) == GPTPS_OK);
+    CHECK(get(&own_stop_calls) == 1 && own_stop_st == GPTPS_OK);
+    CHECK(get(&n_cancelled) == 1);      /* was 0: the instance never closed */
+    CHECK(get(&n_terminal) == 2);       /* the run's FINISHED + the stop, once */
+    CHECK(get(&n_started) == 1);        /* and it did not restart after the stop */
+}
+
 int main(void)
 {
     test_unregister_cancel_reports_every_item();
@@ -540,6 +680,10 @@ int main(void)
     test_manual_cancel_reports_a_failed_attempt_awaiting_accounting();
     test_manual_cancel_does_not_repeat_a_reported_cancel();
     test_manual_cancel_does_not_repeat_a_finished_one_shot();
+    test_manual_cancel_after_a_failed_attempt_reported();
+    test_remove_after_a_failed_attempt_reported();
+    test_threaded_cancel_after_a_failed_attempt_reported();
+    test_service_cancel_after_a_run_finished();
 
     if (fails) { printf("%d reconcile check(s) FAILED\n", fails); return 1; }
     printf("all reconcile checks passed\n");

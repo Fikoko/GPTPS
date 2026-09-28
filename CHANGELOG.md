@@ -135,6 +135,28 @@ the release version and is documented in `include/gptps.h`.
   each path: six ended with a terminal event missing before the fix, and two pin that
   an attempt already cancelled, or already finished, is not reported twice.
 
+- **A stop that landed as an attempt ended closed the handle in silence.** A
+  `gptps_cancel` or `GPTPS_REMOVE_CANCEL` can reach an item whose attempt has already
+  reported its own outcome - after an in-process body returned, or an external child
+  exited, but before the dispatcher has accounted for the item. That outcome was a
+  per-attempt `FAILED` for a failing one-shot, or one run's `FINISHED` for an always-up
+  service, and neither is terminal. The accounting then freed the item with no
+  terminal event - for the failed attempt it read `started` alone as "closed", and for
+  the service's run it did not check at all - so there was no retry, no dead letter,
+  and nothing for `gptps_await` or any observer that reconciles. A service shut down
+  while a finished run waited in `done` went the same way. The entry above fixed the
+  same test in the path that ends work without running it; the three places in this
+  one now use it too, so such a handle ends with `FAILED` / `GPTPS_E_CANCELLED` after
+  the attempt's own events. The window is narrow but ordinary: a cancel from the
+  attempt's own `FAILED` callback hits it every time, and a stress harness cancelling
+  through `gptps_dq_cancel` hit it in every run that cancelled failing work.
+  `include/gptps.h`'s `gptps_cancel` now says what a late cancel does.
+  Four new cases in `tests/test_reconcile.c` — a cancel from the attempt's own `FAILED`
+  callback (MANUAL with and without a retry left, and THREADED), a `REMOVE_CANCEL` while
+  that `FAILED` is being delivered, and a service cancelled from its first run's
+  `FINISHED` — all ended with no terminal event before, and each of the three places
+  fails its own case when reverted.
+
 - **"Every submitted handle reaches exactly one terminal event" was stated
   unconditionally in eleven places, and is false for two opt-in shapes.** A REQUEUE item
   stays open for as long as its body keeps failing — that is the policy working as

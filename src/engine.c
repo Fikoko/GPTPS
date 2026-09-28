@@ -919,6 +919,8 @@ static int res_never_fits(const gptps *e, const gptps_item *it)
     return 0;
 }
 
+static int terminal_reported(const gptps_item *it);   /* defined with drain_cancelled */
+
 static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         uint64_t *out_next_wake, int *out_more)
 {
@@ -966,16 +968,32 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     it->not_before_ms = requeue_at(now, it->policy.retry_backoff_seconds);
                     fifo_push(&e->delayed, it);
                 } else {
+                    /* An always-up service's FINISHED ends one RUN, not the handle, so
+                     * one stopped here - cancelled, removed or shut down after its run
+                     * returned OK - still owes the FAILED / GPTPS_E_CANCELLED that ends
+                     * the handle. Freed silently, it closed with no terminal event:
+                     * gptps_cancel landing in the window after execute() read the
+                     * flag, or shutdown finding the run in `done`. */
+                    if (!terminal_reported(it) && npend < GPTPS_PENDING_CAP) {
+                        pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
+                        ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
+                        pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; ++npend;
+                    }
                     item_free(it);
                 }
                 continue;
             }
             if (it->cancelled) {
                 /* per-handle gptps_cancel: terminal, never retried or dead-lettered.
-                 * An item that never started has had NO event at all, so it still owes
-                 * the observer a terminal one. One that ran already got its FAILED
-                 * event from execute() - emitting here too would double-count. */
-                if (!it->started && npend < GPTPS_PENDING_CAP) {
+                 * It still owes a terminal event unless this attempt already sent
+                 * one. An item whose attempt never started has had none. One that ran
+                 * and saw the flag got FAILED / GPTPS_E_CANCELLED from execute(), and
+                 * emitting here too would double-count. But a cancel can land after
+                 * execute() read the flag: the attempt then reported its own FAILED,
+                 * which is per-attempt, not terminal - and testing `started` alone
+                 * freed that item with no terminal event at all. */
+                if (!terminal_reported(it) && npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
                     ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
@@ -996,11 +1014,11 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                      * reservation only when it sees a terminal event, so a silent free
                      * leaked its budget permanently).
                      *   CANCEL: FAILED/E_CANCELLED is itself the terminal event, so it is
-                     *     emitted only for an item that never started - one that ran
-                     *     already got exactly that event from execute().
+                     *     emitted unless this attempt already sent it - see the
+                     *     cancelled branch above for why that is not `started`.
                      *   DROP:   EV_DROPPED after the attempt's FAILED, matching the
                      *     ordinary (non-removal) DROP path. */
-                    int owes = it->reg->cancelling ? !it->started : 1;
+                    int owes = it->reg->cancelling ? !terminal_reported(it) : 1;
                     if (owes && npend < GPTPS_PENDING_CAP) {
                         pend[npend].kind = it->reg->cancelling ? GPTPS_EV_FAILED : GPTPS_EV_DROPPED;
                         pend[npend].handle = it->handle;
