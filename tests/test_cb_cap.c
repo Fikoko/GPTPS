@@ -8,7 +8,7 @@
  * from another bucket too, relinked onto its own. The QUEUED observer calls
  * gptps_step on the submitting thread (MANUAL): GPTPS_E_BUSY when guarded.
  */
-#define _POSIX_C_SOURCE 200809L   /* pthread_barrier_t, nanosleep under -std=c99 */
+#define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
 #include "gptps.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -18,8 +18,21 @@
 #define NTHREADS 8
 static gptps *E;
 static pthread_mutex_t ser = PTHREAD_MUTEX_INITIALIZER;
-static pthread_barrier_t bar;
 static int n_busy, n_other;
+
+/* A barrier from a mutex and a condvar: macOS has no pthread_barrier_t. */
+static pthread_mutex_t bm = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t bc = PTHREAD_COND_INITIALIZER;
+static int b_count, b_gen;
+static void barrier_wait(void)
+{
+    int gen;
+    pthread_mutex_lock(&bm);
+    gen = b_gen;
+    if (++b_count == NTHREADS) { b_count = 0; ++b_gen; pthread_cond_broadcast(&bc); }
+    else while (gen == b_gen) pthread_cond_wait(&bc, &bm);
+    pthread_mutex_unlock(&bm);
+}
 
 static gptps_status body(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 static void obs(const gptps_event *ev, void *ud)
@@ -32,11 +45,11 @@ static void obs(const gptps_event *ev, void *ud)
 static void *host(void *a)
 {
     (void)a;
-    pthread_barrier_wait(&bar);            /* all alive at once: eight distinct ids */
+    barrier_wait();                        /* all alive at once: eight distinct ids */
     pthread_mutex_lock(&ser);
     gptps_submit(E, "t", NULL, 0, NULL);
     pthread_mutex_unlock(&ser);
-    pthread_barrier_wait(&bar);            /* none exits (and frees its id) early */
+    barrier_wait();                        /* none exits (and frees its id) early */
     return NULL;
 }
 /* Two detached threads, one after the other, with nothing ordering the first's
@@ -73,10 +86,8 @@ int main(void)
     d.default_cost.struct_size = sizeof d.default_cost; d.default_policy.struct_size = sizeof d.default_policy;
     if (gptps_register_task(E, &d) != GPTPS_OK) return 3;
     gptps_register_observer(E, obs, NULL);
-    pthread_barrier_init(&bar, NULL, NTHREADS);
     for (i = 0; i < NTHREADS; ++i) if (pthread_create(&th[i], NULL, host, NULL)) return 4;
     for (i = 0; i < NTHREADS; ++i) pthread_join(th[i], NULL);
-    pthread_barrier_destroy(&bar);
     run_detached();
     while (gptps_step(E, &ran) == GPTPS_OK && ran) { }
     if (gptps_shutdown(E) != GPTPS_OK) { puts("shutdown failed"); return 1; }
