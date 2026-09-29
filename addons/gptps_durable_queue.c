@@ -359,13 +359,13 @@ static gptps_status do_rewrite(gptps_dq *dq)
 /* ---- observer: mark a record done when its task terminates ----
  *
  * A DEAD_LETTERED or DROPPED that teardown imposed - the grace expired on work
- * waiting in backoff, or the drain refused a REQUEUE item another cycle - carries
- * GPTPS_EV_FLAG_SHUTDOWN (see gptps_shutdown). Neither is a verdict on the work:
- * quarantining it would file healthy work as poison, and closing it would lose it,
- * so the record stays pending and the next run's gptps_dq_recover re-submits it,
- * like everything else shutdown abandons (which the engine reports as FAILED /
- * GPTPS_E_CANCELLED without GPTPS_EV_FLAG_SELF_CANCELLED, an event this observer
- * never counts as terminal).
+ * still queued or waiting in backoff, or the drain refused a REQUEUE item another
+ * cycle - carries GPTPS_EV_FLAG_SHUTDOWN (see gptps_shutdown). Neither is a
+ * verdict on the work: quarantining it would file healthy work as poison, and
+ * closing it would lose it, so the record stays pending and the next run's
+ * gptps_dq_recover re-submits it, like everything else shutdown abandons (which
+ * the engine reports as FAILED / GPTPS_E_CANCELLED without
+ * GPTPS_EV_FLAG_SELF_CANCELLED, an event this observer never counts as terminal).
  *
  * The flag, not the status, decides. Those events carry GPTPS_E_SHUTDOWN, but so
  * does the disposition of a body that itself returned it - forwarding a remote

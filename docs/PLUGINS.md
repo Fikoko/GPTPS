@@ -131,9 +131,11 @@ claimed namespace makes that impossible rather than undetectable.
 | observer | worker / dispatcher / submitter | **released** | **yes** — this is how `orch` builds DAGs |
 
 "Yes" has three exceptions, the calls that would wait on or tear down the thread you
-are on: `shutdown` and `step` return `GPTPS_E_BUSY` from a task or an observer, and so
-does `unregister_task` whenever the removal would have to wait for work of that type.
-Hand those to a thread of your own.
+are on: `shutdown` and `step` return `GPTPS_E_BUSY` from a task or an observer, on
+whichever thread it runs, and so does `unregister_task` from a task or from an observer
+on a worker or the dispatcher, whenever the removal would have to wait for work of that
+type (on the submitting thread a THREADED engine waits; a MANUAL one never waits, and
+refuses a busy DRAIN). Hand those to a thread of your own.
 
 An in-process task is **cooperative**: if you loop, you must poll
 `api->is_cancelled(ctx)`. Without it your task cannot honour a timeout,

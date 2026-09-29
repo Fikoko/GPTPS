@@ -19,6 +19,7 @@
  * wrong, and the ways it can be wrong are: overflowing it, and leaving an entry
  * pointing at an item that has been removed and freed. Cases 2-4 do exactly those,
  * so ASan turns a stale entry into a hard failure rather than a subtle mis-ordering.
+ * Case 6 is the one THREADED case: its bug needs items to wait across passes.
  */
 #include "gptps.h"
 #include <stdio.h>
@@ -259,6 +260,98 @@ static void case_scheduler_hook_reorders(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
+/* --- case 6: equal hook scores stay oldest-first across passes ------------- */
+/* Case 5 queues everything before the first pass. Here each item is scored by a
+ * pass before the next one arrives, as in any live system. A newcomer enters
+ * intake at sched_score = priority (0 by default), which placed it AHEAD of the
+ * items the hook had already scored below 0, and the stable re-sort kept it
+ * there once the hook gave it the same score: w3, w2, w1. The items have to wait
+ * with a slot free, so they are blocked on a named resource a blocker holds. */
+static int g_hook_calls[8];
+static int g_blk_go, g_blk_started;
+static int g_w_order[3], g_w_slot, g_w_done;
+
+static int64_t sched_const(const gptps_sched_input *in, void *ud)
+{
+    (void)ud;
+    if (in->handle < 8) __atomic_add_fetch(&g_hook_calls[in->handle], 1, __ATOMIC_SEQ_CST);
+    return -5;                                   /* below the default priority */
+}
+
+static gptps_status task_blocker(gptps_ctx *c, void *u)
+{
+    (void)u;
+    __atomic_store_n(&g_blk_started, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&g_blk_go, __ATOMIC_SEQ_CST) && !gptps_is_cancelled(c)) { }
+    return GPTPS_OK;
+}
+
+static gptps_status task_w(gptps_ctx *c, void *u)
+{
+    size_t len;
+    const unsigned char *p = (const unsigned char *)gptps_payload(c, &len);
+    int k = __atomic_fetch_add(&g_w_slot, 1, __ATOMIC_SEQ_CST);
+    (void)u;
+    if (k < 3) __atomic_store_n(&g_w_order[k], (p && len) ? (int)p[0] : -1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_w_done, 1, __ATOMIC_SEQ_CST);
+    return GPTPS_OK;
+}
+
+static void case_hook_ties_across_passes(void)
+{
+    gptps_config cfg;
+    gptps *e = NULL;
+    gptps_task_def d;
+    gptps_handle h = 0;
+    unsigned char pay[1];
+    uint64_t t0;
+    int k;
+
+    memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 4;         /* slots free: the hook runs every pass */
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.name = "blocker"; d.run = task_blocker;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    d.name = "w"; d.run = task_w;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    CHECK(gptps_define_resource(e, "unit", 1) == GPTPS_OK);
+    CHECK(gptps_set_task_resource_cost(e, "blocker", "unit", 1) == GPTPS_OK);
+    CHECK(gptps_set_task_resource_cost(e, "w", "unit", 1) == GPTPS_OK);
+    CHECK(gptps_set_scheduler(e, sched_const, NULL) == GPTPS_OK);
+
+    CHECK(gptps_submit(e, "blocker", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (!__atomic_load_n(&g_blk_started, __ATOMIC_SEQ_CST) && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(__atomic_load_n(&g_blk_started, __ATOMIC_SEQ_CST) == 1);
+
+    for (k = 0; k < 3; ++k) {
+        pay[0] = (unsigned char)(k + 1);
+        CHECK(gptps_submit(e, "w", pay, 1, &h) == GPTPS_OK);
+        CHECK(h > 0 && h < 8);
+        t0 = gptps_now_ms(NULL);                 /* scored by a pass before the next arrives */
+        while (h < 8 && __atomic_load_n(&g_hook_calls[h], __ATOMIC_SEQ_CST) < 1 &&
+               gptps_now_ms(NULL) - t0 < 5000) { }
+    }
+    __atomic_store_n(&g_blk_go, 1, __ATOMIC_SEQ_CST);
+    t0 = gptps_now_ms(NULL);
+    while (__atomic_load_n(&g_w_done, __ATOMIC_SEQ_CST) < 3 && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(__atomic_load_n(&g_w_done, __ATOMIC_SEQ_CST) == 3);
+    for (k = 0; k < 3; ++k) {
+        int got = __atomic_load_n(&g_w_order[k], __ATOMIC_SEQ_CST);
+        if (got != k + 1) {
+            printf("  hook_ties_across_passes: position %d ran w%d, want w%d\n", k, got, k + 1);
+            CHECK(got == k + 1);
+        }
+    }
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
 int main(void)
 {
     case_priority_order();
@@ -266,6 +359,7 @@ int main(void)
     case_cancel_run_tail();
     case_unregister_drops_queued();
     case_scheduler_hook_reorders();
+    case_hook_ties_across_passes();
     printf("test_admission_order: %s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }

@@ -225,6 +225,65 @@ static void test_string_buffers(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
+/* limits.max_concurrent_tasks sizes the worker pool once, at open, and is flagged
+ * restart-only - but a live write went straight into the limit admission reads.
+ * Raised past the pool, the dispatcher admitted items no worker was free to run,
+ * which sat in `ready` holding their memory and named-resource budget, ahead of
+ * anything submitted after them. The write is kept for reads and save only. */
+static int g_hold_go, g_hold_running, g_hold_peak;
+
+static gptps_status task_hold(gptps_ctx *c, void *u)
+{
+    int now = __atomic_add_fetch(&g_hold_running, 1, __ATOMIC_SEQ_CST);
+    int peak = __atomic_load_n(&g_hold_peak, __ATOMIC_SEQ_CST);
+    (void)u;
+    while (peak < now &&
+           !__atomic_compare_exchange_n(&g_hold_peak, &peak, now, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { }
+    while (!__atomic_load_n(&g_hold_go, __ATOMIC_SEQ_CST) && !gptps_is_cancelled(c)) { }
+    __atomic_sub_fetch(&g_hold_running, 1, __ATOMIC_SEQ_CST);
+    return GPTPS_OK;
+}
+
+static void test_pool_size_is_restart_only(void)
+{
+    gptps_config cfg;
+    gptps *e = NULL;
+    gptps_task_def d;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+    uint64_t reserved = 0, budget = 0, t0;
+    int i;
+
+    memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 2;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "hold"; d.run = task_hold; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    CHECK(gptps_define_resource(e, "slot", 100) == GPTPS_OK);
+    CHECK(gptps_set_task_resource_cost(e, "hold", "slot", 1) == GPTPS_OK);
+
+    CHECK(gptps_settings_set(e, "limits.max_concurrent_tasks", "8") == GPTPS_OK);
+    CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK &&
+          strcmp(b, "8") == 0);                 /* kept: what save writes, the next open uses */
+
+    __atomic_store_n(&g_hold_go, 0, __ATOMIC_SEQ_CST);
+    for (i = 0; i < 6; ++i) CHECK(gptps_submit(e, "hold", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (__atomic_load_n(&g_hold_running, __ATOMIC_SEQ_CST) < 2 && gptps_now_ms(NULL) - t0 < 5000) { }
+    t0 = gptps_now_ms(NULL);
+    while (gptps_now_ms(NULL) - t0 < 150) { }  /* the dispatcher's chance to over-admit */
+    CHECK(gptps_resource_usage(e, "slot", &reserved, &budget) == GPTPS_OK);
+    CHECK(reserved == 2);                       /* was 6: four admitted with no worker to run them */
+
+    __atomic_store_n(&g_hold_go, 1, __ATOMIC_SEQ_CST);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(__atomic_load_n(&g_hold_peak, __ATOMIC_SEQ_CST) == 2);
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -347,6 +406,7 @@ int main(void)
 
     test_range_and_escape();
     test_string_buffers();
+    test_pool_size_is_restart_only();
 
     if (fails) { printf("%d settings check(s) FAILED\n", fails); return 1; }
     printf("all settings checks passed\n");

@@ -122,6 +122,26 @@ void gptps_thread_join(gptps_thread *t)
 
 uint64_t gptps_hal_thread_id(void) { return (uint64_t)GetCurrentThreadId(); }
 
+/* mingw-w64 is GCC: its builtins, on the uint32_t itself. MSVC: Interlocked full
+ * barriers, more than acquire/release asks for and right on every Windows target,
+ * ARM64 included (where MSVC's volatile is not acquire/release). */
+uint32_t gptps_hal_load_acquire_u32(const uint32_t *p)
+{
+#if defined(__GNUC__)
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#else
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)p, 0, 0);
+#endif
+}
+void gptps_hal_store_release_u32(uint32_t *p, uint32_t v)
+{
+#if defined(__GNUC__)
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#else
+    InterlockedExchange((volatile LONG *)p, (LONG)v);
+#endif
+}
+
 /* Windows has no fork(), so there is no forked-child hazard to guard against. */
 void     gptps_hal_fork_guard_install(void) { }
 uint64_t gptps_hal_fork_generation(void) { return 0; }

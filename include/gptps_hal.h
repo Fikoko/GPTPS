@@ -77,13 +77,25 @@ gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg); /* NULL on fail
 void          gptps_thread_join(gptps_thread *t);               /* joins, then frees */
 
 /* An opaque, comparable id for the CALLING thread, stable for its lifetime and
- * distinct from every other live thread's. The core uses it for ONE purpose:
- * detecting re-entrancy - gptps_shutdown(), gptps_step() or a gptps_unregister_task()
- * that would have to wait, called from inside a task body or an event callback,
- * which would otherwise join, free or wait on the very thread making the call.
- * Never used for scheduling, indexing, or storage.
- * A single-threaded HAL may return any constant. */
+ * distinct from every other live thread's - but it may be handed to a later thread
+ * once this one has exited. The core compares it with the calling thread's for two
+ * things: detecting re-entrancy - gptps_shutdown(), gptps_step() or a
+ * gptps_unregister_task() that would have to wait, called from inside a task body
+ * or a callback, which would otherwise join, free or wait on the very thread making
+ * the call - and pinning an add-on's namespace window to the thread running its
+ * setup(). For re-entrancy it keys a per-thread record by it (see the counter
+ * below); it is never used for scheduling. A single-threaded HAL may return any
+ * constant. */
 uint64_t gptps_hal_thread_id(void);
+
+/* A counter one thread updates with no lock, which a LATER thread may take over:
+ * the per-thread callback depth the core keys by gptps_hal_thread_id. The record
+ * passes to another thread when the OS gives it the old one's id, or when the core
+ * hands an idle record (depth 0) to a new id. Loads acquire and stores release, so
+ * whoever touches it next sees the last writer's store and everything before it.
+ * A single-threaded HAL may use plain accesses. */
+uint32_t gptps_hal_load_acquire_u32(const uint32_t *p);
+void     gptps_hal_store_release_u32(uint32_t *p, uint32_t v);
 
 /* --- fork safety (POSIX; a no-op elsewhere) ------------------------------ *
  * A host that fork()s while worker threads are live gets a child where only the

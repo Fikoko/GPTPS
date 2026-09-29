@@ -217,6 +217,79 @@ static void test_shutdown_stops_services(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
+/* ---- 3b) a service that crashed just before shutdown still ends CANCELLED -- */
+/* A run that has returned waits in `done` until the dispatcher's next pass judges
+ * it. stop_services marked services running, ready, queued and in restart backoff,
+ * but not there: a crash caught in that window was judged as an ordinary failure
+ * while stopping - a REQUEUE the drain will not restart - and ended DEAD_LETTERED /
+ * GPTPS_E_SHUTDOWN, not with the FAILED / GPTPS_E_CANCELLED the header promises a
+ * service's shutdown. The dispatcher is held inside an emit (a one-shot's RETRIED)
+ * so the crash is still in `done` when gptps_shutdown runs, and let go only once
+ * shutdown has begun (gptps_cancel then answers GPTPS_E_SHUTDOWN). */
+static gptps *g_e3b;
+static int g_crash_now, g_hold_on, g_svc_crashed, g_svc_cancelled, g_svc_dead;
+static gptps_handle g_svc_h;
+
+static gptps_status svc_crash_on_cue(gptps_ctx *c, void *u)
+{
+    (void)u;
+    while (!gptps_is_cancelled(c))
+        if (get(&g_crash_now)) return GPTPS_E_TASK;
+    return GPTPS_OK;
+}
+static gptps_status fails_once(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_E_TASK; }
+
+static void obs_3b(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_RETRIED && strcmp(ev->task_name, "oneshot") == 0) {
+        uint64_t t0 = gptps_now_ms(NULL);           /* the dispatcher, lock released */
+        inc(&g_hold_on);
+        while (gptps_cancel(g_e3b, (gptps_handle)0x7fffffffu) != GPTPS_E_SHUTDOWN &&
+               gptps_now_ms(NULL) - t0 < 5000) { }
+    }
+    if (ev->handle != __atomic_load_n(&g_svc_h, __ATOMIC_SEQ_CST)) return;
+    if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_TASK) inc(&g_svc_crashed);
+    if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED) inc(&g_svc_cancelled);
+    if (ev->kind == GPTPS_EV_DEAD_LETTERED) inc(&g_svc_dead);
+}
+
+static void test_crash_in_done_at_shutdown(void)
+{
+    gptps *e = NULL;
+    gptps_task_def d;
+    gptps_handle h = 0;
+    uint64_t t0;
+
+    CHECK(open_threaded(&e, 2) == GPTPS_OK);
+    if (!e) return;
+    g_e3b = e;
+    set0(&g_crash_now); set0(&g_hold_on); set0(&g_svc_crashed);
+    set0(&g_svc_cancelled); set0(&g_svc_dead);
+    gptps_register_observer(e, obs_3b, NULL);
+    CHECK(reg_service(e, "svc", svc_crash_on_cue, 0) == GPTPS_OK);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "oneshot"; d.run = fails_once; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.max_retries = 1;             /* one RETRIED, emitted by the dispatcher */
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+
+    CHECK(gptps_submit(e, "svc", NULL, 0, &h) == GPTPS_OK);
+    __atomic_store_n(&g_svc_h, h, __ATOMIC_SEQ_CST);
+    CHECK(gptps_submit(e, "oneshot", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_ge(&g_hold_on, 1, 3000));          /* the dispatcher is held */
+    __atomic_store_n(&g_crash_now, 1, __ATOMIC_SEQ_CST);
+    CHECK(wait_ge(&g_svc_crashed, 1, 3000));      /* its worker has posted it to `done` */
+    t0 = gptps_now_ms(NULL);
+    while (gptps_now_ms(NULL) - t0 < 50) { }
+
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&g_svc_cancelled) == 1);            /* was 0 */
+    CHECK(get(&g_svc_dead) == 0);                 /* was 1: DEAD_LETTERED / E_SHUTDOWN */
+    g_e3b = NULL;
+}
+
 /* ---- 4) unregister(DRAIN) on a service is auto-upgraded to CANCEL ----------- */
 static void test_unregister_drain_upgrades(void)
 {
@@ -333,6 +406,7 @@ int main(void)
     test_registration_rules();
     test_restart_and_cancel();
     test_shutdown_stops_services();
+    test_crash_in_done_at_shutdown();
     test_unregister_drain_upgrades();
     test_ok_exit_restarts();
     test_service_with_resource();

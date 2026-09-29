@@ -68,8 +68,10 @@ typedef struct {
     uint32_t shard_depth;      /* how many items a shard may hold at once (running +
                                 * waiting in ITS queue). A shard is offered work while its
                                 * outstanding count is below this. 0 => 2x that shard's
-                                * limits.max_concurrent_tasks. Set it to exactly
-                                * max_concurrent_tasks for no prefetch at all. */
+                                * limits.max_concurrent_tasks, as the setting reads at
+                                * open - after a live write, the value for the shard's
+                                * NEXT open, so pass the depth explicitly then. Set it
+                                * to exactly max_concurrent_tasks for no prefetch. */
 } gptps_balance_config;
 
 /* Open above a pool. Registers one observer on every shard and reads each shard's

@@ -3,13 +3,17 @@
 /*
  * test_hang.c - teardown must always TERMINATE.
  *
- * Every check here is a way the engine used to stop returning: a re-entrant
+ * Every check here is a way teardown used to go wrong: a re-entrant
  * gptps_shutdown that joins its own thread, a no-timeout external child that
  * outlives its pipe, a zero-backoff supervised service that re-admits itself as
- * fast as the dispatcher loops, and an undrained dead-letter list that grows
- * without bound. They share a property that makes them worth one file: the
- * failure mode is a HANG or unbounded growth, not a wrong answer - so the CTest
- * TIMEOUT on this test is itself part of the assertion.
+ * fast as the dispatcher loops, an undrained dead-letter list that grows without
+ * bound, a constraint that keeps deferring an item past the grace, queued work
+ * still admitted past it, and a gptps_shutdown from a callback the engine made on
+ * the host's own thread. All but the last share a property that makes them worth
+ * one file: the failure mode is a HANG or unbounded growth, not a wrong answer -
+ * so the CTest TIMEOUT on this test is itself part of the assertion. The last
+ * freed the engine under its caller instead: case 10 checks the return codes, and
+ * ASan the use-after-free.
  *
  * HELPER_PATH is the prog_helper binary (defined by CMake).
  */
@@ -372,6 +376,307 @@ static void test_grace_bounds_the_backoff_queue(void)
     CHECK(get(&g_backoff_terminal) == 1);   /* and it is reported, not just freed */
 }
 
+/* ------------------------ 8. the grace ends an item a constraint keeps deferring */
+
+static int g_defer_calls, g_defer_ran, g_defer_dead, g_defer_status, g_defer_flagged;
+
+/* Re-check after 1ms: the item is due again at every wake, which is the state the
+ * hang needed - once the deadline passes its own re-check is the only wake left. */
+static gptps_admit_decision always_defer(const gptps_constraint_input *in,
+                                         uint32_t *retry_after_ms, void *ud)
+{
+    (void)in; (void)ud;
+    inc(&g_defer_calls);
+    *retry_after_ms = 1;
+    return GPTPS_DEFER;
+}
+
+static gptps_status task_counts(gptps_ctx *c, void *u) { (void)c; (void)u; inc(&g_defer_ran); return GPTPS_OK; }
+
+static void obs_defer(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind != GPTPS_EV_DEAD_LETTERED) return;
+    set(&g_defer_status, (int)ev->status);
+    if (ev->flags & GPTPS_EV_FLAG_SHUTDOWN) inc(&g_defer_flagged);
+    inc(&g_defer_dead);
+}
+
+/* Step 2 of a dispatcher pass moves parked items that fell due back to intake,
+ * and only THEN did the grace end what was left in `delayed` - so an item that was
+ * due was never there, and step 4 deferred it again. After the deadline nothing
+ * else woke the dispatcher, so every pass found it due: gptps_shutdown spun on it
+ * forever. The CTest TIMEOUT is the assertion that it returns. */
+static void test_grace_ends_a_deferred_item(void)
+{
+    gptps *e = open_graced();
+    uint64_t t0, elapsed;
+
+    if (!e) return;
+    set(&g_defer_calls, 0); set(&g_defer_ran, 0); set(&g_defer_dead, 0);
+    set(&g_defer_status, 0); set(&g_defer_flagged, 0);
+    gptps_register_observer(e, obs_defer, NULL);
+    CHECK(gptps_register_constraint(e, always_defer, NULL) == GPTPS_OK);
+    reg_inproc(e, "gated", task_counts, 0);
+    CHECK(gptps_submit(e, "gated", NULL, 0, NULL) == GPTPS_OK);
+
+    t0 = gptps_now_ms(NULL);
+    while (get(&g_defer_calls) < 3 && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(get(&g_defer_calls) >= 3);            /* parked, and cycling */
+
+    t0 = gptps_now_ms(NULL);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    elapsed = gptps_now_ms(NULL) - t0;
+
+    CHECK(elapsed < 2000);                      /* the 200ms grace, not forever */
+    CHECK(get(&g_defer_ran) == 0);              /* never admitted */
+    CHECK(get(&g_defer_dead) == 1);             /* ended by its policy... */
+    CHECK(get(&g_defer_status) == (int)GPTPS_E_SHUTDOWN);
+    CHECK(get(&g_defer_flagged) == 1);          /* ...as teardown's doing */
+}
+
+/* ------------------------------ 9. past the grace, queued work is ended, not run */
+
+static int g_q_started, g_q_dead, g_q_flagged;
+
+static void obs_queued(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_STARTED) inc(&g_q_started);
+    if (ev->kind == GPTPS_EV_DEAD_LETTERED && ev->status == GPTPS_E_SHUTDOWN) {
+        if (ev->flags & GPTPS_EV_FLAG_SHUTDOWN) inc(&g_q_flagged);
+        inc(&g_q_dead);
+    }
+}
+
+/* The grace cancelled what was RUNNING, and admission carried on regardless: work
+ * still queued was started after the deadline, only to be cancelled on the next
+ * pass - or, an in-process body that never polls, run to completion, one queued
+ * item after another. Four 800ms bodies behind one worker took ~3.2s to shut down
+ * with a 200ms grace. Past the deadline nothing is admitted, and the queue is
+ * ended by policy like the backoff queue in case 7. */
+static void test_grace_ends_queued_work(void)
+{
+    gptps *e = open_graced();                   /* one worker: the other three queue */
+    uint64_t t0, elapsed;
+    int i;
+
+    if (!e) return;
+    set(&g_q_started, 0); set(&g_q_dead, 0); set(&g_q_flagged, 0);
+    set(&g_body_runs, 0);
+    gptps_register_observer(e, obs_queued, NULL);
+    reg_inproc(e, "slow", task_noncooperative, 0);
+    for (i = 0; i < 4; ++i) CHECK(gptps_submit(e, "slow", NULL, 0, NULL) == GPTPS_OK);
+
+    t0 = gptps_now_ms(NULL);
+    while (get(&g_q_started) < 1 && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(get(&g_q_started) == 1);
+
+    t0 = gptps_now_ms(NULL);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    elapsed = gptps_now_ms(NULL) - t0;
+
+    CHECK(elapsed < 1800);                      /* the grace + the one body in flight */
+    CHECK(get(&g_body_runs) == 1);              /* was 4 */
+    CHECK(get(&g_q_started) == 1);
+    CHECK(get(&g_q_dead) == 3);
+    CHECK(get(&g_q_flagged) == 3);
+}
+
+/* ------------------------------ 9b. past the grace, nothing more is admitted */
+
+static int g_blk_started, g_rest_started, g_rest_dead, g_rest_scored;
+
+/* A scheduler hook that only counts: it must not be called past the grace. */
+static int64_t sched_count(const gptps_sched_input *in, void *ud)
+{ (void)in; (void)ud; inc(&g_rest_scored); return 0; }
+
+static gptps_status task_until_cancelled(gptps_ctx *c, void *u)
+{
+    (void)u;
+    set(&g_blk_started, 1);
+    while (!gptps_is_cancelled(c)) { }
+    return GPTPS_OK;
+}
+
+static void obs_rest(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (strcmp(ev->task_name, "rest") != 0) return;
+    if (ev->kind == GPTPS_EV_STARTED) inc(&g_rest_started);
+    if (ev->kind == GPTPS_EV_DEAD_LETTERED && ev->status == GPTPS_E_SHUTDOWN &&
+        (ev->flags & GPTPS_EV_FLAG_SHUTDOWN)) inc(&g_rest_dead);
+}
+
+/* Case 9's three queued items are all ended in the pass the grace expires in. A
+ * pass ends at most GPTPS_PENDING_CAP (256) of them, though, so a long queue is
+ * still there on the next pass - with a slot free once the running item has been
+ * cancelled - and nothing may be admitted from it. Nor may a scheduler hook be
+ * run over it: rescoring the whole remainder on every such pass made a shutdown
+ * with a long queue quadratic, under the engine lock. */
+static void test_grace_admits_nothing(void)
+{
+    gptps *e = open_graced();                   /* one worker, 200ms grace */
+    uint64_t t0;
+    int i, scored;
+
+    if (!e) return;
+    set(&g_blk_started, 0); set(&g_rest_started, 0); set(&g_rest_dead, 0);
+    set(&g_rest_scored, 0);
+    gptps_register_observer(e, obs_rest, NULL);
+    CHECK(gptps_set_scheduler(e, sched_count, NULL) == GPTPS_OK);
+    reg_inproc(e, "blocker", task_until_cancelled, 0);
+    reg_inproc(e, "rest", task_noop, 0);
+    CHECK(gptps_submit(e, "blocker", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (!get(&g_blk_started) && gptps_now_ms(NULL) - t0 < 5000) { }
+    CHECK(get(&g_blk_started) == 1);
+    for (i = 0; i < 600; ++i)
+        if (gptps_submit(e, "rest", NULL, 0, NULL) != GPTPS_OK) { CHECK(!"submit rest"); break; }
+
+    /* The blocker holds the only slot until the grace, so nothing rescores before
+     * it either: any hook call from here on is one past the grace. */
+    scored = get(&g_rest_scored);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&g_rest_started) == 0);           /* none admitted after the grace */
+    CHECK(get(&g_rest_dead) == 600);            /* every one ended, flagged, instead */
+    CHECK(get(&g_rest_scored) == scored);       /* and none rescored */
+}
+
+/* ---------------- 10. no shutdown or step from a callback on the host's thread */
+
+static int g_rc_queued, g_rc_cancel, g_rc_cancel_step, g_rc_drain, g_rc_watch, g_rc_teardown;
+static int g_rc_unreg;
+
+static void obs_host(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_QUEUED && strcmp(ev->task_name, "q") == 0) {
+        /* A guarded call of its own first: the thread is still inside the QUEUED
+         * callback when that call returns. */
+        CHECK(gptps_settings_set(g_engine, "limits.max_dead_letters", "512") == GPTPS_OK);
+        set(&g_rc_queued, (int)gptps_shutdown(g_engine));
+    }
+    if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED) {
+        if (strcmp(ev->task_name, "c") == 0) {
+            set(&g_rc_cancel, (int)gptps_shutdown(g_engine));
+            set(&g_rc_cancel_step, (int)gptps_step(g_engine, NULL));
+        }
+        if (strcmp(ev->task_name, "u") == 0 && get(&g_rc_unreg) == 999)
+            set(&g_rc_unreg, (int)gptps_shutdown(g_engine));
+        if (strcmp(ev->task_name, "t") == 0)
+            set(&g_rc_teardown, (int)gptps_shutdown(g_engine));
+    }
+}
+
+/* The event callback's half of submit's guard (the case above uses an observer). */
+static int g_rc_evcb;
+static void evcb_shuts_down(const gptps_event *ev, void *ud)
+{ (void)ud; if (ev->kind == GPTPS_EV_QUEUED) set(&g_rc_evcb, (int)gptps_shutdown(g_engine)); }
+
+static void drain_shuts_down(const gptps_dead_letter *dl, void *ud)
+{ (void)dl; (void)ud; set(&g_rc_drain, (int)gptps_shutdown(g_engine)); }
+
+/* A host setting whose write accessor shuts down: gptps_settings_reload runs it. */
+static int g_rc_reload;
+static size_t knob_rd(void *t, char *b, size_t c) { (void)t; return (size_t)snprintf(b, c, "%s", "x"); }
+static gptps_status knob_wr(void *t, const char *v)
+{ (void)t; (void)v; set(&g_rc_reload, (int)gptps_shutdown(g_engine)); return GPTPS_OK; }
+
+static void watch_shuts_down(const char *key, const char *value, void *ud)
+{
+    (void)value; (void)ud;
+    if (strcmp(key, "limits.max_dead_letters") == 0) set(&g_rc_watch, (int)gptps_shutdown(g_engine));
+}
+
+/* Case 1 covers callbacks on the engine's own threads. These run on the HOST's:
+ * the QUEUED gptps_submit emits (to an observer, with a guarded gptps_settings_set
+ * nested in it, and to a bare event callback), the FAILED of gptps_unregister_task
+ * and of gptps_cancel (which also tries gptps_step), a dead-letter drain callback,
+ * a settings watcher, a write accessor gptps_settings_reload runs, and the terminal
+ * events gptps_shutdown itself emits for what it cancels. No check knew about
+ * them, so a gptps_shutdown from one went through and freed the engine under the
+ * call still walking it (and from shutdown's own events, ran teardown inside
+ * teardown). MANUAL mode, so every one of them is on this thread. */
+static void test_host_thread_callbacks_refuse_shutdown(void)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    gptps_handle h = 0;
+    size_t ran = 0;
+
+    memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.mode = GPTPS_RUN_MANUAL;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    g_engine = e;
+    set(&g_rc_queued, 999); set(&g_rc_cancel, 999); set(&g_rc_cancel_step, 999);
+    set(&g_rc_drain, 999); set(&g_rc_watch, 999); set(&g_rc_teardown, 999);
+    set(&g_rc_reload, 999); set(&g_rc_unreg, 999);
+    gptps_register_observer(e, obs_host, NULL);
+    reg_inproc(e, "q", task_noop, 0);
+    reg_inproc(e, "c", task_noop, 0);
+    reg_inproc(e, "t", task_noop, 0);
+    reg_inproc(e, "u", task_noop, 0);
+    reg_inproc(e, "bad", task_always_fails, 0);
+
+    CHECK(gptps_submit(e, "q", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(get(&g_rc_queued) == (int)GPTPS_E_BUSY);   /* refused after its nested call too */
+
+    CHECK(gptps_submit(e, "u", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(e, "u", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_unregister_task(e, "u", GPTPS_REMOVE_CANCEL) == GPTPS_OK);
+    CHECK(get(&g_rc_unreg) == (int)GPTPS_E_BUSY);    /* from the FAILED the removal emits */
+
+    CHECK(gptps_submit(e, "c", NULL, 0, &h) == GPTPS_OK);
+    CHECK(gptps_cancel(e, h) == GPTPS_OK);      /* still queued: FAILED here, on this thread */
+    CHECK(get(&g_rc_cancel) == (int)GPTPS_E_BUSY);
+    CHECK(get(&g_rc_cancel_step) == (int)GPTPS_E_BUSY);
+
+    CHECK(gptps_submit(e, "bad", NULL, 0, NULL) == GPTPS_OK);
+    while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+    CHECK(gptps_dead_letter_count(e) == 1);
+    CHECK(gptps_dead_letter_drain(e, drain_shuts_down, NULL) == 1);
+    CHECK(get(&g_rc_drain) == (int)GPTPS_E_BUSY);
+
+    CHECK(gptps_settings_watch(e, watch_shuts_down, NULL) == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "limits.max_dead_letters", "64") == GPTPS_OK);
+    CHECK(get(&g_rc_watch) == (int)GPTPS_E_BUSY);
+
+    {
+        gptps_setting_def sd;
+        FILE *f = fopen("hang_reload.toml", "wb");
+        CHECK(f != NULL);
+        if (f) { fputs("[host]\nknob = \"y\"\n", f); fclose(f); }
+        memset(&sd, 0, sizeof sd);
+        sd.struct_size = sizeof sd; sd.key = "host.knob"; sd.type = GPTPS_SETTING_STRING;
+        sd.desc = "writes shut down"; sd.hot = 1; sd.read = knob_rd; sd.write = knob_wr;
+        CHECK(gptps_register_setting(e, &sd) == GPTPS_OK);
+        CHECK(gptps_settings_reload(e, "hang_reload.toml") == GPTPS_OK);
+        CHECK(get(&g_rc_reload) == (int)GPTPS_E_BUSY);   /* the accessor ran, and was refused */
+        remove("hang_reload.toml");
+    }
+
+    CHECK(gptps_submit(e, "t", NULL, 0, NULL) == GPTPS_OK);   /* left queued for teardown */
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&g_rc_teardown) == (int)GPTPS_E_BUSY);
+
+    /* The same QUEUED, reaching an event callback and no observer. */
+    e = NULL;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (e) {
+        g_engine = e;
+        set(&g_rc_evcb, 999);
+        reg_inproc(e, "q", task_noop, 0);
+        gptps_set_event_cb(e, evcb_shuts_down, NULL);
+        CHECK(gptps_submit(e, "q", NULL, 0, NULL) == GPTPS_OK);
+        CHECK(get(&g_rc_evcb) == (int)GPTPS_E_BUSY);
+        CHECK(gptps_shutdown(e) == GPTPS_OK);
+    }
+    g_engine = NULL;
+}
+
 int main(void)
 {
     test_reentrant_shutdown_is_refused();
@@ -384,6 +689,10 @@ int main(void)
     test_dead_letter_is_capped();
     test_grace_cancel_is_terminal();
     test_grace_bounds_the_backoff_queue();
+    test_grace_ends_a_deferred_item();
+    test_grace_ends_queued_work();
+    test_grace_admits_nothing();
+    test_host_thread_callbacks_refuse_shutdown();
 
     if (fails) { printf("%d teardown check(s) FAILED\n", fails); return 1; }
     printf("all teardown checks passed\n");

@@ -133,11 +133,55 @@ static void test_shrink_still_fits(void)
     CHECK(get(&finished_wait) == 1);
 }
 
+/* gptps_set_task_resource_cost is live-safe and applies at once: it wakes the
+ * dispatcher. It did not, so an item held back only by its cost stayed queued
+ * after the cost was lowered until something unrelated woke the dispatcher - on
+ * an engine with nothing else happening, never. Two slots, so a slot is free
+ * while a blocker holds the one unit. */
+static void test_cost_change_applies_at_once(void)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    int go = 0;
+    uint64_t reserved = 0, budget = 0, t0;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 2;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK && e);
+    if (!e) return;
+    gptps_set_event_cb(e, obs, NULL);
+    reset();
+    reg(e, "wait",  task_wait, 0, &go);
+    reg(e, "small", task_noop, 0, NULL);
+    CHECK(gptps_define_resource(e, "unit", 1) == GPTPS_OK);
+    CHECK(gptps_set_task_resource_cost(e, "wait",  "unit", 1) == GPTPS_OK);
+    CHECK(gptps_set_task_resource_cost(e, "small", "unit", 1) == GPTPS_OK);
+
+    CHECK(gptps_submit(e, "wait", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (reserved < 1 && gptps_now_ms(NULL) - t0 < 3000)
+        CHECK(gptps_resource_usage(e, "unit", &reserved, &budget) == GPTPS_OK);
+    CHECK(reserved == 1);                        /* the blocker holds the unit */
+    CHECK(gptps_submit(e, "small", NULL, 0, NULL) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    while (gptps_now_ms(NULL) - t0 < 100) { }
+    CHECK(get(&finished_small) == 0);            /* queued: its cost does not fit */
+
+    CHECK(gptps_set_task_resource_cost(e, "small", "unit", 0) == GPTPS_OK);
+    wait_for(&finished_small, 1);
+    CHECK(get(&finished_small) == 1);            /* was 0: nothing woke the dispatcher */
+
+    __atomic_store_n(&go, 1, __ATOMIC_SEQ_CST);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
 int main(void)
 {
     test_memory_shrink();
     test_resource_shrink();
     test_shrink_still_fits();
+    test_cost_change_applies_at_once();
     if (fails) { printf("%d budget-shrink check(s) FAILED\n", fails); return 1; }
     printf("all budget-shrink checks passed\n");
     return 0;

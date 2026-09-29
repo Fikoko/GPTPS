@@ -89,6 +89,26 @@ gptps_flag *gptps_flag_create(bool initial)
     return f;
 }
 
+/* Same fallback caveat as the flag: without the builtins, a plain volatile access
+ * (C11 atomics would need an _Atomic object, which the core does not have). */
+uint32_t gptps_hal_load_acquire_u32(const uint32_t *p)
+{
+#if defined(__GNUC__)
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#else
+    return *(const volatile uint32_t *)p;
+#endif
+}
+
+void gptps_hal_store_release_u32(uint32_t *p, uint32_t v)
+{
+#if defined(__GNUC__)
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#else
+    *(volatile uint32_t *)p = v;
+#endif
+}
+
 void gptps_flag_destroy(gptps_flag *f)
 {
     free(f);

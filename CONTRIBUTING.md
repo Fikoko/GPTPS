@@ -76,9 +76,9 @@ before it belongs in the engine.
 
 **Nothing may hang the host.** `gptps_shutdown` always returns; `gptps_shutdown` and
 `gptps_step` refuse re-entrant calls with `GPTPS_E_BUSY` rather than deadlocking, and so
-does a `gptps_unregister_task` that would have to wait. An engine thread never waits on
-the engine. `tests/test_hang.c` and `tests/test_unregister_reentry.c` enforce these with
-hard timeouts.
+does a `gptps_unregister_task` from an engine thread that would have to wait. An engine
+thread never waits on the engine. `tests/test_hang.c` and
+`tests/test_unregister_reentry.c` enforce these with hard timeouts.
 
 **Lock order is `settings->m` → `e->m`.** Never take them the other way. Event
 callbacks and observers run with `e->m` released and may re-enter the engine.

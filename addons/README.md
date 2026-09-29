@@ -185,8 +185,9 @@ anything a prior run left pending.
   cancels.
 - **Shutdown is not a verdict.** Work the engine gives up on at teardown stays pending
   rather than being quarantined or dropped: whatever a MANUAL host leaves unstepped,
-  running work the grace cancels, work still in backoff when `limits.shutdown_grace_ms`
-  expires, and a requeue item the drain will not start again. The next run recovers it.
+  running work the grace cancels, work still queued or in backoff when
+  `limits.shutdown_grace_ms` expires, and a requeue item the drain will not start again.
+  The next run recovers it.
   Teardown's dead letters and drops are marked `GPTPS_EV_FLAG_SHUTDOWN`; a body that
   itself returns `GPTPS_E_SHUTDOWN` gets that status without the flag, and is judged by
   its failure policy like any other failure. A body that returns `GPTPS_E_CANCELLED`

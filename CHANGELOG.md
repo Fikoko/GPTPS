@@ -12,14 +12,14 @@ the release version and is documented in `include/gptps.h`.
 - **`gptps_event.flags`, with `GPTPS_EV_FLAG_SHUTDOWN` and
   `GPTPS_EV_FLAG_SELF_CANCELLED`.** Two statuses could not say who ended an item.
   `GPTPS_E_SHUTDOWN` sits on the `DEAD_LETTERED` / `DROPPED` teardown imposes (the grace
-  expiring on work in backoff, the drain refusing a requeue item another cycle), but a
-  task body may return it too. `GPTPS_E_CANCELLED` sits on every cancel, whether a
-  `gptps_cancel`, a removal or a shutdown stopped the item or its body returned it
-  (see Changed, below). The flags say which: `GPTPS_EV_FLAG_SHUTDOWN` on teardown's
-  dispositions, `GPTPS_EV_FLAG_SELF_CANCELLED` on a `FAILED` whose `GPTPS_E_CANCELLED`
-  the body returned itself. Statuses are unchanged. The field is appended; read it
-  only when `struct_size` covers it, since an engine older than 2.3 hands you a
-  shorter struct (`docs/PLUGINS.md` shows the guard). `gptps_balance` sets
+  expiring on work still queued or in backoff, the drain refusing a requeue item another
+  cycle), but a task body may return it too. `GPTPS_E_CANCELLED` sits on every cancel,
+  whether a `gptps_cancel`, a removal or a shutdown stopped the item or its body
+  returned it (see Changed, below). The flags say which: `GPTPS_EV_FLAG_SHUTDOWN` on
+  teardown's dispositions, `GPTPS_EV_FLAG_SELF_CANCELLED` on a `FAILED` whose
+  `GPTPS_E_CANCELLED` the body returned itself. Statuses are unchanged. The field is
+  appended; read it only when `struct_size` covers it, since an engine older than 2.3
+  hands you a shorter struct (`docs/PLUGINS.md` shows the guard). `gptps_balance` sets
   `GPTPS_EV_FLAG_SHUTDOWN` on its own teardown dispositions too.
   `durable_queue` now decides by the flags. The one case 1.3.0 quarantined by design —
   a requeue item whose body had returned `GPTPS_E_SHUTDOWN` to end a cycle, then
@@ -43,6 +43,86 @@ the release version and is documented in `include/gptps.h`.
   pins it: with two retries and no backoff, three attempts and a dead letter before,
   one attempt now. `tests/test_retry_order.c`'s case for that return now expects no
   `RETRIED`, and `tests/test_durable.c` checks the record closes and is never re-run.
+
+### Fixed — shutdown past its grace, callbacks on the host's thread, and four more defects
+
+Found while answering #12, and in review of the fixes; every one has a test that fails
+without its fix.
+
+- **A constraint that kept deferring an item hung `gptps_shutdown` forever.** The header
+  promises such an item is ended by its policy once `limits.shutdown_grace_ms` expires,
+  and the grace did end what it found in the backoff queue. But a dispatcher pass first
+  moves every parked item that has fallen due back to intake, and only then applies the
+  grace. Once the deadline had passed, the item's own re-check was the only wake left,
+  so the item was due at every pass: never in the backoff queue when the grace looked,
+  and deferred again by admission. Whether a shutdown hung depended on where a re-check
+  fell against the deadline; with a short re-check interval it hung on every run, since
+  at least 1.2.0. `tests/test_hang.c` case 8.
+- **Past the grace, queued work was still admitted.** The grace cancelled what was
+  running, and admission carried on. Each item still queued was started after the
+  deadline, only to be cancelled on the next pass. An in-process body that never polls
+  `gptps_is_cancelled()` instead ran to completion, one queued item after another, so
+  the bound on shutdown was not a bound: four 800ms bodies behind one worker took 3.2s
+  with a 200ms grace. Now work still queued when the grace expires is ended by its
+  policy like work in backoff, which also closes the hang above: `DEAD_LETTERED`, or
+  `DROPPED` under `on_failure = drop`, with `GPTPS_E_SHUTDOWN` and
+  `GPTPS_EV_FLAG_SHUTDOWN`. It used to end as `FAILED` / `GPTPS_E_CANCELLED` after being
+  started. Nothing more is admitted after that, however long the queue, and a scheduler
+  hook is not run over what is left. `durable_queue` keeps both kinds of record pending,
+  so recovery is unchanged. `tests/test_hang.c` cases 9 and 9b.
+- **`gptps_shutdown` and `gptps_step` from a callback on the host's own thread were not
+  refused.** The header says both return `GPTPS_E_BUSY` from a callback. That held on
+  the engine's own threads and inside `gptps_step`, but some callbacks run on the
+  host's thread: the `QUEUED` that `gptps_submit` emits, the `FAILED` that
+  `gptps_cancel`, `gptps_unregister_task` and `gptps_shutdown` emit for what they
+  cancel, the dead-letter drain callback, a settings watcher, a setting's write
+  accessor during `gptps_settings_set` or `gptps_settings_reload`, an add-on's `setup`,
+  `teardown` and `disable`, and an event an add-on emits. A `gptps_shutdown` from one
+  of them freed the engine under the call still using it. From `gptps_shutdown`'s own
+  events, it ran teardown inside teardown. They are refused now. The header's
+  THREADING section lists which callbacks count, and now says what was always assumed:
+  a callback must return normally, not longjmp or throw out. The engine keeps a record
+  per such thread, found by a hash under the engine lock that all but
+  `gptps_settings_set` and `gptps_settings_reload` already hold, and left with no lock.
+  Measured at one to eight producers against the engine before these fixes,
+  `gptps_submit` stays within about 4% of its old throughput with a counting observer
+  and without one — the measurement's own run-to-run noise. A thread that escapes a
+  callback anyway is refused `gptps_shutdown` and `gptps_step` from then on, rather
+  than leaving the engine a dangling pointer. The records are bounded: past 1024
+  threads inside such callbacks at once, or with no memory for one, a callback runs
+  unguarded. New HAL entry points: `gptps_hal_load_acquire_u32` and
+  `gptps_hal_store_release_u32`, which a HAL supplied through `GPTPS_HAL_SOURCE` must
+  now implement (plain accesses suffice single-threaded, as in
+  `freestanding/hal_stub.c`). `tests/test_hang.c` case 10, `tests/test_addon.c` and,
+  built with a cap of 4, `tests/test_cb_cap.c`.
+- **`gptps_set_task_resource_cost` took effect only at the next unrelated wake.** It
+  now wakes the dispatcher, so queued items of the type are judged by the new cost at
+  once. Before, an item held back only by its cost stayed queued after the cost was
+  lowered, on an otherwise idle engine forever. `tests/test_budget_shrink.c`.
+- **A service that crashed just before `gptps_shutdown` ended `DEAD_LETTERED`.** A run
+  that has returned waits for the dispatcher's next pass. `gptps_shutdown` stopped
+  services that were running, ready, queued or in restart backoff, but not one in that
+  window. A crash caught there was judged like any failure while stopping, as a requeue
+  the drain will not restart, and ended `DEAD_LETTERED` / `GPTPS_E_SHUTDOWN` instead of
+  with the `FAILED` / `GPTPS_E_CANCELLED` the header promises a service's shutdown.
+  `tests/test_service.c`.
+- **`limits.max_concurrent_tasks` is restart-only, as it was documented.** The pool is
+  sized once, at open, but a live `gptps_settings_set` still reached the limit admission
+  reads. A lower value throttled the running engine. A higher one admitted more items
+  than the pool has threads: they waited in the ready queue holding their memory and
+  named-resource budget, and went ahead of anything submitted after them. A live write
+  is now kept only for `gptps_settings_get` and `gptps_settings_save`, so a saved file
+  carries it to the next open. To throttle a running engine, re-budget a named
+  resource. `tests/test_settings.c`.
+- **Equal scheduler-hook scores came out newest-first.** A new item enters the queue at
+  its priority and was placed by it against items the hook had already scored. A hook
+  returning scores below the default priority 0, such as `-deadline`, put every newcomer
+  ahead of the equal-score items already waiting. The stable re-sort then kept it there,
+  although the header says ties resolve FIFO. It happened whenever items waited across
+  passes with a slot free, and dated from 1.1.0's ordered intake. Ties now break
+  explicitly on the order items entered the queue.
+  `tests/test_admission_order.c` gains the case its earlier hook case could not hit,
+  since that one queued everything before the first pass.
 
 ### Fixed — `durable_queue`: recovering under backpressure
 
@@ -76,6 +156,17 @@ the release version and is documented in `include/gptps.h`.
   It comes under a separate
   commercial license that never restricts GPTPS itself. GPTPS stays MIT, and no
   release is certified today.
+- **The Readme's `earliest_deadline_first` was oldest-first.** It scored by
+  `enqueue_ms`. The example now takes the deadline from the payload, and says what the
+  hook can see: no deadline of its own.
+- **Re-budgeting a named resource is live-safe, and the header now says so.** It called
+  every `gptps_define_*` setup-time. Re-budgeting an existing resource has woken the
+  dispatcher since 1.2.0, and `tests/test_budget_shrink.c` covers a cut under queued
+  work. The header now names that exception. It also says what a cut does: it cancels
+  nothing, and it dead-letters queued items that can no longer fit once an admission
+  scan reaches them, so a budget of 0 is not a pause. `gptps_set_task_resource_cost`,
+  which `gpu_quota`'s plug-in already calls at runtime from a settings watcher, is
+  declared live-safe too.
 - **`examples/success_gate.c`: a success-only dependency lives in the host.**
   `gptps_orch_after` releases its gate on any terminal outcome, a dead letter or a drop
   included, so it cannot express "run this only if that succeeded". The example shows

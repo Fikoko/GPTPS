@@ -136,9 +136,10 @@ typedef enum {
     GPTPS_E_DENIED,       /* a constraint hook rejected admission */
     GPTPS_E_BUSY          /* refused rather than wait, e.g. a task removal with work
                            * outstanding (REJECT_IF_BUSY; DRAIN in MANUAL mode; any removal
-                           * that would wait, from a task body or a callback), gptps_shutdown
-                           * / gptps_step from one, or an add-on's call that would wait on
-                           * its own callback thread (gptps_xport_submit) */
+                           * that would wait, from a task body or a callback on an engine
+                           * thread), gptps_shutdown / gptps_step from a task body or any
+                           * callback, or an add-on's call that would wait on its own
+                           * callback thread (gptps_xport_submit) */
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);
@@ -373,6 +374,8 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *    MANY threads at once on the same engine. Registration-style setup
  *    (gptps_register_task, gptps_register/unregister_constraint/observer,
  *    gptps_define_*) is SETUP-time: do it before submitting work or while quiescent.
+ *    The one exception is gptps_define_resource on a name already defined: that
+ *    re-budgets it, which is safe at any time and takes effect at once.
  *  - Which thread a callback fires on (THREADED mode):
  *      QUEUED                  -> the thread that called gptps_submit;
  *      STARTED/FINISHED/FAILED -> a worker thread;
@@ -383,15 +386,20 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *        gptps_cancel / gptps_unregister_task - and, for a queued or restarting
  *        service instance, gptps_shutdown.
  *    In MANUAL mode every callback fires on the thread that called gptps_step(),
- *    except the terminal events gptps_cancel, gptps_unregister_task and
- *    gptps_shutdown emit on their caller's thread.
+ *    except QUEUED and the terminal events gptps_cancel, gptps_unregister_task and
+ *    gptps_shutdown emit, which fire on their caller's thread.
+ *    In either mode, the dead-letter drain callback and settings watchers run on
+ *    the thread that called gptps_dead_letter_drain / gptps_settings_set, and an
+ *    event an add-on emits reaches the event callback on the add-on's thread.
  *  - Event callbacks (gptps_event_cb, observers) and the dead-letter drain
  *    callback ALWAYS run with the engine lock RELEASED, so they MAY call back
  *    into the engine (e.g. gptps_submit to retry) without deadlock. Keep them
  *    quick - a slow drain callback holds up the drain.
  *  - Constraint hooks (gptps_constraint_fn) are the EXCEPTION: they run on the
  *    dispatcher thread UNDER the engine lock, so they MUST be fast / non-blocking
- *    and MUST NOT call back into this engine (that would re-enter the lock).
+ *    and MUST NOT call back into this engine (that would re-enter the lock). So
+ *    do scheduler hooks (gptps_sched_fn) and a task type's cost() callback, which
+ *    runs on the submitting thread inside gptps_submit.
  *  - In-process task bodies run with the lock released and must poll
  *    gptps_is_cancelled() to be stoppable (timeouts and gptps_cancel are
  *    cooperative for INPROC; OOP/PROGRAM are hard-killed at their deadline).
@@ -400,9 +408,24 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *  - gptps_shutdown() and gptps_step() are the exceptions to "callbacks may
  *    re-enter": both return GPTPS_E_BUSY when called from a task body or a
  *    callback, since either would tear down / recurse into the caller's own
- *    thread. gptps_unregister_task() does the same whenever the removal would
- *    have to wait for work of that type, which may need the caller's thread.
- *    Signal your main thread instead.
+ *    thread. "A callback" is any of them, on whichever thread it runs: an event
+ *    callback, including the QUEUED that gptps_submit emits on its caller's
+ *    thread; the dead-letter drain callback; a settings watcher, and a setting's
+ *    write accessor while gptps_settings_set or gptps_settings_reload runs it; an
+ *    add-on's setup, teardown and disable. (A read accessor is not covered: have
+ *    it read. Nor is a hook that runs under the engine lock, which must not call
+ *    into the engine at all - see above.)
+ *    gptps_unregister_task() returns GPTPS_E_BUSY too, when called from a task
+ *    body or from a callback on one of the engine's own threads, whenever the
+ *    removal would have to wait for work of that type, which may need that
+ *    thread. Signal your main thread instead.
+ *  - Every callback must RETURN normally: no longjmp, C++ exception or thread exit
+ *    out of one. The engine marks the thread as inside the callback until it
+ *    returns, so a thread that escapes one is refused gptps_shutdown and gptps_step
+ *    from then on - and so is a later thread the OS gives the same id. The marks
+ *    are bounded: with more than 1024 threads inside such callbacks at once (or
+ *    escaped from one), or with no memory for a mark, a callback runs unmarked, and
+ *    a gptps_shutdown or gptps_step from it is not refused.
  *  - FORK: an engine must not be used in a child of fork(). Its mutex may be held
  *    by a thread that did not survive, so the child would deadlock; every entry
  *    point therefore returns GPTPS_E_SHUTDOWN on an engine created before the
@@ -415,7 +438,13 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  * ==========================================================================*/
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_limits) */
-    uint32_t max_concurrent_tasks; /* 0 => auto (detected cores); 1 => strictly sequential */
+    uint32_t max_concurrent_tasks; /* 0 => auto (detected cores); 1 => strictly sequential.
+                                    * Sizes the worker pool, once, at open: a live write of
+                                    * "limits.max_concurrent_tasks" is kept only for
+                                    * reads and gptps_settings_save (a saved file carries
+                                    * it to a later open) and changes nothing in the
+                                    * running engine. To throttle live, use a
+                                    * named resource (gptps_define_resource re-budgets). */
     uint64_t max_memory_bytes;     /* 0 => auto (fraction of detected RAM) */
     /* v1.9: backpressure. 0 => unbounded intake (default). Otherwise gptps_submit
      * returns GPTPS_E_FULL once this many items are queued (not yet admitted),
@@ -469,10 +498,19 @@ GPTPS_API gptps_status gptps_set_task_priority(gptps *e, const char *task_name, 
  * beyond the dedicated memory budget (limits.max_memory_bytes), which stays its
  * own dimension (it is wired to OS enforcement + auto-tune). Costs are per task
  * TYPE; an item that costs more of a resource than its whole budget is rejected
- * at submit with GPTPS_E_BUDGET. Setup-time calls (define before submitting work).
+ * at submit with GPTPS_E_BUDGET. Setup-time calls (define before submitting work) -
+ * except a RE-budget: gptps_define_resource on an existing name may be called at
+ * any time, and is the live throttle. A raise admits waiting work at once. A cut
+ * cancels nothing: running items keep what they reserved until they end. An item
+ * still queued that can no longer ever fit is dead-lettered with GPTPS_E_BUDGET
+ * when an admission scan reaches it - on a pass with a slot free, once nothing
+ * ahead of it in the queue fits - and a new submit of it is refused at once, so a
+ * budget of 0 is not a pause. gptps_set_task_resource_cost may likewise be called
+ * at any time: queued items of the type are judged by the new cost from the next
+ * admission on, and a cost above the budget dead-letters them as a cut does.
  * ==========================================================================*/
 
-/* Declare (or, if it already exists, re-budget) a named resource. */
+/* Declare (or, if it already exists, re-budget - live-safe) a named resource. */
 GPTPS_API gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget);
 
 /* Set a task type's per-item cost against a named resource (0 = no cost). The
@@ -690,21 +728,24 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * (absent) deadline would hang the HOST's exit path forever and be orphaned when
  * the supervisor gave up. An in-process body that never polls
  * gptps_is_cancelled() still cannot be preempted - nothing in-process can be.
- * Work still waiting in backoff when the grace expires - a retry, an item between
- * REQUEUE cycles, or one a constraint DEFERred, which may never have run - is
- * ended at once by its policy: GPTPS_EV_DEAD_LETTERED, or GPTPS_EV_DROPPED under
- * on_failure = drop, with status GPTPS_E_SHUTDOWN. So is a REQUEUE item that runs
- * out of retries during the drain, which never schedules another cycle - a
- * GPTPS_EV_DEAD_LETTERED, while the attempt's own status stays on its FAILED. The
- * dead letters both paths retain (gptps_dead_letter_drain) carry that status too.
+ * Once the grace expires nothing more is admitted. Work still waiting then - queued
+ * and not yet admitted, or in backoff: a retry, an item between REQUEUE cycles, or
+ * one a constraint DEFERred, which may never have run - is ended at once by its
+ * policy: GPTPS_EV_DEAD_LETTERED, or GPTPS_EV_DROPPED under on_failure = drop,
+ * with status GPTPS_E_SHUTDOWN. So is a REQUEUE item that runs out of retries
+ * during the drain, which never schedules another cycle - a GPTPS_EV_DEAD_LETTERED,
+ * while the attempt's own status stays on its FAILED. The dead letters both paths
+ * retain (gptps_dead_letter_drain) carry that status too.
  * Both events carry GPTPS_EV_FLAG_SHUTDOWN (ABI 2.3). The engine does not reserve
  * the status: a task body may return GPTPS_E_SHUTDOWN too, and when that return ends
  * the item its DEAD_LETTERED / DROPPED carries the status but not the flag.
  *
- * NOT RE-ENTRANT: returns GPTPS_E_BUSY if called from a task body or an event
- * callback, because it would join the very thread making the call (THREADED) or
- * free the engine that gptps_step is standing on (MANUAL). Signal your main
- * thread and shut down from there. */
+ * NOT RE-ENTRANT: returns GPTPS_E_BUSY if called from a task body or any callback
+ * (see THREADING), because it would join the very thread making the call
+ * (THREADED), free the engine that gptps_step is standing on (MANUAL), or free it
+ * under the call that made the callback - a submit, cancel, removal, drain or
+ * settings call, an add-on load, disable or emit, or gptps_shutdown itself. Signal
+ * your main thread and shut down from there. */
 GPTPS_API gptps_status gptps_shutdown(gptps *e);
 
 /* ============================================================================
@@ -798,12 +839,13 @@ typedef struct {
 } gptps_event;
 
 /* On a GPTPS_EV_DEAD_LETTERED or GPTPS_EV_DROPPED: teardown imposed this disposition
- * - the shutdown grace expired on work waiting in backoff, or the drain refused a
- * REQUEUE item another cycle (see gptps_shutdown) - rather than the item's failure
- * policy running its course. Such an event's status is GPTPS_E_SHUTDOWN. A task
- * body may return GPTPS_E_SHUTDOWN too, and its disposition then carries that status
- * WITHOUT this flag: the flag, not the status, is what says teardown ended the
- * item. Never set on any other kind of event. */
+ * - the shutdown grace expired on work still queued or waiting in backoff, or the
+ * drain refused a REQUEUE item another cycle (see gptps_shutdown) - rather than the
+ * item's failure policy running its course. Such an event's status is
+ * GPTPS_E_SHUTDOWN. A task body may return GPTPS_E_SHUTDOWN too, and its
+ * disposition then carries that status WITHOUT this flag: the flag, not the
+ * status, is what says teardown ended the item. Never set on any other kind of
+ * event. */
 #define GPTPS_EV_FLAG_SHUTDOWN 0x1u
 /* On a GPTPS_EV_FAILED carrying GPTPS_E_CANCELLED: the task body (or its child
  * process) returned that status itself - no gptps_cancel, removal or shutdown
@@ -1336,12 +1378,12 @@ GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, vo
  * that fits, keeping all of the skip-to-fit / budget / starvation machinery.
  *
  * The hook returns an int64 score; the dispatcher admits the HIGHEST-scoring
- * pending item that fits the live budget (ties resolve FIFO). It runs on the
- * dispatcher thread UNDER the engine lock on the hot path, so it MUST be fast /
- * non-blocking and MUST NOT call back into this engine. `gptps_sched_input` and
- * `gptps_sched_fn` are declared up in the host-table ABI section (so add-ons can
- * install a scheduler through the routines table); check in->struct_size before
- * reading fields appended in a later minor.
+ * pending item that fits the live budget (ties resolve FIFO: whichever entered
+ * the queue first). It runs on the dispatcher thread UNDER the engine lock on the
+ * hot path, so it MUST be fast / non-blocking and MUST NOT call back into this
+ * engine. `gptps_sched_input` and `gptps_sched_fn` are declared up in the
+ * host-table ABI section (so add-ons can install a scheduler through the routines
+ * table); check in->struct_size before reading fields appended in a later minor.
  *
  * NOTE: a score should be a reasonably STABLE ordering key for a given item across
  * passes. The starvation guard charges "skips" to whichever item is currently

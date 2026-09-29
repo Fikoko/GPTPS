@@ -118,13 +118,15 @@ without deadlock or re-entrancy under the lock.
 3. **Enforce deadlines** — flip the cancel flag on any running task past its
    deadline (cooperative for in-process; the OOP path hard-kills separately).
 4. **Admit** — priority-ordered, skip-to-fit, with reservation, holding a slot for
-   each due retry from 2b (see §5).
+   each due retry from 2b (see §5). Nothing once a shutdown's grace has expired.
 5. **Emit** buffered events with the lock released, then `continue` (re-runs the
    loop so a signal arriving during the emit window can't be lost).
 6. **Shutdown** check — when fully drained, wake workers to exit and break. The
    drain is BOUNDED: `gptps_shutdown` arms a deadline (`limits.shutdown_grace_ms`,
    default 30s, `0` = wait forever), and once it passes, step 3b raises every
-   in-flight item's cancel flag so one stuck child cannot hang the host's exit.
+   in-flight item's cancel flag so one stuck child cannot hang the host's exit, and
+   ends everything still queued or in backoff by its policy (`DEAD_LETTERED`, or
+   `DROPPED` under drop, with `GPTPS_E_SHUTDOWN` and `GPTPS_EV_FLAG_SHUTDOWN`).
 7. **Sleep** — `cond_timedwait` until the nearest deadline/backoff, or `cond_wait`
    until signalled. (Steps 1–7 hold the lock continuously when no events were
    emitted, so no wakeup can be lost.)
@@ -210,8 +212,10 @@ Then:
 - Once `top` has been skipped `reserve_after_skips` times (default 8, configurable),
   the dispatcher **reserves** for it: backfill is suspended and the engine drains
   running tasks until `top` fits. This bounds starvation to at most
-  `reserve_after_skips` backfills. Since over-budget submits are rejected up
-  front, a reserved task is always eventually admittable.
+  `reserve_after_skips` backfills. Over-budget submits are rejected up front, and
+  a queued item that a live budget cut or cost raise leaves unable ever to fit is
+  dead-lettered with `GPTPS_E_BUDGET` when the scan reaches it, so a reserved task
+  is always eventually admitted or ended: the reservation cannot wait forever.
 - **A due retry announced this pass** (step 2b, zero backoff) is not in `intake` yet.
   Work at or above its priority is admitted as usual; lower work only while it still
   fits beside every due retry, a slot and its declared memory each. MANUAL mode admits
@@ -310,7 +314,9 @@ build-system `-D` flags.
 this interface. In MANUAL mode (§3.1) the required subset is small: mutex,
 condvar (create/destroy/signal/broadcast — `wait`/`timedwait` and `thread_start`
 are *not* called, since there are no engine threads), the cancel flag, the
-monotonic clock, and hardware detection (return `cpu_count = 1`). `dlopen` and
+monotonic clock, the thread id and the acquire/release `u32` pair (a constant and plain
+accesses will do), the fork-guard pair (no-ops), and hardware detection (return
+`cpu_count = 1`). `dlopen` and
 `atomic_replace` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use dynamic
 add-ons or settings persistence. Combined with `gptps_set_allocator` (§3.2) for a
 static memory pool, that is the whole bare-metal dependency surface.
@@ -402,7 +408,9 @@ in the add-on. Validation (range / enum / parseable) runs in the generic layer
   settings register *after* `gptps_register_task` releases `e->m`, against the
   stable heap `gptps_reg` (append-only; freed in bulk at shutdown).
 - **Hot vs restart:** `write_fn` pushes to live state and signals the dispatcher
-  where applicable; `max_concurrent_tasks` is restart-only (pool fixed at open).
+  where applicable; `max_concurrent_tasks` is restart-only (pool fixed at open): a live
+  write is kept for reads and `gptps_settings_save` (a saved file carries it to the next
+  open), and admission never sees it.
 - **Persistence:** `gptps_settings_save` regenerates a grouped TOML file written via
   `gptps_hal_atomic_replace` (temp + rename/MoveFileEx); `gptps_settings_reload`
   re-applies known keys through the validated `set()` path and swaps `e->toml`.

@@ -465,11 +465,15 @@ dispatch key chosen by the peer.
 (skip-to-fit, budget, starvation guard) is fixed; the *ordering* is a hook. Return a score
 per item and the dispatcher admits the highest that fits — so deadline-first, per-tenant
 fair-share, cost-aware, or aging disciplines compose without a core fork (default is
-priority/FIFO):
+priority/FIFO). The hook sees the task name, priority, attempt, queue age and payload; a
+deadline is yours to supply, here as the payload's first 8 bytes:
 
 ```c
 static int64_t earliest_deadline_first(const gptps_sched_input *in, void *ud) {
-    (void)ud; return -(int64_t)in->enqueue_ms;   /* older enqueue = higher score */
+    int64_t deadline = INT64_MAX;                     /* no deadline: last */
+    (void)ud;
+    if (in->payload_len >= sizeof deadline) memcpy(&deadline, in->payload, sizeof deadline);
+    return deadline == INT64_MIN ? INT64_MAX : -deadline;   /* sooner = higher score */
 }
 gptps_set_scheduler(e, earliest_deadline_first, NULL);
 ```
@@ -728,7 +732,7 @@ gptps/
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
 │   ├── SAFETY.md        the planned commercial safety-artifacts package and how it is licensed
 │   └── SECURITY.md      trust boundary and non-guarantees
-├── tests/               ← CTest suite (65 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tests/               ← CTest suite (67 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
 │   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
@@ -763,7 +767,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **65** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
+plug-in · **67** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
@@ -772,11 +776,18 @@ hang it hangs your host's exit path — so these are contractual, and
 
 - `gptps_shutdown` always returns. In-flight work drains for at most
   `limits.shutdown_grace_ms` (default 30s; `0` opts back into waiting forever), then
-  gets cancelled — an external child with no timeout of its own cannot wedge teardown.
-- `gptps_shutdown` / `gptps_step` return `GPTPS_E_BUSY` rather than deadlocking when
-  called from a task body or an event callback, and so does a `gptps_unregister_task`
-  there that would have to wait for work of that type
-  ([`tests/test_unregister_reentry.c`](tests/test_unregister_reentry.c)).
+  gets cancelled, and work still queued or in backoff is ended by its policy with
+  `GPTPS_E_SHUTDOWN` — an external child with no timeout of its own cannot wedge
+  teardown, and neither can a constraint that keeps deferring.
+- `gptps_shutdown` / `gptps_step` return `GPTPS_E_BUSY` rather than deadlocking or
+  freeing the engine under the caller when called from a task body or a callback as
+  THREADING in `include/gptps.h` defines it: including the `QUEUED` on the submitting
+  thread, the dead-letter drain callback, a settings watcher, a setting's write
+  accessor and an add-on's `setup`/`teardown`/`disable`, but not a setting's read
+  accessor or a hook that runs under the engine lock, which must not call into the
+  engine at all.
+  So does a `gptps_unregister_task` on an engine thread that would have to wait for
+  work of that type ([`tests/test_unregister_reentry.c`](tests/test_unregister_reentry.c)).
 - The engine's growable state is bounded, with one deliberate exception. The
   dead-letter list (`limits.max_dead_letters`, default 1024) and the bytes an
   out-of-process child can make the parent buffer (16 MiB) are capped, and truncation

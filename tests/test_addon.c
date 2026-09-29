@@ -8,6 +8,11 @@
 #include "gptps.h"
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #ifndef ADDON_DEMO_PATH
 #define ADDON_DEMO_PATH "./addon_demo.so"
@@ -30,6 +35,66 @@ static void on_ev(const gptps_event *ev, void *ud)
 {
     (void)ud;
     if (ev->kind == GPTPS_EV_FINISHED) inc(&c_finished);
+}
+
+/* For the add-on that emits from setup(), teardown() and addon_emit_now();
+ * 999 = never called. */
+static gptps *g_e4;
+static int c_rc_setup = 999, c_rc_now = 999, c_rc_teardown = 999;
+static void on_ev_emit(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (strcmp(ev->task_name, "emit.setup") == 0)
+        __atomic_store_n(&c_rc_setup, (int)gptps_shutdown(g_e4), __ATOMIC_SEQ_CST);
+    if (strcmp(ev->task_name, "emit.now") == 0)
+        __atomic_store_n(&c_rc_now, (int)gptps_shutdown(g_e4), __ATOMIC_SEQ_CST);
+    if (strcmp(ev->task_name, "emit.teardown") == 0)
+        __atomic_store_n(&c_rc_teardown, (int)gptps_shutdown(g_e4), __ATOMIC_SEQ_CST);
+}
+
+/* A symbol of the addon_emit module, loading it if the engine has not yet: the
+ * engine's own gptps_load_addon of the same path then shares it. Loaded this way,
+ * with the path the engine itself passes to the loader, it stays mapped until the
+ * process exits. Returned as void (*)(void), the type every function-pointer cast
+ * may go through without -Wcast-function-type. */
+typedef void (*any_fn)(void);
+static any_fn emit_sym(const char *name)
+{
+    any_fn fn = NULL;
+#ifdef _WIN32
+    HMODULE m = LoadLibraryA(ADDON_EMIT_PATH);
+    if (m) fn = (any_fn)GetProcAddress(m, name);
+#else
+    void *h = dlopen(ADDON_EMIT_PATH, RTLD_NOW);
+    if (h) *(void **)(&fn) = dlsym(h, name);
+#endif
+    return fn;
+}
+
+/* The hook addon_emit calls from its setup() and disable(). */
+static int c_rc_hook_setup = 999, c_rc_hook_disable = 999, g_in_disable;
+static void on_hook(gptps *e)
+{
+    __atomic_store_n(g_in_disable ? &c_rc_hook_disable : &c_rc_hook_setup,
+                     (int)gptps_shutdown(e), __ATOMIC_SEQ_CST);
+}
+/* Installed before the engine loads the add-on, so its setup() finds it. */
+typedef void (*set_hook_fn)(void (*)(gptps *));
+static int set_emit_hook(void)
+{
+    any_fn fn = emit_sym("addon_emit_set_hook");
+    if (!fn) return 0;
+    ((set_hook_fn)fn)(on_hook);
+    return 1;
+}
+
+/* Call addon_emit_now in the loaded add-on, on this (the host's) thread. */
+static int call_emit_now(void)
+{
+    any_fn fn = emit_sym("addon_emit_now");
+    if (!fn) return 0;
+    fn();
+    return 1;
 }
 
 /* For the ABI-2.1 engine below. c_deadline_ok records a verdict the PLUGIN
@@ -169,6 +234,33 @@ int main(void)
             CHECK(gptps_task_exists(e3, "uw0")  == 0);
             CHECK(gptps_task_exists(e3, "uw19") == 0);
             gptps_shutdown(e3);
+        }
+    }
+
+    /* An add-on's setup(), teardown() and disable() run on the host's thread, and
+     * so does the host code they call back into: an event callback reached through
+     * the host table, or a hook the host handed the add-on. A gptps_shutdown from
+     * there went through, and freed the engine under the gptps_load_addon,
+     * gptps_addon_disable or gptps_shutdown still using it. It must be refused
+     * like one from any other callback. */
+    {
+        gptps *e4 = NULL;
+        CHECK(gptps_open(NULL, &e4) == GPTPS_OK);
+        if (e4) {
+            g_e4 = e4;
+            gptps_set_event_cb(e4, on_ev_emit, NULL);
+            CHECK(set_emit_hook());
+            CHECK(gptps_load_addon(e4, ADDON_EMIT_PATH) == GPTPS_OK);
+            CHECK(get(&c_rc_hook_setup) == (int)GPTPS_E_BUSY);  /* from inside setup() */
+            CHECK(get(&c_rc_setup) == (int)GPTPS_E_BUSY);
+            CHECK(call_emit_now());
+            CHECK(get(&c_rc_now) == (int)GPTPS_E_BUSY);
+            g_in_disable = 1;
+            CHECK(gptps_addon_disable(e4, "emit") == GPTPS_OK);
+            CHECK(get(&c_rc_hook_disable) == (int)GPTPS_E_BUSY); /* from inside disable() */
+            CHECK(gptps_shutdown(e4) == GPTPS_OK);
+            CHECK(get(&c_rc_teardown) == (int)GPTPS_E_BUSY);
+            g_e4 = NULL;
         }
     }
 

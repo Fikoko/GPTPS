@@ -70,6 +70,8 @@ void gptps_thread_join(gptps_thread *t) { (void)t; }
 
 /* Single-threaded, no fork: one constant id, and nothing to guard. */
 uint64_t gptps_hal_thread_id(void) { return 1u; }
+uint32_t gptps_hal_load_acquire_u32(const uint32_t *p) { return *p; }
+void     gptps_hal_store_release_u32(uint32_t *p, uint32_t v) { *p = v; }
 void     gptps_hal_fork_guard_install(void) { }
 uint64_t gptps_hal_fork_generation(void) { return 0; }
 

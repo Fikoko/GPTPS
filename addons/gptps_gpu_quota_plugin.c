@@ -50,8 +50,9 @@
  * non-zero cost admits NOTHING - it is maximally restrictive, not unlimited. An
  * operator typing 0 into a quota means the opposite, so this plug-in translates:
  * 0 in the setting means unlimited, and unlimited is expressed to the engine as the
- * largest budget nothing can exceed. Getting this backwards silently wedges every
- * task of the type, which is exactly the sort of thing a policy plug-in must not do. */
+ * largest budget nothing can exceed. Getting this backwards would fail every task of
+ * the type - refused at submit, and dead-lettered if already queued, with
+ * GPTPS_E_BUDGET - which is exactly the sort of thing a policy plug-in must not do. */
 #define GPUQ_UNLIMITED ((uint64_t)~(uint64_t)0)
 
 /* The host table is genuinely process-wide: the core hands out the address of one
@@ -130,9 +131,9 @@ static gptps_status gpuq_setup(gptps *e, const gptps_api_routines *api, char **e
      * mode the pre-ABI-2.0 constraint+observer implementation had.
      *
      * Starts UNLIMITED, deliberately. Loading a policy plug-in must not change
-     * behaviour until it is configured: a zero budget here would stall every task
+     * behaviour until it is configured: a zero budget here would fail every task
      * that later gets a non-zero cost, so merely having the plug-in present would
-     * wedge the engine. Opt-in, not opt-out. */
+     * break the host's work. Opt-in, not opt-out. */
     st = api->define_resource(e, GPUQ_RESOURCE, GPUQ_UNLIMITED);
     if (st != GPTPS_OK) return st;
 

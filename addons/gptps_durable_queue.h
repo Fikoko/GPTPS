@@ -31,11 +31,11 @@
  *     cancel reached it. To withdraw the work, use gptps_dq_cancel.
  *   - Work that shutdown gives up on: whatever a MANUAL host leaves unstepped,
  *     running work the grace cancels and stopped services (FAILED /
- *     GPTPS_E_CANCELLED); work still in backoff when limits.shutdown_grace_ms
- *     expires, and a REQUEUE item the drain will not start again (DEAD_LETTERED,
- *     or DROPPED under on_failure = drop, marked GPTPS_EV_FLAG_SHUTDOWN - see
- *     gptps_shutdown). Teardown ending work is not a verdict on it, so it is
- *     neither quarantined nor lost.
+ *     GPTPS_E_CANCELLED); work still queued or in backoff when
+ *     limits.shutdown_grace_ms expires, and a REQUEUE item the drain will not start
+ *     again (DEAD_LETTERED, or DROPPED under on_failure = drop, marked
+ *     GPTPS_EV_FLAG_SHUTDOWN - see gptps_shutdown). Teardown ending work is not a
+ *     verdict on it, so it is neither quarantined nor lost.
  *   A body that itself returns GPTPS_E_SHUTDOWN is still judged by its policy:
  *   its dead letter or drop carries that status but not the flag, so it is
  *   quarantined or closed like any other failure.

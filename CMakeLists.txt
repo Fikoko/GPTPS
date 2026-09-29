@@ -495,14 +495,20 @@ target_link_libraries(test_addon PRIVATE gptps)
 add_library(addon_unwind MODULE tests/addon_unwind.c)
 target_include_directories(addon_unwind PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(addon_unwind PROPERTIES PREFIX "")
+# Emits an event from setup(), teardown() and its exported addon_emit_now(), all on
+# the host's thread.
+add_library(addon_emit MODULE tests/addon_emit.c)
+target_include_directories(addon_emit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_emit PROPERTIES PREFIX "")
 
 target_compile_definitions(test_addon PRIVATE
     ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
     ADDON_BAD_PATH="$<TARGET_FILE:addon_bad>"
     ADDON_CANCEL_PATH="$<TARGET_FILE:addon_cancel>"
     ADDON_UNWIND_PATH="$<TARGET_FILE:addon_unwind>"
+    ADDON_EMIT_PATH="$<TARGET_FILE:addon_emit>"
 )
-add_dependencies(test_addon addon_demo addon_bad addon_cancel addon_unwind)
+add_dependencies(test_addon addon_demo addon_bad addon_cancel addon_unwind addon_emit)
 add_test(NAME addon COMMAND test_addon)
 set_tests_properties(addon PROPERTIES TIMEOUT 30)
 
@@ -716,6 +722,15 @@ target_compile_definitions(test_hang PRIVATE HELPER_PATH="$<TARGET_FILE:prog_hel
 add_dependencies(test_hang prog_helper)
 add_test(NAME hang COMMAND test_hang)
 set_tests_properties(hang PROPERTIES TIMEOUT 60)
+if(UNIX)
+    # The core again, with the callback-record cap cut to 4 so a test can pass it.
+    add_executable(test_cb_cap tests/test_cb_cap.c ${GPTPS_SRC})
+    target_include_directories(test_cb_cap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(test_cb_cap PRIVATE GPTPS_CB_THREADS_MAX=4)
+    target_link_libraries(test_cb_cap PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME cb_cap COMMAND test_cb_cap)
+    set_tests_properties(cb_cap PROPERTIES TIMEOUT 30)
+endif()
 
 # --- every submitted handle reaches exactly one terminal event -------------
 add_executable(test_reconcile tests/test_reconcile.c)
