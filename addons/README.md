@@ -293,8 +293,10 @@ than in the dispatcher.
 - **A gate that never gets submitted is visible.** A gate whose deps are all satisfied
   is submitted at once, and that submit can be refused (type paused, intake full, name
   never registered, cost that can never fit). The orchestrator retries the transient
-  cases a bounded number of times and then gives up, so `gptps_orch_pending()` always
-  converges to 0 — which is what makes it a usable drain predicate, and also what would
+  cases a bounded number of times and then gives up, so such a gate never holds
+  `gptps_orch_pending()` above 0 — which is what makes it a usable drain predicate (for
+  gates on handles this engine issued and still remembers, see the retention bullet
+  above; a dependency handle of 0 is refused with `GPTPS_E_INVAL`), and also what would
   otherwise hide the failure. `gptps_orch_stalled()` counts the gates it gave up on,
   `gptps_orch_stalled_at()` names one and reports the status it was refused with, and
   `gptps_orch_retry()` re-submits them all once you have fixed the cause.
@@ -424,8 +426,9 @@ engine, built on the observer seam — ANSI/VT escapes only (no ncurses; Windows
 enabled automatically). Panes/metrics:
 
 - header: uptime + **throughput** (done/s);
-- counts (queued/started/finished/failed/retried/dead) + an **in-flight gauge bar**;
-- per-task table: run / ok / fail / dead, **success rate (ok%)**, and **average
+- counts (queued/started/finished/failed/retried/dead/dropped) + an **in-flight gauge
+  bar**;
+- per-task table: run / ok / fail / dead / drop, **success rate (ok%)**, and **average
   queue→finish latency (ms)**, plus the task's hotkey;
 - a **scrollable** recent-events log (timestamped) — `k`/`j` scroll older/newer.
 

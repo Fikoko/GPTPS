@@ -5,9 +5,10 @@
  *
  * Built before the pool/loader because gptps_open() depends on resolved limits.
  * This slice owns the resolution rule and the auto-tune defaults. The config
- * FILE is parsed by config_toml.c and applied in gptps_open(): [limits] seed the
- * values resolved here, and [task_defaults]/[tasks.*] override per-task policy at
- * registration. ([hardware_patterns.*] matching is a later increment.)
+ * FILE is parsed by config_toml.c and applied at open (gptps_open, or gptps_open_ex
+ * with cfg->config_path): [limits] seed the values resolved here, and
+ * [task_defaults]/[tasks.*] override per-task policy at registration.
+ * ([hardware_patterns.*] matching is a later increment.)
  */
 #include "gptps.h"
 #include "gptps_hal.h"
@@ -31,7 +32,7 @@ gptps_status gptps_config_resolve(const gptps_limits *in, gptps_limits *out)
     s = gptps_hal_detect(&hw);
     if (s != GPTPS_OK) return s;
 
-    /* concurrency: explicit wins; else detected cores; never below 1. */
+    /* concurrency: explicit wins; else online logical CPUs; never below 1. */
     conc = (in && in->max_concurrent_tasks) ? in->max_concurrent_tasks : hw.cpu_count;
     if (conc == 0) conc = 1u;
 

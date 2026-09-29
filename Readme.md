@@ -235,7 +235,7 @@ exhaust their retries are kept in the dead-letter list — reprocess them with
 ```c
 gptps_config cfg = { .struct_size = sizeof cfg };
 cfg.limits.struct_size = sizeof cfg.limits;
-cfg.limits.max_concurrent_tasks = 4;          /* 0 => auto-detect cores      */
+cfg.limits.max_concurrent_tasks = 4;          /* 0 => online logical CPUs    */
 cfg.limits.max_memory_bytes     = 512u << 20; /* admission budget (declared) */
 gptps_open_ex(&cfg, &e);
 ```
@@ -272,8 +272,9 @@ change — see [Scaling](#scaling-opt-in-by-composition).
 
 `gptps_open("gptps.toml", &e)` tunes the engine from a config file — no recompile to
 re-tune for a new machine or change a task's failure policy. Pass `NULL` to skip it and
-auto-tune. A subset of TOML is supported (tables, `int`/`float`/`bool`/`"string"` and
-single-line string arrays, `#` comments):
+auto-tune. `gptps_open_ex` reads the same file when `cfg.config_path` is set, and an
+explicit value in `cfg.limits` wins over the file's. A subset of TOML is supported
+(tables, `int`/`float`/`bool`/`"string"` and single-line string arrays, `#` comments):
 
 ```toml
 # top level: binary plug-ins to dlopen at open, by explicit path. There is no search
@@ -286,7 +287,7 @@ addons = ["./libmytasks.so", "/usr/local/lib/gptps/gpu_quota_plugin.so"]
 "gpuq.units" = 2               # a namespaced plug-in's per-task knob
 
 [limits]
-max_concurrent_tasks = 8       # 0 / omitted => detected cores
+max_concurrent_tasks = 8       # 0 / omitted => online logical CPUs
 max_memory_gb        = 4.0     # or max_memory_bytes = 4294967296
 
 [scheduler]
@@ -504,13 +505,13 @@ auto-enabled on a TTY, with the Windows console put into VT mode automatically.
 ```text
 GPTPS · live demo   up 0.1s   28.6 done/s
 queued 18  started 8  in-flight 4  [##########################] peak 4
-finished 4  failed 0  retried 0  dead 0
+finished 4  failed 0  retried 0  dead 0  dropped 0
 kpi:full mode:realtime refresh:250ms
 
 TASKS
-  label              run    ok  fail  dead   ok%   avg ms  key
-  Resize               8     4     0     0  100%     81.0  [r]
-  Thumbnail            0     0     0     0    --       --  [t]
+  label              run    ok  fail  dead  drop   ok%   avg ms  key
+  Resize               8     4     0     0     0  100%     81.0  [r]
+  Thumbnail            0     0     0     0     0    --       --  [t]
 
 RECENT
      0.1 FINISHED resize         #4
@@ -522,7 +523,7 @@ keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter
 ```
 
 - **Live metrics:** throughput, an in-flight gauge, cumulative counts, and a per-task
-  table (runs / ok / fail / dead / success-rate / average latency).
+  table (runs / ok / fail / dead / drop / success-rate / average latency).
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
   dashboard's own CPU/RAM cost (minimal/normal/full) live; `p` pauses; `s` opens the live
   **settings editor**; `?` shows a help overlay of every key.

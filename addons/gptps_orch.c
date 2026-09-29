@@ -348,6 +348,10 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
     size_t i, remaining;
     if (out) *out = 0;
     if (!o || !task || (ndeps && !deps)) return GPTPS_E_INVAL;
+    /* 0 is no handle: the engine never issues it, so it never terminates, and a
+     * gate on it was held forever - pending() never reached 0. It is exactly what a
+     * held gate's *out holds, which makes it an easy value to pass on by mistake. */
+    for (i = 0; i < ndeps; ++i) if (deps[i] == 0) return GPTPS_E_INVAL;
 
     apx_mutex_lock(&o->mu);
 

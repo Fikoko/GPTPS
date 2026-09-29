@@ -117,7 +117,9 @@ typedef struct {
     const gptps_config     *engine_cfg;   /* NULL => each worker auto-tunes to the WHOLE
                                            * machine - which oversubscribes for N > 1,
                                            * exactly like gptps_pool. Size the limits so
-                                           * the workers SUM to what the box can bear. */
+                                           * the workers SUM to what the box can bear. A
+                                           * config_path here is read by every worker,
+                                           * add-ons included, as gptps_open_ex reads it. */
     const gptps_task_def   *tasks;        /* registered, in order, on every worker's engine */
     size_t                  ntasks;
     gptps_xport_child_init_fn child_init; /* optional */

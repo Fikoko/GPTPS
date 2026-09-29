@@ -287,6 +287,73 @@ static void test_limits_range(void)
     remove(BAD_PATH);
 }
 
+/* gptps_open_ex's config_path is the "optional TOML path" gptps_open takes, and it
+ * was kept only as the save / reload path: none of the file applied at open, yet a
+ * gptps_settings_reload later applied part of it. An explicit cfg limit still wins
+ * over the file, as the header says. */
+static void test_open_ex_reads_its_file(void)
+{
+    gptps *e = NULL;
+    gptps_config cfg;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+
+    CHECK(write_bad("[limits]\n"
+                    "max_concurrent_tasks = 3\n"
+                    "max_intake_depth = 77\n"
+                    "[scheduler]\n"
+                    "reserve_after_skips = 5\n") == 0);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg;
+    cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.config_path = BAD_PATH;
+    cfg.limits.max_intake_depth = 9;          /* explicit: wins over the file's 77 */
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
+        CHECK(gptps_settings_get(e, "limits.max_intake_depth", b, sizeof b) == GPTPS_OK && strcmp(b, "9") == 0);
+        CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", b, sizeof b) == GPTPS_OK && strcmp(b, "5") == 0);
+        gptps_shutdown(e); e = NULL;
+    }
+    /* a file it cannot read is an error here too, not a silent fallback */
+    cfg.config_path = "/no/such/dir/none.toml";
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_E_CONFIG);
+    if (e) { gptps_shutdown(e); e = NULL; }
+    remove(BAD_PATH);
+}
+
+/* In a config file 0 means auto, for the pool size and the memory budget alike. A
+ * reload of such a file failed with GPTPS_E_CONFIG on the pool size, whose live
+ * setting refused 0, and set the memory budget to zero bytes - dead-lettering all
+ * queued work that declares memory. The shipped example file says 0 for the pool
+ * size (its memory line is max_memory_gb = 0.0, which a reload does not read). */
+static void test_reload_zero_means_auto(void)
+{
+    gptps *e = NULL;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+
+    CHECK(write_bad("[limits]\nmax_concurrent_tasks = 0\nmax_memory_bytes = 0\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);
+        CHECK(gptps_settings_get(e, "limits.max_memory_bytes", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "0") != 0);           /* auto, i.e. a real budget */
+        CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "0") == 0);           /* auto at the next open */
+        CHECK(gptps_settings_set(e, "limits.max_memory_bytes", "0") == GPTPS_OK);
+        CHECK(gptps_settings_get(e, "limits.max_memory_bytes", b, sizeof b) == GPTPS_OK);
+        CHECK(strcmp(b, "0") != 0);
+        gptps_shutdown(e); e = NULL;
+    }
+    remove(BAD_PATH);
+#ifdef EXAMPLE_TOML_PATH
+    CHECK(gptps_open(EXAMPLE_TOML_PATH, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);
+        gptps_shutdown(e); e = NULL;
+    }
+#endif
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -304,6 +371,8 @@ int main(void)
     test_dir_as_config_path();
     test_comment_escapes();
     test_limits_range();
+    test_open_ex_reads_its_file();
+    test_reload_zero_means_auto();
 
     /* Phase A: addons[] auto-load -> the plugin's task runs end-to-end */
     reset();

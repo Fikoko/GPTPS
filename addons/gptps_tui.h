@@ -4,9 +4,10 @@
  * tui.h - a real-time terminal dashboard for GPTPS (optional, portable add-on).
  *
  * Attaches to an engine via the observer seam and shows live task activity:
- * cumulative counts (queued/started/finished/failed/retried/dead), in-flight
- * gauge, a per-task table, and a scrolling recent-events log. Fully portable -
- * ANSI/VT escapes only (no ncurses), with Windows VT enabled automatically.
+ * cumulative counts (queued/started/finished/failed/retried/dead/dropped),
+ * in-flight gauge, a per-task table, and a scrolling recent-events log. Fully
+ * portable - ANSI/VT escapes only (no ncurses), with Windows VT enabled
+ * automatically.
  *
  * Settings are layered:
  *   - GLOBAL (gptps_tui_config): refresh rate, color, interactivity, which panes
@@ -23,7 +24,8 @@
  *     when stdout/stdin is not a TTY, so it is safe to call headlessly.
  *
  * Lifecycle: install -> add tasks -> (submit work / run) -> gptps_shutdown(e) ->
- * gptps_tui_close(t)  (close AFTER shutdown; the engine has no unregister-observer).
+ * gptps_tui_close(t)  (close AFTER shutdown: close does not unregister the
+ * dashboard's observer, which the engine may call until shutdown returns).
  *
  * Portable: POSIX (termios) + Windows (console mode); pure C99 + the public API.
  */

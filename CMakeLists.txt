@@ -322,7 +322,8 @@ target_include_directories(test_toml
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(test_toml PRIVATE gptps)
-target_compile_definitions(test_toml PRIVATE ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>")
+target_compile_definitions(test_toml PRIVATE ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
+    EXAMPLE_TOML_PATH="${CMAKE_CURRENT_SOURCE_DIR}/gptps.example.toml")
 add_test(NAME toml COMMAND test_toml)
 set_tests_properties(toml PROPERTIES TIMEOUT 30)
 

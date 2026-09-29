@@ -124,6 +124,51 @@ without its fix.
   `tests/test_admission_order.c` gains the case its earlier hook case could not hit,
   since that one queued everything before the first pass.
 
+### Changed — `gptps_open_ex` reads the config file it is given
+
+- **`cfg->config_path` is read at open, exactly as `gptps_open(path)` reads it.** The
+  header calls it the "optional TOML path", but `gptps_open_ex` kept it only as the
+  default path for `gptps_settings_save` and `_reload`: none of the file's `[limits]`,
+  `[scheduler]`, `[tasks.*]` or `addons` applied at open, yet a later
+  `gptps_settings_reload` applied part of the same file. Now it all applies, and an
+  explicit value in `cfg->limits` still wins over the file's, as the header says. **A
+  host that set `config_path` only as a save path now has the file applied at open —
+  its `addons = [...]` included, so the file is the same trust boundary `gptps_open`'s
+  is (`docs/SECURITY.md`) — and a path that does not exist yet, or does not parse, now
+  fails the open with `GPTPS_E_CONFIG`, where it used to open and wait for the first
+  save.** Create the file first, or leave `config_path` NULL and pass the path to
+  `gptps_settings_save` and `_reload` yourself. `gptps_pool` and `gptps_xport` open
+  every shard or worker with `gptps_open_ex`, so each now reads a `config_path` it is
+  given. A later `gptps_settings_reload` applies the file as `gptps_settings_set`
+  would, so a key it sets overrides a `cfg->limits` value that won at open.
+  `gptps_open(path)` is now `gptps_open_ex` with that path. `tests/test_toml.c`.
+
+### Fixed — four smaller defects
+
+- **In a live setting, as in a config file, 0 now means auto.** Reloading a file whose
+  `[limits]` say `max_concurrent_tasks = 0`, as the shipped `gptps.example.toml` does,
+  failed with `GPTPS_E_CONFIG`: the live setting refused 0. And a reloaded or set
+  `max_memory_bytes = 0` became a budget of zero bytes, which dead-letters every queued
+  item that declares memory. The pool size now keeps 0 (auto at the next open); the
+  memory budget resolves it to ~0.75 of detected RAM, as at open. `tests/test_toml.c`.
+- **`GPTPS_SUBMIT_TIMEOUT_MS` did nothing in MANUAL mode.** `gptps_step` computed an
+  attempt's deadline from the task type's `timeout_seconds` only, while the threaded
+  worker honoured the per-submit `timeout_ms`, so in MANUAL mode a body got the task
+  type's deadline, or none, instead of the one its submit asked for. Both now share
+  one rule.
+  `tests/test_step.c`.
+- **`gptps_orch_after` accepted a dependency handle of 0, and held that gate forever.**
+  No submit returns 0, but a held gate's `*out` does, which makes it easy to pass on by
+  mistake; `gptps_orch_pending` then never reached 0, although its doc said it always
+  converges. It is refused with `GPTPS_E_INVAL` now, and the doc names the other ways
+  a gate can wait forever (a handle this engine never issued, or one that finished
+  before the gate and is no longer remembered). The function's doc also listed a plain
+  failed attempt as terminal, which it is not. `tests/test_orch.c`.
+- **The dashboard ignored `DROPPED`.** A dropped item (`on_failure = drop`) was in no
+  count, missing from `ok%`, and logged as `?`. `gptps_tui` now counts it (`dropped N`,
+  a `drop` column), counts it as a failure in `ok%`, and names it in the log.
+  `tests/test_tui.c`.
+
 ### Fixed — `durable_queue`: recovering under backpressure
 
 - **`gptps_dq_recover` may be called again, and the header says how.** It said "safe to
@@ -150,6 +195,12 @@ without its fix.
 
 ### Documentation
 
+- **The auto pool size is one worker per online logical CPU, not per core.** That is
+  twice as many with SMT; `gptps.example.toml`, `gptps.h`, the Readme,
+  `docs/SECURITY.md` and `docs/ARCHITECTURE.md` now say so. `docs/ARCHITECTURE.md`'s
+  admission rule now includes named resources, the dashboard's docs its dropped count,
+  and `gptps_tui.h` no longer gives a reason for closing after shutdown that stopped
+  being true when observers became unregistrable.
 - **Safety artifacts.** `docs/SAFETY.md` and a Readme section describe the planned GPTPS
   Safety Artifacts Package. Each package will hold the GPTPS-level evidence a product
   team typically needs when certifying a product built on one specific GPTPS release.

@@ -37,6 +37,56 @@ static unsigned frame_finished(gptps_tui *t, char *buf, size_t n)
     return v;
 }
 
+/* A DROPPED (on_failure = drop) is a terminal failure like a dead letter, just
+ * not retained. The dashboard counted it nowhere, left it out of ok%, and logged it
+ * as "?". */
+static int c_dropped;
+static void drop_obs(const gptps_event *ev, void *ud)
+{ (void)ud; if (ev->kind == GPTPS_EV_DROPPED) inc(&c_dropped); }
+static gptps_status task_fail(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_E_TASK; }
+
+static void test_dropped_is_shown(void)
+{
+    gptps *e = NULL;
+    gptps_tui *t;
+    gptps_tui_config cfg;
+    gptps_task_def d;
+    char frame[8192];
+    uint64_t start;
+
+    CHECK(gptps_open(NULL, &e) == GPTPS_OK);
+    if (!e) return;
+    gptps_register_observer(e, drop_obs, NULL);
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg;
+    cfg.color = 0;
+    cfg.interactive = 0;
+    t = gptps_tui_install(e, &cfg);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "lossy"; d.run = task_fail; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.default_policy.on_failure = GPTPS_ON_FAILURE_DROP;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    CHECK(gptps_tui_add_task(t, "lossy", "Lossy", 0, NULL, 0) == GPTPS_OK);
+
+    __atomic_store_n(&c_dropped, 0, __ATOMIC_SEQ_CST);
+    CHECK(gptps_submit(e, "lossy", NULL, 0, NULL) == GPTPS_OK);
+    start = gptps_now_ms(NULL);
+    while (get(&c_dropped) < 1 && gptps_now_ms(NULL) - start < 2000) { }
+    CHECK(get(&c_dropped) == 1);
+
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "dropped 1") != NULL);   /* counted */
+    CHECK(strstr(frame, "dead  drop") != NULL);  /* its column, beside dead */
+    CHECK(strstr(frame, "DROPPED")   != NULL);   /* named in the log */
+    CHECK(strstr(frame, "  0%")      != NULL);   /* and a failure in ok%, not "--" */
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -372,6 +422,8 @@ int main(void)
     gptps_shutdown(e);     /* close AFTER shutdown */
     gptps_tui_close(t);
     (void)i;
+    test_dropped_is_shown();
+
     if (fails) { printf("%d tui check(s) FAILED\n", fails); return 1; }
     printf("all tui checks passed\n");
     return 0;

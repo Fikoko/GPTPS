@@ -19,11 +19,12 @@ holds, corrupt the engine, and crash the host. This is not a weakness in the des
 it is what "in-process" means, and it is why INPROC is fast. Do not run code you
 distrust this way.
 
-**Config files and add-on paths are code.** `gptps_open(path)` parses TOML, and a
-top-level `addons = ["libfoo.so"]` array causes each entry to be `dlopen`ed. A
-writable config file is therefore equivalent to arbitrary code execution in your
-process. Treat the config path with exactly the care you would treat a shared
-library search path: if an attacker can write it, they own the process.
+**Config files and add-on paths are code.** `gptps_open(path)`, and `gptps_open_ex` with
+`cfg->config_path`, parse TOML, and a top-level `addons = ["libfoo.so"]` array causes
+each entry to be `dlopen`ed. A writable config file is therefore equivalent to
+arbitrary code execution in your process. Treat the config path with exactly the care
+you would treat a shared library search path: if an attacker can write it, they own
+the process.
 
 **The engine does not sandbox.** There is no seccomp filter, no namespace, no
 capability drop, and no privilege separation anywhere in the core.
@@ -96,7 +97,7 @@ The engine is bounded by construction, and the bounds are the defence:
 | Bound | Setting | Default |
 |---|---|---|
 | Queued (un-admitted) items | `limits.max_intake_depth` | unbounded — **set this** if submitters are untrusted |
-| Concurrently running items | `limits.max_concurrent_tasks` | one per detected core |
+| Concurrently running items | `limits.max_concurrent_tasks` | one per online logical CPU |
 | Memory admitted at once | `limits.max_memory_bytes` | ~0.75 × detected RAM |
 | Retained dead letters | `limits.max_dead_letters` | 1024, oldest evicted |
 | Shutdown drain | `limits.shutdown_grace_ms` | 30s, then in-flight work is cancelled and waiting work is ended by policy |

@@ -23,6 +23,8 @@
  * SUM to what the machine can bear (e.g. max_concurrent_tasks ~= cores / N); a
  * NULL cfg auto-tunes EACH shard to the whole machine, which oversubscribes for
  * N > 1. Register the SAME task types on every shard (a submit may land on any).
+ * A cfg->config_path is read by EVERY shard, as gptps_open_ex reads it: each
+ * applies the file's limits (per shard, as above) and loads its add-ons.
  *
  * ROUTING: gptps_pool_submit spreads load round-robin. gptps_pool_submit_keyed
  * sends a given key to a fixed shard (key % N) - use it for per-key affinity

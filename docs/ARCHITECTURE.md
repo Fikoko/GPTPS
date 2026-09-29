@@ -178,12 +178,13 @@ Each task type declares a rough **cost**: `mem_bytes`, plus any number of generi
 resource under a specific name, and the second was read by no code anywhere. The
 engine resolves a budget at open time
 (`max_concurrent_tasks`, `max_memory_bytes`) — explicit values win, else
-hardware auto-tune (cores; ~0.75× RAM).
+hardware auto-tune (online logical CPUs; ~0.75× RAM).
 
 Admission is **declared-cost-fits-live-budget**, *not* an all-or-nothing cap:
 
 ```
 admit X  ⟺  running < max_concurrent  ∧  reserved_mem + cost(X) ≤ max_memory
+                                       ∧  ∀ resource r: reserved_r + cost_r(X) ≤ budget_r
 ```
 
 This is the novel framing: single-process **self-throttling** — "can my own
@@ -380,9 +381,10 @@ makes the loader look unused; naming them accurately is more honest and more use
 
 ## 10. Configuration
 
-`gptps_open(path)` parses a config file (a TOML *subset* — tables, dotted tables,
-int/float/bool/string scalars, single-line string arrays, `#` comments — parsed
-by `config_toml.c`, no external dependency). It maps to:
+`gptps_open(path)` — or `gptps_open_ex` with `cfg->config_path`, where an explicit
+`cfg->limits` value wins over the file's — parses a config file (a TOML *subset* —
+tables, dotted tables, int/float/bool/string scalars, single-line string arrays, `#`
+comments — parsed by `config_toml.c`, no external dependency). It maps to:
 
 - `[limits]` → engine budget (concurrency, memory);
 - `[scheduler]` → `reserve_after_skips`;
@@ -390,7 +392,7 @@ by `config_toml.c`, no external dependency). It maps to:
   applied at registration (def < `task_defaults` < `tasks.<name>`);
 - top-level `addons = [...]` → shared libraries auto-loaded at open.
 
-`gptps_open_ex(cfg, ...)` is the explicit, file-free path.
+`gptps_open_ex(cfg, ...)` with `cfg->config_path` NULL is the explicit, file-free path.
 
 ### Settings registry (`src/settings.c`)
 

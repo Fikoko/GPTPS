@@ -56,7 +56,7 @@ typedef struct {
     int      hotkey;
     void    *payload;
     size_t   plen;
-    unsigned started, finished, failed, retried, dead;
+    unsigned started, finished, failed, retried, dead, dropped;
     uint64_t lat_sum_ms, lat_max_ms;   /* queue->finish latency accumulators */
     unsigned lat_n;
 } tui_task;
@@ -68,7 +68,7 @@ struct gptps_tui {
     gptps_tui_config cfg;
     tui_mutex        mu;
     uint64_t         start_ms;
-    unsigned         q, s, fin, fail, retr, dead, peak;
+    unsigned         q, s, fin, fail, retr, dead, drop, peak;
     /* In-flight is COUNTED, not derived as started - finished - failed. A cancel that
      * lands while the item is still queued emits a terminal FAILED with no preceding
      * STARTED, so the subtraction wrapped to 4294967295 on unsigned - and since peak
@@ -155,6 +155,9 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         case GPTPS_EV_FAILED:        t->fail++; if (t->inflight) t->inflight--; break;
         case GPTPS_EV_RETRIED:       t->retr++; break;
         case GPTPS_EV_DEAD_LETTERED: t->dead++; break;
+        /* a terminal failure like a dead letter, just not retained (on_failure =
+         * drop): it was missing from every count and showed as "?" in the log */
+        case GPTPS_EV_DROPPED:       t->drop++; break;
         default: break;
     }
     if (t->inflight > t->peak) t->peak = t->inflight;
@@ -240,6 +243,7 @@ static void tui_on_event(const gptps_event *ev, void *ud)
             case GPTPS_EV_FAILED:        tk->failed++;   break;
             case GPTPS_EV_RETRIED:       tk->retried++;  break;
             case GPTPS_EV_DEAD_LETTERED: tk->dead++;     break;
+            case GPTPS_EV_DROPPED:       tk->dropped++;  break;
             default: break;
         }
     }
@@ -267,6 +271,7 @@ static const char *kind_str(int k)
         case GPTPS_EV_FAILED:        return "FAILED";
         case GPTPS_EV_RETRIED:       return "RETRIED";
         case GPTPS_EV_DEAD_LETTERED: return "DEAD";
+        case GPTPS_EV_DROPPED:       return "DROPPED";
         default:                     return "?";
     }
 }
@@ -565,19 +570,20 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         for (j = 0; j < gw; ++j) pos = appendf(buf, cap, pos, "%s", j < w ? fillc : trakc);
         pos = appendf(buf, cap, pos, "%s%s]%s peak %u\n", X, D, X, t->peak);
     }
-    pos = appendf(buf, cap, pos, "%sfinished %u%s  %sfailed %u%s  retried %u  %sdead %u%s\n",
-                  G, t->fin, X, (t->fail ? R : ""), t->fail, X, t->retr, (t->dead ? R : ""), t->dead, X);
+    pos = appendf(buf, cap, pos, "%sfinished %u%s  %sfailed %u%s  retried %u  %sdead %u%s  %sdropped %u%s\n",
+                  G, t->fin, X, (t->fail ? R : ""), t->fail, X, t->retr, (t->dead ? R : ""), t->dead, X,
+                  (t->drop ? R : ""), t->drop, X);
     pos = appendf(buf, cap, pos, "%skpi:%s mode:%s refresh:%ums%s\n",
                   D, kpi_str(t->kpi), mode_str(t->mode), t->cfg.refresh_ms, X);
 
     if (t->show_tasks && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
-        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %8s  key%s\n",
-                      D, "label", "run", "ok", "fail", "dead", "ok%", "avg ms", X);
+        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s  key%s\n",
+                      D, "label", "run", "ok", "fail", "dead", "drop", "ok%", "avg ms", X);
         for (i = 0; i < t->ntasks; ++i) {
             tui_task *k = &t->tasks[i];
             char key[8], pct[8], lat[12];
-            unsigned terminal = k->finished + k->dead;
+            unsigned terminal = k->finished + k->dead + k->dropped;
             const char *pc = "";
             if (k->hotkey) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
             if (terminal) {
@@ -587,7 +593,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
                  * past 2^32: the ok% column flips from 100 to 0 with nothing else in the row
                  * changing, and stays wrong for the life of the process. The clamp is not
                  * decoration either. `terminal` is itself a 32-bit sum, so once finished + dead
-                 * passes UINT_MAX it wraps to a tiny divisor and the quotient reaches ten
+                 * + dropped passes UINT_MAX it wraps to a tiny divisor and the quotient reaches ten
                  * digits - more than pct holds, which is what GCC 16's -Wformat-truncation
                  * objects to. Clamped, the invariant both the %3u here and the %5s column
                  * below already assume - okp is 0..100, three digits - is true rather than
@@ -598,8 +604,9 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
                 if (color) pc = (okp >= 90) ? G : (okp >= 50) ? "\x1b[33m" : R;   /* green/yellow/red */
             } else strcpy(pct, "  --");
             if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum_ms / k->lat_n); else strcpy(lat, "      --");
-            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %s%5s%s %8s  %s\n",
-                          k->label, k->started, k->finished, k->failed, k->dead, pc, pct, color ? X : "", lat, key);
+            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %5u %s%5s%s %8s  %s\n",
+                          k->label, k->started, k->finished, k->failed, k->dead, k->dropped,
+                          pc, pct, color ? X : "", lat, key);
         }
     }
 
@@ -619,7 +626,8 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         else               pos = appendf(buf, cap, pos, "\n%sRECENT%s\n", B, X);
         for (i = 0; i < shown; ++i) {
             tui_event *re = &t->recent[(start + i) % t->rcap];
-            const char *kc = (re->kind == GPTPS_EV_FAILED || re->kind == GPTPS_EV_DEAD_LETTERED) ? R
+            const char *kc = (re->kind == GPTPS_EV_FAILED || re->kind == GPTPS_EV_DEAD_LETTERED ||
+                              re->kind == GPTPS_EV_DROPPED) ? R
                            : (re->kind == GPTPS_EV_FINISHED) ? G : D;
             double rel = (double)(re->ts - t->start_ms) / 1000.0; /* seconds since install */
             pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %-14.14s #%llu\n",

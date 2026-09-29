@@ -438,14 +438,16 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  * ==========================================================================*/
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_limits) */
-    uint32_t max_concurrent_tasks; /* 0 => auto (detected cores); 1 => strictly sequential.
+    uint32_t max_concurrent_tasks; /* 0 => auto (online logical CPUs); 1 => sequential.
                                     * Sizes the worker pool, once, at open: a live write of
                                     * "limits.max_concurrent_tasks" is kept only for
                                     * reads and gptps_settings_save (a saved file carries
                                     * it to a later open) and changes nothing in the
-                                    * running engine. To throttle live, use a
-                                    * named resource (gptps_define_resource re-budgets). */
-    uint64_t max_memory_bytes;     /* 0 => auto (fraction of detected RAM) */
+                                    * running engine ("0" = auto at the next open). To
+                                    * throttle live, use a named resource
+                                    * (gptps_define_resource re-budgets). */
+    uint64_t max_memory_bytes;     /* 0 => auto (fraction of detected RAM); live as
+                                    * "limits.max_memory_bytes", where "0" is auto too */
     /* v1.9: backpressure. 0 => unbounded intake (default). Otherwise gptps_submit
      * returns GPTPS_E_FULL once this many items are queued (not yet admitted),
      * bounding memory an overproducing client can pin (max_memory_bytes caps only
@@ -465,7 +467,11 @@ typedef enum {
 
 typedef struct {
     size_t        struct_size;     /* = sizeof(gptps_config) */
-    const char   *config_path;     /* optional TOML path; NULL => limits below + defaults */
+    const char   *config_path;     /* optional TOML path, read at open exactly as
+                                    * gptps_open(path) reads it: it must exist and
+                                    * parse, or the open fails with GPTPS_E_CONFIG. Also
+                                    * the default path for gptps_settings_save /
+                                    * _reload. NULL => limits below + defaults */
     gptps_limits  limits;          /* explicit values win over auto-tune & file */
     gptps_run_mode mode;           /* v1.6: THREADED (default) or MANUAL (gptps_step) */
 } gptps_config;
@@ -1026,8 +1032,10 @@ GPTPS_API gptps_status gptps_settings_set(gptps *e, const char *key, const char 
 
 /* Persistence. save() regenerates a grouped TOML file atomically (comments are
  * NOT preserved). reload() re-parses and re-applies known keys via set()+validation
- * (best-effort: returns the first error; a parse failure applies nothing). For both,
- * path==NULL uses the path the engine was opened with (GPTPS_E_INVAL if none). */
+ * (best-effort: returns the first error; a parse failure applies nothing) - as set()
+ * would, so a key the file sets overrides a limit the host passed in cfg->limits at
+ * open, and a 0 there means auto. For both, path==NULL uses the path the engine was
+ * opened with (GPTPS_E_INVAL if none). */
 GPTPS_API gptps_status gptps_settings_save(gptps *e, const char *path);
 GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
 

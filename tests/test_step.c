@@ -42,6 +42,16 @@ static int g_runs;
 static gptps_status ok_task(gptps_ctx *ctx, void *ud)   { (void)ud; g_runs++; gptps_result_set(ctx, "done", 4); return GPTPS_OK; }
 static gptps_status fail_task(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_E_TASK; }
 
+/* Records the deadline its own attempt sees, relative to when it started. */
+static uint64_t g_deadline_in;
+static gptps_status deadline_task(gptps_ctx *ctx, void *ud)
+{
+    uint64_t d = gptps_deadline_ms(ctx), now = gptps_now_ms(ctx);
+    (void)ud;
+    g_deadline_in = d > now ? d - now : 0;
+    return GPTPS_OK;
+}
+
 static void reg(gptps *e, const char *name, gptps_status (*fn)(gptps_ctx *, void *))
 {
     gptps_task_def d; memset(&d, 0, sizeof d);
@@ -174,6 +184,26 @@ int main(void)
         CHECK(gptps_step(e, &n) == GPTPS_OK);
         CHECK(n == 1);
         CHECK(g_runs == 2);
+        gptps_shutdown(e);
+    }
+
+    /* ---- a per-submit timeout_ms reaches the body in MANUAL mode too ----
+     * gptps_step computed the attempt's deadline from the task type's
+     * timeout_seconds only; the threaded worker also honours GPTPS_SUBMIT_TIMEOUT_MS.
+     * So the same submit gave a body its deadline in one mode and none in the other. */
+    {
+        gptps *e = open_manual(1);
+        gptps_submit_options o;
+        size_t n = 0;
+        memset(&o, 0, sizeof o);
+        o.struct_size = sizeof o;
+        o.flags = GPTPS_SUBMIT_TIMEOUT_MS;
+        o.timeout_ms = 5000;
+        reg(e, "dl", deadline_task);
+        g_deadline_in = 0;
+        CHECK(gptps_submit_ex(e, "dl", NULL, 0, &o, NULL) == GPTPS_OK);
+        CHECK(gptps_step(e, &n) == GPTPS_OK && n == 1);
+        CHECK(g_deadline_in > 4000 && g_deadline_in <= 5000);   /* was 0: no deadline */
         gptps_shutdown(e);
     }
 

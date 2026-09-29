@@ -883,6 +883,20 @@ static int engine_in_callback(const gptps *e, uint64_t tid)
     return 0;
 }
 
+/* The deadline of an attempt starting now, for the worker and gptps_step alike.
+ * The deadline flag is the in-process cooperative path; OOP enforces its own
+ * deadline in the worker (poll + hard-kill), so it gets no flag deadline. A
+ * per-submit timeout_ms_override (gptps_submit_ex) wins over the task type's
+ * timeout_seconds and allows a sub-second deadline - gptps_step used to read only
+ * the latter, so in MANUAL mode GPTPS_SUBMIT_TIMEOUT_MS did nothing. */
+static uint64_t attempt_deadline(const gptps_item *it)
+{
+    if (it->def->exec != GPTPS_EXEC_INPROC) return 0;
+    if (it->timeout_ms_override) return gptps_hal_monotonic_ms() + (uint64_t)it->timeout_ms_override;
+    return it->policy.timeout_seconds
+        ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
+}
+
 static void *worker_main(void *arg)
 {
     gptps *e = (gptps *)arg;
@@ -910,17 +924,7 @@ static void *worker_main(void *arg)
             continue;                       /* lock still held; loop top re-checks ready */
         }
         cb = e->ev_cb; ud = e->ev_ud;      /* snapshot callback under the lock */
-        /* deadline flag is the in-process cooperative path; OOP enforces its own
-         * deadline in the worker (poll + hard-kill), so it gets no flag deadline.
-         * A per-submit timeout_ms_override (gptps_submit_ex) wins over the task
-         * type's timeout_seconds and allows a sub-second deadline. */
-        if (it->def->exec != GPTPS_EXEC_INPROC)
-            it->deadline_ms = 0;
-        else if (it->timeout_ms_override)
-            it->deadline_ms = gptps_hal_monotonic_ms() + (uint64_t)it->timeout_ms_override;
-        else
-            it->deadline_ms = it->policy.timeout_seconds
-                ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
+        it->deadline_ms = attempt_deadline(it);
         gptps_flag_set(it->cancel, false);
         it->started = 1;                   /* execute() will emit STARTED + a terminal event */
         fifo_push(&e->running_items, it);
@@ -1659,12 +1663,27 @@ static size_t rd_i32(char *b, size_t c, int32_t  v) { return (size_t)snprintf(b,
 
 /* core settings: target = gptps* */
 static size_t       sc_rd_maxmem(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u64(b, c, e->limits.max_memory_bytes); gptps_mutex_unlock(e->m); return n; }
-static gptps_status sc_wr_maxmem(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->limits.max_memory_bytes = (uint64_t)strtoull(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+/* "0" means auto here as it does at open and in a config file (~0.75 of detected
+ * RAM): a live 0 used to become a budget of zero bytes, so reloading a file that
+ * says `max_memory_bytes = 0` dead-lettered every queued item that declares memory. */
+static gptps_status sc_wr_maxmem(void *t, const char *v)
+{
+    gptps *e = (gptps *)t;
+    uint64_t mem = (uint64_t)strtoull(v, NULL, 10);
+    if (mem == 0) {
+        gptps_limits l;
+        if (gptps_config_resolve(NULL, &l) != GPTPS_OK) return GPTPS_E_CONFIG;
+        mem = l.max_memory_bytes;
+    }
+    gptps_mutex_lock(e->m); e->limits.max_memory_bytes = mem; gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
 /* Restart-only, and only that: the write is kept for reads and gptps_settings_save
  * (conc_next) and never reaches e->limits. It used to, and admission reads e->limits
  * - so a lowered value throttled the running engine, and a raised one admitted more
  * items than the pool has threads, which then sat in `ready` holding their memory and
- * named-resource budget, ahead of anything submitted later. */
+ * named-resource budget, ahead of anything submitted later. "0" is kept as 0, auto
+ * at the next open, as in a config file. */
 static size_t       sc_rd_conc(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->conc_next); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_conc(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->conc_next = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
 static size_t       sc_rd_intake(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->limits.max_intake_depth); gptps_mutex_unlock(e->m); return n; }
@@ -1931,7 +1950,8 @@ static void register_task_local_settings(gptps *e, gptps_reg *r)
     if (snap != stack_snap) gptps_free(snap);
 }
 
-gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
+/* The engine itself, from a config whose file (if any) has already been read. */
+static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
 {
     gptps *e;
     gptps_status s;
@@ -1967,9 +1987,11 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
 
     /* core settings (read live engine state; hot ones apply immediately) */
     reg_core_setting(e, "limits.max_memory_bytes", GPTPS_SETTING_UINT, 1, 0, 0, 0,
-                     "admission memory budget in bytes", sc_rd_maxmem, sc_wr_maxmem);
-    reg_core_setting(e, "limits.max_concurrent_tasks", GPTPS_SETTING_UINT, 0, 1, 1, 65536,
-                     "worker pool size (restart to apply)", sc_rd_conc, sc_wr_conc);
+                     "admission memory budget in bytes (0 = auto)", sc_rd_maxmem, sc_wr_maxmem);
+    /* 0 is in range: it means auto, as in the file - and reloading a file that says
+     * so (the shipped gptps.example.toml does) used to fail with GPTPS_E_CONFIG. */
+    reg_core_setting(e, "limits.max_concurrent_tasks", GPTPS_SETTING_UINT, 0, 1, 0, 65536,
+                     "worker pool size (restart to apply; 0 = auto)", sc_rd_conc, sc_wr_conc);
     /* has_range is not decoration on these four: each write callback casts to
      * uint32_t, so without a declared ceiling "4294967296" validated fine and then
      * truncated to 0 - which for max_intake_depth means the bound the operator just
@@ -2074,82 +2096,96 @@ static void apply_task_config(const gptps_toml *t, const char *name,
     }
 }
 
+/* A config file is read here, whichever entry point named it. gptps_open_ex used
+ * to take cfg->config_path only as the default path for gptps_settings_save and
+ * _reload, although the header calls it the "optional TOML path": a host that
+ * opened with it got none of the file's [limits], [scheduler], [tasks.*] or add-ons
+ * - until its first gptps_settings_reload applied part of the same file. */
+gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
+{
+    gptps_config c;
+    gptps_toml *t;
+    gptps_status s;
+    const char *const *addons;
+    char err[128];
+    long long ll;
+    double gb;
+    int n, k;
+
+    if (!out_engine) return GPTPS_E_INVAL;
+    if (cfg && cfg->struct_size < GPTPS_CONFIG_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: append-safe floor */
+    if (!cfg || !cfg->config_path) return open_engine(cfg, out_engine);
+
+    memset(&c, 0, sizeof c);
+    memcpy(&c, cfg, cfg->struct_size < sizeof c ? cfg->struct_size : sizeof c);
+    c.struct_size = sizeof c;
+    t = gptps_toml_parse_file(c.config_path, err, sizeof err);
+    if (!t) { *out_engine = NULL; return GPTPS_E_CONFIG; }
+    /* [limits]: a file value fills a limit the caller left 0 - the header's rule is
+     * that explicit cfg values win over the file, and 0 means "not set" in both. */
+    /* RANGE-check, do not cast. `max_concurrent_tasks = -1` used to become
+     * 4294967295 and the engine then tried to start that many OS threads;
+     * `max_memory_bytes = -1` silently turned the operator's memory limit into
+     * no limit at all. A sign test alone is not enough either - a positive value
+     * wider than the destination truncates (4294967296 -> 0 -> unbounded) - so
+     * each key is checked against the width AND the meaning of its field, and a
+     * violation is reported as GPTPS_E_CONFIG rather than clamped. The live
+     * settings surface for the same keys already enforces exactly this. A bad
+     * value is an error even where the caller's own value would win. */
+    if (gptps_toml_int(t, "limits", "max_concurrent_tasks", &ll)) {
+        if (ll < 0 || ll > 65536) { gptps_toml_free(t); *out_engine = NULL; return GPTPS_E_CONFIG; }
+        if (!c.limits.max_concurrent_tasks) c.limits.max_concurrent_tasks = (uint32_t)ll;
+    }
+    if (gptps_toml_int(t, "limits", "max_memory_bytes", &ll)) {
+        if (ll < 0) { gptps_toml_free(t); *out_engine = NULL; return GPTPS_E_CONFIG; }
+        if (!c.limits.max_memory_bytes) c.limits.max_memory_bytes = (uint64_t)ll;
+    } else if (gptps_toml_double(t, "limits", "max_memory_gb", &gb) && gb > 0.0) {
+        if (!c.limits.max_memory_bytes) c.limits.max_memory_bytes = (uint64_t)(gb * 1073741824.0);
+    }
+    if (gptps_toml_int(t, "limits", "max_intake_depth", &ll)) {
+        if (ll < 0 || ll > 4294967295LL) { gptps_toml_free(t); *out_engine = NULL; return GPTPS_E_CONFIG; }
+        if (!c.limits.max_intake_depth) c.limits.max_intake_depth = (uint32_t)ll;
+    }
+
+    s = open_engine(&c, out_engine);
+    if (s != GPTPS_OK) { gptps_toml_free(t); return s; }
+
+    (*out_engine)->toml = t;                /* retained for register-time task overrides */
+    /* [limits]: knobs that live on the engine rather than in gptps_limits (which
+     * cannot grow - it sits BEFORE `mode` inside gptps_config, so appending to it
+     * would move `mode` and break the frozen GPTPS_CONFIG_MIN_SIZE). */
+    if (gptps_toml_int(t, "limits", "shutdown_grace_ms", &ll) && ll >= 0 && ll <= 4294967295LL)
+        (*out_engine)->shutdown_grace_ms = (uint32_t)ll;
+    if (gptps_toml_int(t, "limits", "max_dead_letters", &ll) && ll >= 0 && ll <= 4294967295LL)
+        (*out_engine)->max_dead_letters = (uint32_t)ll;
+    /* [scheduler]: starvation-guard knob (0 => reserve immediately, no backfill) */
+    if (gptps_toml_int(t, "scheduler", "reserve_after_skips", &ll) && ll >= 0 && ll <= 4294967295LL)
+        (*out_engine)->reserve_after_skips = (uint32_t)ll;
+    /* top-level addons = ["lib1.so", ...]. A failure here is NOT silent: the
+     * add-on is a policy carrier (a constraint that enforces a quota, say), and
+     * "ran without it" is exactly the outcome an operator must not discover from
+     * behaviour alone. Report it and keep going - the engine itself is valid. */
+    n = gptps_toml_str_array(t, "", "addons", &addons);
+    for (k = 0; k < n; ++k) {
+        gptps_status as = gptps_load_addon(*out_engine, addons[k]);
+        if (as != GPTPS_OK) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "add-on '%s' from %s failed to load: %s",
+                     addons[k], c.config_path, gptps_strerror(as));
+            gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+        }
+    }
+    return GPTPS_OK;
+}
+
 gptps_status gptps_open(const char *config_path, gptps **out_engine)
 {
     gptps_config cfg;
-    gptps_toml *t = NULL;
-    gptps_status s;
-
     memset(&cfg, 0, sizeof cfg);
     cfg.struct_size = sizeof cfg;
     cfg.config_path = config_path;
     cfg.limits.struct_size = sizeof cfg.limits;
-
-    if (config_path) {
-        char err[128];
-        long long ll;
-        double gb;
-        t = gptps_toml_parse_file(config_path, err, sizeof err);
-        if (!t) return GPTPS_E_CONFIG;
-        /* [limits]: explicit file values seed the config; 0/absent => auto-tune */
-        /* RANGE-check, do not cast. `max_concurrent_tasks = -1` used to become
-         * 4294967295 and the engine then tried to start that many OS threads;
-         * `max_memory_bytes = -1` silently turned the operator's memory limit into
-         * no limit at all. A sign test alone is not enough either - a positive value
-         * wider than the destination truncates (4294967296 -> 0 -> unbounded) - so
-         * each key is checked against the width AND the meaning of its field, and a
-         * violation is reported as GPTPS_E_CONFIG rather than clamped. The live
-         * settings surface for the same keys already enforces exactly this. */
-        if (gptps_toml_int(t, "limits", "max_concurrent_tasks", &ll)) {
-            if (ll < 0 || ll > 65536) { gptps_toml_free(t); return GPTPS_E_CONFIG; }
-            cfg.limits.max_concurrent_tasks = (uint32_t)ll;   /* 0 => auto-tune */
-        }
-        if (gptps_toml_int(t, "limits", "max_memory_bytes", &ll)) {
-            if (ll < 0) { gptps_toml_free(t); return GPTPS_E_CONFIG; }
-            cfg.limits.max_memory_bytes = (uint64_t)ll;
-        } else if (gptps_toml_double(t, "limits", "max_memory_gb", &gb) && gb > 0.0) {
-            cfg.limits.max_memory_bytes = (uint64_t)(gb * 1073741824.0);
-        }
-        if (gptps_toml_int(t, "limits", "max_intake_depth", &ll)) {
-            if (ll < 0 || ll > 4294967295LL) { gptps_toml_free(t); return GPTPS_E_CONFIG; }
-            cfg.limits.max_intake_depth = (uint32_t)ll;
-        }
-    }
-
-    s = gptps_open_ex(&cfg, out_engine);
-    if (s != GPTPS_OK) { gptps_toml_free(t); return s; }
-
-    if (t) {
-        const char *const *addons;
-        long long ll;
-        int n, k;
-        (*out_engine)->toml = t;            /* retained for register-time task overrides */
-        /* [limits]: knobs that live on the engine rather than in gptps_limits (which
-         * cannot grow - it sits BEFORE `mode` inside gptps_config, so appending to it
-         * would move `mode` and break the frozen GPTPS_CONFIG_MIN_SIZE). */
-        if (gptps_toml_int(t, "limits", "shutdown_grace_ms", &ll) && ll >= 0 && ll <= 4294967295LL)
-            (*out_engine)->shutdown_grace_ms = (uint32_t)ll;
-        if (gptps_toml_int(t, "limits", "max_dead_letters", &ll) && ll >= 0 && ll <= 4294967295LL)
-            (*out_engine)->max_dead_letters = (uint32_t)ll;
-        /* [scheduler]: starvation-guard knob (0 => reserve immediately, no backfill) */
-        if (gptps_toml_int(t, "scheduler", "reserve_after_skips", &ll) && ll >= 0 && ll <= 4294967295LL)
-            (*out_engine)->reserve_after_skips = (uint32_t)ll;
-        /* top-level addons = ["lib1.so", ...]. A failure here is NOT silent: the
-         * add-on is a policy carrier (a constraint that enforces a quota, say), and
-         * "ran without it" is exactly the outcome an operator must not discover from
-         * behaviour alone. Report it and keep going - the engine itself is valid. */
-        n = gptps_toml_str_array(t, "", "addons", &addons);
-        for (k = 0; k < n; ++k) {
-            gptps_status as = gptps_load_addon(*out_engine, addons[k]);
-            if (as != GPTPS_OK) {
-                char msg[256];
-                snprintf(msg, sizeof msg, "add-on '%s' from %s failed to load: %s",
-                         addons[k], config_path, gptps_strerror(as));
-                gptps_log(NULL, GPTPS_LOG_ERROR, msg);
-            }
-        }
-    }
-    return GPTPS_OK;
+    return gptps_open_ex(&cfg, out_engine);
 }
 
 /* deep-copy a NULL-terminated argv; returns NULL on alloc failure or empty */
@@ -4003,8 +4039,7 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
             fifo_push(&e->done, it);
             continue;
         }
-        it->deadline_ms = (it->policy.timeout_seconds && it->def->exec == GPTPS_EXEC_INPROC)
-            ? gptps_hal_monotonic_ms() + (uint64_t)it->policy.timeout_seconds * 1000u : 0;
+        it->deadline_ms = attempt_deadline(it);
         gptps_flag_set(it->cancel, false);
         it->started = 1;                   /* execute() will emit STARTED + a terminal event */
         fifo_push(&e->running_items, it);

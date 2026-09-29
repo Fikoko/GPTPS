@@ -338,7 +338,11 @@ int main(void)
     CHECK(gptps_settings_get(e, "tasks.work.on_failure", buf, sizeof buf) == GPTPS_OK);
     CHECK(strcmp(buf, "drop") == 0);                                  /* unchanged */
     CHECK(gptps_settings_set(e, "scheduler.reserve_after_skips", "abc") == GPTPS_E_CONFIG);
-    CHECK(gptps_settings_set(e, "limits.max_concurrent_tasks", "0") == GPTPS_E_CONFIG); /* min 1 */
+    /* 0 is auto at the next open, as in a config file (it used to be refused, so
+     * reloading a file that says 0 failed); the ceiling still holds */
+    CHECK(gptps_settings_set(e, "limits.max_concurrent_tasks", "0") == GPTPS_OK);
+    CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", buf, sizeof buf) == GPTPS_OK && strcmp(buf, "0") == 0);
+    CHECK(gptps_settings_set(e, "limits.max_concurrent_tasks", "65537") == GPTPS_E_CONFIG);
     CHECK(gptps_settings_set(e, "nope.nope", "1") == GPTPS_E_NOTFOUND);
     CHECK(gptps_settings_get(e, "nope.nope", buf, sizeof buf) == GPTPS_E_NOTFOUND);
 

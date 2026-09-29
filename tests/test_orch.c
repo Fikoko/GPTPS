@@ -240,6 +240,12 @@ int main(void)
     wait_for(&started, 2);
     CHECK(get(&started) == 2);
 
+    /* 0 is no handle - but it is what a held gate's *out holds. It used to be
+     * accepted, and that gate was held forever. */
+    deps[0] = hA; deps[1] = 0;
+    CHECK(gptps_orch_after(o, "mark", NULL, 0, deps, 2, NULL) == GPTPS_E_INVAL);
+    CHECK(gptps_orch_pending(o) == 0);   /* no gate was created */
+
     deps[0] = hA; deps[1] = hB;
     CHECK(gptps_orch_after(o, "mark", NULL, 0, deps, 2, NULL) == GPTPS_OK);
     CHECK(gptps_orch_pending(o) == 1);   /* held: deps not yet terminal */

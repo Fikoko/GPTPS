@@ -83,10 +83,13 @@ gptps_orch *gptps_orch_install_ex(gptps *e, size_t done_cap);
 size_t gptps_orch_prune(gptps_orch *o);
 
 /* Submit `task` to run only after EVERY handle in deps[0..ndeps) reaches a
- * terminal state (finished, failed, dropped, or dead-lettered). If all deps are
+ * terminal state (see WHAT COUNTS AS "TERMINAL" above: finished, dropped,
+ * dead-lettered, or cancelled - not a plain failed attempt). If all deps are
  * already terminal, submits immediately and *out (may be NULL) gets the engine
  * handle; otherwise the gate is held and *out is set to 0 (it is submitted later
- * from the observer, so its handle is not returned here). ndeps == 0 submits now. */
+ * from the observer, so its handle is not returned here). ndeps == 0 submits now.
+ * A dependency handle of 0 - which no submit ever returns, but a held gate's
+ * *out is - is refused with GPTPS_E_INVAL: nothing would ever release it. */
 gptps_status gptps_orch_after(gptps_orch *o, const char *task,
                               const void *payload, size_t len,
                               const gptps_handle *deps, size_t ndeps,
@@ -95,7 +98,13 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
 /* Number of gates not yet released: still waiting on a dependency, or waiting on a
  * retry of a submission the engine transiently rejected.
  *
- * This always converges to 0, which is what makes it usable as a drain predicate. A
+ * This converges to 0 - which is what makes it usable as a drain predicate - as
+ * long as every gate keeps the Contract above: each dependency is a handle this
+ * engine issued, and the gate was created before it terminated or while it is
+ * still remembered. A handle it never issued, or one that finished before the gate
+ * and was then forgotten (pruned, dropped by done_cap, or finished before install),
+ * is never seen to terminate, so its gate is never released - not even by
+ * shutdown. A
  * gate whose dependencies are all terminal is submitted immediately; if the engine
  * rejects that submit transiently (the task type is PAUSED, or the intake queue is
  * full) the gate is retried on each subsequent terminal event, a bounded number of
