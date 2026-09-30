@@ -21,7 +21,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # Pinned, unlike ci.yml: ubuntu-latest moves to Ubuntu 26 from 2026-10-19, and
+    # whatever a new image's compiler or tools break should surface on a CI push,
+    # not on a tag push. Move this forward once ci.yml is green on the new image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
