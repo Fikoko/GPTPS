@@ -781,6 +781,16 @@ target_link_libraries(example_success_gate PRIVATE gptps)
 add_test(NAME example_success_gate COMMAND example_success_gate)
 set_tests_properties(example_success_gate PROPERTIES TIMEOUT 20)
 
+# The dead-letter ledger: one row per business id, closed by a single
+# close_row() both the observer and the drain call (first fact closes, later
+# ones confirm), a re-drive bounded per row that moves the row to its new
+# handle, and a host-side outage switch cleared before the morning drain.
+add_executable(example_item_ledger examples/item_ledger.c)
+target_include_directories(example_item_ledger PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(example_item_ledger PRIVATE gptps)
+add_test(NAME example_item_ledger COMMAND example_item_ledger)
+set_tests_properties(example_item_ledger PROPERTIES TIMEOUT 20)
+
 # single-thread + static memory pool (no worker threads, no libc heap)
 add_executable(example_embedded examples/embedded.c)
 target_include_directories(example_embedded PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
