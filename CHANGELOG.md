@@ -5,7 +5,38 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.4.0] - 2026-09-30
+
+### Upgrading from 1.3
+
+Three changes can need a change in your code:
+
+- **`gptps_open_ex` reads `cfg->config_path` at open,** its `addons` included. A path
+  that does not exist yet, or does not parse, now fails the open with
+  `GPTPS_E_CONFIG`. If you set it only as a save path, create the file first, or leave
+  it NULL and pass the path to `gptps_settings_save` and `_reload` yourself.
+- **A task body that returns `GPTPS_E_CANCELLED` is no longer retried.** To ask for a
+  retry, return `GPTPS_E_TASK` or your own failure code.
+- **A HAL supplied through `GPTPS_HAL_SOURCE` must implement
+  `gptps_hal_load_acquire_u32` and `gptps_hal_store_release_u32`,** or the link fails.
+  Plain accesses suffice single-threaded, as in `freestanding/hal_stub.c`. The bundled
+  POSIX and Windows HALs have them.
+
+Three more change what a running host sees:
+
+- **Past `limits.shutdown_grace_ms`, work still queued is never started.** It ends
+  `DEAD_LETTERED`, or `DROPPED` under `on_failure = drop`, with `GPTPS_E_SHUTDOWN` and
+  `GPTPS_EV_FLAG_SHUTDOWN`, as work in backoff already did. 1.3.0 still started it
+  after the deadline, only to cancel it, so the grace did not bound shutdown.
+- **A live write of `limits.max_concurrent_tasks` no longer changes the running
+  engine.** It was documented restart-only, and now it is: the value takes effect at
+  the next open. To throttle a running engine, re-budget a named resource.
+- **`gptps_shutdown` and `gptps_step` return `GPTPS_E_BUSY` from a callback on the
+  host's own thread,** such as the dead-letter drain callback or a settings watcher.
+  The header always said they refuse callbacks; that held only on the engine's own
+  threads.
+
+The sections below give the details.
 
 ### Added — the event says who ended an item (ABI 2.3)
 
