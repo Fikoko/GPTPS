@@ -70,9 +70,13 @@ mem_bytes       = 268435456          # advertise this task's per-run memory cost
 priority        = 10                 # run resizes ahead of lower-priority work
 
 [tasks.report]
-timeout_seconds = 300
+timeout_seconds = 900                # 15 min: fits a real 5-15 minute report
 max_retries     = 3
-on_failure      = "requeue"          # bodies MUST be idempotent to use requeue
+on_failure      = "dead_letter"      # bounded: retries, then the dead-letter list.
+                                     # "requeue" is UNBOUNDED - it requeues forever
+                                     # (attempt count resets, no dead letter), so a
+                                     # persistently failing task never surfaces and
+                                     # its handle never closes.
 priority        = -5                 # background work: yields to everything else
 
 # Generic settings round-trip here too. A host can declare its own typed knobs at
