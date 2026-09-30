@@ -228,6 +228,14 @@ without its fix.
   retry, the dependent is never submitted, and independent work still completes. It is
   registered as a test, and `addons/README.md` points to it from orch's definition of
   terminal. Contributed by @kuntakinte7270 in #11.
+- **`gptps.example.toml`'s `[tasks.report]` no longer requeues forever.** It paired a
+  300 s timeout with `on_failure = "requeue"`, which is unbounded: once the retries run
+  out, the item starts a new cycle at attempt 1 and never dead-letters, and its handle
+  stays open until a cancel or shutdown closes it. Copied as is, the sample killed any
+  report that ran past 5 minutes and then retried it all night. It now uses a 900 s
+  timeout and the default `dead_letter` policy, so a report that keeps failing lands on
+  the dead-letter list after its 3 retries, and a comment says why `requeue` is not a
+  safe default. Fixed by @nightops00dev in #13.
 
 ## [1.3.0] - 2026-09-28
 

@@ -75,8 +75,9 @@ max_retries     = 3
 on_failure      = "dead_letter"      # bounded: retries, then the dead-letter list.
                                      # "requeue" is UNBOUNDED - it requeues forever
                                      # (attempt count resets, no dead letter), so a
-                                     # persistently failing task never surfaces and
-                                     # its handle never closes.
+                                     # persistently failing task shows up only as
+                                     # FAILED events, and its handle stays open
+                                     # until a cancel or shutdown closes it.
 priority        = -5                 # background work: yields to everything else
 
 # Generic settings round-trip here too. A host can declare its own typed knobs at
