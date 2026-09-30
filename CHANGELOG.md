@@ -5,6 +5,22 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Documentation
+
+- **`examples/item_ledger.c`: the ledger a host keeps while it re-drives dead letters.**
+  One row per business id, found by the item's current handle, since events carry no
+  payload. The observer and the dead-letter drain close a row through the same function:
+  whichever arrives first closes it, and the other only confirms. The two can come in
+  either order, because the drain can hand over an item before its `DEAD_LETTERED` is
+  delivered. A re-drive re-submits the business id unchanged after the outage that
+  failed it has cleared, moves the row to the new handle, and is bounded per row. So an
+  item with bad input is re-driven once, fails again, and the next drain leaves it dead.
+  A late event for the superseded handle finds no row and changes nothing. The example
+  runs in MANUAL mode, is registered as a test, and fails if any of that breaks. Written
+  for the questions in #12; contributed by @nightops00dev in #14.
+
 ## [1.4.0] - 2026-09-30
 
 ### Upgrading from 1.3

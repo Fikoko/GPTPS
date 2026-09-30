@@ -724,8 +724,8 @@ gptps/
 │   ├── gptps_gpu_quota_plugin.c  the same quota policy as a dlopen BINARY plug-in
 │   └── CMakeLists.txt   one library + header + .pc per add-on
 ├── templates/plugin/    ← a complete, copyable binary plug-in (built out-of-tree by CI)
-├── examples/            ← runnable examples (demo, config_file, task_control, success_gate, external_program,
-│                          dashboard, embedded, wasm_program, bench_pool, bench_balance)
+├── examples/            ← runnable examples (demo, config_file, task_control, success_gate, item_ledger,
+│                          external_program, dashboard, embedded, wasm_program, bench_pool, bench_balance)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/
 │   ├── ARCHITECTURE.md  how it works inside
@@ -733,7 +733,7 @@ gptps/
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
 │   ├── SAFETY.md        the planned commercial safety-artifacts package and how it is licensed
 │   └── SECURITY.md      trust boundary and non-guarantees
-├── tests/               ← CTest suite (67 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tests/               ← CTest suite (68 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
 │   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
@@ -768,7 +768,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **67** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
+plug-in · **68** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

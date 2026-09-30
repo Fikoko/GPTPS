@@ -58,8 +58,8 @@ typedef struct {
     char id[16];          /* the business id, e.g. "id-3" */
     gptps_handle h;       /* the handle that CURRENTLY owns this row */
     int state;            /* 0 open, 1 finished, 2 dead-lettered */
-    int closed;           /* a terminal fact was applied for the current attempt */
-    int closes;           /* terminal facts applied: exactly 1 over the row's life */
+    int closed;           /* a terminal fact was applied under the current handle */
+    int closes;           /* closes under the current handle: exactly 1 */
     int confirmations;    /* terminal arrivals after the close: confirmations */
     int rounds;           /* re-drives spent on this row: bounded per row */
     gptps_status status;  /* recorded at close */
@@ -140,7 +140,8 @@ static void observe(const gptps_event *ev, void *ud)
  * here is safe. The payload is valid only for this call. A row's re-drives
  * are bounded PER ROW: past the bound, or if the re-submit itself fails, the
  * drain closes the row from its own facts - which, when the event arrived
- * first, is exactly the confirmation path. */
+ * first, is exactly the confirmation path. So does a business id too long for
+ * the copy: re-submitting it truncated would re-drive a different item. */
 static void redrive(const gptps_dead_letter *dl, void *ud)
 {
     gptps *e = (gptps *)ud;
@@ -153,7 +154,8 @@ static void redrive(const gptps_dead_letter *dl, void *ud)
     id[n] = '\0';
     r = row_by_handle(dl->handle);
     if (!r) return; /* superseded, like a late event */
-    if (r->rounds >= REDRIVE_ROUNDS || gptps_submit(e, "item", id, strlen(id), &h) != GPTPS_OK) {
+    if (dl->payload_len >= sizeof id || r->rounds >= REDRIVE_ROUNDS
+        || gptps_submit(e, "item", id, strlen(id), &h) != GPTPS_OK) {
         close_row(r, 2, dl->status, dl->attempts); /* declined: dead from the drain's facts */
         printf("  [drain ] '%s' left dead (%s)\n", id, gptps_strerror(dl->status));
         return;
@@ -282,7 +284,7 @@ int main(void)
         REQUIRE(r3->closes == 1);          /* the close count never moved */
     }
 
-    /* Every row closed exactly once over its whole life. */
+    /* Every row closed exactly once under its current handle. */
     for (i = 0; i < ITEM_N; ++i)
         REQUIRE(g.r[i].closes == 1);
 
