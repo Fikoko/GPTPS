@@ -15,11 +15,33 @@
  * DEFERs everything parks the whole queue in one pass. MANUAL mode keeps it thread-free
  * and the queue as deep as it was built: nothing runs unless stepped.
  */
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "gptps.h"
-#include "gptps_hal.h"   /* the engine's own monotonic clock: portable, no feature macros */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
+
+/* A fine clock of its own, not the engine's millisecond one: on Windows that ticks every
+ * ~15.6ms, and at a hundred milliseconds a tick either way moves the ratio by a third. */
+static double now_ms(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+#endif
+}
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -71,29 +93,29 @@ static double cancels(int n, int reps)
     if (!h) { ++fails; return 0.0; }
     for (r = 0; r < reps && !fails; ++r) {
         gptps *e = open_manual();
-        uint64_t t0;
+        double t0;
         size_t ran;
         if (!e) { ++fails; break; }
 
         if (!fill(e, h, n)) { ++fails; gptps_shutdown(e); break; }
-        t0 = gptps_hal_monotonic_ms();
+        t0 = now_ms();
         for (i = n - 1; i >= 0; --i) if (gptps_cancel(e, h[i]) != GPTPS_OK) { ++fails; break; }
-        total += (double)(gptps_hal_monotonic_ms() - t0);
+        total += now_ms() - t0;
 
         if (!fill(e, h, n)) { ++fails; gptps_shutdown(e); break; }
-        t0 = gptps_hal_monotonic_ms();
+        t0 = now_ms();
         for (i = 0; i < n; ++i)
             if (gptps_cancel(e, h[i]) != GPTPS_OK || gptps_submit(e, "n", NULL, 0, &h[i]) != GPTPS_OK) { ++fails; break; }
-        total += (double)(gptps_hal_monotonic_ms() - t0);
+        total += now_ms() - t0;
         for (i = 0; i < n; ++i) gptps_cancel(e, h[i]);   /* empty it again, untimed */
 
         if (gptps_register_constraint(e, defer_all, NULL) != GPTPS_OK || !fill(e, h, n)) {
             ++fails; gptps_shutdown(e); break;
         }
         if (gptps_step(e, &ran) != GPTPS_OK || ran != 0) ++fails;   /* all of it now in `delayed` */
-        t0 = gptps_hal_monotonic_ms();
+        t0 = now_ms();
         for (i = n - 1; i >= 0; --i) if (gptps_cancel(e, h[i]) != GPTPS_OK) { ++fails; break; }
-        total += (double)(gptps_hal_monotonic_ms() - t0);
+        total += now_ms() - t0;
 
         gptps_shutdown(e);
     }
@@ -103,19 +125,20 @@ static double cancels(int n, int reps)
 
 int main(void)
 {
-    int n = 5000, reps = 1, i;
+    int n = 1250, reps = 1, i;
     double a, b, ratio;
 
-    /* Grow n until the smaller run is long enough that clock noise cannot dominate the
-     * ratio (100ms: six ticks of a ~16ms clock) - but past 20000 items, repeat instead.
-     * Deeper queues outgrow the CPU caches, and a cache miss per item reads as a
-     * super-linear curve on an O(1) path; 20000 is where the old walk already took
-     * 5-6x longer per doubling. */
+    /* Grow n until the smaller run takes 100ms - but past 5000 items, repeat instead.
+     * Every cancel is a lookup by handle, scattered across memory, and once the queue
+     * outgrows the caches a miss per item reads as a super-linear curve on an O(1) path:
+     * 3.2 at 20000/40000 on Windows CI, with the coarse clock's noise on top. A walk
+     * shows long before the cap - the old one measured 4.3 at 5000/10000 - so the cap
+     * costs the gate nothing. */
     for (;;) {
         a = cancels(n, reps);
         if (fails) { printf("test_cancel_perf: FAILED (engine error)\n"); return 1; }
         if (a >= 100.0) break;
-        if (n < 20000) n *= 2; else if (reps < 256) reps *= 2; else break;
+        if (n < 5000) n *= 2; else if (reps < 4096) reps *= 2; else break;
     }
     b = cancels(2 * n, reps);
     /* Best of three per size, as in admission_perf: a stalled run on a shared machine
