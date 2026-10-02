@@ -88,6 +88,25 @@ int main(void)
     CHECK(g_runs == 0);
     gptps_shutdown(e);
     gptps_dq_close(dq);
+
+    /* Out of memory while LOADING: the open fails and the journal stays as it was.
+     * Replay used to stop where the allocation failed, and the compaction after it
+     * rewrote the journal without everything it had not loaded - here, all three. */
+    remove(JOURNAL);
+    e = open_manual(); CHECK(e != NULL); if (!e) return 1;
+    dq = gptps_dq_open(e, JOURNAL); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return 1; }
+    { int i; for (i = 0; i < 3; ++i) CHECK(gptps_dq_submit(dq, "work", &b, 1, &h) == GPTPS_OK); }
+    gptps_shutdown(e);                      /* never stepped: all three pending */
+    gptps_dq_close(dq);
+    e = open_manual(); CHECK(e != NULL); if (!e) return 1;
+    g_fail_realloc = 1;                     /* the record table's first growth fails */
+    CHECK(gptps_dq_open(e, JOURNAL) == NULL);
+    CHECK(g_fail_realloc == 0);
+    dq = gptps_dq_open(e, JOURNAL); CHECK(dq != NULL);
+    if (dq) CHECK(gptps_dq_pending(dq) == 3);   /* was 0 */
+    gptps_shutdown(e);
+    if (dq) gptps_dq_close(dq);
     remove(JOURNAL);
 
     if (fails) { printf("%d durable-queue OOM check(s) FAILED\n", fails); return 1; }

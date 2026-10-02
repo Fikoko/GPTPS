@@ -7,6 +7,52 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — `durable_queue`: a stalled engine, a damaged journal, a quadratic drain, and crash loops
+
+- **Journaling work no longer stalls the engine.** `gptps_dq_submit` held the queue's
+  lock across its fsync, a millisecond or more of disk, and the queue's observer needs
+  that lock for the events of every task, journaled or not, on the engine's own worker
+  and dispatcher threads. While one thread journaled work back-to-back, the engine all
+  but stopped: plain tasks fell from ~420,000/s to 2-13/s, and of 344 queued 20 ms jobs
+  only 24-30 finished during a 3,000-item submit loop that took 2.8 s. A host enqueuing
+  a batch through the queue froze everything else until it was done. Now the fsync
+  holds no lock the engine needs, and the same loop lets all 344 finish. Submits made at
+  the same time share one fsync (group commit): 8 threads journal ~4,250 items/s where
+  they managed ~1,070, which is what one thread still gets. `gptps_dq_cancel` waits for
+  its fsync the same way. Nothing changes in what is durable when: a submit still
+  returns only once its record is on disk, and one whose fsync fails returns
+  `GPTPS_E_IO` and is not enqueued.
+- **One damaged record no longer destroys every record after it.** Replay stopped at
+  the first record that did not verify, as if it were the torn tail a crash leaves,
+  and the compaction `gptps_dq_open` runs next rewrote the journal without everything
+  after that point: fsync'd, acknowledged work, deleted without a word. One flipped
+  bit in record 2 of 5 left 1 pending record of 5. Now damage that is not at the end
+  of the file is skipped and every valid record after it kept; the original journal
+  is first copied to `<journal>.corrupt`, and a warning goes to the log sink. A record
+  torn at the end of the file is still dropped silently. A record whose header claims
+  more bytes than the file holds looks exactly like a torn write, so anything after it
+  is reported and preserved but not loaded. Running out of memory while loading now
+  fails the open and leaves the journal alone; it used to compact away whatever had
+  not been loaded.
+- **Draining a recovered backlog is linear in its size** (it was quadratic). Each
+  event searched the whole record table for its handle: 40,000 recovered records took
+  0.54 s to drain where the engine alone took 0.004 s, and each doubling took about
+  four times longer. An index by handle makes each event constant-time: the same
+  backlog now drains in 0.07 s, including the new attempt markers below.
+  `tests/test_durable_perf.c` gates the shape of the curve.
+- **A task that kills its own process no longer crash-loops the host.** Quarantine
+  waited for a `DEAD_LETTERED`, which a process killed by its own task never sends, so
+  the record was recovered, and killed the process, on every restart. The journal now
+  notes when each attempt starts and ends; a record that was running at three deaths of
+  the process is quarantined at open, with a warning. At two it becomes a suspect, and
+  suspects are recovered one at a time: recovery replays records in the same order
+  every time, so the records running beside a crashing task are there at each of its
+  deaths too, and counting alone would quarantine them with it. Any attempt that ends,
+  however it ends, clears the count, so a clean shutdown counts as no death at all.
+  `gptps_dq_recover` therefore returns at most one suspect in its count; the others
+  follow as each turn ends. The new markers are record types an older reader skips:
+  a journal written now still opens in 1.4.0, which loses only the crash counts.
+
 ### Documentation
 
 - **`examples/item_ledger.c`: the ledger a host keeps while it re-drives dead letters.**

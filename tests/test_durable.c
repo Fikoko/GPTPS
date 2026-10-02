@@ -15,8 +15,15 @@
  *      and one that returns GPTPS_E_CANCELLED closes its record.
  *   E) recovery under backpressure: gptps_dq_recover can be called again,
  *      re-submitting what an intake of two refused.
+ *   F) crash loops: a body that kills its own process is quarantined after three
+ *      deaths, and the records that happened to run beside it are not; a clean
+ *      shutdown, however often, counts as no death at all.
+ *   G) a damaged journal: damage in the middle costs only the damaged bytes, is
+ *      reported, and the original is preserved; a torn tail is dropped silently.
+ *   H) journaling does not stall the engine, and every acknowledged submit survives
+ *      a SIGKILL in the middle of concurrent submits and compactions.
  *
- * Phase A fully shuts down (joining all engine threads) before the fork, so the
+ * Every phase fully shuts down (joining all engine threads) before a fork, so the
  * fork happens from a single-threaded process.
  */
 #if !defined(_WIN32)
@@ -29,6 +36,8 @@
 #include <stdlib.h>
 #include <time.h>
 #if !defined(_WIN32)               /* the crash-recovery phase forks (POSIX only) */
+#  include <poll.h>
+#  include <signal.h>
 #  include <unistd.h>
 #  include <sys/wait.h>
 #  include <sys/stat.h>
@@ -632,6 +641,347 @@ static void test_recover_again(void)
     remove(JOURNAL_A);
 }
 
+/* Warnings the add-on sends to the core's log sink. It sends them only from
+ * gptps_dq_open, on the calling thread - here always the main one. */
+static int  g_warns;
+static char g_warn[1024];
+static void warn_sink(gptps_log_level lvl, const char *msg, void *ud)
+{
+    (void)ud;
+    if (lvl < GPTPS_LOG_WARN || !msg || !strstr(msg, "gptps_durable_queue")) return;
+    ++g_warns;
+    snprintf(g_warn, sizeof g_warn, "%s", msg);
+}
+
+/* F) A clean shutdown is not a crash. An attempt the grace cancels ENDS - its FAILED
+ * is journaled - so nothing is counted against the record, however many times it
+ * happens. Were those attempts mistaken for deaths, the third round would hand the
+ * two records back one at a time, and a later one would quarantine them. */
+static void test_shutdown_not_a_crash(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; int round;
+    remove(JOURNAL_A);
+    __atomic_store_n(&g_ok, 0, __ATOMIC_SEQ_CST);
+    for (round = 0; round < 5; ++round) {
+        __atomic_store_n(&g_spin_runs, 0, __ATOMIC_SEQ_CST);
+        if (round == 4) __atomic_store_n(&g_ok, 1, __ATOMIC_SEQ_CST);  /* last: let them finish */
+        e = open_engine(2); CHECK(e != NULL); if (!e) return;
+        reg_abandon(e, GPTPS_ON_FAILURE_DEAD_LETTER);
+        CHECK(gptps_settings_set(e, "limits.shutdown_grace_ms", "100") == GPTPS_OK);
+        dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+        if (!dq) { gptps_shutdown(e); return; }
+        if (round == 0) {
+            CHECK(gptps_dq_submit(dq, "spin", "a", 1, &h) == GPTPS_OK);
+            CHECK(gptps_dq_submit(dq, "spin", "b", 1, &h) == GPTPS_OK);
+        } else {
+            CHECK(gptps_dq_quarantined(dq) == 0);
+            CHECK(gptps_dq_recover(dq) == 2);           /* both at once, every time */
+        }
+        CHECK(wait_for(&g_spin_runs, 2));
+        gptps_shutdown(e);                              /* the grace cancels both */
+        CHECK(gptps_dq_pending(dq) == (round == 4 ? 0u : 2u));
+        CHECK(gptps_dq_quarantined(dq) == 0);
+        gptps_dq_close(dq);
+    }
+    remove(JOURNAL_A);
+}
+
+/* G) A damaged journal. Five pending records of task "work", payload bytes 0..4,
+ * make a file of an 8-byte header and five 29-byte records. Replay used to stop at
+ * the first record that did not verify, as if it were the torn tail a crash leaves,
+ * and gptps_dq_open's compaction then rewrote the file without everything after it:
+ * one flipped bit in record 2 left 1 pending record of 5, silently. */
+#define JOURNAL_C "dq_test_c.journal"
+#define REC 29
+
+/* The journal format, for the tests that write one by hand: the file header, then
+ * [DQR1][type][0][name_len][payload_len][seq][name][payload][fnv1a], little-endian. */
+static uint32_t jfnv(const unsigned char *p, size_t n, uint32_t h) { while (n--) { h ^= *p++; h *= 16777619u; } return h; }
+static void jrec(FILE *f, char type, uint64_t seq, const char *name, const void *payload, uint32_t plen)
+{
+    unsigned char hdr[20], crc[4];
+    size_t nl = strlen(name);
+    uint32_t h;
+    int i;
+    hdr[0] = 0x31; hdr[1] = 0x52; hdr[2] = 0x51; hdr[3] = 0x44;
+    hdr[4] = (unsigned char)type; hdr[5] = 0;
+    hdr[6] = (unsigned char)nl; hdr[7] = (unsigned char)(nl >> 8);
+    for (i = 0; i < 4; ++i) hdr[8 + i]  = (unsigned char)(plen >> (8 * i));
+    for (i = 0; i < 8; ++i) hdr[12 + i] = (unsigned char)(seq >> (8 * i));
+    h = jfnv(hdr, sizeof hdr, 2166136261u);
+    h = jfnv((const unsigned char *)name, nl, h);
+    h = jfnv((const unsigned char *)payload, plen, h);
+    for (i = 0; i < 4; ++i) crc[i] = (unsigned char)(h >> (8 * i));
+    fwrite(hdr, 1, sizeof hdr, f);
+    if (nl) fwrite(name, 1, nl, f);
+    if (plen) fwrite(payload, 1, plen, f);
+    fwrite(crc, 1, sizeof crc, f);
+}
+static FILE *jopen(const char *path)
+{
+    static const unsigned char H[8] = { 0x31, 0x51, 0x44, 0x47, 0x01, 0x00, 0x00, 0x00 };
+    FILE *f = fopen(path, "wb");
+    if (f) fwrite(H, 1, sizeof H, f);
+    return f;
+}
+
+static long file_size(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    long n = -1;
+    if (f) { if (fseek(f, 0, SEEK_END) == 0) n = ftell(f); fclose(f); }
+    return n;
+}
+static int xor_byte(const char *path, long at, int mask)
+{
+    FILE *f = fopen(path, "r+b");
+    int c = EOF;
+    if (!f) return 0;
+    if (fseek(f, at, SEEK_SET) == 0) c = fgetc(f);
+    if (c != EOF && fseek(f, at, SEEK_SET) == 0) fputc(c ^ mask, f);
+    fclose(f);
+    return c != EOF;
+}
+static void make_five(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; unsigned char b;
+    remove(JOURNAL_C);
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+    dq = gptps_dq_open(e, JOURNAL_C); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    for (b = 0; b < 5; ++b) CHECK(gptps_dq_submit(dq, "work", &b, 1, &h) == GPTPS_OK);
+    gptps_shutdown(e);                                  /* never stepped: all five pending */
+    gptps_dq_close(dq);
+    CHECK(file_size(JOURNAL_C) == 8 + 5 * REC);         /* the layout the offsets assume */
+}
+static gptps *reopen_c(gptps_dq **out)
+{
+    gptps *e = open_manual_depth(0);
+    *out = NULL;
+    CHECK(e != NULL); if (!e) return NULL;
+    *out = gptps_dq_open(e, JOURNAL_C); CHECK(*out != NULL);
+    if (!*out) { gptps_shutdown(e); return NULL; }
+    return e;
+}
+static void test_damaged_journal(void)
+{
+    gptps *e; gptps_dq *dq; size_t ran = 0; FILE *f;
+    char copy[64];
+    snprintf(copy, sizeof copy, "%s.corrupt", JOURNAL_C);
+    remove(copy);
+    __atomic_store_n(&g_block, 0, __ATOMIC_SEQ_CST);
+    gptps_set_log_sink(warn_sink, NULL);
+
+    /* 1. A flipped bit in record 2's payload costs record 2 and nothing else. */
+    make_five();
+    CHECK(xor_byte(JOURNAL_C, 8 + REC + 24, 0x01));
+    g_warns = 0; reset_ran();
+    e = reopen_c(&dq);
+    if (e) {
+        CHECK(gptps_dq_pending(dq) == 4);               /* was 1 */
+        CHECK(g_warns == 1 && strstr(g_warn, "skipped") != NULL);
+        CHECK(file_size(copy) == 8 + 5 * REC);          /* the damaged original, kept */
+        CHECK(file_size(JOURNAL_C) == 8 + 4 * REC);     /* compacted to the four */
+        CHECK(gptps_dq_recover(dq) == 4);
+        while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+        CHECK(get(&g_ran[0]) == 1 && get(&g_ran[1]) == 0 && get(&g_ran[2]) == 1 &&
+              get(&g_ran[3]) == 1 && get(&g_ran[4]) == 1);
+        CHECK(gptps_dq_pending(dq) == 0);
+        gptps_shutdown(e); gptps_dq_close(dq);
+    }
+    e = reopen_c(&dq);                                  /* the compacted file is clean */
+    if (e) { CHECK(g_warns == 1); gptps_shutdown(e); gptps_dq_close(dq); }
+    remove(copy);
+
+    /* 2. Record 2's length pushed past the end of the file. A torn write looks exactly
+     * like that, and its payload could carry journal records of its own, so what
+     * follows is reported and preserved but not loaded. */
+    make_five();
+    CHECK(xor_byte(JOURNAL_C, 8 + REC + 8 + 2, 0x10)); /* payload_len += 1 MiB */
+    g_warns = 0;
+    e = reopen_c(&dq);
+    if (e) {
+        CHECK(gptps_dq_pending(dq) == 1);
+        CHECK(g_warns == 1 && strstr(g_warn, "were not read") != NULL);
+        CHECK(file_size(copy) == 8 + 5 * REC);
+        gptps_shutdown(e); gptps_dq_close(dq);
+    }
+    remove(copy);
+
+    /* 3. A torn tail - a record's header and part of its body, as a crash mid-append
+     * leaves it - is dropped silently, as it always was. */
+    make_five();
+    f = fopen(JOURNAL_C, "ab");
+    if (f) {
+        static const unsigned char torn[30] = {
+            0x31, 0x52, 0x51, 0x44, 'P', 0, 4, 0, 100, 0, 0, 0,   /* "DQR1", P, name 4, payload 100 */
+            6, 0, 0, 0, 0, 0, 0, 0, 'w', 'o', 'r', 'k',           /* seq 6, the name */
+            1, 2, 3, 4, 5, 6 };                                   /* 6 of its 100 payload bytes */
+        fwrite(torn, 1, sizeof torn, f);
+        fclose(f);
+    }
+    g_warns = 0;
+    e = reopen_c(&dq);
+    if (e) {
+        CHECK(gptps_dq_pending(dq) == 5);
+        CHECK(g_warns == 0);
+        CHECK(file_size(copy) < 0);                     /* nothing to preserve */
+        gptps_shutdown(e); gptps_dq_close(dq);
+    }
+
+    /* 4. Damage, then a stale copy of an older record where record 3 was - the kind of
+     * block a file system without data ordering can expose after a crash. Reading does
+     * not resume at a 'P' whose seq is not above every one read before it, so record 1
+     * does not come back twice; it resumes at record 4. */
+    make_five();
+    CHECK(xor_byte(JOURNAL_C, 8 + REC + 24, 0x01));
+    f = fopen(JOURNAL_C, "r+b");
+    if (f) {
+        unsigned char b0 = 0;
+        if (fseek(f, 8 + 2 * REC, SEEK_SET) == 0) jrec(f, 'P', 1, "work", &b0, 1);
+        fclose(f);
+    }
+    CHECK(file_size(JOURNAL_C) == 8 + 5 * REC);
+    g_warns = 0; reset_ran();
+    e = reopen_c(&dq);
+    if (e) {
+        CHECK(gptps_dq_pending(dq) == 3);               /* records 1, 4 and 5 */
+        CHECK(g_warns == 1);
+        CHECK(gptps_dq_recover(dq) == 3);
+        while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+        CHECK(get(&g_ran[0]) == 1 && get(&g_ran[3]) == 1 && get(&g_ran[4]) == 1);
+        CHECK(get(&g_ran[1]) + get(&g_ran[2]) == 0);
+        gptps_shutdown(e); gptps_dq_close(dq);
+    }
+    gptps_set_log_sink(NULL, NULL);
+    remove(JOURNAL_C); remove(copy);
+}
+
+/* H) Journaling must not stall the engine. A "pump" task submits durably back-to-back
+ * - each gptps_dq_submit waiting on an fsync - while a thousand plain tasks have to
+ * get through the same engine. The queue used to hold its lock across the fsync, and
+ * its observer needs that lock for every task's events, so the workers queued behind
+ * the pump: plain tasks went from ~420,000/s to 2-13/s, and this would take minutes.
+ * Now the fsync holds no lock the engine needs. The pump runs on an engine worker, so
+ * the test needs no threads of its own. */
+static int       g_pump_submits, g_pump_stop, g_plain_done;
+static gptps_dq *g_pdq;
+static gptps_status task_pump(gptps_ctx *ctx, void *ud)
+{
+    uint64_t start = gptps_now_ms(ctx);
+    (void)ud;
+    while (!get(&g_pump_stop) && !gptps_is_cancelled(ctx) && gptps_now_ms(ctx) - start < 20000) {
+        gptps_handle h; unsigned char b = 7;
+        if (gptps_dq_submit(g_pdq, "jot", &b, 1, &h) == GPTPS_OK) inc(&g_pump_submits);
+    }
+    return GPTPS_OK;
+}
+static gptps_status task_jot(gptps_ctx *ctx, void *ud)   { (void)ctx; (void)ud; return GPTPS_OK; }
+static gptps_status task_plain(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; inc(&g_plain_done); return GPTPS_OK; }
+static void test_journaling_does_not_stall(void)
+{
+    gptps *e; gptps_dq *dq; gptps_task_def d; gptps_handle h; int i, before; time_t t0;
+    remove(JOURNAL_A);
+    __atomic_store_n(&g_pump_submits, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_pump_stop, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_plain_done, 0, __ATOMIC_SEQ_CST);
+    e = open_engine(4); CHECK(e != NULL); if (!e) return;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.name = "pump";  d.run = task_pump;  gptps_register_task(e, &d);
+    d.name = "jot";   d.run = task_jot;   gptps_register_task(e, &d);
+    d.name = "plain"; d.run = task_plain; gptps_register_task(e, &d);
+    dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    g_pdq = dq;
+    CHECK(gptps_submit(e, "pump", NULL, 0, &h) == GPTPS_OK);
+    CHECK(wait_for(&g_pump_submits, 5));                 /* journaling is under way */
+    before = get(&g_pump_submits);
+    for (i = 0; i < 1000; ++i) CHECK(gptps_submit(e, "plain", NULL, 0, &h) == GPTPS_OK);
+    t0 = time(NULL);
+    while (get(&g_plain_done) < 1000 && time(NULL) - t0 < 10) nap();
+    CHECK(get(&g_plain_done) == 1000);                  /* was minutes */
+    CHECK(get(&g_pump_submits) > before);               /* and the pump ran all along */
+    __atomic_store_n(&g_pump_stop, 1, __ATOMIC_SEQ_CST);
+    gptps_shutdown(e);
+    gptps_dq_close(dq);
+    g_pdq = NULL;
+    remove(JOURNAL_A);
+}
+
+/* F) Suspects go back one at a time, each when the previous one's turn ends - however
+ * it ends - and the crash count that made them suspects lives on disk as a 'K' marker.
+ * The journals are written by hand, as two crashes would have left them. */
+static gptps_handle g_qh[8];
+static int          g_nq;
+static void queued_obs(const gptps_event *ev, void *ud)
+{
+    (void)ud;   /* QUEUED: records the handle, and must not call into the queue */
+    if (ev->kind == GPTPS_EV_QUEUED && g_nq < 8) g_qh[g_nq++] = ev->handle;
+}
+static void test_suspects_one_at_a_time(void)
+{
+    gptps *e; gptps_dq *dq; gptps_task_def d; size_t ran = 0; FILE *f;
+    unsigned char two[4] = { 2, 0, 0, 0 }, b;
+    __atomic_store_n(&g_block, 0, __ATOMIC_SEQ_CST);
+
+    /* 1. A suspect that fails ends its turn: it is dead-lettered and quarantined as
+     * any failure is, and the next one goes. */
+    remove(JOURNAL_C);
+    f = jopen(JOURNAL_C); CHECK(f != NULL); if (!f) return;
+    b = 0xAB; jrec(f, 'P', 1, "poison", &b, 1); jrec(f, 'K', 1, "", two, 4);
+    b = 1;    jrec(f, 'P', 2, "work", &b, 1);   jrec(f, 'K', 2, "", two, 4);
+    b = 2;    jrec(f, 'P', 3, "work", &b, 1);   jrec(f, 'K', 3, "", two, 4);
+    fclose(f);
+    reset_ran();
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "poison"; d.run = task_poison; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;       /* dead_letter, 0 retries */
+    gptps_register_task(e, &d);
+    dq = gptps_dq_open(e, JOURNAL_C); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    CHECK(gptps_dq_pending(dq) == 3);
+    CHECK(gptps_dq_recover(dq) == 1);                   /* the oldest suspect, alone */
+    CHECK(gptps_dq_recover(dq) == 0);                   /* nothing more while its turn lasts */
+    CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1); /* poison fails; the next is handed over */
+    CHECK(get(&g_ran[1]) == 0);
+    CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1);
+    CHECK(get(&g_ran[1]) == 1 && get(&g_ran[2]) == 0);
+    CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1);
+    CHECK(get(&g_ran[2]) == 1);
+    CHECK(gptps_dq_pending(dq) == 0);
+    CHECK(gptps_dq_quarantined(dq) == 1);
+    gptps_shutdown(e); gptps_dq_close(dq);
+
+    /* 2. A suspect retracted with gptps_dq_cancel ends its turn, and so does one the
+     * engine cancels while it waits - which keeps its record, as a cancel always does. */
+    remove(JOURNAL_C);
+    f = jopen(JOURNAL_C); CHECK(f != NULL); if (!f) return;
+    b = 3; jrec(f, 'P', 1, "work", &b, 1); jrec(f, 'K', 1, "", two, 4);
+    b = 4; jrec(f, 'P', 2, "work", &b, 1); jrec(f, 'K', 2, "", two, 4);
+    b = 5; jrec(f, 'P', 3, "work", &b, 1); jrec(f, 'K', 3, "", two, 4);
+    fclose(f);
+    reset_ran(); g_nq = 0;
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+    CHECK(gptps_register_observer(e, queued_obs, NULL) == GPTPS_OK);
+    dq = gptps_dq_open(e, JOURNAL_C); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    CHECK(gptps_dq_recover(dq) == 1 && g_nq == 1);
+    CHECK(gptps_dq_cancel(dq, g_qh[0]) == GPTPS_OK);
+    CHECK(g_nq == 2);                                   /* the retraction handed over the next */
+    CHECK(gptps_cancel(e, g_qh[1]) == GPTPS_OK);
+    CHECK(g_nq == 3);                                   /* and so did that one's FAILED */
+    while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+    CHECK(get(&g_ran[3]) == 0 && get(&g_ran[4]) == 0 && get(&g_ran[5]) == 1);
+    CHECK(gptps_dq_pending(dq) == 1);                   /* the engine-cancelled one, kept */
+    gptps_shutdown(e); gptps_dq_close(dq);
+    remove(JOURNAL_C);
+}
+
 #if defined(TEST_DURABLE_FORK)
 /* gptps_dq_cancel's failure path: "if it cannot be made durable the call returns
  * GPTPS_E_IO, leaving the record open and the execution alone". The journal's
@@ -775,6 +1125,229 @@ static void test_recovery(void)
     }
     remove(JOURNAL_B);
 }
+
+/* F) crash loops. A body that kills its own process is never dead-lettered, so
+ * quarantine never saw it: every run recovered it and died with it. Here "killer"
+ * waits until three "slow" records are running beside it and then SIGKILLs its
+ * process, as the OOM killer would. Each run is a child process:
+ *   run 1 - all four submitted; the journal is compacted while all four run, so the
+ *           evidence has to survive a rewrite; then the first death.
+ *   run 2 - one death changes nothing: all four go back at once; the second death.
+ *   run 3 - all four are suspects and go back one at a time, oldest first: each slow
+ *           one runs alone and finishes, then killer runs and dies a third time.
+ *   then  - gptps_dq_open quarantines killer, and only killer, with a warning. The
+ *           slow records were running at two of its deaths and are not convicted.
+ * A child that sees anything else _exit()s with a code instead of being killed. */
+static int g_run;                       /* which run a child is: set before the fork */
+static int g_slow_started, g_slow_active, g_slow_overlap, g_killer_started, g_compacted;
+
+static gptps_status task_slow(gptps_ctx *ctx, void *ud)
+{
+    uint64_t start = gptps_now_ms(ctx);
+    (void)ud;
+    if (inc(&g_slow_active) > 1) inc(&g_slow_overlap);
+    inc(&g_slow_started);
+    if (g_run >= 3) while (gptps_now_ms(ctx) - start < 150) nap();   /* on trial: then pass */
+    else while (!gptps_is_cancelled(ctx) && gptps_now_ms(ctx) - start < 20000) nap();
+    __atomic_sub_fetch(&g_slow_active, 1, __ATOMIC_SEQ_CST);
+    return GPTPS_OK;
+}
+static gptps_status task_killer(gptps_ctx *ctx, void *ud)
+{
+    uint64_t start = gptps_now_ms(ctx);
+    (void)ud;
+    inc(&g_killer_started);
+    if (g_run < 3)
+        while ((get(&g_slow_started) < 3 || (g_run == 1 && !get(&g_compacted))) &&
+               gptps_now_ms(ctx) - start < 20000) nap();
+    else if (get(&g_slow_started) != 3 || get(&g_slow_overlap) != 0)
+        _exit(20);                      /* the suspects did not go one at a time */
+    kill(getpid(), SIGKILL);
+    return GPTPS_E_TASK;
+}
+static void crash_child(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; gptps_task_def d; unsigned char b; time_t t0;
+    e = open_engine(4);
+    if (!e) _exit(2);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.name = "slow"; d.run = task_slow; gptps_register_task(e, &d);
+    d.name = "killer"; d.run = task_killer; gptps_register_task(e, &d);
+    dq = gptps_dq_open(e, JOURNAL_B);
+    if (!dq) _exit(3);
+    if (g_run == 1) {
+        for (b = 1; b <= 3; ++b) if (gptps_dq_submit(dq, "slow", &b, 1, &h) != GPTPS_OK) _exit(4);
+        b = 9;
+        if (gptps_dq_submit(dq, "killer", &b, 1, &h) != GPTPS_OK) _exit(4);
+        t0 = time(NULL);
+        while ((get(&g_slow_started) < 3 || !get(&g_killer_started)) && time(NULL) - t0 < 10) nap();
+        if (gptps_dq_compact(dq) != GPTPS_OK) _exit(5);
+        inc(&g_compacted);
+    } else {
+        if (gptps_dq_pending(dq) != 4) _exit(6);
+        if (gptps_dq_recover(dq) != (g_run == 2 ? 4u : 1u)) _exit(7);   /* run 3: one suspect */
+    }
+    t0 = time(NULL);
+    while (time(NULL) - t0 < 15) nap();
+    _exit(8);                           /* killer never took the process down */
+}
+/* H) Every acknowledged submit survives a SIGKILL that lands in the middle of the
+ * group commit. In a child, three pumps submit durably at once - so they share
+ * fsyncs - while a fourth task compacts the journal over and over, and each pump
+ * writes the id of every submit that returned GPTPS_OK to a pipe. The work itself
+ * never finishes, so every record stays pending. The parent kills the child mid-storm,
+ * then recovers the journal: every id the child acknowledged must run, exactly once.
+ * This is the protocol's whole promise - a compaction that dropped a record whose 'P'
+ * had become durable, or that wrote one whose submit then failed, would show here. */
+#define STORM_PUMPS 3
+static int g_storm_fd = -1, g_storm_next, g_storm_ran[1 << 16];
+static gptps_dq *g_sdq;
+static gptps_status task_storm_pump(gptps_ctx *ctx, void *ud)
+{
+    (void)ud;
+    while (!gptps_is_cancelled(ctx)) {
+        uint32_t id = (uint32_t)inc(&g_storm_next);
+        gptps_handle h;
+        if (id >= (1u << 16)) break;
+        if (gptps_dq_submit(g_sdq, "item", &id, sizeof id, &h) == GPTPS_OK &&
+            write(g_storm_fd, &id, sizeof id) != (ssize_t)sizeof id) _exit(9);
+    }
+    return GPTPS_OK;
+}
+static gptps_status task_storm_compact(gptps_ctx *ctx, void *ud)
+{
+    (void)ud;
+    while (!gptps_is_cancelled(ctx)) { gptps_dq_compact(g_sdq); nap(); }
+    return GPTPS_OK;
+}
+static gptps_status task_storm_item(gptps_ctx *ctx, void *ud)
+{
+    size_t n = 0;
+    const uint32_t *id = (const uint32_t *)gptps_payload(ctx, &n);
+    (void)ud;
+    if (g_sdq) { while (!gptps_is_cancelled(ctx)) nap(); return GPTPS_OK; }   /* child: never done */
+    if (id && n == sizeof *id && *id < (1u << 16)) ++g_storm_ran[*id];       /* parent: count it */
+    return GPTPS_OK;
+}
+static void reg_storm(gptps *e)
+{
+    gptps_task_def d;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    d.name = "pump";    d.run = task_storm_pump;    gptps_register_task(e, &d);
+    d.name = "compact"; d.run = task_storm_compact; gptps_register_task(e, &d);
+    d.name = "item";    d.run = task_storm_item;    gptps_register_task(e, &d);
+}
+static void test_storm_crash(void)
+{
+    pid_t pid;
+    int pfd[2], wst = 0, i, acked = 0, missing = 0, twice = 0;
+    static int acked_id[1 << 16];
+    uint32_t id;
+    remove(JOURNAL_B);
+    memset(acked_id, 0, sizeof acked_id);
+    memset(g_storm_ran, 0, sizeof g_storm_ran);
+    CHECK(pipe(pfd) == 0);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid < 0) return;
+    if (pid == 0) {
+        gptps *e; gptps_handle h;
+        close(pfd[0]);
+        g_storm_fd = pfd[1];
+        e = open_engine(STORM_PUMPS + 3);   /* the pumps, the compactor, two stuck items */
+        if (!e) _exit(2);
+        reg_storm(e);
+        g_sdq = gptps_dq_open(e, JOURNAL_B);
+        if (!g_sdq) _exit(3);
+        for (i = 0; i < STORM_PUMPS; ++i) gptps_submit(e, "pump", NULL, 0, &h);
+        gptps_submit(e, "compact", NULL, 0, &h);
+        for (;;) nap();                     /* until the parent kills it */
+    }
+    close(pfd[1]);
+    {   /* let the storm run until 300 submits are acknowledged, or 10s */
+        time_t t0 = time(NULL);
+        struct pollfd pf;
+        pf.fd = pfd[0]; pf.events = POLLIN; pf.revents = 0;
+        while (acked < 300 && time(NULL) - t0 < 10) {
+            if (poll(&pf, 1, 100) <= 0) continue;
+            if (read(pfd[0], &id, sizeof id) != (ssize_t)sizeof id) break;
+            if (id < (1u << 16)) { ++acked_id[id]; ++acked; }
+        }
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &wst, 0);
+    CHECK(WIFSIGNALED(wst) && WTERMSIG(wst) == SIGKILL);
+    while (read(pfd[0], &id, sizeof id) == (ssize_t)sizeof id)   /* acknowledged before it died */
+        if (id < (1u << 16)) { ++acked_id[id]; ++acked; }
+    close(pfd[0]);
+    CHECK(acked >= 300);
+    {
+        gptps *e; gptps_dq *dq; size_t ran = 0;
+        g_sdq = NULL;
+        e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+        reg_storm(e);
+        dq = gptps_dq_open(e, JOURNAL_B); CHECK(dq != NULL);
+        if (!dq) { gptps_shutdown(e); return; }
+        gptps_dq_recover(dq);
+        while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+        for (i = 0; i < (1 << 16); ++i) {
+            if (acked_id[i] && g_storm_ran[i] == 0) ++missing;
+            if (g_storm_ran[i] > 1) ++twice;
+        }
+        CHECK(missing == 0);                /* acknowledged, then lost */
+        CHECK(twice == 0);
+        if (missing) printf("  storm: %d of %d acknowledged submits were lost\n", missing, acked);
+        gptps_shutdown(e);
+        gptps_dq_close(dq);
+    }
+    remove(JOURNAL_B);
+}
+
+static void test_crash_loop(void)
+{
+    pid_t pid;
+    int wst = 0;
+    remove(JOURNAL_B);
+    for (g_run = 1; g_run <= 3; ++g_run) {
+        __atomic_store_n(&g_slow_started, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_slow_active, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_slow_overlap, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_killer_started, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&g_compacted, 0, __ATOMIC_SEQ_CST);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid < 0) return;
+        if (pid == 0) crash_child();
+        waitpid(pid, &wst, 0);
+        CHECK(WIFSIGNALED(wst) && WTERMSIG(wst) == SIGKILL);
+        if (WIFEXITED(wst)) printf("  crash-loop run %d exited with %d\n", g_run, WEXITSTATUS(wst));
+    }
+    {
+        gptps *e; gptps_dq *dq;
+        g_warns = 0;
+        gptps_set_log_sink(warn_sink, NULL);
+        e = open_manual_depth(0); CHECK(e != NULL);
+        dq = e ? gptps_dq_open(e, JOURNAL_B) : NULL; CHECK(dq != NULL);
+        if (dq) {
+            CHECK(gptps_dq_quarantined(dq) == 1);       /* killer, and only killer */
+            CHECK(gptps_dq_pending(dq) == 0);           /* the slow ones finished in run 3 */
+            CHECK(g_warns == 1 && strstr(g_warn, "'killer'") != NULL);
+            g_drained_n = 0; g_drained_name[0] = 0; g_drained_payload = 0;
+            CHECK(gptps_dq_drain_quarantine(dq, quarantine_cb, NULL) == 1);
+            CHECK(strcmp(g_drained_name, "killer") == 0 && g_drained_payload == 9);
+        }
+        if (e) gptps_shutdown(e);
+        if (dq) gptps_dq_close(dq);
+        gptps_set_log_sink(NULL, NULL);
+    }
+    remove(JOURNAL_B);
+}
 #endif /* TEST_DURABLE_FORK */
 
 int main(void)
@@ -792,9 +1365,15 @@ int main(void)
     test_body_cancels_itself();
     test_shutdown_manual();
     test_recover_again();
+    test_shutdown_not_a_crash();
+    test_suspects_one_at_a_time();
+    test_damaged_journal();
+    test_journaling_does_not_stall();
 #if defined(TEST_DURABLE_FORK)
     test_cancel_io();  /* POSIX: the E_IO path, by swapping the journal's fd */
     test_recovery();   /* crash-recovery via fork (POSIX) */
+    test_crash_loop(); /* POSIX: a body that kills its process, three times */
+    test_storm_crash();/* POSIX: SIGKILL in the middle of the group commit */
 #endif
     if (fails) { printf("%d durable-queue check(s) FAILED\n", fails); return 1; }
     printf("all durable-queue checks passed\n");

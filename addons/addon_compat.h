@@ -45,6 +45,15 @@ static APX_UNUSED int apx_cond_wait_ms(apx_cond *c, apx_mutex *m, unsigned ms)
 { return SleepConditionVariableCS(c, m, (DWORD)ms) ? 1 : 0; }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return _commit(_fileno(f)); }
 static APX_UNUSED int  apx_truncate(FILE *f, long len) { return _chsize(_fileno(f), len); }
+/* Sync by descriptor, for a file another thread may be writing at the same time:
+ * _commit holds the CRT's per-descriptor lock for the whole flush, which would stall
+ * every write to the file behind it, so this flushes the OS handle directly. */
+static APX_UNUSED int  apx_fileno(FILE *f)             { return _fileno(f); }
+static APX_UNUSED int  apx_fsync_fd(int fd)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    return (h != INVALID_HANDLE_VALUE && FlushFileBuffers(h)) ? 0 : -1;
+}
 /* NTFS has no durable directory-entry fsync API exposed here; rename is
  * effectively durable once the file data is committed, so this is a no-op. */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)  { (void)dir; return 0; }
@@ -88,6 +97,10 @@ static APX_UNUSED int apx_cond_wait_ms(apx_cond *c, apx_mutex *m, unsigned ms)
 }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return fsync(fileno(f)); }
 static APX_UNUSED int  apx_truncate(FILE *f, long len) { return ftruncate(fileno(f), (off_t)len); }
+/* Sync by descriptor, for a file another thread may be writing at the same time:
+ * fsync needs no stdio lock, and the kernel lets writes to the file go on meanwhile. */
+static APX_UNUSED int  apx_fileno(FILE *f)             { return fileno(f); }
+static APX_UNUSED int  apx_fsync_fd(int fd)            { return fsync(fd); }
 /* fsync the directory so a rename of a journal file is durable across a crash
  * (the rename's directory-entry update must itself be flushed). */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)

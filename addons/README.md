@@ -173,6 +173,9 @@ and quarantines it when the task is dead-lettered; `gptps_dq_recover()` re-submi
 anything a prior run left pending.
 
 - **Guarantee:** at-least-once — task bodies must be idempotent.
+- **Journaling does not stall the engine.** Only the submitting thread waits for the
+  disk: no lock the engine's threads need is held across the fsync, and submits made at
+  the same time share one fsync (group commit).
 - **Quarantine drains are at-least-once too.** `gptps_dq_drain_quarantine()` compacts
   the drained records out of the journal afterwards; if that compaction fails they are
   still on disk, so a restart hands them to your callback **again**. Fine for an
@@ -198,6 +201,17 @@ anything a prior run left pending.
   rest.
   Stop when a call re-submits nothing although the engine has drained — a record whose
   type is not registered is refused every time.
+- **Crash loops end.** A task that takes the whole process down — a segfault, an abort,
+  the OOM killer — is never dead-lettered, so it used to be recovered by every run and
+  kill every run. The journal now notes when each attempt starts and ends. A record
+  that was running when the process died twice becomes a *suspect*, and suspects go
+  back one at a time, so the next death points at one record rather than at everything
+  that ran beside it. At three deaths it is quarantined at open, with a warning to the
+  log sink. Any attempt that ends clears the count.
+- **A damaged journal is not destroyed.** A record torn at the end of the file — what a
+  crash leaves — is dropped silently, as before. Damage anywhere else is skipped and
+  every valid record after it kept; the original is copied to `<journal>.corrupt` first,
+  and a warning goes to the log sink.
 - **Not for services that exit cleanly.** A `GPTPS_TASK_SERVICE` without
   `GPTPS_TASK_RETIRE_ON_OK` reports `FINISHED` each time its `run()` returns `GPTPS_OK`,
   so its first clean exit closes the record. One that runs until stopped keeps it.

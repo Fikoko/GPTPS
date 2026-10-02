@@ -615,6 +615,13 @@ target_include_directories(test_durable_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_durable_oom PRIVATE gptps)
 add_test(NAME durable_oom COMMAND test_durable_oom)
 set_tests_properties(durable_oom PROPERTIES TIMEOUT 30)
+# Complexity gate, like admission_perf: draining a recovered backlog stays LINEAR in
+# its size (the observer's lookup used to walk every record, per event).
+add_executable(test_durable_perf tests/test_durable_perf.c)
+target_include_directories(test_durable_perf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable_perf PRIVATE gptps_durable_queue)
+add_test(NAME durable_perf COMMAND test_durable_perf)
+set_tests_properties(durable_perf PROPERTIES TIMEOUT 120)
 endif()
 
 if(TARGET gptps_orch)
