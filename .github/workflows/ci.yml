@@ -31,14 +31,17 @@ on:
 #     that stops the tests being registered) would configure clean, build clean, and
 #     produce a green run that executed nothing. A test runner that reports success
 #     for work it never ran is worse than no test runner. The flag makes "no tests"
-#     the failure it always was. Note the count is platform-dependent - nine add_test
-#     calls sit inside if(UNIX), so Windows registers 34 where POSIX registers 43 -
-#     which is why this is a zero/non-zero gate and not a count floor.
+#     the failure it always was. Note the count is platform-dependent - the add_test
+#     calls inside if(UNIX) do not register on Windows, and GPTPS_ADDONS narrows it
+#     further - which is why this is a zero/non-zero gate and not a count floor.
 #
 #   timeout-minutes   - the default is SIX HOURS. Every test carries its own CTest
 #     TIMEOUT, so the exposure is the unbounded non-test work: pacman -Syuu in the
-#     msys2 setup, the two apt-get calls in `cross`, checkout, and the builds. The
+#     msys2 setup, the two apt-get installs in `cross`, checkout, and the builds. The
 #     values below sit at 8x or more over each job's worst observed green runtime.
+#     The apt-get installs are steps of their own with their own limit, so a stalled
+#     mirror fails a step NAMED as an install, in minutes - not a 20-minute cancel
+#     of a step that also builds and tests, which reads like a hung test.
 
 jobs:
   # Build + test on the POSIX targets. Windows has its own jobs below (mingw-w64
@@ -364,17 +367,23 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: 32-bit (i386) build + full test
+      - name: install the i386 toolchain
+        timeout-minutes: 8
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib
+          sudo apt-get install -y -o Acquire::Retries=3 gcc-multilib
+      - name: 32-bit (i386) build + full test
+        run: |
           cmake -S . -B build32 -DCMAKE_C_FLAGS=-m32 -DCMAKE_EXE_LINKER_FLAGS=-m32
           cmake --build build32 -j
           ctest --test-dir build32 --output-on-failure --no-tests=error
-      - name: big-endian (s390x) build + serialization tests under QEMU
+      - name: install the s390x cross toolchain + QEMU
+        timeout-minutes: 8
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-s390x-linux-gnu qemu-user-static
+          sudo apt-get install -y -o Acquire::Retries=3 gcc-s390x-linux-gnu qemu-user-static
+      - name: big-endian (s390x) build + serialization tests under QEMU
+        run: |
           cmake -S . -B build-s390x -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-s390x.cmake"
           cmake --build build-s390x -j
           # qemu-user needs the guest sysroot to find the s390x dynamic loader + libs
