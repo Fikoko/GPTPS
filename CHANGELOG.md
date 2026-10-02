@@ -5,7 +5,45 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.5.0] - 2026-10-02
+
+### Upgrading from 1.4
+
+No API changed incompatibly, and the ABI is still 2.3. Three changes can need a change
+in a host:
+
+- **`gptps_dq_recover` can return fewer records than are pending.** A record that was
+  running at two deaths of the process is a suspect, and suspects are recovered one at
+  a time: the count includes at most one, and the others are handed to the engine as
+  each turn ends. Code that expects every pending record enqueued when the call
+  returns, or compares its count with `gptps_dq_pending`, must not.
+  `gptps_dq_set_resubmit_cb` reports each record as it goes.
+- **`gptps_dq_open` returns NULL if it runs out of memory loading the journal,** where
+  1.4 compacted away whatever it had not loaded.
+- **A queued item costs 48-80 more bytes at 64-bit:** 16 in the item, and 32-64 in the
+  engine's new index by handle, which briefly holds its old and new tables while it
+  grows. A host whose allocator is a fixed pool sized for 1.4 needs that headroom; a
+  submit that cannot grow the index fails with `GPTPS_E_NOMEM`, as one that cannot
+  allocate its item does.
+
+Four more change what a host sees:
+
+- **A record that was running at three deaths of the process is quarantined at open,**
+  with a warning, instead of crash-looping the host. Like a dead-lettered record, it
+  stays in the journal until `gptps_dq_drain_quarantine` hands it over.
+- **Damage in a journal no longer ends the load.** A damaged record that is not a torn
+  tail is skipped and the valid records after it are kept; the journal is first copied
+  to `<journal>.corrupt`, and a warning goes to the log sink - stderr, unless
+  `gptps_set_log_sink` redirects it.
+- **On macOS, each durable submit is slower.** The fsync is now `F_FULLFSYNC`, which
+  flushes the drive's own cache, where a plain fsync leaves the data for a power cut to
+  take. To journal many items, `gptps_dq_submit_batch` pays one fsync for all of them.
+- **The journal grows by a 24-byte marker for each attempt,** and another for each
+  attempt that fails; a compaction drops them, keeping at most two for a record still
+  pending. A journal written by 1.5 still opens in 1.4.0, which skips the markers and
+  loses only the crash counts.
+
+The sections below give the details.
 
 ### Added — `durable_queue`: batches, the handle a recovered record runs under, and fsync on macOS that reaches the disk
 
