@@ -1163,7 +1163,10 @@ static gptps_status task_killer(gptps_ctx *ctx, void *ud)
     else if (get(&g_slow_started) != 3 || get(&g_slow_overlap) != 0)
         _exit(20);                      /* the suspects did not go one at a time */
     kill(getpid(), SIGKILL);
-    return GPTPS_E_TASK;
+    /* Never return. On macOS kill() returns before the process is gone, and a body
+     * that returned would end its attempt - an 'F' - clearing the very count under
+     * test. A real crash (a segfault, an abort, the OOM killer) does not return. */
+    for (;;) nap();
 }
 static void crash_child(void)
 {
@@ -1187,8 +1190,10 @@ static void crash_child(void)
         if (gptps_dq_compact(dq) != GPTPS_OK) _exit(5);
         inc(&g_compacted);
     } else {
+        size_t got;
         if (gptps_dq_pending(dq) != 4) _exit(6);
-        if (gptps_dq_recover(dq) != (g_run == 2 ? 4u : 1u)) _exit(7);   /* run 3: one suspect */
+        got = gptps_dq_recover(dq);
+        if (got != (g_run == 2 ? 4u : 1u)) _exit(70 + (int)(got < 9 ? got : 9));   /* run 3: one suspect */
     }
     t0 = time(NULL);
     while (time(NULL) - t0 < 15) nap();
@@ -1309,6 +1314,30 @@ static void test_storm_crash(void)
     remove(JOURNAL_B);
 }
 
+/* Print a journal's records - type, seq, and a 'K' marker's count - so that a crash-loop
+ * run that went wrong says what the journal held. Diagnostics only. */
+static void dump_journal(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    unsigned char h[20], body[4];
+    printf("  journal %s:", path);
+    if (!f || fseek(f, 8, SEEK_SET) != 0) { printf(" (unreadable)\n"); if (f) fclose(f); return; }
+    while (fread(h, 1, sizeof h, f) == sizeof h) {
+        unsigned nlen = (unsigned)(h[6] | (h[7] << 8));
+        unsigned long plen = (unsigned long)h[8] | ((unsigned long)h[9] << 8) |
+                             ((unsigned long)h[10] << 16) | ((unsigned long)h[11] << 24);
+        printf(" %c%u", h[4] >= 32 && h[4] < 127 ? h[4] : '?', (unsigned)h[12]);
+        if (h[4] == 'K' && plen == 4 && nlen == 0 && fread(body, 1, 4, f) == 4) {
+            printf("(%u)", (unsigned)body[0]);
+            if (fseek(f, 4, SEEK_CUR) != 0) break;
+            continue;
+        }
+        if (fseek(f, (long)(nlen + plen + 4), SEEK_CUR) != 0) break;
+    }
+    printf("\n");
+    fclose(f);
+}
+
 static void test_crash_loop(void)
 {
     pid_t pid;
@@ -1326,7 +1355,10 @@ static void test_crash_loop(void)
         if (pid == 0) crash_child();
         waitpid(pid, &wst, 0);
         CHECK(WIFSIGNALED(wst) && WTERMSIG(wst) == SIGKILL);
-        if (WIFEXITED(wst)) printf("  crash-loop run %d exited with %d\n", g_run, WEXITSTATUS(wst));
+        if (WIFEXITED(wst)) {
+            printf("  crash-loop run %d exited with %d\n", g_run, WEXITSTATUS(wst));
+            dump_journal(JOURNAL_B);
+        }
     }
     {
         gptps *e; gptps_dq *dq;
