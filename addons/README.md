@@ -175,7 +175,15 @@ anything a prior run left pending.
 - **Guarantee:** at-least-once — task bodies must be idempotent.
 - **Journaling does not stall the engine.** Only the submitting thread waits for the
   disk: no lock the engine's threads need is held across the fsync, and submits made at
-  the same time share one fsync (group commit).
+  the same time share one fsync (group commit). To journal many items from one thread,
+  `gptps_dq_submit_batch` pays one fsync for all of them.
+- **Which handle a recovered record runs under.** Events carry no payload, so set
+  `gptps_dq_set_resubmit_cb` before `gptps_dq_recover`: it reports each record the queue
+  hands back to the engine with its new handle.
+- **On macOS** the fsync is `F_FULLFSYNC`, the only one there that flushes the drive's
+  cache; a plain `fsync` can still lose data to a power cut.
+- **Compact when the engine is quiet:** a compaction holds the queue while it rewrites
+  and fsyncs the journal.
 - **Quarantine drains are at-least-once too.** `gptps_dq_drain_quarantine()` compacts
   the drained records out of the journal afterwards; if that compaction fails they are
   still on disk, so a restart hands them to your callback **again**. Fine for an

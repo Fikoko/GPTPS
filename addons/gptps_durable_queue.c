@@ -29,6 +29,9 @@
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#  define _DARWIN_C_SOURCE   /* F_FULLFSYNC: see apx_fsync_fd in addon_compat.h */
+#endif
 #include "gptps_durable_queue.h"
 #include "addon_compat.h"   /* portable mutex, condition variable + fsync */
 
@@ -106,7 +109,8 @@ typedef struct {
  * ended - which is also what a compaction reads (see "journal writes and group commit"). */
 typedef struct dq_waiter {
     uint64_t          ticket;   /* write order */
-    uint64_t          seq;      /* the record it is about */
+    uint64_t          seq;      /* the records it is about: seq .. seq_end (a batch) */
+    uint64_t          seq_end;
     char              type;     /* 'P' or 'D' */
     int               state;    /* DQ_W_* */
     struct dq_waiter *next;
@@ -126,6 +130,8 @@ struct gptps_dq {
     dq_slot        *slots;     /* handle -> seq of an OPEN record with a handle this run */
     size_t          nslots, live, dead, reserved;
     uint64_t        trial;     /* seq of the suspect resubmitted alone right now, or 0 */
+    gptps_dq_resubmit_cb resub;   /* gptps_dq_set_resubmit_cb */
+    void           *resub_ud;
     apx_mutex       jmu;       /* the journal - see "journal writes and group commit" */
     FILE           *fp;        /* JMU: append handle */
     apx_mutex       smu;       /* the group commit below */
@@ -309,7 +315,34 @@ static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
     }
     end = ftell(dq->fp);
     apx_mutex_lock(&dq->smu);
-    w->ticket = ++dq->tickets; w->seq = seq; w->type = type; w->state = DQ_W_WAITING;
+    w->ticket = ++dq->tickets; w->seq = w->seq_end = seq; w->type = type; w->state = DQ_W_WAITING;
+    w->next = dq->waiters; dq->waiters = w;
+    dq->last_end = end;
+    apx_mutex_unlock(&dq->smu);
+    return 0;
+}
+
+/* write_durable for a batch: n 'P' records with seqs first .. first+n-1, one waiter for
+ * all of them, so one fsync settles the batch. All of it, or - rolled back - none.
+ * Caller holds jmu. */
+static int write_durable_batch(gptps_dq *dq, dq_waiter *w, const gptps_dq_item *items,
+                               size_t n, uint64_t first)
+{
+    long start, end;
+    size_t i;
+    if (!dq->fp) return -1;
+    fseek(dq->fp, 0, SEEK_END);       /* see write_durable */
+    start = ftell(dq->fp);
+    for (i = 0; i < n; ++i)
+        if (write_record(dq->fp, 'P', first + i, items[i].task_name, items[i].payload, items[i].len) != 0) {
+            rollback_to(dq->fp, start);
+            return -1;
+        }
+    if (fflush(dq->fp) != 0) { rollback_to(dq->fp, start); return -1; }
+    end = ftell(dq->fp);
+    apx_mutex_lock(&dq->smu);
+    w->ticket = ++dq->tickets; w->seq = first; w->seq_end = first + n - 1;
+    w->type = 'P'; w->state = DQ_W_WAITING;
     w->next = dq->waiters; dq->waiters = w;
     dq->last_end = end;
     apx_mutex_unlock(&dq->smu);
@@ -392,7 +425,7 @@ static int waiter_state(const gptps_dq *dq, uint64_t seq, char type)
     const dq_waiter *w;
     int st = -1;
     for (w = dq->waiters; w; w = w->next) {
-        if (w->seq != seq || w->type != type) continue;
+        if (seq < w->seq || seq > w->seq_end || w->type != type) continue;
         if (w->state == DQ_W_DURABLE) return DQ_W_DURABLE;
         st = w->state;
     }
@@ -893,8 +926,13 @@ static gptps_status resubmit(gptps_dq *dq, dq_rec *rc)
     gptps_status st;
     if (map_reserve(dq, 1) != 0) return GPTPS_E_NOMEM;
     st = gptps_submit(dq->e, rc->name, rc->payload, rc->len, &h);
-    if (st == GPTPS_OK) { rc->handle = h; map_put(dq, h, rc->seq); }
-    else map_unreserve(dq);
+    if (st == GPTPS_OK) {
+        rc->handle = h;
+        map_put(dq, h, rc->seq);
+        if (dq->resub) dq->resub(rc->name, rc->payload, rc->len, h, dq->resub_ud);
+    } else {
+        map_unreserve(dq);
+    }
     return st;
 }
 
@@ -1154,6 +1192,108 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     }
     apx_mutex_unlock(&dq->mu);
     return st;
+}
+
+gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
+{
+    char **nm = NULL;
+    void **pl = NULL;
+    dq_waiter w;
+    uint64_t first;
+    size_t i, pushed;
+    int wrote, durable;
+    gptps_status bad = GPTPS_OK;
+    if (!dq || (n && !items)) return GPTPS_E_INVAL;
+    if (n == 0) return GPTPS_OK;
+    /* gptps_dq_submit's bounds, for every item, before anything is written: a batch is
+     * journaled whole or not at all. */
+    for (i = 0; i < n && bad == GPTPS_OK; ++i)
+        if (!items[i].task_name || items[i].len > DQ_MAX_PAYLOAD ||
+            strlen(items[i].task_name) > DQ_MAX_NAME || (items[i].len && !items[i].payload))
+            bad = GPTPS_E_INVAL;
+    if (bad == GPTPS_OK) {
+        nm = (char **)calloc(n, sizeof *nm);
+        pl = (void **)calloc(n, sizeof *pl);
+        if (!nm || !pl) bad = GPTPS_E_NOMEM;
+    }
+    for (i = 0; i < n && bad == GPTPS_OK; ++i) {       /* duplicated first: see gptps_dq_submit */
+        nm[i] = dup_str(items[i].task_name);
+        pl[i] = dup_mem(items[i].payload, items[i].len);
+        if (!nm[i] || (items[i].len && !pl[i])) bad = GPTPS_E_NOMEM;
+    }
+    if (bad != GPTPS_OK) goto refuse;
+
+    apx_mutex_lock(&dq->mu);
+    if (map_reserve(dq, n) != 0) { apx_mutex_unlock(&dq->mu); bad = GPTPS_E_NOMEM; goto refuse; }
+    for (pushed = 0; pushed < n && push_rec(dq); ++pushed) { }
+    if (pushed < n) {                                 /* reserved before journaling, all or none */
+        dq->n -= pushed;
+        dq->reserved -= n;
+        apx_mutex_unlock(&dq->mu);
+        bad = GPTPS_E_NOMEM;
+        goto refuse;
+    }
+    first = dq->next_seq;
+    dq->next_seq += n;
+    for (i = 0; i < n; ++i) {
+        dq_rec *rc = &dq->recs[dq->n - n + i];
+        rc->seq = first + i; rc->name = nm[i]; rc->payload = pl[i]; rc->len = items[i].len;
+        rc->committing = 1;
+        nm[i] = NULL; pl[i] = NULL;                   /* the table owns them now */
+    }
+    apx_mutex_lock(&dq->jmu);                         /* before letting go of mu: see "group commit" */
+    apx_mutex_unlock(&dq->mu);
+    wrote = write_durable_batch(dq, &w, items, n, first);
+    apx_mutex_unlock(&dq->jmu);
+    if (wrote == 0) sync_until(dq, &w);               /* one fsync for the lot */
+    durable = (wrote == 0 && w.state == DQ_W_DURABLE);
+
+    apx_mutex_lock(&dq->mu);
+    if (wrote == 0) unregister_waiter(dq, &w);
+    for (i = 0; i < n; ++i) {
+        dq_rec *rc = find_by_seq(dq, first + i);
+        gptps_handle h = 0;
+        rc->committing = 0;
+        items[i].handle = 0;
+        if (!durable) {                               /* not journaled: not records */
+            rc->done = 1;
+            map_unreserve(dq);
+            items[i].status = GPTPS_E_IO;
+            continue;
+        }
+        dq->pending += 1;
+        items[i].status = gptps_submit(dq->e, rc->name, rc->payload, rc->len, &h);
+        if (items[i].status == GPTPS_OK) {
+            rc->handle = h;
+            map_put(dq, h, rc->seq);
+            items[i].handle = h;
+        } else {                                      /* refused: closed, as gptps_dq_submit does */
+            rc->done = 1; if (dq->pending) dq->pending -= 1;
+            map_unreserve(dq);
+            append_marker(dq, 'D', rc->seq);
+        }
+    }
+    apx_mutex_unlock(&dq->mu);
+    free(nm); free(pl);
+    return durable ? GPTPS_OK : GPTPS_E_IO;
+
+refuse:
+    for (i = 0; i < n; ++i) {
+        items[i].handle = 0; items[i].status = bad;
+        if (nm) free(nm[i]);
+        if (pl) free(pl[i]);
+    }
+    free(nm); free(pl);
+    return bad;
+}
+
+gptps_status gptps_dq_set_resubmit_cb(gptps_dq *dq, gptps_dq_resubmit_cb cb, void *user_data)
+{
+    if (!dq) return GPTPS_E_INVAL;
+    apx_mutex_lock(&dq->mu);
+    dq->resub = cb; dq->resub_ud = user_data;
+    apx_mutex_unlock(&dq->mu);
+    return GPTPS_OK;
 }
 
 size_t gptps_dq_recover(gptps_dq *dq)

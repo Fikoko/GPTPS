@@ -95,12 +95,24 @@ static APX_UNUSED int apx_cond_wait_ms(apx_cond *c, apx_mutex *m, unsigned ms)
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
     return pthread_cond_timedwait(c, m, &ts) == ETIMEDOUT ? 0 : 1;
 }
-static APX_UNUSED int  apx_fsync(FILE *f)              { return fsync(fileno(f)); }
-static APX_UNUSED int  apx_truncate(FILE *f, long len) { return ftruncate(fileno(f), (off_t)len); }
 /* Sync by descriptor, for a file another thread may be writing at the same time:
- * fsync needs no stdio lock, and the kernel lets writes to the file go on meanwhile. */
+ * fsync needs no stdio lock, and the kernel lets writes to the file go on meanwhile.
+ * On macOS fsync() hands the data to the drive without flushing the drive's own
+ * cache, so a power cut can still take it; F_FULLFSYNC flushes that too, which is
+ * what "durable" promises. A file system that refuses it (some network and FUSE
+ * mounts) gets fsync, the best it offers. F_FULLFSYNC is a Darwin extension: the
+ * includer defines _DARWIN_C_SOURCE beside _POSIX_C_SOURCE, or it is hidden and
+ * this quietly falls back to fsync. */
 static APX_UNUSED int  apx_fileno(FILE *f)             { return fileno(f); }
-static APX_UNUSED int  apx_fsync_fd(int fd)            { return fsync(fd); }
+static APX_UNUSED int  apx_fsync_fd(int fd)
+{
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+#endif
+    return fsync(fd);
+}
+static APX_UNUSED int  apx_fsync(FILE *f)              { return apx_fsync_fd(fileno(f)); }
+static APX_UNUSED int  apx_truncate(FILE *f, long len) { return ftruncate(fileno(f), (off_t)len); }
 /* fsync the directory so a rename of a journal file is durable across a crash
  * (the rename's directory-entry update must itself be flushed). */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)

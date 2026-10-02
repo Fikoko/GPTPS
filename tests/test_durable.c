@@ -982,6 +982,98 @@ static void test_suspects_one_at_a_time(void)
     remove(JOURNAL_C);
 }
 
+/* gptps_dq_submit_batch: every item journaled with one fsync, then each enqueued.
+ * An item the engine refuses is closed, as a single submit's is; an item past the
+ * limits refuses the whole batch before anything is written; the next run recovers
+ * exactly the items that were taken. */
+static void test_batch(void)
+{
+    gptps *e; gptps_dq *dq; gptps_dq_item it[5], bad[2];
+    unsigned char b[5] = { 0, 1, 2, 3, 4 };
+    size_t ran = 0; int i;
+    remove(JOURNAL_A);
+    __atomic_store_n(&g_block, 0, __ATOMIC_SEQ_CST);
+    reset_ran();
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+    dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    for (i = 0; i < 5; ++i) { it[i].task_name = "work"; it[i].payload = &b[i]; it[i].len = 1; }
+    it[3].task_name = "nosuch";                         /* the engine refuses this one */
+    CHECK(gptps_dq_submit_batch(dq, it, 5) == GPTPS_OK);
+    for (i = 0; i < 5; ++i)
+        CHECK(i == 3 ? (it[i].status == GPTPS_E_NOTFOUND && it[i].handle == 0)
+                     : (it[i].status == GPTPS_OK && it[i].handle != 0));
+    CHECK(gptps_dq_pending(dq) == 4);
+    bad[0] = it[0];
+    bad[1].task_name = "work"; bad[1].payload = NULL; bad[1].len = 7;   /* no bytes for its length */
+    CHECK(gptps_dq_submit_batch(dq, bad, 2) == GPTPS_E_INVAL);
+    CHECK(bad[0].status == GPTPS_E_INVAL && bad[0].handle == 0);
+    CHECK(gptps_dq_pending(dq) == 4);                   /* nothing of it was written */
+    CHECK(gptps_dq_submit_batch(dq, NULL, 0) == GPTPS_OK);
+    gptps_shutdown(e);                                  /* never stepped: four pending */
+    gptps_dq_close(dq);
+
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+    dq = gptps_dq_open(e, JOURNAL_A); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    CHECK(gptps_dq_pending(dq) == 4);
+    CHECK(gptps_dq_recover(dq) == 4);
+    while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+    CHECK(get(&g_ran[0]) == 1 && get(&g_ran[1]) == 1 && get(&g_ran[2]) == 1 &&
+          get(&g_ran[3]) == 0 && get(&g_ran[4]) == 1);
+    CHECK(gptps_dq_pending(dq) == 0);
+    gptps_shutdown(e);
+    gptps_dq_close(dq);
+    remove(JOURNAL_A);
+}
+
+/* gptps_dq_set_resubmit_cb: every record the queue hands back to the engine is
+ * reported with its new handle - three recovered at once, a suspect on its turn, and
+ * the next suspect when that turn ends, from inside the step that ended it. Each handle
+ * reported is the one the engine's QUEUED announced, in the same order. */
+static gptps_handle  g_rh[8];
+static unsigned char g_rp[8];
+static int           g_nr;
+static void resub_cb(const char *name, const void *payload, size_t len, gptps_handle h, void *ud)
+{
+    (void)ud;
+    if (g_nr < 8 && name && strcmp(name, "work") == 0) {
+        g_rh[g_nr] = h;
+        g_rp[g_nr] = (payload && len == 1) ? *(const unsigned char *)payload : 0xFF;
+        ++g_nr;
+    }
+}
+static void test_resubmit_cb(void)
+{
+    gptps *e; gptps_dq *dq; FILE *f; size_t ran = 0; int i;
+    unsigned char two[4] = { 2, 0, 0, 0 }, b;
+    remove(JOURNAL_C);
+    __atomic_store_n(&g_block, 0, __ATOMIC_SEQ_CST);
+    f = jopen(JOURNAL_C); CHECK(f != NULL); if (!f) return;
+    for (b = 1; b <= 3; ++b) jrec(f, 'P', b, "work", &b, 1);
+    b = 4; jrec(f, 'P', 4, "work", &b, 1); jrec(f, 'K', 4, "", two, 4);   /* two suspects */
+    b = 5; jrec(f, 'P', 5, "work", &b, 1); jrec(f, 'K', 5, "", two, 4);
+    fclose(f);
+    g_nr = 0; g_nq = 0;
+    e = open_manual_depth(0); CHECK(e != NULL); if (!e) return;
+    CHECK(gptps_register_observer(e, queued_obs, NULL) == GPTPS_OK);
+    dq = gptps_dq_open(e, JOURNAL_C); CHECK(dq != NULL);
+    if (!dq) { gptps_shutdown(e); return; }
+    CHECK(gptps_dq_set_resubmit_cb(NULL, resub_cb, NULL) == GPTPS_E_INVAL);
+    CHECK(gptps_dq_set_resubmit_cb(dq, resub_cb, NULL) == GPTPS_OK);
+    CHECK(gptps_dq_recover(dq) == 4);                   /* three, and the first suspect */
+    CHECK(g_nr == 4);
+    for (i = 0; i < g_nr && i < 4; ++i) CHECK(g_rp[i] == i + 1);
+    while (gptps_step(e, &ran) == GPTPS_OK && ran) { }   /* suspect 4's turn ends: 5 goes */
+    CHECK(g_nr == 5 && g_rp[4] == 5);
+    CHECK(g_nq == 5);
+    for (i = 0; i < 5 && i < g_nq; ++i) CHECK(g_rh[i] == g_qh[i]);
+    CHECK(gptps_dq_pending(dq) == 0);
+    gptps_shutdown(e);
+    gptps_dq_close(dq);
+    remove(JOURNAL_C);
+}
+
 #if defined(TEST_DURABLE_FORK)
 /* gptps_dq_cancel's failure path: "if it cannot be made durable the call returns
  * GPTPS_E_IO, leaving the record open and the execution alone". The journal's
@@ -1038,8 +1130,14 @@ static void test_cancel_io(void)
             CHECK(get(&g_io_ev) == 0);                  /* ...and nothing cancelled */
             {
                 gptps_handle hx = 0; unsigned char x = 5;
+                gptps_dq_item bi[2];
                 CHECK(gptps_dq_submit(dq, "work", &x, 1, &hx) == GPTPS_E_IO);
                 CHECK(hx == 0 && gptps_dq_pending(dq) == 2);
+                bi[0].task_name = bi[1].task_name = "work";
+                bi[0].payload = bi[1].payload = &x; bi[0].len = bi[1].len = 1;
+                CHECK(gptps_dq_submit_batch(dq, bi, 2) == GPTPS_E_IO);   /* one fsync, failed: none */
+                CHECK(bi[0].status == GPTPS_E_IO && bi[1].status == GPTPS_E_IO && bi[0].handle == 0);
+                CHECK(gptps_dq_pending(dq) == 2);
             }
             CHECK(dup2(saved, jfd) == jfd);
             close(saved);
@@ -1201,10 +1299,11 @@ static void crash_child(void)
 }
 /* H) Every acknowledged submit survives a SIGKILL that lands in the middle of the
  * group commit. In a child, three pumps submit durably at once - so they share
- * fsyncs - while a fourth task compacts the journal over and over, and each pump
- * writes the id of every submit that returned GPTPS_OK to a pipe. The work itself
- * never finishes, so every record stays pending. The parent kills the child mid-storm,
- * then recovers the journal: every id the child acknowledged must run, exactly once.
+ * fsyncs, and one of them in batches of eight - while a fourth task compacts the
+ * journal over and over, and each pump writes the id of every submit that returned
+ * GPTPS_OK to a pipe. The work itself never finishes, so every record stays pending.
+ * The parent kills the child mid-storm, then recovers the journal: every id the child
+ * acknowledged must run, exactly once.
  * This is the protocol's whole promise - a compaction that dropped a record whose 'P'
  * had become durable, or that wrote one whose submit then failed, would show here. */
 #define STORM_PUMPS 3
@@ -1219,6 +1318,25 @@ static gptps_status task_storm_pump(gptps_ctx *ctx, void *ud)
         if (id >= (1u << 16)) break;
         if (gptps_dq_submit(g_sdq, "item", &id, sizeof id, &h) == GPTPS_OK &&
             write(g_storm_fd, &id, sizeof id) != (ssize_t)sizeof id) _exit(9);
+    }
+    return GPTPS_OK;
+}
+static gptps_status task_storm_bpump(gptps_ctx *ctx, void *ud)   /* batches of 8 */
+{
+    (void)ud;
+    while (!gptps_is_cancelled(ctx)) {
+        gptps_dq_item bi[8];
+        uint32_t id[8];
+        int k;
+        for (k = 0; k < 8; ++k) {
+            id[k] = (uint32_t)inc(&g_storm_next);
+            if (id[k] >= (1u << 16)) return GPTPS_OK;
+            bi[k].task_name = "item"; bi[k].payload = &id[k]; bi[k].len = sizeof id[k];
+        }
+        if (gptps_dq_submit_batch(g_sdq, bi, 8) != GPTPS_OK) continue;
+        for (k = 0; k < 8; ++k)
+            if (bi[k].status == GPTPS_OK && write(g_storm_fd, &id[k], sizeof id[k]) != (ssize_t)sizeof id[k])
+                _exit(9);
     }
     return GPTPS_OK;
 }
@@ -1245,6 +1363,7 @@ static void reg_storm(gptps *e)
     d.default_cost.struct_size = sizeof d.default_cost;
     d.default_policy.struct_size = sizeof d.default_policy;
     d.name = "pump";    d.run = task_storm_pump;    gptps_register_task(e, &d);
+    d.name = "bpump";   d.run = task_storm_bpump;   gptps_register_task(e, &d);
     d.name = "compact"; d.run = task_storm_compact; gptps_register_task(e, &d);
     d.name = "item";    d.run = task_storm_item;    gptps_register_task(e, &d);
 }
@@ -1270,7 +1389,7 @@ static void test_storm_crash(void)
         reg_storm(e);
         g_sdq = gptps_dq_open(e, JOURNAL_B);
         if (!g_sdq) _exit(3);
-        for (i = 0; i < STORM_PUMPS; ++i) gptps_submit(e, "pump", NULL, 0, &h);
+        for (i = 0; i < STORM_PUMPS; ++i) gptps_submit(e, i ? "pump" : "bpump", NULL, 0, &h);
         gptps_submit(e, "compact", NULL, 0, &h);
         for (;;) nap();                     /* until the parent kills it */
     }
@@ -1399,6 +1518,8 @@ int main(void)
     test_recover_again();
     test_shutdown_not_a_crash();
     test_suspects_one_at_a_time();
+    test_batch();
+    test_resubmit_cb();
     test_damaged_journal();
     test_journaling_does_not_stall();
 #if defined(TEST_DURABLE_FORK)

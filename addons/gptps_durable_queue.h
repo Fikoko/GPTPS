@@ -123,6 +123,29 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path);
 gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
                              const void *payload, size_t len, gptps_handle *out_handle);
 
+/* One item of gptps_dq_submit_batch: fill task_name, payload and len; the call fills
+ * handle and status. */
+typedef struct {
+    const char   *task_name;
+    const void   *payload;
+    size_t        len;
+    gptps_handle  handle;   /* out: the engine's handle, 0 unless status is GPTPS_OK */
+    gptps_status  status;   /* out: what gptps_submit returned for it, or the batch's error */
+} gptps_dq_item;
+
+/* gptps_dq_submit for n items with ONE fsync: all of them are written to the journal and
+ * made durable together, then each is enqueued, in order. Journaled one at a time, work
+ * costs an fsync per item - about a thousand items a second from one thread on a fast
+ * disk; a batch pays one fsync for the lot.
+ * Returns GPTPS_OK once the batch is durable. Each item's status then says whether the
+ * engine took it, and an item it refused is closed in the journal, as gptps_dq_submit
+ * closes one. GPTPS_E_IO if the batch could not be made durable: nothing is enqueued,
+ * and every status is GPTPS_E_IO. GPTPS_E_INVAL (an item past gptps_dq_submit's limits)
+ * or GPTPS_E_NOMEM before anything is written, with every status set to it - a batch
+ * is journaled whole or not at all. n == 0 is GPTPS_OK. The QUEUED events arrive on
+ * this thread with the queue's lock held, as gptps_dq_submit's do. */
+gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n);
+
 /* Re-submit every record that survived from a previous run/crash (persisted but
  * never completed). Quarantined (dead-lettered) records are terminal-but-retained,
  * NOT incomplete: they are skipped here - recover them out-of-band via
@@ -143,6 +166,21 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
  * one's turn ends (its attempt ends, it reaches a verdict, or it is cancelled or
  * retracted before it runs). So the count includes at most one of them. */
 size_t gptps_dq_recover(gptps_dq *dq);
+
+/* Called for every record this queue hands back to the engine - each one
+ * gptps_dq_recover re-submits, and each suspect handed over later (see "Crash loops") -
+ * with its task name, payload and NEW handle. Events carry no payload, so this is how a
+ * host links the work it journaled (an invoice id in the payload, say) to the handle
+ * that work runs under after a restart.
+ * It runs with the queue's lock held, on the thread that resubmitted the record: the
+ * caller of gptps_dq_recover, or for a suspect the thread that ended the previous
+ * suspect's turn. So it must not call into this queue, and the payload is valid only for
+ * the call. The record's own events can reach other observers before it runs, as a
+ * submit's can before gptps_submit returns: key a ledger on the handle, and attach the
+ * id when this arrives. Set it before gptps_dq_recover; NULL clears it. */
+typedef void (*gptps_dq_resubmit_cb)(const char *task_name, const void *payload, size_t len,
+                                     gptps_handle handle, void *user_data);
+gptps_status gptps_dq_set_resubmit_cb(gptps_dq *dq, gptps_dq_resubmit_cb cb, void *user_data);
 
 /* Retract a durable submit: close the record for `h` so no later gptps_dq_recover
  * re-submits it, then gptps_cancel(e, h) the execution. `h` is an engine handle
@@ -200,6 +238,11 @@ size_t gptps_dq_drain_quarantine_ex(gptps_dq *dq, gptps_dq_quarantine_cb cb,
 
 /* Rewrite the journal to contain only still-pending records, bounding its growth
  * within a long-running process. Returns GPTPS_OK or GPTPS_E_IO.
+ *
+ * Compact when the engine is quiet. A compaction holds the queue from start to end - it
+ * rewrites every pending record and fsyncs the result - and the engine's threads wait
+ * at their next event until it is done: a pause about as long as writing the journal's
+ * pending records once. gptps_dq_drain_quarantine compacts too.
  *
  * Not optional at scale: nothing else bounds the journal, and both replay on open
  * and the observer's per-completion lookup walk everything accumulated since the

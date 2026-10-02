@@ -7,6 +7,23 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — `durable_queue`: batches, the handle a recovered record runs under, and fsync on macOS that reaches the disk
+
+- **`gptps_dq_submit_batch`** journals n items with one fsync, then enqueues each.
+  One at a time, durable work costs an fsync per item: 3,000 items took 2.8 s from one
+  thread. As one batch they took 3 ms, and 32 ms in batches of 100. A batch is
+  journaled whole or not at all, and each item's status says whether the engine took
+  it.
+- **`gptps_dq_set_resubmit_cb`** reports every record the queue hands back to the
+  engine - each one `gptps_dq_recover` re-submits, and a suspect on its later turn -
+  with its new handle. Events carry no payload and `gptps_dq_recover` returns a count,
+  so a host keeping a ledger of journaled work (an invoice id in the payload, say) had
+  no way to tell which handle a recovered record ran under after a restart.
+- **On macOS, the queue's fsync now reaches the disk.** `fsync()` there leaves the data
+  in the drive's own cache, where a power cut can still take it; the queue now uses
+  `F_FULLFSYNC`, and plain `fsync` where a file system refuses it. It is slower, which
+  is the price of what "durable" promises.
+
 ### Fixed — cancelling from a deep queue walked it
 
 - **`gptps_cancel` is O(1) in queue depth.** It found its item by walking every queue,
@@ -71,6 +88,9 @@ the release version and is documented in `include/gptps.h`.
 
 ### Documentation
 
+- **`durable_queue`: compact when the engine is quiet.** A compaction holds the queue
+  while it rewrites the journal and fsyncs it, and the engine's threads wait at their
+  next event until it is done. `gptps_dq_compact`'s header now says so.
 - **`examples/item_ledger.c`: the ledger a host keeps while it re-drives dead letters.**
   One row per business id, found by the item's current handle, since events carry no
   payload. The observer and the dead-letter drain close a row through the same function:
