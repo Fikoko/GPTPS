@@ -7,6 +7,19 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Fixed — cancelling from a deep queue walked it
+
+- **`gptps_cancel` is O(1) in queue depth.** It found its item by walking every queue,
+  and a cancel from intake wiped the cache that keeps an ordered insert O(1), so the
+  next submit walked the whole queue too. Cancelling 40,000 queued items newest-first
+  took 3.7-4.5 s, and cancelling and resubmitting at that depth 4.5-5.5 s - each cancel
+  holding the engine lock for its walk, stalling the dispatcher and every submitter.
+  Now the engine keeps an index by handle and its queues are doubly linked: the same
+  runs take 3 ms and 6 ms. `gptps_dq_cancel`, `gptps_orch`, `gptps_balance` and a host
+  cancelling what is left at the end of a window all go through it.
+  `tests/test_cancel_perf.c` gates the shape of the curve, from intake and from
+  backoff, and `tests/test_cancel.c` now cancels after every way an item can end.
+
 ### Fixed — `durable_queue`: a stalled engine, a damaged journal, a quadratic drain, and crash loops
 
 - **Journaling work no longer stalls the engine.** `gptps_dq_submit` held the queue's

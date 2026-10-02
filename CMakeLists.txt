@@ -354,6 +354,16 @@ target_link_libraries(test_admission_perf PRIVATE gptps)
 add_test(NAME admission_perf COMMAND test_admission_perf)
 set_tests_properties(admission_perf PROPERTIES TIMEOUT 120)
 
+# The same kind of gate for gptps_cancel: finding and unlinking an item stays O(1) in
+# queue depth, in intake and in `delayed`, and a cancel never costs the next submit.
+add_executable(test_cancel_perf tests/test_cancel_perf.c)
+target_include_directories(test_cancel_perf
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_cancel_perf PRIVATE gptps)
+add_test(NAME cancel_perf COMMAND test_cancel_perf)
+set_tests_properties(cancel_perf PROPERTIES TIMEOUT 120)
+
 add_executable(test_deadletter tests/test_deadletter.c) # dead-letter drain API
 target_include_directories(test_deadletter
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

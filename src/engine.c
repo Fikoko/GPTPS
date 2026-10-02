@@ -90,6 +90,9 @@ typedef struct gptps_item {
     uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed+NULLed at release (done-drain), else at item_free */
     size_t                res_n;
     struct gptps_item    *next;
+    struct gptps_item    *prev;      /* every queue is doubly linked: see "finding an item" */
+    unsigned char         where;     /* GPTPS_Q_*: the engine queue holding it, NONE in a local list */
+    unsigned char         indexed;   /* in the handle index: gptps_cancel can still reach it */
 } gptps_item;
 
 /* One instance value of a generic per-task setting (see gptps_define_task_setting).
@@ -158,7 +161,19 @@ typedef struct gptps_constraint {
     struct gptps_constraint *next;
 } gptps_constraint;
 
-typedef struct { gptps_item *head, *tail; size_t count; } gptps_fifo;
+/* `id` is the GPTPS_Q_* value an item takes on while it is in this queue; a local
+ * list's is GPTPS_Q_NONE. */
+typedef struct { gptps_item *head, *tail; size_t count; unsigned char id; } gptps_fifo;
+#define GPTPS_Q_NONE    0
+#define GPTPS_Q_INTAKE  1
+#define GPTPS_Q_DELAYED 2
+#define GPTPS_Q_READY   3
+#define GPTPS_Q_RUNNING 4
+#define GPTPS_Q_DONE    5
+#define GPTPS_Q_DEAD    6
+
+/* One slot of the handle index: h == 0 empty, it == NULL a deleted entry. */
+typedef struct { gptps_handle h; gptps_item *it; } gptps_hslot;
 
 /* One per thread id that is, or has been, inside a callback the engine made on it
  * (see gptps.cb_threads). The chains and `tid` are under e->m. `depth` is written
@@ -355,6 +370,10 @@ struct gptps {
      * pool is sized once, at open - so a live write lands here, for reads and
      * gptps_settings_save, and never in e->limits, which admission reads. */
     uint32_t       conc_next;
+    /* handle -> item for every item gptps_cancel can still reach (see "finding an
+     * item"). Open addressing, a load of at most a half, under m. */
+    gptps_hslot   *hidx;
+    size_t         nhidx, hidx_live, hidx_dead;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -364,29 +383,121 @@ struct gptps {
 static void fifo_push(gptps_fifo *q, gptps_item *it)
 {
     it->next = NULL;
+    it->prev = q->tail;
     if (q->tail) q->tail->next = it; else q->head = it;
     q->tail = it;
     q->count += 1;
+    it->where = q->id;
 }
 static gptps_item *fifo_pop(gptps_fifo *q)
 {
     gptps_item *it = q->head;
-    if (it) { q->head = it->next; if (!q->head) q->tail = NULL; it->next = NULL; q->count -= 1; }
+    if (it) {
+        q->head = it->next;
+        if (q->head) q->head->prev = NULL; else q->tail = NULL;
+        it->next = it->prev = NULL;
+        q->count -= 1;
+        it->where = GPTPS_Q_NONE;
+    }
     return it;
 }
+/* Unlink `target`, which must be in `q`, in O(1). */
 static void fifo_remove(gptps_fifo *q, gptps_item *target)
 {
-    gptps_item *prev = NULL, *cur = q->head;
-    while (cur) {
-        if (cur == target) {
-            if (prev) prev->next = cur->next; else q->head = cur->next;
-            if (q->tail == cur) q->tail = prev;
-            cur->next = NULL;
-            q->count -= 1;
-            return;
-        }
-        prev = cur; cur = cur->next;
+    if (target->prev) target->prev->next = target->next; else q->head = target->next;
+    if (target->next) target->next->prev = target->prev; else q->tail = target->prev;
+    target->next = target->prev = NULL;
+    q->count -= 1;
+    target->where = GPTPS_Q_NONE;
+}
+
+/* ------------------------------------------------------------------------- */
+/* finding an item                                                           */
+/* ------------------------------------------------------------------------- */
+/* gptps_cancel used to find its item by walking running_items, ready, done, intake
+ * and delayed in turn, and to unlink it from a singly linked list by walking again;
+ * a cancel from intake then wiped intake's run cache, so the next submit walked the
+ * whole queue for its place. Cancelling a deep queue newest-first was O(n^2) - 4.5s
+ * for 40,000 queued items - and so was cancelling and resubmitting at depth: every
+ * cancel held the engine lock for its walk, stalling the dispatcher and every
+ * submitter, and gptps_dq_cancel, orch, balance and a 06:30 "cancel what is left" all
+ * end up here. Admission was made O(1) in queue depth for the same reason
+ * (tests/test_admission_perf.c), and leaving intake unbounded is only "memory, never
+ * throughput" if every path that touches it agrees.
+ *
+ * So every queue is doubly linked (any item unlinks in O(1)), each item records which
+ * queue holds it (`where`, kept by fifo_push / fifo_pop / fifo_remove and the intake
+ * pair, so no caller sets it), and an index maps a handle to its item for as long as
+ * gptps_cancel may act on it: from submit until the item is freed, dead-lettered (a
+ * dead letter is not cancellable), or detached into a local list to be drained
+ * without the lock. Those three exits are the only ways out of the live queues, and
+ * each removes the entry: item_drop, dead_letter_push, and index_drop_list at the
+ * detach sites. A missed one would leave a pointer to freed memory behind, which
+ * the cancel-after-every-ending tests and ASan exist to catch.
+ * tests/test_cancel_perf.c gates the shape of the curve. */
+static size_t hidx_slot(gptps_handle h, size_t n)
+{
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdull; h ^= h >> 33;
+    return (size_t)(h & (n - 1));
+}
+
+/* Room for one more entry at a load (live + deleted) of at most a half, so a probe
+ * always meets an empty slot; rehashing drops the deleted. 0 on success. e->m held. */
+static int hidx_reserve(gptps *e)
+{
+    gptps_hslot *nt;
+    size_t nn, i;
+    if ((e->hidx_live + e->hidx_dead + 1) * 2 <= e->nhidx) return 0;
+    if (e->hidx_live + 1 > ((size_t)-1) / (8 * sizeof *nt)) return -1;
+    for (nn = 64; nn < (e->hidx_live + 1) * 4; nn <<= 1) { }
+    nt = (gptps_hslot *)gptps_calloc(nn, sizeof *nt);
+    if (!nt) return -1;
+    for (i = 0; i < e->nhidx; ++i) {
+        size_t j;
+        if (!e->hidx[i].h || !e->hidx[i].it) continue;
+        for (j = hidx_slot(e->hidx[i].h, nn); nt[j].h; j = (j + 1) & (nn - 1)) { }
+        nt[j] = e->hidx[i];
     }
+    gptps_free(e->hidx);
+    e->hidx = nt; e->nhidx = nn; e->hidx_dead = 0;
+    return 0;
+}
+
+static void hidx_put(gptps *e, gptps_item *it)   /* hidx_reserve first; e->m held */
+{
+    size_t j = hidx_slot(it->handle, e->nhidx);
+    while (e->hidx[j].h && e->hidx[j].it) j = (j + 1) & (e->nhidx - 1);
+    if (e->hidx[j].h) e->hidx_dead -= 1;          /* reusing a deleted slot */
+    e->hidx[j].h = it->handle; e->hidx[j].it = it;
+    e->hidx_live += 1;
+    it->indexed = 1;
+}
+
+static gptps_hslot *hidx_find(gptps *e, gptps_handle h)   /* e->m held */
+{
+    size_t j, k;
+    if (!e->nhidx || h == 0) return NULL;
+    for (j = hidx_slot(h, e->nhidx), k = 0; k < e->nhidx && e->hidx[j].h;
+         ++k, j = (j + 1) & (e->nhidx - 1))
+        if (e->hidx[j].h == h && e->hidx[j].it) return &e->hidx[j];
+    return NULL;
+}
+
+/* Drop `it` from the index - it can no longer be cancelled. Idempotent. e->m held. */
+static void hidx_del(gptps *e, gptps_item *it)
+{
+    gptps_hslot *s;
+    if (!it->indexed) return;
+    s = hidx_find(e, it->handle);
+    if (s) { s->it = NULL; e->hidx_live -= 1; e->hidx_dead += 1; }
+    it->indexed = 0;
+}
+
+/* The same for every item of a local list about to be drained without the lock. */
+static void index_drop_list(gptps *e, gptps_fifo *q)
+{
+    gptps_item *it;
+    for (it = q->head; it; it = it->next) hidx_del(e, it);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -476,24 +587,27 @@ static void intake_insert(gptps *e, gptps_item *it)
     }
 
     it->next = prev ? prev->next : q->head;
+    it->prev = prev;
+    if (it->next) it->next->prev = it; else q->tail = it;
     if (prev) prev->next = it; else q->head = it;
-    if (!it->next) q->tail = it;
     q->count += 1;
+    it->where = GPTPS_Q_INTAKE;
 
     if (found) e->intake_runs[at].tail = it;             /* it is the run's new tail */
     else       intake_run_cache(e, at, it->sched_score, it);
 }
 
-/* Unlink `it`, whose predecessor in intake is `prev` (NULL when it is the head),
- * and repair the run cache if it was pointing at `it` as a run tail. */
-static void intake_unlink(gptps *e, gptps_item *it, gptps_item *prev)
+/* Unlink `it` from intake, in O(1), and repair the run cache if it was pointing at
+ * `it` as a run tail - so a removal never costs the next insert a walk. */
+static void intake_unlink(gptps *e, gptps_item *it)
 {
     gptps_fifo *q = &e->intake;
+    gptps_item *prev = it->prev;
     size_t at;
     int found;
 
     if (prev) prev->next = it->next; else q->head = it->next;
-    if (q->tail == it) q->tail = prev;
+    if (it->next) it->next->prev = prev; else q->tail = prev;
     q->count -= 1;
 
     at = intake_run_slot(e, it->sched_score, &found);
@@ -501,7 +615,8 @@ static void intake_unlink(gptps *e, gptps_item *it, gptps_item *prev)
         if (prev && prev->sched_score == it->sched_score) e->intake_runs[at].tail = prev;
         else intake_run_drop(e, at);                     /* that run is empty now */
     }
-    it->next = NULL;
+    it->next = it->prev = NULL;
+    it->where = GPTPS_Q_NONE;
 }
 
 /* Bottom-up merge sort of an item list by sched_score DESCENDING, equal scores
@@ -543,13 +658,14 @@ static gptps_item *intake_sort(gptps_item *list)
     }
 }
 
-/* Re-establish admission order after a scheduler hook restamped every score. */
+/* Re-establish admission order after a scheduler hook restamped every score. The sort
+ * relinks `next` only, so the back links are rebuilt on the way to the tail. */
 static void intake_resort(gptps *e)
 {
-    gptps_item *it;
+    gptps_item *it, *prev = NULL;
     e->intake.head = intake_sort(e->intake.head);
-    for (it = e->intake.head; it && it->next; it = it->next) { }
-    e->intake.tail = it;
+    for (it = e->intake.head; it; prev = it, it = it->next) it->prev = prev;
+    e->intake.tail = prev;
     intake_forget(e);                 /* every cached tail is now meaningless */
 }
 
@@ -587,6 +703,14 @@ static void item_free(gptps_item *it)
     gptps_free(it->name_owned);
     gptps_free(it->res_reserved);
     gptps_free(it);
+}
+
+/* Free an item gptps_cancel could still reach - one of the three ways out of the live
+ * queues (see "finding an item"). e->m held. */
+static void item_drop(gptps *e, gptps_item *it)
+{
+    hidx_del(e, it);
+    item_free(it);
 }
 
 static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p)
@@ -987,6 +1111,7 @@ static void *worker_main(void *arg)
  * the done-drain before it got here), so freeing it needs no ledger bookkeeping. */
 static void dead_letter_push(gptps *e, gptps_item *it)
 {
+    hidx_del(e, it);                  /* a dead letter is drained, never cancelled */
     while (e->max_dead_letters && e->dead_letter_count >= e->max_dead_letters) {
         gptps_item *old = fifo_pop(&e->dead_letter);
         if (!old) break;
@@ -1088,7 +1213,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
     int more = 0;           /* work is still owed, re-run at once: pend[] filled up, or
                              * a zero-backoff retry is due once its RETRIED is out (2b) */
     gptps_item *it;
-    gptps_fifo announced = { NULL, NULL, 0 };   /* retries decided this pass: see 2b */
+    gptps_fifo announced = { NULL, NULL, 0, GPTPS_Q_NONE };   /* retries decided this pass: see 2b */
     uint32_t held = 0;      /* DUE retries 2b parked: step 4 keeps a slot free for each */
     uint64_t held_mem = 0;  /* ... and their memory (a saturating sum) from any work */
     int64_t held_score = 0; /* ... the highest of them outranks (its sched_score) */
@@ -1139,7 +1264,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                         pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                     }
-                    item_free(it);
+                    item_drop(e, it);
                 }
                 continue;
             }
@@ -1158,7 +1283,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                 }
-                item_free(it);
+                item_drop(e, it);
                 continue;
             }
             if (it->started && it->outcome == GPTPS_E_CANCELLED) {
@@ -1171,7 +1296,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                  * (`started` matters: an item a REMOVE_CANCEL discarded before it ran
                  * has the same outcome and no event at all - the removal branch below
                  * owes it one.) */
-                item_free(it);
+                item_drop(e, it);
                 continue;
             }
             if (it->reg && it->reg->removed) {
@@ -1199,7 +1324,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                         pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                     }
-                    item_free(it);
+                    item_drop(e, it);
                 } else {
                     if (npend < GPTPS_PENDING_CAP) {
                         pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
@@ -1277,7 +1402,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                             pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
                         }
-                        item_free(it);
+                        item_drop(e, it);
                         break;
                     case GPTPS_ON_FAILURE_DEAD_LETTER:
                     default:
@@ -1299,7 +1424,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
 
         /* 2) move backoff-ready delayed items back to intake (single scan) */
         {
-            gptps_item *cur = e->delayed.head, *prev = NULL;
+            gptps_item *cur = e->delayed.head;
             while (cur) {
                 gptps_item *nxt = cur->next;
                 if (cur->not_before_ms <= now) {
@@ -1312,14 +1437,10 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                      * restart, constraint DEFER - funnels through `delayed`, so this
                      * is the one place that has to clear it. */
                     cur->started = 0;
-                    if (prev) prev->next = nxt; else e->delayed.head = nxt;
-                    if (e->delayed.tail == cur) e->delayed.tail = prev;
-                    cur->next = NULL;
-                    e->delayed.count -= 1;
+                    fifo_remove(&e->delayed, cur);
                     intake_insert(e, cur);   /* back into ADMISSION order, not at the tail */
                 } else {
                     next_wake = min_nonzero(next_wake, cur->not_before_ms);
-                    prev = cur;
                 }
                 cur = nxt;
             }
@@ -1395,7 +1516,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
                     pend[npend].result = NULL; pend[npend].result_len = 0;
                     pend[npend].flags = GPTPS_EV_FLAG_SHUTDOWN; ++npend;
-                    if (drop) item_free(it); else dead_letter_push(e, it);
+                    if (drop) item_drop(e, it); else dead_letter_push(e, it);
                 }
                 intake_forget(e);                /* popped from the head: every cached tail may be gone */
                 if (e->delayed.head || e->intake.head) more = 1;
@@ -1446,7 +1567,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
             intake_resort(e);   /* the keys just changed, so the order has to be rebuilt */
         }
         while (!past_grace && e->intake.head && e->running < e->limits.max_concurrent_tasks) {
-            gptps_item *best = NULL, *best_prev = NULL, *cur, *prv;
+            gptps_item *best = NULL, *cur;
             gptps_item *top = e->intake.head;            /* ordered intake: the head IS `top` */
             uint64_t *snap = NULL;                       /* named-resource reservation snapshot */
             uint32_t retry_after = 0;
@@ -1458,11 +1579,11 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
              * only as far as that item is what makes admission O(1) in the common case
              * where the head fits, instead of O(queue depth) per admitted item. */
             {
-                gptps_item *stranded = NULL, *stranded_prev = NULL;
-                for (prv = NULL, cur = e->intake.head; cur; prv = cur, cur = cur->next) {
-                    if (res_never_fits(e, cur)) { stranded = cur; stranded_prev = prv; break; }
+                gptps_item *stranded = NULL;
+                for (cur = e->intake.head; cur; cur = cur->next) {
+                    if (res_never_fits(e, cur)) { stranded = cur; break; }
                     if (e->reserved_mem + cur->cost.mem_bytes <= e->limits.max_memory_bytes &&
-                        res_fits(e, cur)) { best = cur; best_prev = prv; break; }
+                        res_fits(e, cur)) { best = cur; break; }
                 }
                 if (stranded) {
                     /* Never-fits after a runtime budget shrink: give it the terminal
@@ -1470,7 +1591,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                      * gone before the next scan. Same shape as the DENY path below;
                      * like it, stop while the item is still queued if pend[] is full. */
                     if (npend >= GPTPS_PENDING_CAP) { more = 1; break; }
-                    intake_unlink(e, stranded, stranded_prev);
+                    intake_unlink(e, stranded);
                     stranded->outcome = GPTPS_E_BUDGET;
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = stranded->handle;
                     ev_set_name(pend[npend].name, item_name(stranded)); pend[npend].status = GPTPS_E_BUDGET;
@@ -1516,7 +1637,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
 
             dec = run_constraints(e, best, &retry_after); /* consulted only on the chosen item */
             if (dec == GPTPS_DEFER) {
-                intake_unlink(e, best, best_prev);
+                intake_unlink(e, best);
                 best->not_before_ms = now + retry_after; /* re-check after the delay */
                 fifo_push(&e->delayed, best);
                 next_wake = min_nonzero(next_wake, best->not_before_ms);
@@ -1527,7 +1648,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                  * entire (unbounded) intake queue in one pass. Stop while the item is
                  * still queued rather than dead-letter it with no terminal event. */
                 if (npend >= GPTPS_PENDING_CAP) { more = 1; break; }
-                intake_unlink(e, best, best_prev);
+                intake_unlink(e, best);
                 best->outcome = GPTPS_E_DENIED;          /* recorded for dead-letter drain */
                 if (npend < GPTPS_PENDING_CAP) {
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = best->handle;
@@ -1549,7 +1670,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                 if (!snap) { next_wake = min_nonzero(next_wake, now + 50); break; }
             }
             if (best != top) top->skips += 1;            /* charge the skipped higher-priority task */
-            intake_unlink(e, best, best_prev);
+            intake_unlink(e, best);
             e->reserved_mem += best->cost.mem_bytes;
             e->running      += 1;
             if (snap) {                                  /* reserve named resources + snapshot for release */
@@ -1975,6 +2096,9 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
     e->conc_next = e->limits.max_concurrent_tasks;
 
     e->next_handle = 1;
+    e->intake.id = GPTPS_Q_INTAKE;   e->delayed.id = GPTPS_Q_DELAYED;
+    e->ready.id  = GPTPS_Q_READY;    e->running_items.id = GPTPS_Q_RUNNING;
+    e->done.id   = GPTPS_Q_DONE;     e->dead_letter.id = GPTPS_Q_DEAD;
     e->reserve_after_skips = GPTPS_RESERVE_AFTER;
     e->shutdown_grace_ms   = GPTPS_SHUTDOWN_GRACE_MS_DEFAULT;
     e->max_dead_letters    = GPTPS_MAX_DEAD_LETTERS_DEFAULT;
@@ -2496,17 +2620,12 @@ static unsigned reg_live_refs(const gptps *e, const gptps_reg *r)
  * on queues whose items have NOT reserved admission budget (intake / delayed). */
 static unsigned fifo_detach_reg(gptps_fifo *q, const gptps_reg *r, gptps_fifo *out)
 {
-    gptps_item *it = q->head, *prev = NULL; unsigned n = 0;
-    while (it) {
-        gptps_item *next = it->next;
-        if (it->reg == r) {
-            if (prev) prev->next = next; else q->head = next;
-            if (q->tail == it) q->tail = prev;
-            q->count -= 1;
-            it->next = NULL;
-            fifo_push(out, it); ++n;
-        } else prev = it;
-        it = next;
+    gptps_item *it, *next; unsigned n = 0;
+    for (it = q->head; it; it = next) {
+        next = it->next;
+        if (it->reg != r) continue;
+        fifo_remove(q, it);
+        fifo_push(out, it); ++n;
     }
     return n;
 }
@@ -2519,14 +2638,11 @@ static unsigned fifo_detach_reg(gptps_fifo *q, const gptps_reg *r, gptps_fifo *o
 static unsigned fifo_detach_reg_admitted(gptps *e, gptps_fifo *q, const gptps_reg *r,
                                          gptps_fifo *out)
 {
-    gptps_item *it = q->head, *prev = NULL; unsigned n = 0;
-    while (it) {
-        gptps_item *next = it->next;
+    gptps_item *it, *next; unsigned n = 0;
+    for (it = q->head; it; it = next) {
+        next = it->next;
         if (it->reg == r) {
-            if (prev) prev->next = next; else q->head = next;
-            if (q->tail == it) q->tail = prev;
-            q->count -= 1;
-            it->next = NULL;
+            fifo_remove(q, it);
             e->reserved_mem -= it->cost.mem_bytes;
             e->running      -= 1;
             if (it->res_reserved) {
@@ -2538,8 +2654,7 @@ static unsigned fifo_detach_reg_admitted(gptps *e, gptps_fifo *q, const gptps_re
                 it->res_n = 0;
             }
             fifo_push(out, it); ++n;
-        } else prev = it;
-        it = next;
+        }
     }
     return n;
 }
@@ -2595,16 +2710,12 @@ static void drain_cancelled(gptps *e, gptps_fifo *q, gptps_event_cb cb, void *ud
  * drains `out` with the lock released so each still gets its terminal event. */
 static unsigned fifo_detach_services(gptps_fifo *q, gptps_fifo *out)
 {
-    gptps_item *it = q->head, *prev = NULL; unsigned n = 0;
-    while (it) {
-        gptps_item *next = it->next;
-        if (it->reg && it->reg->service) {
-            if (prev) prev->next = next; else q->head = next;
-            if (q->tail == it) q->tail = prev;
-            it->next = NULL; fifo_push(out, it); ++n;
-            q->count -= 1;
-        } else prev = it;
-        it = next;
+    gptps_item *it, *next; unsigned n = 0;
+    for (it = q->head; it; it = next) {
+        next = it->next;
+        if (!it->reg || !it->reg->service) continue;
+        fifo_remove(q, it);
+        fifo_push(out, it); ++n;
     }
     return n;
 }
@@ -2776,7 +2887,7 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
     if (!e || !task_name) return GPTPS_E_INVAL;
     if (strlen(task_name) > GPTPS_TASK_NAME_MAX) return GPTPS_E_INVAL;   /* never registrable */
 
-    dropped.head = dropped.tail = NULL; dropped.count = 0;
+    dropped.head = dropped.tail = NULL; dropped.count = 0; dropped.id = GPTPS_Q_NONE;
 
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
@@ -2816,6 +2927,7 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
              * admission budget, so detaching them must release the ledger too */
             fifo_detach_reg_admitted(e, &e->ready, r, &dropped);
             fifo_detach_reg_admitted(e, &e->done,  r, &dropped);
+            index_drop_list(e, &dropped);   /* drained below, without the lock */
         } else if (reg_live_refs(e, r) > 0) {
             gptps_mutex_unlock(e->m);     /* DRAIN/REJECT: step the queue empty first, then remove */
             return GPTPS_E_BUSY;
@@ -2857,6 +2969,7 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
             fifo_detach_reg(&e->intake, r, &dropped);   /* queued backlog (no budget reserved yet) */
             intake_forget(e);
             fifo_detach_reg(&e->delayed, r, &dropped);
+            index_drop_list(e, &dropped);   /* drained below, without the lock */
             for (it = e->running_items.head; it; it = it->next)
                 if (it->reg == r) gptps_flag_set(it->cancel, true);   /* cooperative cancel in-flight */
             gptps_cond_broadcast(e->cv_work);
@@ -3651,6 +3764,9 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         gptps_mutex_unlock(e->m); item_free(it);
         return GPTPS_E_FULL;
     }
+    /* Room in the handle index first (see "finding an item"): past this point the
+     * item is reachable, and a failure would leave it uncancellable. */
+    if (hidx_reserve(e) != 0) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_NOMEM; }
 
     it->handle = e->next_handle++;
     it->def = &r->def;
@@ -3680,6 +3796,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     }
 
     intake_insert(e, it);   /* by admission order, so the dispatcher need not search */
+    hidx_put(e, it);
     if (out_handle) *out_handle = it->handle;
     gptps_cond_signal(e->cv_disp);
     {
@@ -3721,12 +3838,11 @@ gptps_status gptps_submit_ex(gptps *e, const char *task_name,
  * no-op cancel-after-completion), GPTPS_E_SHUTDOWN during teardown. */
 gptps_status gptps_cancel(gptps *e, gptps_handle h)
 {
+    gptps_hslot *slot;
     gptps_item *it;
     gptps_pending_ev p;
     gptps_event_cb cb = NULL;
     void *ud = NULL;
-    int qi;
-    gptps_fifo *queues[2];
     gptps_cb_thread *in;
 
     if (!e || h == 0) return GPTPS_E_INVAL;
@@ -3735,62 +3851,60 @@ gptps_status gptps_cancel(gptps *e, gptps_handle h)
     gptps_mutex_lock(e->m);
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
 
-    /* in-flight (running) or admitted-but-unstarted (ready): mark cancelled and
-     * raise the cooperative flag. The worker/dispatcher carries it to terminal
-     * (a ready item is discarded before start; a running in-proc item observes
-     * the flag). No budget bookkeeping here - done-processing releases it. */
-    for (it = e->running_items.head; it; it = it->next)
-        if (it->handle == h) {
-            it->cancelled = 1; gptps_flag_set(it->cancel, true);
-            gptps_mutex_unlock(e->m); return GPTPS_OK;
-        }
-    for (it = e->ready.head; it; it = it->next)
-        if (it->handle == h) {
-            it->cancelled = 1; gptps_flag_set(it->cancel, true);
-            gptps_cond_broadcast(e->cv_work);   /* wake a worker to discard it */
-            gptps_mutex_unlock(e->m); return GPTPS_OK;
-        }
-    /* finished-but-not-yet-reaped (in `done`): a worker has posted it and the
-     * dispatcher has not made its terminal decision yet. Mark cancelled so that
-     * decision frees it instead of retrying / REQUEUEing - without this a crash-
-     * restarting service momentarily in `done` would dodge the cancel and restart.
-     * Budget is released by the done-drain, so no ledger bookkeeping here. */
-    for (it = e->done.head; it; it = it->next)
-        if (it->handle == h) {
-            it->cancelled = 1; gptps_flag_set(it->cancel, true);
-            gptps_mutex_unlock(e->m); return GPTPS_OK;
-        }
+    /* Straight to the item, wherever it is (see "finding an item"). */
+    slot = hidx_find(e, h);
+    it = slot ? slot->it : NULL;
+    switch (it ? it->where : GPTPS_Q_NONE) {
+    case GPTPS_Q_RUNNING:
+        /* in flight: mark cancelled and raise the cooperative flag. The worker carries
+         * it to terminal (a running in-proc item observes the flag). No budget
+         * bookkeeping here - done-processing releases it. */
+        it->cancelled = 1; gptps_flag_set(it->cancel, true);
+        gptps_mutex_unlock(e->m); return GPTPS_OK;
+    case GPTPS_Q_READY:
+        /* admitted but not started: a worker discards it before it starts */
+        it->cancelled = 1; gptps_flag_set(it->cancel, true);
+        gptps_cond_broadcast(e->cv_work);   /* wake a worker to discard it */
+        gptps_mutex_unlock(e->m); return GPTPS_OK;
+    case GPTPS_Q_DONE:
+        /* finished-but-not-yet-reaped (in `done`): a worker has posted it and the
+         * dispatcher has not made its terminal decision yet. Mark cancelled so that
+         * decision frees it instead of retrying / REQUEUEing - without this a crash-
+         * restarting service momentarily in `done` would dodge the cancel and restart.
+         * Budget is released by the done-drain, so no ledger bookkeeping here. */
+        it->cancelled = 1; gptps_flag_set(it->cancel, true);
+        gptps_mutex_unlock(e->m); return GPTPS_OK;
+    case GPTPS_Q_INTAKE:
+        intake_unlink(e, it);   /* repairs the run cache: the next submit stays O(1) */
+        break;
+    case GPTPS_Q_DELAYED:
+        fifo_remove(&e->delayed, it);
+        break;
+    default:
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_NOTFOUND;   /* unknown handle, or already terminal */
+    }
 
     /* queued (intake) or backoff-delayed: not admitted, no budget reserved -
-     * remove, free, and emit a terminal cancelled event with the lock released. */
-    queues[0] = &e->intake; queues[1] = &e->delayed;
-    for (qi = 0; qi < 2; ++qi)
-        for (it = queues[qi]->head; it; it = it->next)
-            if (it->handle == h) {
-                fifo_remove(queues[qi], it);
-                if (queues[qi] == &e->intake) intake_forget(e);  /* may have been a cached run tail */
-                p.kind = GPTPS_EV_FAILED; p.handle = h; ev_set_name(p.name, item_name(it));
-                p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-                p.result = NULL; p.result_len = 0; p.flags = 0;
-                cb = e->ev_cb; ud = e->ev_ud;
-                item_free(it);
-                /* This can be the last live reference to a draining task type, and
-                 * cv_drain is otherwise only broadcast from a dispatcher pass - so a
-                 * blocked gptps_unregister_task(DRAIN) would sleep until some
-                 * unrelated event happened to wake the dispatcher, or forever on an
-                 * idle engine. Waking cv_disp matters too: the cancelled item may be
-                 * the reserved `top` that was holding back skip-to-fit backfill. */
-                gptps_cond_broadcast(e->cv_drain);
-                gptps_cond_signal(e->cv_disp);
-                in = cb_enter_locked(e);
-                gptps_mutex_unlock(e->m);
-                emit_now(e, cb, ud, &p);        /* lock released: observers may re-enter */
-                cb_leave(in);
-                return GPTPS_OK;
-            }
-
+     * removed above; free it and emit a terminal cancelled event with the lock released. */
+    p.kind = GPTPS_EV_FAILED; p.handle = h; ev_set_name(p.name, item_name(it));
+    p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
+    p.result = NULL; p.result_len = 0; p.flags = 0;
+    cb = e->ev_cb; ud = e->ev_ud;
+    item_drop(e, it);
+    /* This can be the last live reference to a draining task type, and
+     * cv_drain is otherwise only broadcast from a dispatcher pass - so a
+     * blocked gptps_unregister_task(DRAIN) would sleep until some
+     * unrelated event happened to wake the dispatcher, or forever on an
+     * idle engine. Waking cv_disp matters too: the cancelled item may be
+     * the reserved `top` that was holding back skip-to-fit backfill. */
+    gptps_cond_broadcast(e->cv_drain);
+    gptps_cond_signal(e->cv_disp);
+    in = cb_enter_locked(e);
     gptps_mutex_unlock(e->m);
-    return GPTPS_E_NOTFOUND;   /* unknown handle, or already terminal */
+    emit_now(e, cb, ud, &p);        /* lock released: observers may re-enter */
+    cb_leave(in);
+    return GPTPS_OK;
 }
 
 gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data)
@@ -4095,6 +4209,7 @@ static void stop_services(gptps *e, gptps_fifo *out)
     fifo_detach_services(&e->intake, out);
     intake_forget(e);
     fifo_detach_services(&e->delayed, out);
+    index_drop_list(e, out);          /* the caller drains `out` without the lock */
 }
 
 gptps_status gptps_shutdown(gptps *e)
@@ -4136,7 +4251,7 @@ gptps_status gptps_shutdown(gptps *e)
      * instant to finish on its own, after which the dispatcher cancels it. */
     e->stop_deadline_ms = e->shutdown_grace_ms
         ? gptps_hal_monotonic_ms() + (uint64_t)e->shutdown_grace_ms : 0;
-    dropped.head = dropped.tail = NULL; dropped.count = 0;
+    dropped.head = dropped.tail = NULL; dropped.count = 0; dropped.id = GPTPS_Q_NONE;
     stop_services(e, &dropped);         /* cooperatively stop long-running service instances */
     cb = e->ev_cb; ud = e->ev_ud;       /* snapshot under the lock */
     gptps_cond_signal(e->cv_disp);
@@ -4167,6 +4282,7 @@ gptps_status gptps_shutdown(gptps *e)
     while ((it = fifo_pop(&e->ready))         != NULL) fifo_push(&dropped, it);
     while ((it = fifo_pop(&e->done))          != NULL) fifo_push(&dropped, it);
     while ((it = fifo_pop(&e->running_items)) != NULL) fifo_push(&dropped, it);
+    index_drop_list(e, &dropped);
     cb = e->ev_cb; ud = e->ev_ud;
     gptps_mutex_unlock(e->m);
     drain_cancelled(e, &dropped, cb, ud);
@@ -4209,6 +4325,7 @@ gptps_status gptps_shutdown(gptps *e)
     gptps_toml_free(e->toml);
     gptps_free(e->config_path);
 
+    gptps_free(e->hidx);
     gptps_free(e->workers);
     gptps_free(e->owned_tids);
     {   size_t b;

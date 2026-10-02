@@ -733,7 +733,7 @@ gptps/
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
 │   ├── SAFETY.md        the planned commercial safety-artifacts package and how it is licensed
 │   └── SECURITY.md      trust boundary and non-guarantees
-├── tests/               ← CTest suite (69 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tests/               ← CTest suite (70 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
 │   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
@@ -768,7 +768,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **69** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
+plug-in · **70** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
@@ -795,9 +795,10 @@ hang it hangs your host's exit path — so these are contractual, and
   is always counted rather than silent. The intake queue
   (`limits.max_intake_depth`) is **unbounded by default** — right for a host that
   submits its own work, wrong for one that accepts work from elsewhere; set it and
-  handle `GPTPS_E_FULL` if a submitter can outrun your workers. Admission is O(1) in
-  queue depth either way, so leaving it unbounded costs memory, never throughput
-  ([`tests/test_admission_perf.c`](tests/test_admission_perf.c) gates that).
+  handle `GPTPS_E_FULL` if a submitter can outrun your workers. Admission and
+  `gptps_cancel` are O(1) in queue depth either way, so leaving it unbounded costs
+  memory, never throughput ([`tests/test_admission_perf.c`](tests/test_admission_perf.c)
+  and [`tests/test_cancel_perf.c`](tests/test_cancel_perf.c) gate both).
   [`docs/SECURITY.md`](docs/SECURITY.md) has the full table.
 - Every submitted handle reaches exactly one terminal event — the invariant the
   observer seam, and every add-on built on it, depends on
