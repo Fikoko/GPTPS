@@ -60,8 +60,13 @@ Source layout:
   executor, failure engine, scheduler, add-on loader, dead-letter drain.
 - `src/config.c` — config model + hardware auto-tune.
 - `src/config_toml.c` — the TOML-subset config-file parser.
-- `src/hal_posix.c` — the POSIX HAL backend.
-- `src/exec_oop_posix.c` — the out-of-process and external-program executors.
+- `src/settings.c` — the typed settings registry (§10).
+- `src/alloc.c` — the allocator seam, `gptps_set_allocator` (§3.2).
+- `src/hal_posix.c` / `src/hal_win.c` — the POSIX and Win32 HAL backends.
+- `src/exec_oop_posix.c` — the out-of-process and external-program executors;
+  `src/exec_win.c` is the external-program executor on Windows.
+- `src/gptps_internal.h` — prototypes shared between the core's own files; not
+  installed.
 - `addons/` — optional modules built on the public API (e.g. the durable queue).
 
 ---
@@ -360,22 +365,25 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams can simply be compiled into the host. **Nine** ship
+and the observer/constraint seams can simply be compiled into the host. **Eleven** ship
 in `addons/`: `durable_queue.c` (observer seam → crash-durable journal),
 `gpu_quota.c` (a thin wrapper over the core's named-resource budgets),
 `wasm_exec.c` (module-as-task with a pluggable wasm runtime), `tui.c` (observer +
 settings → live dashboard), `gptps_orch.c` (observer + submit → run-after/fan-in
 dependencies), `gptps_await.c` (observer seam → block until a handle is terminal),
-`gptps_remote.c` (the cross-host wire codec `gptps_xport` is specified against), and
-the two composition libraries `gptps_pool.c` (N engines in one process, scale-up) and
-`gptps_xport.c` (N worker processes, scale-out). `gpu_quota_plugin.c` builds
-separately as the example *binary* plug-in rather than a linkable module. See
-[`addons/README.md`](../addons/README.md).
+`gptps_stats.c` (observer seam → counters, gauges and latency, bound to no wire
+format), `gptps_remote.c` (the cross-host wire codec `gptps_xport` is specified
+against), and the three composition libraries `gptps_pool.c` (N engines in one
+process, scale-up), `gptps_balance.c` (one queue in front of a pool, routed late to
+the least-loaded shard) and `gptps_xport.c` (N worker processes, scale-out).
+`gpu_quota_plugin.c` builds separately as the example *binary* plug-in rather than a
+linkable module. See [`addons/README.md`](../addons/README.md).
 
-Note the last two are *composition libraries* rather than add-ons in the loader's
-sense: they register on no seam, use no host table, and sit above the engine instead
-of inside it. `gptps_pool` in fact owns N whole engines. Calling them add-ons is what
-makes the loader look unused; naming them accurately is more honest and more useful.
+Note the last three are *composition libraries* rather than add-ons in the loader's
+sense: they use no host table and sit above the engine instead of inside it
+(`gptps_balance` watches each shard's events, but from outside, as any host could).
+`gptps_pool` in fact owns N whole engines. Calling them add-ons is what makes the
+loader look unused; naming them accurately is more honest and more useful.
 
 ---
 
