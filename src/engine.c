@@ -441,16 +441,20 @@ static size_t hidx_slot(gptps_handle h, size_t n)
     return (size_t)(h & (n - 1));
 }
 
-/* Room for one more entry at a load (live + deleted) of at most a half, so a probe
- * always meets an empty slot; rehashing drops the deleted. 0 on success. e->m held. */
-static int hidx_reserve(gptps *e)
+/* The table for `live` entries: a power of two, at least 64, a quarter full. */
+static size_t hidx_size_for(size_t live)
 {
-    gptps_hslot *nt;
-    size_t nn, i;
-    if ((e->hidx_live + e->hidx_dead + 1) * 2 <= e->nhidx) return 0;
-    if (e->hidx_live + 1 > ((size_t)-1) / (8 * sizeof *nt)) return -1;
-    for (nn = 64; nn < (e->hidx_live + 1) * 4; nn <<= 1) { }
-    nt = (gptps_hslot *)gptps_calloc(nn, sizeof *nt);
+    size_t nn;
+    for (nn = 64; nn < live * 4; nn <<= 1) { }
+    return nn;
+}
+
+/* Rebuild the index at nn slots, dropping the deleted. 0 on success; on failure the
+ * old table stands. e->m held. */
+static int hidx_rebuild(gptps *e, size_t nn)
+{
+    gptps_hslot *nt = (gptps_hslot *)gptps_calloc(nn, sizeof *nt);
+    size_t i;
     if (!nt) return -1;
     for (i = 0; i < e->nhidx; ++i) {
         size_t j;
@@ -461,6 +465,15 @@ static int hidx_reserve(gptps *e)
     gptps_free(e->hidx);
     e->hidx = nt; e->nhidx = nn; e->hidx_dead = 0;
     return 0;
+}
+
+/* Room for one more entry at a load (live + deleted) of at most a half, so a probe
+ * always meets an empty slot. 0 on success. e->m held. */
+static int hidx_reserve(gptps *e)
+{
+    if ((e->hidx_live + e->hidx_dead + 1) * 2 <= e->nhidx) return 0;
+    if (e->hidx_live + 1 > ((size_t)-1) / (8 * sizeof(gptps_hslot))) return -1;
+    return hidx_rebuild(e, hidx_size_for(e->hidx_live + 1));
 }
 
 static void hidx_put(gptps *e, gptps_item *it)   /* hidx_reserve first; e->m held */
@@ -498,6 +511,17 @@ static void index_drop_list(gptps *e, gptps_fifo *q)
 {
     gptps_item *it;
     for (it = q->head; it; it = it->next) hidx_del(e, it);
+}
+
+/* Shrink the index as the queues do, or a burst would hold its memory - 32-64 bytes an
+ * item at 64-bit - until gptps_shutdown. Once an eighth of it or less is live, it is
+ * rebuilt a quarter full, by the dispatcher's next pass rather than in gptps_cancel:
+ * one rebuild however far the queues fell, amortized O(1) per submit and drop as
+ * growing is. One that cannot allocate leaves the old table. e->m held. */
+static void hidx_trim(gptps *e)
+{
+    if (e->nhidx > 64 && e->hidx_live * 8 < e->nhidx)
+        (void)hidx_rebuild(e, hidx_size_for(e->hidx_live));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1685,6 +1709,9 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
             fifo_push(&e->ready, best);
             gptps_cond_signal(e->cv_work);
         }
+
+        /* 5) let the handle index shrink with the queues */
+        hidx_trim(e);
 
         /* (the caller emits pend[] with the lock released, then re-runs a pass) */
 

@@ -27,6 +27,35 @@ static void *cnt_malloc(size_t n, void *ud)           { void *p; (void)ud; p = m
 static void *cnt_realloc(void *p, size_t n, void *ud) { (void)ud; CHECK(p != NULL); return realloc(p, n); }
 static void  cnt_free(void *p, void *ud)              { (void)ud; CHECK(p != NULL); free(p); --live; }
 
+/* Bytes rather than blocks, for the burst below: each block carries its size. */
+typedef union { size_t n; long double ld; long long ll; void *p; } blk_hdr;
+static size_t bytes_live;
+static void *byt_malloc(size_t n, void *ud)
+{
+    blk_hdr *b = (blk_hdr *)malloc(sizeof *b + n);
+    (void)ud;
+    if (!b) return NULL;
+    b->n = n; bytes_live += n;
+    return b + 1;
+}
+static void *byt_realloc(void *p, size_t n, void *ud)
+{
+    blk_hdr *b = (blk_hdr *)p - 1;
+    size_t was = b->n;
+    (void)ud;
+    b = (blk_hdr *)realloc(b, sizeof *b + n);
+    if (!b) return NULL;
+    b->n = n; bytes_live = bytes_live - was + n;
+    return b + 1;
+}
+static void byt_free(void *p, void *ud)
+{
+    blk_hdr *b = (blk_hdr *)p - 1;
+    (void)ud;
+    bytes_live -= b->n;
+    free(b);
+}
+
 static gptps_status echo_task(gptps_ctx *ctx, void *ud)
 {
     size_t n; const void *p; (void)ud;
@@ -90,6 +119,40 @@ int main(void)
         CHECK(live > 0);               /* engine still holds its own structures */
         gptps_shutdown(e);
         CHECK(live == 0);              /* every core allocation was freed (balanced) */
+    }
+
+    /* A burst gives its memory back. Every cancellable item is indexed by handle (see
+     * "finding an item" in src/engine.c), so the index grows with the queue - and must
+     * shrink with it, or 100,000 queued items leave 8 MiB of index behind them until
+     * gptps_shutdown, on a host that may have sized a static pool for its steady state.
+     * The shrink is the dispatcher's, so each measurement follows a pass. */
+    {
+        enum { N = 100000 };
+        gptps *e; gptps_handle h, *hs; size_t base, n; int i, ok = 1;
+        memset(&a, 0, sizeof a); a.struct_size = sizeof a;
+        a.malloc_fn = byt_malloc; a.realloc_fn = byt_realloc; a.free_fn = byt_free;
+        CHECK(gptps_set_allocator(&a) == GPTPS_OK);
+        hs = (gptps_handle *)malloc(N * sizeof *hs);   /* libc: not the engine's */
+        CHECK(hs != NULL);
+        e = open_manual();
+        reg_echo(e);
+        CHECK(gptps_submit(e, "echo", NULL, 0, &h) == GPTPS_OK);   /* the index's first table */
+        CHECK(gptps_cancel(e, h) == GPTPS_OK);
+        CHECK(gptps_step(e, &n) == GPTPS_OK && n == 0);
+        base = bytes_live;
+        for (i = 0; hs && i < N; ++i) ok &= gptps_submit(e, "echo", NULL, 0, &hs[i]) == GPTPS_OK;
+        CHECK(ok);
+        CHECK(bytes_live > base + (size_t)N * 64);    /* the burst is held, in the hook */
+        for (i = 0; hs && i < N; ++i) ok &= gptps_cancel(e, hs[i]) == GPTPS_OK;
+        CHECK(ok);
+        CHECK(gptps_step(e, &n) == GPTPS_OK && n == 0);
+        if (bytes_live != base)
+            printf("  %lu bytes held after the burst, %lu before it\n",
+                   (unsigned long)bytes_live, (unsigned long)base);
+        CHECK(bytes_live == base);     /* all of it handed back, the index included */
+        gptps_shutdown(e);
+        CHECK(bytes_live == 0);
+        free(hs);
     }
 
     /* reset to libc: the custom hook must go quiet */

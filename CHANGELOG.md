@@ -19,6 +19,9 @@ the release version and is documented in `include/gptps.h`.
   cancelling what is left at the end of a window all go through it.
   `tests/test_cancel_perf.c` gates the shape of the curve, from intake and from
   backoff, and `tests/test_cancel.c` now cancels after every way an item can end.
+  The index and the second link cost 48-80 bytes per queued item at 64-bit. The index
+  shrinks again as the queues drain, so a burst does not keep its memory until
+  `gptps_shutdown`; `tests/test_alloc.c` counts the bytes.
 
 ### Fixed — `durable_queue`: a stalled engine, a damaged journal, a quadratic drain, and crash loops
 
