@@ -4,16 +4,21 @@
  * gptps_hal.h - GPTPS Hardware Abstraction Layer (INTERNAL, not a public API).
  *
  * The only platform-specific seam. The interface is pure C99; each
- * implementation (hal_posix.c, hal_win.c) uses the best primitive its
- * platform/toolchain offers. Atomics live ONLY inside the implementation so
- * the C99 core never includes an _Atomic type.
+ * implementation (hal_posix.c, hal_win.c, freestanding/hal_stub.c, or a port built
+ * in with -DGPTPS_HAL_SOURCE=<file>) uses the best primitive its platform offers.
+ * Atomics live ONLY inside the implementation so the C99 core never includes an
+ * _Atomic type.
  *
- *   core (C99) ──uses──► gptps_hal_* (this header) ──impl──► hal_posix.c / hal_win.c
+ *   core (C99) ──uses──► gptps_hal_* (this header) ──impl──► hal_posix.c / hal_win.c / ...
  *
- * Both backends implement the full interface (hwdetect, monotonic clock, cancel
- * flag, threads/mutex/condvar, dynamic loading). The external-program executor
- * exists on both (exec_oop_posix.c / exec_win.c via CreateProcess + Job Object);
- * the forked EXEC_OOP kind is POSIX-only (no fork() on Windows).
+ * The comments below are the CONTRACT a backend keeps. docs/HAL.md gives each clause
+ * with the reason the core needs it, and tests/test_hal_conformance.c holds every
+ * backend to it (CTest runs it against the HAL of every build). The contract also
+ * leaves freedoms - spurious wakeups, a coarse clock, signals that wake more than
+ * one - and tests/hal_chaos.c takes all of them while the whole suite runs on it,
+ * which shows the core needs nothing more. The external-program executor is
+ * platform code too but not HAL (exec_oop_posix.c / exec_win.c); the forked
+ * EXEC_OOP kind is POSIX-only (no fork() on Windows).
  */
 #ifndef GPTPS_HAL_H
 #define GPTPS_HAL_H
@@ -27,7 +32,8 @@
 extern "C" {
 #endif
 
-/* --- hardware detection (feeds config auto-tune) ------------------------- */
+/* --- hardware detection (feeds config auto-tune) -------------------------
+ * GPTPS_OK with cpu_count >= 1 (ram_bytes 0 when unknown); NULL is GPTPS_E_INVAL. */
 typedef struct {
     unsigned cpu_count;  /* online logical CPUs, always >= 1 */
     uint64_t ram_bytes;  /* total physical RAM; 0 if undetectable */
@@ -36,15 +42,20 @@ typedef struct {
 
 gptps_status gptps_hal_detect(gptps_hwinfo *out);
 
-/* --- monotonic clock (milliseconds) -------------------------------------- */
+/* --- monotonic clock (milliseconds) --------------------------------------
+ * Never decreases, on any thread, and runs at the rate of real time. Any step is
+ * fine (Win32's is about 16 ms): the core never counts on two readings differing.
+ * A HAL without a real-time clock (the freestanding stub counts reads) still runs
+ * the engine, but its deadlines and backoff are then not in milliseconds. */
 uint64_t gptps_hal_monotonic_ms(void);
 
 /* --- cancel flag --------------------------------------------------------- *
  * Opaque + heap-allocated so the _Atomic / __atomic storage stays confined to
  * the HAL implementation. The watchdog thread calls _set(); the task thread
- * polls via gptps_is_cancelled() which reads _get(). Correct under the C
- * memory model on the real path (compiler atomics); see hal_posix.c for the
- * pre-builtin fallback caveat.
+ * polls via gptps_is_cancelled() which reads _get(). _get returns the last value
+ * set (or the initial one), and a set on one thread is seen by a _get on another.
+ * Correct under the C memory model on the real path (compiler atomics); see
+ * hal_posix.c for the pre-builtin fallback caveat.
  */
 typedef struct gptps_flag gptps_flag;
 
@@ -55,6 +66,23 @@ bool        gptps_flag_get(const gptps_flag *f);
 
 /* --- threads / mutex / condvar (dispatcher + worker pool) ---------------- *
  * Opaque + heap-allocated so the C99 core never embeds a pthread_t/Win32 type.
+ *
+ * mutex: mutual exclusion, and everything before an unlock is visible after the
+ *   next lock. The core never locks a mutex it holds, so recursive (Win32's
+ *   CRITICAL_SECTION) and non-recursive implementations both conform.
+ * cond:  a wait releases the mutex while it blocks and holds it again when it
+ *   returns. signal wakes at least one waiter, broadcast every current waiter;
+ *   with no waiter both do nothing. A wait may return with no signal - the core
+ *   re-checks every predicate in a loop - but not as a rule: a wait that returns
+ *   at once nearly every time turns the worker pool and the dispatcher into
+ *   spinning loops. timedwait returns after about `ms` with no signal, and early
+ *   on one, for ANY ms up to UINT64_MAX: the dispatcher's sleep until the next
+ *   deadline can be 4294967295000 ms (timeout_seconds * 1000). Clamp what the
+ *   platform cannot express; the core works out its wait again on every wakeup.
+ * thread: start runs fn(arg) on a new thread, or returns NULL. join waits for fn
+ *   to return, frees the handle, and makes the thread's writes visible; once per
+ *   thread. A thread may start late. A HAL that returns NULL from start runs the
+ *   engine in MANUAL mode only (the freestanding stub).
  */
 typedef struct gptps_mutex  gptps_mutex;
 typedef struct gptps_cond   gptps_cond;
@@ -113,7 +141,10 @@ void     gptps_hal_store_release_u32(uint32_t *p, uint32_t v);
 void     gptps_hal_fork_guard_install(void);
 uint64_t gptps_hal_fork_generation(void);
 
-/* --- dynamic loading (add-on loader) ------------------------------------ */
+/* --- dynamic loading (add-on loader) - OPTIONAL ---------------------------
+ * open: NULL on failure. sym: NULL for a missing symbol. close: unload. A HAL
+ * without dynamic loading returns NULL from open, and binary plug-ins (TOML
+ * `addons = [...]`) are then unavailable. */
 typedef struct gptps_dl gptps_dl;
 gptps_dl *gptps_dl_open(const char *path);          /* RTLD_LOCAL; NULL on failure */
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol);
@@ -129,9 +160,11 @@ void      gptps_dl_close(gptps_dl *h);
  * leak-free under LeakSanitizer. */
 void      gptps_dl_release(gptps_dl *h);
 
-/* --- atomic file replace (settings save: temp -> final) ------------------ *
+/* --- atomic file replace (settings save: temp -> final) - OPTIONAL -------- *
  * Atomically replace `final_path` with `tmp_path` (rename on POSIX, MoveFileEx
- * on Windows so it works when the target already exists). GPTPS_OK / GPTPS_E_IO. */
+ * on Windows so it works when the target already exists). GPTPS_OK / GPTPS_E_IO.
+ * A HAL without a filesystem returns GPTPS_E_IO, and settings save is then
+ * unavailable. */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path);
 
 /* --- still pending (later increment): OS memory cap (out-of-process

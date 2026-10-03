@@ -358,6 +358,26 @@ jobs:
           cmake --build build-fast -j
           ctest --test-dir build-fast --output-on-failure --no-tests=error
 
+  # The other half of the HAL contract. hal_conformance holds each HAL to it; this
+  # builds the whole suite on tests/hal_chaos.c - a HAL that takes every freedom the
+  # contract leaves (spurious and early wakeups, signals that wake everyone, a 16 ms
+  # clock, late thread starts) - so the core is shown to need nothing more. A new
+  # seed each run; the log names it, and GPTPS_CHAOS_SEED replays the same choices.
+  hal_chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the suite on the weakest legal HAL
+        run: |
+          cmake -S . -B build-chaos -DGPTPS_HAL_SOURCE="$PWD/tests/hal_chaos.c"
+          cmake --build build-chaos -j
+      - name: Run it
+        run: |
+          export GPTPS_CHAOS_SEED=${{ github.run_number }}
+          echo "chaos seed $GPTPS_CHAOS_SEED, one call in 4"
+          ctest --test-dir build-chaos --output-on-failure --no-tests=error
+
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
   # (s390x, 64-bit big-endian, run under QEMU). The journal/TOML/settings
@@ -410,7 +430,7 @@ jobs:
           # A test not named here RUNS: adding one and forgetting this list makes the
           # job fail loudly, which is the right direction to be wrong in.
           ctest --test-dir build-s390x --output-on-failure --no-tests=error \
-            -E '^(oop|program|program_helper|cgroup|addon|addon_ns|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|xport_engine|wasm|tui|hang|durable|stress|gptps_bench_pool|gptps_bench_balance|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm)$'
+            -E '^(oop|program|program_helper|cgroup|addon|addon_ns|hal_conformance_dl|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|xport_engine|wasm|tui|hang|durable|stress|gptps_bench_pool|gptps_bench_balance|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm)$'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
   # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL
@@ -439,3 +459,13 @@ jobs:
             exit 1
           fi
           echo "OK: no pthread / dlopen symbols (still links a hosted libc, by design)"
+      - name: HAL conformance, MANUAL-only profile
+        # The same test CTest runs against every other HAL, built against the stub
+        # alone. --freestanding declares what the stub lacks (a real-time clock,
+        # fork, a filesystem, dynamic loading); each check it skips says so, and a
+        # stub that broke anything else would fail here.
+        run: |
+          cc -ffreestanding -fno-builtin -std=c99 -Wall -Wextra -Werror -O2 \
+             -I include -I src tests/test_hal_conformance.c freestanding/hal_stub.c \
+             -o hal_conformance_stub
+          ./hal_conformance_stub --freestanding

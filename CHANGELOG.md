@@ -7,6 +7,61 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — a conformance test for the HAL, and a HAL that takes every freedom it allows
+
+- **`tests/test_hal_conformance.c` holds a HAL to its contract.** It has 40 checks:
+  - the clock never decreases, on any thread, and runs at the rate of real time,
+    measured against `time()`;
+  - mutual exclusion;
+  - waits lose no wakeup, and a broadcast wakes every waiter;
+  - timed waits neither oversleep nor spin, for every timeout the core can pass;
+  - acquire/release message passing;
+  - the fork generation and thread ids;
+  - dynamic loading and the atomic replace.
+
+  CTest runs it against the HAL of every build, and a port built with
+  `-DGPTPS_HAL_SOURCE` runs the same file. CI's freestanding job runs it against the
+  stub in a MANUAL-only profile, where `--freestanding` declares what the stub lacks
+  and each skipped check says what stops working without it. Ten deliberately broken
+  POSIX HALs each fail it at the check named for what was broken: a clock in ticks
+  instead of milliseconds, a broadcast that wakes one waiter, a wait that spins, a
+  mutex that does nothing, and six more. A HAL whose acquire/release are plain
+  accesses passes on x86, as it must, and fails under ThreadSanitizer, which CI runs
+  it under.
+- **`tests/hal_chaos.c`: the suite on the weakest HAL the contract allows.** It takes
+  every freedom the contract leaves a port, often:
+  - waits that return without a signal;
+  - timed waits that return early, or a clock step late;
+  - signals that wake every waiter;
+  - a clock that moves in 16 ms steps;
+  - locks that yield first, and threads that start late.
+
+  The whole suite passes on it: 11 runs here, up to one call in two. CI's new
+  `hal_chaos` job runs it with a new seed each time. With the conformance test, that
+  checks both sides of the contract: a HAL keeps it, and the core needs nothing more.
+- **`docs/HAL.md`** gives the contract clause by clause, with why the core needs each
+  clause and the check that holds a HAL to it. It also lists what the test cannot
+  show: memory ordering on x86, wall-clock steps, a failed thread start.
+
+### Fixed — the POSIX HAL's timed wait
+
+Both found while writing the conformance test.
+
+- **On a 32-bit `time_t`, a long task timeout made the dispatcher spin.** The
+  dispatcher sleeps until the next deadline, and the POSIX HAL added the wait to the
+  clock without a clamp. A deadline far enough away overflows a 32-bit `time_t`:
+  about 68 years on Linux, which a `timeout_seconds` of `UINT32_MAX` written to mean
+  "none" is. `pthread_cond_timedwait` then returned at once, every time. Before the
+  fix, the test's wait returned 25,255 times in 200 ms on CI's i386 runner. Waits are
+  now clamped to a day, and the core works out its wait again on every wakeup. A
+  64-bit `time_t` was not affected.
+- **On macOS, timed waits followed the wall clock.** macOS has no
+  `pthread_condattr_setclock`, so the dispatcher's sleep ended at an absolute time on
+  `CLOCK_REALTIME`. Setting the clock back stretched the sleep by as much as the clock
+  moved, so a deadline or a backoff due in a second could fire hours late. The wait is
+  now relative (`pthread_cond_timedwait_relative_np`), measured on a clock nothing
+  moves.
+
 ### Documentation
 
 - **`examples/item_ledger.c`: what a threaded host must add.** In THREADED mode an

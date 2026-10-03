@@ -23,7 +23,7 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
-- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
+- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
 - [Safety artifacts (commercial)](#safety-artifacts-commercial) · [License](#license)
 
 ## Quick start
@@ -482,7 +482,8 @@ gptps_set_scheduler(e, earliest_deadline_first, NULL);
 **Faster locks (`-DGPTPS_HAL_FAST`).** An opt-in build knob swaps in adaptive
 (spin-then-block) mutexes on glibc — a latency knob for the engine's contended critical
 sections; OFF by default keeps the portable pthread HAL. The HAL is a module boundary, so a
-downstream can drop in its own platform-optimized backend.
+downstream can drop in its own platform-optimized backend — and `ctest -R hal_conformance`
+holds that backend to the same contract as the shipped ones ([docs/HAL.md](docs/HAL.md)).
 
 **Balance batches of mixed-size work (`gptps_balance`).** Round-robin is the wrong
 router for a heavy-tailed *batch*: one shard draws three long items while its neighbours
@@ -733,7 +734,7 @@ gptps/
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
 │   ├── SAFETY.md        the planned commercial safety-artifacts package and how it is licensed
 │   └── SECURITY.md      trust boundary and non-guarantees
-├── tests/               ← CTest suite (70 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tests/               ← CTest suite (72 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
 │   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
@@ -768,7 +769,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **70** tests · **12** CI runs (11 job definitions; `build-test` is a 2-way
+plug-in · **72** tests · **13** CI runs (12 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

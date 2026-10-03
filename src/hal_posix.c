@@ -274,18 +274,35 @@ void gptps_cond_wait(gptps_cond *c, gptps_mutex *m) { pthread_cond_wait(&c->c, &
 void gptps_cond_signal(gptps_cond *c)               { pthread_cond_signal(&c->c); }
 void gptps_cond_broadcast(gptps_cond *c)            { pthread_cond_broadcast(&c->c); }
 
+/* The core may ask for any wait up to UINT64_MAX ms: its one timed wait sleeps until
+ * the next deadline, and a task's deadline is timeout_seconds * 1000 ms away. Added to
+ * the clock unclamped, that overflows a 32-bit time_t, and pthread_cond_timedwait then
+ * returns at once, every time - the dispatcher spins. A day is far enough: the core
+ * works out its wait again each time it wakes. */
+#define GPTPS_HAL_MAX_WAIT_MS ((uint64_t)24u * 60u * 60u * 1000u)
+
 void gptps_cond_timedwait(gptps_cond *c, gptps_mutex *m, uint64_t ms)
 {
     struct timespec ts;
-#if defined(__linux__)
-    clock_gettime(CLOCK_MONOTONIC, &ts); /* cond created with CLOCK_MONOTONIC */
+    if (ms > GPTPS_HAL_MAX_WAIT_MS) ms = GPTPS_HAL_MAX_WAIT_MS;
+#if defined(__APPLE__)
+    /* No pthread_condattr_setclock here, so an absolute deadline would be on the wall
+     * clock, which a time change moves. A relative wait is measured on a clock that
+     * nothing moves. */
+    ts.tv_sec  = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)((ms % 1000u) * 1000000u);
+    pthread_cond_timedwait_relative_np(&c->c, &m->m, &ts);
 #else
-    clock_gettime(CLOCK_REALTIME, &ts);  /* fallback: setclock unavailable */
-#endif
+#  if defined(__linux__)
+    clock_gettime(CLOCK_MONOTONIC, &ts); /* cond created with CLOCK_MONOTONIC */
+#  else
+    clock_gettime(CLOCK_REALTIME, &ts);  /* fallback: setclock not wired up here */
+#  endif
     ts.tv_sec  += (time_t)(ms / 1000u);
     ts.tv_nsec += (long)((ms % 1000u) * 1000000u);
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
     pthread_cond_timedwait(&c->c, &m->m, &ts);
+#endif
 }
 
 gptps_thread *gptps_thread_start(gptps_thread_fn fn, void *arg)

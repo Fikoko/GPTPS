@@ -301,8 +301,10 @@ so the core never includes an `_Atomic` type.
 
 Surface: hardware detection (CPU/RAM/GPU hint), monotonic clock, the cancel flag
 (opaque, atomic inside), mutex / condvar / thread, dynamic loading, and atomic
-file replace (`gptps_hal_atomic_replace`, for the settings save). Two
-backends implement it: `hal_posix.c` (pthreads, `clock_gettime`,
+file replace (`gptps_hal_atomic_replace`, for the settings save). Its contract —
+clause by clause, with what the core needs each clause for — is in
+[`docs/HAL.md`](HAL.md), and `tests/test_hal_conformance.c` holds every backend to
+it. Two full backends implement it: `hal_posix.c` (pthreads, `clock_gettime`,
 `sysctl`/`sysinfo`, `dlopen`) and `hal_win.c` (`_beginthreadex`,
 `CRITICAL_SECTION` + `CONDITION_VARIABLE`, `Interlocked*`, `GetTickCount64`,
 `GetSystemInfo`/`GlobalMemoryStatusEx`, `LoadLibrary`). CMake picks the backend by
@@ -317,15 +319,18 @@ at the top of each backend (and at the top of the amalgamation), so a plain
 build-system `-D` flags.
 
 **Porting to a new target (RTOS / bare-metal).** Write one backend implementing
-this interface. In MANUAL mode (§3.1) the required subset is small: mutex,
-condvar (create/destroy/signal/broadcast — `wait`/`timedwait` and `thread_start`
-are *not* called, since there are no engine threads), the cancel flag, the
-monotonic clock, the thread id and the acquire/release `u32` pair (a constant and plain
-accesses will do), the fork-guard pair (no-ops), and hardware detection (return
-`cpu_count = 1`). `dlopen` and
-`atomic_replace` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use dynamic
-add-ons or settings persistence. Combined with `gptps_set_allocator` (§3.2) for a
-static memory pool, that is the whole bare-metal dependency surface.
+this interface, build it in with `-DGPTPS_HAL_SOURCE=<file>`, and run
+`ctest -R hal_conformance`: [`docs/HAL.md`](HAL.md) is the checklist. In MANUAL
+mode (§3.1) the required subset is small, because a single-threaded host calls no
+wait and starts no thread: mutex and condvar create/destroy/lock/unlock/signal/
+broadcast (no-ops will do), the cancel flag, the monotonic clock, the thread id and
+the acquire/release `u32` pair (a constant and plain accesses will do), the
+fork-guard pair (a constant), and hardware detection (return `cpu_count = 1`).
+`dlopen` and `atomic_replace` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use
+dynamic add-ons or settings persistence. `freestanding/hal_stub.c` is exactly that,
+and CI runs the conformance test against it in that profile. Combined with
+`gptps_set_allocator` (§3.2) for a static memory pool, that is the whole bare-metal
+dependency surface.
 
 ---
 
@@ -505,11 +510,12 @@ sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
 **self-skip** where the facility is absent rather than failing (cgroup delegation, a
-wasm runtime CLI). CI runs eleven jobs: `build-test` (Linux + macOS, a 2-way matrix),
+wasm runtime CLI). CI runs twelve jobs: `build-test` (Linux + macOS, a 2-way matrix),
 `werror` (`-O2 -Wall -Wextra -Werror`), `package` (installs, then builds a plug-in
 out-of-tree against the installed package), `windows` (mingw-w64), `msvc` (cl.exe),
 `amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan), `tsan`,
-`hal_fast`, `cross` (i386 + big-endian s390x under QEMU), and `freestanding`. The `tsan` and `cross` jobs select tests with an EXCLUDE list, so
+`hal_fast`, `hal_chaos` (the whole suite on the weakest HAL the contract allows),
+`cross` (i386 + big-endian s390x under QEMU), and `freestanding`. The `tsan` and `cross` jobs select tests with an EXCLUDE list, so
 a newly added test is covered by default rather than silently skipped.
 
 ---

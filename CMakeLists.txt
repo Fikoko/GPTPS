@@ -296,6 +296,20 @@ target_include_directories(test_foundation
 target_link_libraries(test_foundation PRIVATE gptps)
 add_test(NAME foundation COMMAND test_foundation)
 
+# Does the HAL keep its contract (include/gptps_hal.h, docs/HAL.md)? Built against
+# whichever HAL this build uses, so a -DGPTPS_HAL_SOURCE port is held to the same
+# checks. The dynamic-loading checks are a test of their own, so the s390x job can
+# leave them out with the other dlopen tests and still run the rest.
+add_executable(test_hal_conformance tests/test_hal_conformance.c)
+target_include_directories(test_hal_conformance
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_hal_conformance PRIVATE gptps)
+add_dependencies(test_hal_conformance addon_demo)
+add_test(NAME hal_conformance COMMAND test_hal_conformance)
+add_test(NAME hal_conformance_dl COMMAND test_hal_conformance --dl-only $<TARGET_FILE:addon_demo>)
+set_tests_properties(hal_conformance hal_conformance_dl PROPERTIES TIMEOUT 120)
+
 add_executable(test_engine tests/test_engine.c)
 target_include_directories(test_engine
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
