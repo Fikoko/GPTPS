@@ -2,14 +2,25 @@
 #
 # Pass this file to gptps_open("gptps.example.toml", &engine). Everything here is
 # optional: omitted values fall back to hardware auto-tune (limits) and to each
-# task's compiled-in def defaults (policies). A subset of TOML is supported -
-# tables, int / float / bool / "string" scalars, single-line string arrays, and
-# `#` comments.
+# task's compiled-in def defaults (policies). docs/CONFIG.md lists every key, with
+# its type, range, default, and when a change applies.
 #
-# These same keys are the runtime SETTINGS registry: read/change them live with
-# gptps_settings_get/set, and gptps_settings_save() writes the current values back
-# here. NOTE: save REGENERATES the file (grouped [section] key = value) - hand
-# comments and ordering are not preserved.
+# The file is checked as it is read. A line that does not parse, a value of the
+# wrong type or out of range, or a key the engine's own tables ([limits],
+# [scheduler], [bounded], [stats]) do not have fails gptps_open with
+# GPTPS_E_CONFIG, and the log names the file, the line and the key - with a
+# suggestion when it looks like a typo. Tables for tasks, resources and your own
+# settings wait for whoever defines them: call gptps_config_check() once setup is
+# done to hear about any key nothing used.
+#
+# A subset of TOML is supported: tables, int / float / bool / "string" scalars,
+# single-line string arrays, "quoted" parts in keys and table names (a task named
+# "resize v2" is [tasks."resize v2"]), and `#` comments.
+#
+# These same keys are the runtime SETTINGS registry: read and change them live
+# with gptps_settings_get/set or the dashboard, and gptps_settings_save() writes
+# the values you changed back into this file, in place. Comments, order and the
+# lines you did not change stay exactly as you wrote them.
 
 # Shared-library add-ons to dlopen at startup, in order. Each registers its task
 # types / constraints / observers over the stable host-table ABI. Paths are passed
@@ -51,6 +62,21 @@ max_dead_letters = 1024
 # 0 => never backfill (strict priority order); omitted => 8.
 reserve_after_skips = 8
 
+# Named resources: anything a task holds while it runs, other than memory - GPUs,
+# licences, database connections. Each key defines one, with the budget admission
+# works against; the name is yours. What a task costs of one goes under
+# [tasks.<name>.resources], below.
+[resources]
+gpu = 2
+
+# Bounded mode: no allocation once work starts (docs/BOUNDED.md). Uncomment to
+# size every pool up front; the engine then refuses work past these maxima
+# instead of allocating for it.
+# [bounded]
+# max_items         = 4096           # items alive at once: queued, running, retrying, dead
+# max_payload_bytes = 256            # each item's payload slot
+# max_result_bytes  = 256            # each executing thread's result buffer
+
 # Defaults applied to EVERY registered task (before any per-task table below).
 [task_defaults]
 timeout_seconds       = 0            # 0 => no timeout
@@ -69,6 +95,9 @@ on_failure      = "drop"
 mem_bytes       = 268435456          # advertise this task's per-run memory cost (256 MiB)
 priority        = 10                 # run resizes ahead of lower-priority work
 
+[tasks.resize.resources]
+gpu = 1                              # each resize holds one of the two GPUs while it runs
+
 [tasks.report]
 timeout_seconds = 900                # 15 min: fits a real 5-15 minute report
 max_retries     = 3
@@ -80,12 +109,11 @@ on_failure      = "dead_letter"      # bounded: retries, then the dead-letter li
                                      # until a cancel or shutdown closes it.
 priority        = -5                 # background work: yields to everything else
 
-# Generic settings round-trip here too. A host can declare its own typed knobs at
-# runtime: gptps_define_global("app.max_upload_mb", ...) lands under its own dotted
-# section, and gptps_define_task_setting("quality", ...) materializes a per-task
-# value as tasks.<name>.quality. Both are saved/reloaded like the keys above. The
-# engine only writes keys it currently knows about, so re-declare a custom setting
-# (same key) on a fresh engine, then gptps_settings_reload to re-apply saved values.
+# Your own settings live here too. A host declares typed knobs at runtime -
+# gptps_define_global("app.max_upload_mb", ...) under its own [app] table, or
+# gptps_define_task_setting("quality", ...) as tasks.<name>.quality - and the
+# value this file gives is applied the moment the key is defined. Save writes
+# them back like the keys above.
 # [app]
 # max_upload_mb = 20
 # [tasks.resize]

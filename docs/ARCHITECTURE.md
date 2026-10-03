@@ -420,16 +420,45 @@ loader look unused; naming them accurately is more honest and more useful.
 
 `gptps_open(path)` — or `gptps_open_ex` with `cfg->config_path`, where an explicit
 `cfg->limits` value wins over the file's — parses a config file (a TOML *subset* —
-tables, dotted tables, int/float/bool/string scalars, single-line string arrays, `#`
-comments — parsed by `config_toml.c`, no external dependency). It maps to:
+tables, dotted tables, int/float/bool/string scalars, single-line string arrays,
+quoted parts in keys and table names, `#` comments — parsed by `config_toml.c`, no
+external dependency). It maps
+to (every key: [CONFIG.md](CONFIG.md), generated from the registry):
 
-- `[limits]` → engine budget (concurrency, memory);
-- `[scheduler]` → `reserve_after_skips`;
+- `[limits]` and `[bounded]` → the keys that size the engine, read before it exists;
+- `[scheduler]`, `[stats]` → settings, applied through the registry;
+- `[resources]` → named resources, defined (or re-budgeted) at open;
 - `[task_defaults]` then `[tasks.<name>]` → per-task policy / cost / priority,
   applied at registration (def < `task_defaults` < `tasks.<name>`);
-- top-level `addons = [...]` → shared libraries auto-loaded at open.
+  `[tasks.<name>.resources]` → what one run costs of each named resource;
+- top-level `addons = [...]` → shared libraries loaded at open.
 
 `gptps_open_ex(cfg, ...)` with `cfg->config_path` NULL is the explicit, file-free path.
+
+**One validation path.** The parser is strict: a line it cannot read fails the open
+with the file and line. Every value then goes through the check a live
+`gptps_settings_set` makes (`valid_value` in `settings.c`): the sizing keys before the
+engine exists, the per-task keys when the file is read (and applied when the task
+registers), everything else through the registry itself. An unknown key in one of
+the engine's own tables is an error, with a suggestion by edit distance; so is a
+table name a letter or two from one of them, when the key under it is that table's. Each entry the parser keeps has a *claimed*
+flag; a key nothing claims at open waits — a `[tasks.<name>]` table for a task not yet
+registered, a setting a plug-in or the host defines later — and `cfg_apply_pending`
+applies it at that definition (an add-on's own keys, when its setup returns, so the
+watcher it registered there hears them; a host's watchers hear only live sets). Keys
+are judged by their dotted form, never by how the
+file split them into table and key, and a value must be the TOML kind its setting
+takes (a number, `true`/`false`, a `"string"`). A table name a letter or two from one of
+the engine's is an error only when the key under it is that table's; otherwise it may
+be the host's, and waits. The registry, the define-time check and the parser share one
+number grammar (`gptps_settings_plain_number`), so no value a setting takes can make a
+saved file unreadable. What is still unclaimed after setup is what
+`gptps_config_check` reports, and what the first submit logs once. One attempt reports
+every problem, not the first one only. The parser goes on past a line it cannot read
+(and passes over the keys under a `[table]` line it cannot read, whose table is
+unknown); a file that parses has every value checked, and a sizing key the open
+refuses is left out so the engine can open to check the rest, then the open is
+refused.
 
 ### Settings registry (`src/settings.c`)
 
@@ -450,9 +479,13 @@ in the add-on. Validation (range / enum / parseable) runs in the generic layer
   where applicable; `max_concurrent_tasks` is restart-only (pool fixed at open): a live
   write is kept for reads and `gptps_settings_save` (a saved file carries it to the next
   open), and admission never sees it.
-- **Persistence:** `gptps_settings_save` regenerates a grouped TOML file written via
-  `gptps_hal_atomic_replace` (temp + rename/MoveFileEx); `gptps_settings_reload`
-  re-applies known keys through the validated `set()` path and swaps `e->toml`.
+- **Persistence:** `gptps_settings_save` updates the file in place, through
+  `gptps_hal_atomic_replace` (temp + rename/MoveFileEx). Each entry records whether a
+  live set or a file last wrote it; save rewrites the lines of the live-set ones (the
+  parser's line numbers say which line holds which key), adds those the file lacks next
+  to their siblings, and copies every other line byte for byte. A file the parser
+  refuses is never overwritten. `gptps_settings_reload` re-applies a file through the
+  same checks as the open and swaps `e->toml`.
 - **Extensible:** add-ons register settings via the public `gptps_register_setting`
   or the host-table `register_setting` routine; the `tui` Settings pane (`s`) is a
   thin editor over the registry.

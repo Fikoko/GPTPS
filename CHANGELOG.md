@@ -7,6 +7,27 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Upgrading from 1.5
+
+Three changes can need a change in a host. All three are about the config file:
+
+- **A config file with a mistake in it fails `gptps_open`.** 1.5 used what it
+  understood and dropped the rest without a word: a misspelt key, a line it could not
+  read, a value of the wrong type. Each is now an error. The open returns
+  `GPTPS_E_CONFIG`, and the log names the file, the line and the key. Open each file
+  you deploy once with this release before you ship it. The file is held to TOML's
+  rules where 1.5 bent them: a quoted number, `"4"`, is a string and no longer passes
+  for a number; a backslash in a string must be written `\\`; a control character in
+  a string must be escaped; a file whose lines end in CR alone is refused, where 1.5
+  read it as one line.
+- **An add-on in `addons` that does not load fails the open.** 1.5 logged it and opened
+  without the add-on.
+- **`gptps_settings_save` edits the file instead of rewriting it.** It writes the values
+  set live and leaves every other line as it was. Saving to a new path copies the
+  loaded file with those changes. A host that saved to dump every setting gets only
+  the changed ones; `gptps_settings_count` and `gptps_settings_get_info` still
+  enumerate them all.
+
 ### Added — bounded mode: no allocation once work starts (ABI 2.4)
 
 - **`gptps_config.max_items`, `max_payload_bytes` and `max_result_bytes`.** With
@@ -82,6 +103,35 @@ the release version and is documented in `include/gptps.h`.
   clause and the check that holds a HAL to it. It also lists what the test cannot
   show: memory ordering on x86, wall-clock steps, a failed thread start.
 
+### Added — a config file can describe a whole deployment, and says what is wrong with it
+
+- **`[resources]`, `[tasks.<name>.resources]` and `[bounded]` in the file.** Named
+  resources and their budgets, what one run of each task costs of them, and bounded
+  mode's maxima could be set only from code; a deployment can now carry them in its
+  file. Each budget and each cost is also a setting (`resources.<name>`,
+  `tasks.<name>.resources.<name>`), so the settings API, the dashboard and save see
+  them too.
+- **`gptps_config_check(e)` (ABI 2.4).** A key that only a later definition can claim
+  waits for it: a `[tasks.<name>]` table until that task registers, a plug-in's or the
+  host's setting until it is defined, and each is checked and applied then. Called
+  once setup is done, `gptps_config_check` logs every key nothing has used, with a
+  suggestion for a near miss (`no task named resise is registered (did you mean
+  resize?)`), and returns `GPTPS_E_CONFIG` if there is one. Without the call, the first
+  submit logs the same keys once, as warnings.
+- **`gptps_settings_set_ex` (ABI 2.4)** is `gptps_settings_set` that says why it refuses
+  a value (`70000 must be a whole number between 0 and 65536`), for a UI to show.
+- **`docs/CONFIG.md` lists every key**, with its type, range, default, and whether a
+  change applies at once or at the next start. `tools/gptps_config_reference.c`
+  generates it from the settings registry, by registering a task named `<task>` and a
+  resource named `<name>`, so the keys they create come out with their placeholders in
+  them. The `config_reference` test fails while the page and the code disagree.
+- **The dashboard's settings editor explains itself.** Under the list it shows what
+  the selected setting does, what it takes, its default, and whether a change applies
+  at once or at the next start. A value it refuses comes with the reason, a byte count
+  comes with its size in KiB, MiB or GiB, the key column fits the longest key, and the
+  list scrolls to keep the selection on screen. `w` reports where it saved, or why it
+  did not.
+
 ### Changed — an item's cancel flag lives in the item
 
 - **A submit no longer allocates in the HAL, so every per-item allocation goes through
@@ -97,6 +147,106 @@ the release version and is documented in `include/gptps.h`.
   deleted slots. `tests/test_hidx.c` drives it against a reference model, on small
   tables where probe runs wrap past the end; dropping the shift, an off-by-one in it,
   or mishandling the wrap each fails it.
+
+### Changed — the config file is checked as it is read, and save edits it in place
+
+- **One check for every value, from a file or live.** The parser is strict: a line it
+  cannot read fails the open with its file and line, and so does a NUL byte. Every
+  value then goes through the check `gptps_settings_set` makes, after one that it is
+  the kind of value its key takes. A key is judged by its dotted name, however the file
+  spells it, so `"limits.max_memroy_bytes" = 1` is the same typo as the one in a
+  `[limits]` table. A key the engine's own tables (`[limits]`, `[scheduler]`,
+  `[bounded]`, `[stats]`) do not have is an error with a suggestion, and so is a table
+  name a letter or two from one of the engine's, when the key under it is that
+  table's: `[limit] max_concurrent_tasks` is a typo, a host's `[status] code` is its
+  own table and waits for its definition. A value a plug-in refuses as it loads, inside
+  the open, fails the open too. One attempt
+  reports every problem, not the first one only: every line that does not parse, or,
+  once the file parses, every value and key that is wrong:
+
+  ```
+  config gptps.toml:2: limits.max_concurrent_tasks: 70000 must be a whole number between 0 and 65536
+  config gptps.toml:9: tasks.resize.on_failure: retry must be one of: dead_letter, requeue, drop
+  config gptps.toml:3: limits.max_memroy_bytes: [limits] has no such key (did you mean limits.max_memory_bytes?)
+  config gptps.toml:6: schedular.reserve_after_skips: there is no [schedular] table (did you mean [scheduler]?)
+  config gptps.toml: 4 errors - the engine was not opened
+  ```
+
+  `gptps_settings_reload` makes the same checks: a file that does not parse changes
+  nothing; otherwise every valid value is applied, each problem is logged, and the
+  result is `GPTPS_E_CONFIG` if there was one.
+- **`gptps_settings_save` updates the file in place.** It used to regenerate it, which
+  dropped every comment, so saving from the dashboard destroyed a hand-written file's
+  notes. Save now rewrites only the values set live, each on its own line, keeping that
+  line's comment, and adds a changed setting the file lacks next to its siblings. Every
+  other line stays as written, so a `0 = auto` stays auto, instead of becoming this
+  machine's core count or memory. A file that does not parse is not overwritten: save
+  logs why and returns `GPTPS_E_CONFIG`. Saving to a new path writes a copy of the
+  loaded file - its add-ons, `[task_defaults]` and comments - with the live changes
+  made in it. The `stats.dead_letters_evicted` counter is never written. A host's
+  settings watchers hear only `gptps_settings_set`, as before, so one that saves on a
+  change never saves over a file being reloaded. On POSIX the file keeps its
+  permission bits across a save; it used to take the process umask's, so a config
+  kept to its owner came back readable by others, and one read-only to its group could
+  come back writable by it. A save while a reload is applying its file returns
+  `GPTPS_E_BUSY`, rather than write a live value over the file being read.
+- **The core settings' descriptions say what each one does and what 0 means.** The
+  dashboard and `docs/CONFIG.md` show them.
+- **`gptps_hwinfo.has_gpu` is documented as outside the HAL contract.** The core never
+  read it. A GPU, like any device a task holds, is a named resource the host or the
+  config file defines.
+
+### Fixed — config values that went in unchecked
+
+Each measured against 1.5.0's code, which this part of the engine had not changed
+since.
+
+- **Per-task values from the file were cast without a check.** `max_retries = -1`
+  became 4294967295 retries, `timeout_seconds = -1` a timeout of 136 years, and
+  `priority = 99999999999` became 1215752191. `on_failure = "retry"` was ignored, and
+  the task kept its compiled-in policy. Each now fails the open.
+- **A live set past a per-task value's width was truncated.** Setting
+  `tasks.<name>.timeout_seconds` to 4294967296 was accepted and stored 0, which means
+  no timeout. The per-task keys now declare their ranges, and the set is refused.
+- **The parser accepted lines it could not read.** A file with an unclosed `[limits`
+  opened; so did `max_concurrent_tasks = = 4`. A `[limits]` value out of range made
+  the open fail with no message at all. Both now fail with the file and the line.
+- **Quoted keys and table names matched nothing.** The parser kept the quotes as part
+  of the name, so the Readme's `"gpuq.units" = 2` example set no setting, and
+  `[tasks."resize v2"]`, which is how TOML names a task with a space in it, matched no
+  task. Quoted parts of keys and table names are now read as TOML reads them, and a
+  dotted key means the same whether the dots are in the table name or the key.
+- **A number setting took values no file could hold.** A setting with a range of 0 to
+  1 accepted `nan`, because every comparison with NaN is false, and any number setting
+  accepted a hex float such as `0x1p-1`, or `inf` where it had no range. Such a value
+  then went into a saved file, which no longer opened. A number is now what a config
+  file writes: a sign, digits, a fraction and an exponent.
+- **A backslash in a string vanished.** `"C:\plugins"` read as `C:plugins`, a path that
+  does not exist, without a word. The parser now reads TOML's escapes, `\uXXXX`
+  included, and refuses any other.
+- **A plug-in could not be configured from the file.** `docs/PLUGINS.md` says one can
+  be, but a plug-in's own keys in the file were never applied at open, and a reload
+  applied them without telling the plug-in, which learns its values through a
+  settings watcher. So `[gpuq] total_units = 4` left the GPU quota plug-in's budget
+  unlimited. Now an add-on's keys take the file's values when its setup returns, and
+  a watcher an add-on registers hears a config file's values - at open, at a reload,
+  and as a task takes its per-task value - while a host's watcher still hears only
+  live sets. An add-on whose setup fails has its watchers switched off and the
+  settings it registered with `register_setting` or `define_global` removed: their
+  accessors and targets are its own, and in 1.5 they stayed, so a later set or
+  reload could run its code after the setup that should have readied it had failed.
+  (A per-task setting it defined stays; the engine owns its cells.)
+  `tests/test_plugin_tier.c` configures the quota from nothing but a file and checks
+  that it bites.
+- **Under a locale with a decimal comma, numbers were misread.** A host that set
+  `LC_NUMERIC` from the environment - as GUI toolkits do - read `max_memory_gb = 4.5`
+  as 4 GiB without a word. Numbers are now read and written as the C locale has them,
+  whatever the host's locale.
+- **An unsigned value past 2^63 could not be written in the file.** A budget or a
+  byte count of up to 2^64 - 1 is a valid setting, but the parser refused it as too
+  large a number, and the open failed with no message. It now reads.
+- **The dashboard printed `(null)` as its title** in the settings, tasks and
+  dead-letter panes when `gptps_tui_config.title` was left unset.
 
 ### Fixed — the POSIX HAL's timed wait
 

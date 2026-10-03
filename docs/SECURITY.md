@@ -130,5 +130,12 @@ Stated so nobody infers them:
   size-checked beyond the caps above.
 - The dead-letter list holds original payloads in memory. If those are sensitive,
   drain it.
-- Settings persistence (`gptps_settings_save`) writes a world-readable file with the
-  process umask.
+- Settings persistence (`gptps_settings_save`) writes a temporary file with the
+  process umask and renames it over the config file. On POSIX the config file keeps
+  its permission bits across a save, so one you restricted stays restricted; the
+  temporary file has the umask's for the moment before the rename, so run with a
+  umask that grants no group or world write (`022` or `077`) where others share the
+  directory. A save to a NEW path copies the config file the engine loaded, but not
+  its permissions: the new file takes the umask's, so set them yourself if the
+  original was restricted. On Windows the saved file takes the folder's inherited
+  ACL.

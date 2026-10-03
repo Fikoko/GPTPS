@@ -104,6 +104,20 @@ Deliberately absent, with reasons in the header: engine lifecycle
 `load_addon`, the single-slot `set_event_cb`, and the destructive
 `dead_letter_drain`.
 
+**Configured from TOML.** A plug-in learns its configuration through `settings_watch`.
+A watcher registered through the host table hears a config file's values, where a
+host's watcher hears only live sets. Register it first in `setup()`, so it is
+listening before anything it watches exists. The settings it defines in `setup()`
+take the file's values when `setup()` returns, so the watcher hears every one of
+them; it also hears a reload, a live `settings_set`, and the value of a per-task
+setting when a task registers. If `setup()` fails, its watchers hear nothing more,
+and the settings it registered with `register_setting` or `define_global` are
+removed, since their accessors and targets are its own. A per-task setting it defined
+stays: the engine owns its cells, so none of the plug-in's code runs for it. A value
+the file gives that the setting refuses fails the open, like any other mistake in
+the file. `addons/gptps_gpu_quota_plugin.c` is configured this way,
+and `tests/test_plugin_tier.c` holds it to that with nothing but a file.
+
 ## 5. Namespaces
 
 Declare `ns` (via `GPTPS_ADDON_INIT_NS`) and you get a guarantee and a rule:

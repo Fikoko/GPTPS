@@ -24,7 +24,7 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
-- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Bounded mode](docs/BOUNDED.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
+- Reference: [Config keys](docs/CONFIG.md) · [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Bounded mode](docs/BOUNDED.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
 - [Safety artifacts (commercial)](#safety-artifacts-commercial) · [License](#license)
 
 ## Quick start
@@ -275,7 +275,10 @@ change — see [Scaling](#scaling-opt-in-by-composition).
 re-tune for a new machine or change a task's failure policy. Pass `NULL` to skip it and
 auto-tune. `gptps_open_ex` reads the same file when `cfg.config_path` is set, and an
 explicit value in `cfg.limits` wins over the file's. A subset of TOML is supported
-(tables, `int`/`float`/`bool`/`"string"` and single-line string arrays, `#` comments):
+(tables, `int`/`float`/`bool`/`"string"` and single-line string arrays, `"quoted"` parts in
+keys and table names such as `[tasks."resize v2"]`, `#` comments). **[docs/CONFIG.md](docs/CONFIG.md) lists every key** with its type,
+range, default and when a change applies; it is generated from the code, and a test
+fails when the two disagree.
 
 ```toml
 # top level: binary plug-ins to dlopen at open, by explicit path. There is no search
@@ -294,6 +297,14 @@ max_memory_gb        = 4.0     # or max_memory_bytes = 4294967296
 [scheduler]
 reserve_after_skips = 8        # starvation guard (0 => strict priority, no backfill)
 
+[resources]                    # named resources: the names and budgets are yours
+gpu = 2
+
+# [bounded]                    # optional: no allocation once work starts (docs/BOUNDED.md)
+# max_items         = 4096
+# max_payload_bytes = 256
+# max_result_bytes  = 256
+
 [task_defaults]                # applied to every task...
 max_retries = 2
 on_failure  = "dead_letter"    # dead_letter | drop | requeue
@@ -305,10 +316,60 @@ max_retries     = 1
 on_failure      = "drop"
 mem_bytes       = 268435456
 priority        = 10
+
+[tasks.resize.resources]       # what one run holds of each named resource
+gpu = 1
 ```
 
 Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]` → `[tasks.<name>]`
 (most specific wins). Explicit `[limits]` values win over auto-tune. See `gptps.example.toml`.
+
+**The file is checked as it is read.** `gptps_open` fails with `GPTPS_E_CONFIG` on a line
+that does not parse, a value out of range or of the wrong type (TOML's types: `"4"` in
+quotes is a string, not a number), a key the engine's own tables (`[limits]`,
+`[scheduler]`, `[bounded]`, `[stats]`) do not have, a table name a letter or two from one
+of the engine's when the key under it is that table's (`[limit] max_concurrent_tasks`),
+an add-on that does not load, and a plug-in's own key that its plug-in refuses. One attempt
+reports every problem, not just the first: every line that does not parse, or, once the
+file parses, every value and key that is wrong. Each comes with its line and key, and a
+suggestion when it looks like a typo:
+
+```
+config gptps.toml:2: limits.max_concurrent_tasks: 70000 must be a whole number between 0 and 65536
+config gptps.toml:9: tasks.resize.on_failure: retry must be one of: dead_letter, requeue, drop
+config gptps.toml:3: limits.max_memroy_bytes: [limits] has no such key (did you mean limits.max_memory_bytes?)
+config gptps.toml:6: schedular.reserve_after_skips: there is no [schedular] table (did you mean [scheduler]?)
+config gptps.toml: 4 errors - the engine was not opened
+```
+
+A key that someone defines later waits for them: a `[tasks.<name>]` table until a task of
+that name registers, a plug-in's or the host's own setting until it is defined — a host's
+`[status]` table too, though it is a letter from `[stats]`. Each is checked and applied
+at that moment. Call `gptps_config_check(e)` once setup is done: it
+logs every key nothing has used (`tasks.resise.max_retries: no task named resise is
+registered (did you mean resize?)`) and returns `GPTPS_E_CONFIG` if there is one. Without
+the call, the first submit logs the same keys once, as warnings.
+
+**Configure at deploy time; tune live only if you want to.** The file can carry
+everything that shapes an engine: its limits, bounded mode, named resources and what each
+task costs of them, and every task's policy. It is read once, at open, and again only
+when you call `gptps_settings_reload`; nothing in it costs anything per task. The live
+tools — the settings API and the [dashboard](#live-terminal-dashboard) — are there when
+you want them: an engine that never installs the `tui` add-on runs no dashboard and no
+observer for it.
+
+**Reload and save.** `gptps_settings_reload(e, NULL)` re-reads the file with the same
+checks. A file that does not parse changes nothing; otherwise every valid value is
+applied, each problem is logged, and the result is `GPTPS_E_CONFIG` if there was one. The
+keys that size the engine (`max_concurrent_tasks`, `[bounded]`, `addons`) take effect at
+the next start. `gptps_settings_save(e, NULL)` writes the values changed live back into
+the file, **in place**: each on its own line, keeping that line's comment; a changed
+setting the file lacks goes next to its siblings; every other line stays exactly as
+written, so a `0 = auto` stays auto. A file with an error in it is not overwritten: save
+logs why and returns `GPTPS_E_CONFIG`. Saving to a new path writes a copy of the loaded
+file — add-ons, `[task_defaults]`, comments and all — with the live changes made in it.
+Whatever save writes reads back as it was: a setting takes only numbers a file can hold
+(no `nan`, `inf` or hex), and a string is written with every control character escaped.
 
 ## Settings (runtime, introspectable, persistable)
 
@@ -326,11 +387,14 @@ size_t n = gptps_settings_count(e);                                   /* enumera
 
 - **Typed + validated:** `set()` parses and range/enum-checks before applying (so a bad
   `on_failure` or out-of-range value is rejected with `GPTPS_E_CONFIG`, not silently dropped).
+  `gptps_settings_set_ex` also says why, for a UI to show: `70000 must be a whole number
+  between 0 and 65536`. A file's values go through the same check.
 - **Hot vs restart:** most settings apply immediately; a few (e.g. the worker-pool size) are
   flagged effective-on-restart. `gptps_settings_get_info` exposes type, default, range, and the
   hot flag for building a UI.
-- **Round-trip:** `gptps_settings_save` regenerates a grouped TOML file (atomically; comments
-  not preserved); `gptps_settings_reload` re-applies it.
+- **Round-trip:** `gptps_settings_save` writes the values changed live into the file in
+  place, atomically, keeping its comments; `gptps_settings_reload` re-applies it. See
+  [Reload and save](#configuration-file-optional).
 - **Extensible:** add-ons register their own settings (via `gptps_register_setting` or the
   host-table routine), so they show up in the registry, TOML, and editor uniformly.
 - **Generic, no glue:** declare your own typed knobs at runtime — `gptps_define_global(e,
@@ -339,7 +403,10 @@ size_t n = gptps_settings_count(e);                                   /* enumera
   materialize `tasks.<name>.quality` on every task. A `run()` reads its own value with
   `gptps_task_setting_int(ctx, "quality", &q)`. The engine stores and validates them; both
   round-trip through TOML and appear in the editor.
-- **Editor:** the `tui` add-on includes a live **Settings pane** (`s`) to browse/edit/save.
+- **Editor:** the `tui` add-on includes a live **Settings pane** (`s`) to browse, edit and
+  save. It explains the selected setting — what it does, what it takes, its default, and
+  whether a change applies at once or at the next start — and says why when it refuses a
+  value.
 
 ## Manage tasks at runtime (control plane)
 
@@ -529,7 +596,9 @@ keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter
   table (runs / ok / fail / dead / drop / success-rate / average latency).
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
   dashboard's own CPU/RAM cost (minimal/normal/full) live; `p` pauses; `s` opens the live
-  **settings editor**; `?` shows a help overlay of every key.
+  **settings editor**, which explains the selected setting, says why it refuses a value,
+  and saves your changes into the config file in place (`w`); `?` shows a help overlay of
+  every key.
 - **Task control plane:** `t` opens a **task manager** — list every type with live
   queued/running/dead counts, inspect one to edit its settings inline, pause/resume (`a`),
   clone (`c`), create a `GPTPS_EXEC_PROGRAM` task from a typed name + argv (`n`), or delete
