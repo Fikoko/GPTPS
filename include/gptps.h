@@ -394,7 +394,10 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *    gptps_shutdown emit, which fire on their caller's thread.
  *    In either mode, the dead-letter drain callback and settings watchers run on
  *    the thread that called gptps_dead_letter_drain / gptps_settings_set, and an
- *    event an add-on emits reaches the event callback on the add-on's thread.
+ *    event an add-on emits reaches the event callback on the add-on's thread. An
+ *    add-on's settings watcher also hears a config file's values, on the thread
+ *    that applies one: the one opening or reloading the engine, loading the
+ *    add-on, or registering or defining what takes the value.
  *  - Event callbacks (gptps_event_cb, observers) and the dead-letter drain
  *    callback ALWAYS run with the engine lock RELEASED, so they MAY call back
  *    into the engine (e.g. gptps_submit to retry) without deadlock. Keep them
@@ -408,17 +411,19 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *    gptps_is_cancelled() to be stoppable (timeouts and gptps_cancel are
  *    cooperative for INPROC; OOP/PROGRAM are hard-killed at their deadline).
  *  - Settings write callbacks take their own lock; the fixed lock order is
- *    settings-lock -> engine-lock -> add-on lock.
+ *    settings-lock -> engine-lock -> add-on lock. A write callback runs HOLDING
+ *    the settings lock, so it must not call the settings API - get, set, save,
+ *    reload, define - on its engine: that would re-enter the lock.
  *  - gptps_shutdown() and gptps_step() are the exceptions to "callbacks may
  *    re-enter": both return GPTPS_E_BUSY when called from a task body or a
  *    callback, since either would tear down / recurse into the caller's own
  *    thread. "A callback" is any of them, on whichever thread it runs: an event
  *    callback, including the QUEUED that gptps_submit emits on its caller's
  *    thread; the dead-letter drain callback; a settings watcher, and a setting's
- *    write accessor while gptps_settings_set or gptps_settings_reload runs it; an
- *    add-on's setup, teardown and disable. (A read accessor is not covered: have
- *    it read. Nor is a hook that runs under the engine lock, which must not call
- *    into the engine at all - see above.)
+ *    write accessor while gptps_settings_set, gptps_settings_reload or a config
+ *    file's value runs it; an add-on's setup, teardown and disable. (A read
+ *    accessor is not covered: have it read. Nor is a hook that runs under the
+ *    engine lock, which must not call into the engine at all - see above.)
  *    gptps_unregister_task() returns GPTPS_E_BUSY too, when called from a task
  *    body or from a callback on one of the engine's own threads, whenever the
  *    removal would have to wait for work of that type, which may need that
@@ -966,7 +971,8 @@ typedef struct {
 /* Introspection record (struct_size first; value/defval rendered inline). */
 typedef struct {
     size_t              struct_size;   /* = sizeof(gptps_setting_info) */
-    const char         *key;           /* borrowed; stable for engine lifetime */
+    const char         *key;           /* borrowed: valid while the setting exists - until its
+                                        * task is unregistered, or its add-on's setup fails */
     gptps_setting_type  type;
     const char         *desc;          /* borrowed */
     int                 hot;
@@ -1051,20 +1057,62 @@ GPTPS_API gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_set
  * truncates, stays NUL-terminated, and still returns GPTPS_OK. */
 GPTPS_API gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap);
 GPTPS_API gptps_status gptps_settings_set(gptps *e, const char *key, const char *value);
+/* As gptps_settings_set, and when it refuses, `why` says why, for a UI to show:
+ * "70000 must be a whole number between 0 and 65536", "no setting is named
+ * limits.max_conc (did you mean limits.max_concurrent_tasks?)". `why` may be NULL;
+ * it is "" on success. ABI 2.4. */
+GPTPS_API gptps_status gptps_settings_set_ex(gptps *e, const char *key, const char *value,
+                                             char *why, size_t cap);
 
-/* Persistence. save() regenerates a grouped TOML file atomically (comments are
- * NOT preserved). reload() re-parses and re-applies known keys via set()+validation
- * (best-effort: returns the first error; a parse failure applies nothing) - as set()
- * would, so a key the file sets overrides a limit the host passed in cfg->limits at
- * open, and a 0 there means auto. For both, path==NULL uses the path the engine was
- * opened with (GPTPS_E_INVAL if none). */
+/* Config file check. A config file is validated as it is read:
+ * gptps_open / gptps_open_ex fail with GPTPS_E_CONFIG on a line that does not parse,
+ * a value out of range or of the wrong type, or a key no engine-owned table has -
+ * and log each problem, naming the file, the line and the key, through the log sink.
+ * A key only a later definition can claim (a [tasks.<name>] table for a task not yet
+ * registered, a plug-in's or the host's own setting) waits for it. Call this once
+ * setup is done: it logs every key nothing has claimed, and every value found invalid
+ * after open, and returns GPTPS_E_CONFIG if there was any. Without a call, the first
+ * submit logs the same keys once, as warnings. GPTPS_OK when opened without a file.
+ * Every key, with its type, range and default: docs/CONFIG.md. ABI 2.4. */
+GPTPS_API gptps_status gptps_config_check(gptps *e);
+
+/* Persistence. save() writes the values set live (gptps_settings_set) into the file,
+ * atomically. A file that exists is updated in place: each changed value is
+ * rewritten on its own line, which keeps its comment; a changed setting the file
+ * lacks is added next to its siblings; every other line - comments, order, values
+ * nobody changed, keys that are not settings - stays as it was, so a "0 = auto"
+ * stays auto. A file that does not parse is left untouched: save() logs why and
+ * returns GPTPS_E_CONFIG. A new path gets a copy of the config file the engine
+ * loaded - add-ons, [task_defaults], comments and all - with the live changes made
+ * in it; without one, the values changed live and those the loaded file set.
+ * While a reload is applying a file, save() returns GPTPS_E_BUSY: try again. So
+ * does reload() while another reload runs, or while an add-on's setup does.
+ * reload() re-reads the file and applies it with the same checks as gptps_open, as
+ * set() would, so a key the file sets overrides a limit the host passed in
+ * cfg->limits at open, and a 0 there means auto. A file that does not parse applies
+ * nothing; otherwise every valid value is applied, each problem is logged, and the
+ * result is GPTPS_E_CONFIG if there was any. For both, path==NULL uses the path the
+ * engine was opened with (GPTPS_E_INVAL if none). */
 GPTPS_API gptps_status gptps_settings_save(gptps *e, const char *path);
 GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
 
 /* Watch for changes: `cb` fires (with the settings lock RELEASED) after each
  * successful gptps_settings_set, with the key and its newly-applied value - for
- * audit logs, auto-save, re-rendering, etc. Register watchers before concurrent
- * settings activity. (reload re-applies known keys without firing watchers.) */
+ * audit logs, auto-save, re-rendering, etc. A config file's values do not fire it -
+ * at open, at a reload, or when a definition takes one - so a watcher that saves
+ * never saves once per key a reload reads, nor over the file being read. Register
+ * watchers before concurrent settings activity.
+ * An add-on's watcher (the host table's settings_watch) hears a config file's
+ * values as well, as settings take them: that is how a plug-in learns its
+ * configuration. Its own settings take the file's values when its setup returns,
+ * so a watcher it registers there hears them - best registered first in setup, so
+ * it is listening before anything it watches exists. If its setup fails, its
+ * watchers hear nothing more and the settings it registered (register_setting,
+ * define_global) are removed; a per-task setting it defined stays, held in cells
+ * the engine owns, so none of its code runs for it. (The built-in per-task values
+ * a task takes from the file as it registers - timeout_seconds, priority and the
+ * rest - go straight into its definition, and [resources] budgets straight to the
+ * resources: no watcher hears those.) */
 typedef void (*gptps_settings_cb)(const char *key, const char *value, void *user_data);
 GPTPS_API gptps_status gptps_settings_watch(gptps *e, gptps_settings_cb cb, void *user_data);
 

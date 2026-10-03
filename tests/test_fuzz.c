@@ -85,6 +85,128 @@ static void fuzz_toml(void)
     remove(FZ_TOML);
 }
 
+/* ---- settings save, editing a file in place ----
+ * gptps_settings_save rewrites hand-written text, so it gets hand-written text of
+ * every shape the parser accepts. The property: a file that parses still parses
+ * after a save, and holds the values set live; nothing else in it may change
+ * meaning. Random files are built from line templates - tables, dotted and quoted
+ * keys, comments, CRLF, strings with # in them - so most of them parse. */
+static unsigned g_saved;   /* files that parsed, so the property was checked */
+
+static gptps_status fz_noop(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
+
+static void save_into(gptps *e, const char *text)
+{
+    static const struct { const char *key, *want; } LIVE[] = {
+        { "scheduler.reserve_after_skips", "5" },
+        { "limits.max_intake_depth",       "7" },
+        { "tasks.fz.on_failure",           "drop" },
+        { "tasks.fz.priority",             "-3" },
+        { "tasks.odd]x.max_retries",       "2" },
+        { "tasks.sp ace.timeout_seconds",  "9" },
+        { "tasks.e=q.max_retries",         "6" },
+    };
+    gptps_toml *before, *after;
+    char err[4096];
+    size_t i, k, n;
+    write_file(FZ_TOML, text, strlen(text));
+    before = gptps_toml_parse_file(FZ_TOML, NULL, 0);
+    if (!before) return;                            /* save refuses those: test_config_strict */
+    ++g_saved;
+    CHECK(gptps_settings_save(e, FZ_TOML) == GPTPS_OK);
+    after = gptps_toml_parse_file(FZ_TOML, err, sizeof err);
+    CHECK(after != NULL);
+    if (!after) {
+        printf("  after a save of:\n---\n%s\n---\n  %s\n  the file became:\n---\n", text, err);
+        { FILE *f = fopen(FZ_TOML, "rb"); int c; if (f) { while ((c = fgetc(f)) != EOF) putchar(c); fclose(f); } }
+        printf("---\n");
+        gptps_toml_free(before);
+        return;
+    }
+    for (i = 0; i < sizeof LIVE / sizeof LIVE[0]; ++i) {
+        long j = gptps_toml_find_dotted(after, LIVE[i].key);
+        const char *v = j >= 0 ? gptps_toml_text_at(after, (size_t)j) : NULL;
+        CHECK(v != NULL && strcmp(v, LIVE[i].want) == 0);
+    }
+    /* every other key the file had is still there, with the same value */
+    n = gptps_toml_count(before);
+    for (k = 0; k < n; ++k) {
+        char d[512];
+        const char *was = gptps_toml_text_at(before, k), *now;
+        long j;
+        int live = 0;
+        gptps_toml_dotted_at(before, k, d, sizeof d);
+        for (i = 0; i < sizeof LIVE / sizeof LIVE[0]; ++i) if (!strcmp(d, LIVE[i].key)) live = 1;
+        if (live) continue;
+        j = gptps_toml_find_dotted(after, d);
+        CHECK(j >= 0);
+        if (j < 0) { printf("  lost %s from:\n%s\n", d, text); continue; }
+        now = gptps_toml_text_at(after, (size_t)j);
+        CHECK((was == NULL) == (now == NULL) && (!was || strcmp(was, now) == 0));
+    }
+    gptps_toml_free(before);
+    gptps_toml_free(after);
+}
+
+static void fuzz_save(void)
+{
+    static const char *const LINES[] = {
+        "", "\r", "# a comment", "   # indented comment", "[scheduler]", "[ limits ]  # spaced",
+        "[tasks.fz]", "[tasks]", "[tasks.fz.resources]", "[app]", "[app.sub]",
+        "reserve_after_skips = 1", "max_intake_depth = 0   # note", "on_failure = \"requeue\"",
+        "priority = 4\r", "\"fz.priority\" = 1", "\"odd]x.max_retries\" = 0", "k%u = 1",
+        "s%u = \"a # not a comment\"  # but this is", "a%u = [\"x\", \"y # z\"]", "b%u = true",
+        "q%u.r = 2.5", "\"quoted %u\" = \"v\"", "  indented%u   =   3   ",
+        "[tasks.\"sp ace\"]", "[tasks.\"odd]x\"]  # a ] in a quoted part", "[ tasks . fz ]",
+        "timeout_seconds = 1", "max_retries = 1", "m%u.\"x = y\" = 1", "\"h#%u\".z = \"w # w\"",
+        "\"e=q\".max_retries = 3  # = in a quoted part", "[tasks.\"e=q\"]",
+    };
+    static const char *crafted[] = {
+        "", "\n", "# only a comment\n", "[scheduler]\n", "[scheduler]\nreserve_after_skips = 8 # was\n",
+        "x = 1", "[tasks.fz]\npriority = 1\n[tasks.fz.resources]\n", "\"scheduler.reserve_after_skips\" = 1\n",
+        "[a]\n[b]\n[c]\n", "top = 1\n\n# header note\n[limits]\n",
+    };
+    gptps *e = NULL;
+    gptps_task_def d;
+    size_t i;
+    if (gptps_open(NULL, &e) != GPTPS_OK) { CHECK(0); return; }
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.exec = GPTPS_EXEC_INPROC; d.run = fz_noop;
+    {
+        static const char *const names[] = { "fz", "odd]x", "sp ace", "e=q" };
+        for (i = 0; i < 4; ++i) {
+            d.name = names[i];
+            CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        }
+    }
+    CHECK(gptps_settings_set(e, "scheduler.reserve_after_skips", "5") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "limits.max_intake_depth", "7") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.fz.on_failure", "drop") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.fz.priority", "-3") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.odd]x.max_retries", "2") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.sp ace.timeout_seconds", "9") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.e=q.max_retries", "6") == GPTPS_OK);
+    for (i = 0; i < sizeof crafted / sizeof crafted[0]; ++i) save_into(e, crafted[i]);
+    for (i = 0; i < 600; ++i) {
+        char text[4096];
+        size_t k = 0, lines = lcg() % 14, m;
+        for (m = 0; m < lines && k + 200 < sizeof text; ++m) {
+            const char *tpl = LINES[lcg() % (sizeof LINES / sizeof LINES[0])];
+            k += (size_t)snprintf(text + k, sizeof text - k, tpl, (unsigned)(lcg() % 1000));
+            if ((lcg() & 7) || m + 1 < lines) text[k++] = '\n';   /* sometimes no final newline */
+            text[k] = 0;
+        }
+        text[k] = 0;
+        save_into(e, text);
+    }
+    /* most generated files parse; if a change to the generator stopped that, the
+     * property above would pass by checking nothing */
+    CHECK(g_saved >= 300);
+    printf("save: %u files edited in place and re-read\n", g_saved);
+    gptps_shutdown(e);
+    remove(FZ_TOML);
+}
+
 /* ---- durable-queue journal ---- */
 static void open_journal_bytes(const void *b, size_t n)
 {
@@ -138,6 +260,7 @@ static void fuzz_journal(void)
 int main(void)
 {
     fuzz_toml();
+    fuzz_save();
     fuzz_journal();
     if (fails) { printf("%d fuzz check(s) FAILED\n", fails); return 1; }
     printf("all fuzz checks passed (run under ASan/UBSan for full value)\n");

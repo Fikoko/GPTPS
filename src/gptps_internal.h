@@ -124,12 +124,38 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
 typedef struct gptps_toml gptps_toml;
 gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen); /* NULL on error */
+/* The same parse of text already in memory; `path` names it in messages. */
+gptps_toml *gptps_toml_parse_text(const char *path, const char *text, char *errbuf, size_t errlen);
+/* The file, read with the checks parse_file makes, NUL-terminated (gptps_free it);
+ * NULL with errbuf filled when it cannot be. */
+char       *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen);
 void        gptps_toml_free(gptps_toml *t);
 int         gptps_toml_int(const gptps_toml *t, const char *section, const char *key, long long *out);
 int         gptps_toml_double(const gptps_toml *t, const char *section, const char *key, double *out);
 int         gptps_toml_bool(const gptps_toml *t, const char *section, const char *key, int *out);
 const char *gptps_toml_str(const gptps_toml *t, const char *section, const char *key);
 int         gptps_toml_str_array(const gptps_toml *t, const char *section, const char *key, const char *const **out);
+/* Entry-wise access for the loader (docs/CONFIG.md): every entry keeps its line,
+ * its value as the text the settings registry validates (NULL for an array), and
+ * whether a consumer has claimed it. A dotted key is section + "." + key wherever
+ * the dots fall, so [a.b] c = 1 and [a] "b.c" = 1 are both a.b.c. */
+const char *gptps_toml_path(const gptps_toml *t);
+size_t      gptps_toml_count(const gptps_toml *t);
+const char *gptps_toml_section_at(const gptps_toml *t, size_t i);
+const char *gptps_toml_key_at(const gptps_toml *t, size_t i);
+const char *gptps_toml_text_at(const gptps_toml *t, size_t i);
+int         gptps_toml_line_at(const gptps_toml *t, size_t i);
+int         gptps_toml_claimed_at(const gptps_toml *t, size_t i);
+void        gptps_toml_claim_at(gptps_toml *t, size_t i);
+void        gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap);
+long        gptps_toml_find_dotted(const gptps_toml *t, const char *dotted);   /* -1 if none */
+/* What a value is, as the file wrote it: the loader holds it to its setting's type. */
+typedef enum { GPTPS_TOML_INT, GPTPS_TOML_FLOAT, GPTPS_TOML_BOOL, GPTPS_TOML_STRING, GPTPS_TOML_ARRAY } gptps_toml_kind;
+gptps_toml_kind gptps_toml_kind_at(const gptps_toml *t, size_t i);
+/* Every [table] line, in file order: its line and its name, quoted parts unquoted. */
+size_t      gptps_toml_table_count(const gptps_toml *t);
+int         gptps_toml_table_line_at(const gptps_toml *t, size_t i);
+const char *gptps_toml_table_at(const gptps_toml *t, size_t i);
 
 /* --- settings registry (settings.c) --- */
 typedef struct gptps_settings gptps_settings;
@@ -144,9 +170,43 @@ size_t          gptps_settings_size(gptps_settings *r);
 gptps_status    gptps_settings_get_by(gptps_settings *r, const char *key, char *buf, size_t cap);
 gptps_status    gptps_settings_set_by(gptps_settings *r, const char *key, const char *value);
 gptps_status    gptps_settings_info_at(gptps_settings *r, size_t index, gptps_setting_info *out);
-gptps_status    gptps_settings_save_to(gptps_settings *r, const char *path);
-gptps_status    gptps_settings_apply_toml(gptps_settings *r, const gptps_toml *t);
-gptps_status    gptps_settings_watch_add(gptps_settings *r, gptps_settings_cb cb, void *ud);
+/* Save (gptps_settings_save): a file that exists is updated in place with the
+ * values set live. A new one starts as a copy of `base` - the config file the
+ * engine loaded, or NULL - updated the same way; without a usable `base`, it gets
+ * the live values and the ones the loaded file set. `in_file` says which: 1 with
+ * the file's value for `key` (as text, unquoted) in `val`, or 0. It may be NULL.
+ * Called with the settings lock held. */
+typedef int (*gptps_settings_in_file_fn)(const char *key, void *ud, char *val, size_t cap);
+gptps_status    gptps_settings_save_to(gptps_settings *r, const char *path, const char *base,
+                                       gptps_settings_in_file_fn in_file, void *ud);
+/* A number as a config file writes it (sign, digits; for !whole a fraction and an
+ * exponent): what every numeric setting takes, so a saved value reads back. */
+int             gptps_settings_plain_number(const char *v, int whole);
+/* strtod and %.17g as the C locale has them, whatever LC_NUMERIC the host set. */
+double          gptps_strtod_c(const char *s, char **end);
+void            gptps_fmt_double_c(char *buf, size_t cap, double v);
+/* set_by and set_live are live sets; set_text is a file's. The last two say why on
+ * GPTPS_E_CONFIG. */
+gptps_status    gptps_settings_set_live(gptps_settings *r, const char *key, const char *value,
+                                        char *why, size_t whylen);
+gptps_status    gptps_settings_set_text(gptps_settings *r, const char *key, const char *value,
+                                        char *why, size_t whylen);
+void            gptps_settings_nosave(gptps_settings *r, const char *key);  /* a statistic: never saved */
+int             gptps_settings_has(gptps_settings *r, const char *key);
+int             gptps_settings_type_of(gptps_settings *r, const char *key, gptps_setting_type *out);
+int             gptps_settings_closest(gptps_settings *r, const char *key, char *buf, size_t cap);
+size_t          gptps_edit_distance(const char *a, const char *b, size_t cap);
+void            gptps_settings_explain(gptps_setting_type type, int has_range, double min, double max,
+                                       const char *const *choices, const char *v, char *why, size_t cap);
+/* A watcher hears the live sets; with `files`, a config file's values too (an
+ * add-on's watcher, registered through its host table). `tag` names the add-on
+ * load that registers a watcher or a setting while its setup runs (else NULL);
+ * forget_tag switches off that load's watchers and removes its settings, when its
+ * setup fails. */
+gptps_status    gptps_settings_watch_add(gptps_settings *r, gptps_settings_cb cb, void *ud, int files,
+                                         const void *tag);
+void            gptps_settings_set_tag(gptps_settings *r, const char *key, const void *tag);
+void            gptps_settings_forget_tag(gptps_settings *r, const void *tag);
 /* Tear down an unregistered task type's settings: every entry added with this
  * `owner` (the engine's per-task knobs and defined leaves), and - when `prefix` is
  * given - every UNOWNED entry under it (a host's gptps_register_setting key under

@@ -35,6 +35,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <float.h>
+#include <stdarg.h>
 
 /* ------------------------------------------------------------------------- */
 /* internal types                                                            */
@@ -123,6 +125,7 @@ typedef struct gptps_reg {
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
     uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
+    struct gptps_res_cell *res_cells; /* owned: its tasks.<name>.resources.<r> settings' cells */
     struct gptps_reg  *next;
 } gptps_reg;
 
@@ -246,7 +249,20 @@ typedef struct {
     char    *name;       /* owned */
     uint64_t budget;
     uint64_t reserved;   /* DISPATCHER-ONLY */
+    int      addon;      /* defined inside an add-on's setup: the add-on exposes it, not the registry */
 } gptps_resource;
+
+/* The cell a resource setting's accessors get (see "resources as settings"): the
+ * engine, the resource's index - stable, resources are never removed - and, for a
+ * cost, the task. */
+typedef struct gptps_res_cell {
+    struct gptps          *e;
+    struct gptps_reg      *r;       /* NULL: the budget */
+    size_t                 ri;
+    struct gptps_res_cell *next;
+} gptps_res_cell;
+
+static void res_add_cost_setting(gptps *e, gptps_reg *r, size_t ri, const char *rname);
 
 struct gptps {
     gptps_limits   limits;
@@ -283,6 +299,9 @@ struct gptps {
 
     gptps_resource *resources;     /* generic named admission budgets (gptps_define_resource) */
     size_t          nres, rescap;
+    gptps_res_cell *res_cells;     /* owned: the resources.<name> settings' cells */
+    uint64_t        bnext_items;   /* bounded.* as written live or by a reload: the next open's */
+    uint32_t        bnext_payload, bnext_result;
 
     gptps_thread  *dispatcher;
     gptps_thread **workers;
@@ -368,6 +387,17 @@ struct gptps {
     gptps_constraint *constraints;/* admission hooks consulted by the dispatcher */
 
     gptps_toml    *toml;          /* parsed config file (NULL if opened without one) */
+    uint32_t       toml_gen;      /* bumped each time a reload swaps `toml` */
+    int            toml_reloading;/* a reload is applying a file not yet in `toml` */
+    unsigned       cfg_late_errors;   /* file values found invalid after open (gptps_config_check) */
+    int            cfg_reported;  /* the unclaimed-key report was made (first submit, or the check) */
+    int            cfg_opening;   /* gptps_open_ex is still reading the file: no report yet */
+    int            cfg_report_due;/* the first submit asked for the report; a thread that holds no
+                                   * settings lock makes it (the dispatcher, or gptps_step) */
+    int            setup_on;      /* an add-on's setup is running, on setup_tid: its file values */
+    uint64_t       setup_tid;     /* wait until it returns (gptps_load_addon), and what it */
+    const void    *setup_tag;     /* registers is tagged with the load, to be undone if it fails */
+    uintptr_t      load_seq;      /* makes each load's tag unique: a library handle is not */
     uint32_t       reserve_after_skips; /* starvation guard: reserve a budget-blocked top task after this many backfill skips */
     gptps_settings *settings;     /* unified settings registry */
     char          *config_path;   /* the path opened with (NULL if none); default for save/reload */
@@ -1827,6 +1857,8 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
 /* dispatcher thread (THREADED mode): engine_pass in a loop, emit, then sleep */
 /* ------------------------------------------------------------------------- */
 
+static void cfg_report_first_submit(gptps *e, int hints);
+
 static void *dispatcher_main(void *arg)
 {
     gptps *e = (gptps *)arg;
@@ -1838,6 +1870,13 @@ static void *dispatcher_main(void *arg)
     gptps_mutex_lock(e->m);
     for (;;) {
         int more = 0;
+        if (e->cfg_report_due) {             /* asked for by the first submit */
+            e->cfg_report_due = 0;
+            gptps_mutex_unlock(e->m);
+            cfg_report_first_submit(e, 0);
+            gptps_mutex_lock(e->m);
+            continue;
+        }
         engine_pass(e, pend, &npend, &next_wake, &more);
         gptps_cond_broadcast(e->cv_drain);   /* let a blocked gptps_unregister_task re-check its drain */
 
@@ -1947,6 +1986,28 @@ static gptps_status sc_wr_dlcap(void *t, const char *v) { gptps *e = (gptps *)t;
  * it after acting on it; the point is that a capped list never truncates silently. */
 static size_t       sc_rd_devict(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u64(b, c, e->dead_evicted); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_devict(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->dead_evicted = (uint64_t)strtoull(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+/* bounded.*: restart-only. The pool is made once, so a write is for the next open
+ * (and for gptps_settings_save), like limits.max_concurrent_tasks. */
+static size_t       sb_rd_items(void *t, char *b, size_t c)   { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u64(b, c, e->bnext_items); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sb_wr_items(void *t, const char *v)        { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->bnext_items = (uint64_t)strtoull(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+static size_t       sb_rd_payload(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->bnext_payload); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sb_wr_payload(void *t, const char *v)      { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->bnext_payload = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+static size_t       sb_rd_result(void *t, char *b, size_t c)  { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->bnext_result); gptps_mutex_unlock(e->m); return n; }
+static gptps_status sb_wr_result(void *t, const char *v)       { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->bnext_result = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+
+/* Resources as settings: resources.<name> is the budget, tasks.<task>.resources.<name>
+ * what one run of the task costs. A budget shrink may strand queued work that the
+ * admission scan must dead-letter, and a raise may admit it, so both wake the
+ * dispatcher - as gptps_define_resource's re-budget does. */
+static size_t rs_rd_budget(void *t, char *b, size_t c)
+{ gptps_res_cell *x = (gptps_res_cell *)t; size_t n; gptps_mutex_lock(x->e->m); n = rd_u64(b, c, x->e->resources[x->ri].budget); gptps_mutex_unlock(x->e->m); return n; }
+static gptps_status rs_wr_budget(void *t, const char *v)
+{ gptps_res_cell *x = (gptps_res_cell *)t; gptps_mutex_lock(x->e->m); x->e->resources[x->ri].budget = (uint64_t)strtoull(v, NULL, 10); gptps_cond_signal(x->e->cv_disp); gptps_mutex_unlock(x->e->m); return GPTPS_OK; }
+static size_t rs_rd_cost(void *t, char *b, size_t c)
+{ gptps_res_cell *x = (gptps_res_cell *)t; size_t n; gptps_mutex_lock(x->e->m); n = rd_u64(b, c, x->r->res_cost ? x->r->res_cost[x->ri] : 0); gptps_mutex_unlock(x->e->m); return n; }
+static gptps_status rs_wr_cost(void *t, const char *v)
+{ gptps_res_cell *x = (gptps_res_cell *)t; gptps_mutex_lock(x->e->m); if (x->r->res_cost) x->r->res_cost[x->ri] = (uint64_t)strtoull(v, NULL, 10); gptps_cond_signal(x->e->cv_disp); gptps_mutex_unlock(x->e->m); return GPTPS_OK; }
+
 static size_t       sc_rd_resv(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->reserve_after_skips); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_resv(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->reserve_after_skips = (uint32_t)strtoul(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
 
@@ -1983,33 +2044,80 @@ static void reg_core_setting(gptps *e, const char *key, gptps_setting_type type,
     gptps_settings_add(e->settings, &d);
 }
 
-static void reg_task_setting(gptps *e, gptps_reg *r, const char *leaf, gptps_setting_type type,
-                             const char *const *choices,
-                             size_t (*rd)(void *, char *, size_t), gptps_status (*wr)(void *, const char *))
+/* The per-task keys, with the ranges of the fields behind them: one table for the
+ * live settings and the config file, so whatever either accepts fits its field. The
+ * live settings used to declare no range at all, so tasks.<t>.max_retries =
+ * 99999999999 was accepted, then truncated by the cast into a uint32_t. */
+typedef struct {
+    const char        *leaf;
+    gptps_setting_type type;
+    int                has_range;
+    double             min, max;
+    const char *const *choices;
+    const char        *desc;
+    size_t       (*rd)(void *, char *, size_t);
+    gptps_status (*wr)(void *, const char *);
+} task_key;
+
+static const task_key TASK_KEYS[] = {
+    { "timeout_seconds",       GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL,
+      "seconds one attempt may run before it is timed out; 0 = no limit", st_rd_timeout, st_wr_timeout },
+    { "max_retries",           GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL,
+      "attempts after the first, before on_failure applies", st_rd_retries, st_wr_retries },
+    { "retry_backoff_seconds", GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL,
+      "seconds from a failed attempt to the next", st_rd_backoff, st_wr_backoff },
+    { "mem_bytes",             GPTPS_SETTING_UINT, 0, 0, 0, NULL,
+      "memory one run declares, in bytes: admission budgets it, the process executors cap it", st_rd_mem, st_wr_mem },
+    { "priority",              GPTPS_SETTING_INT,  1, -2147483648.0, 2147483647.0, NULL,
+      "admission order: higher runs first; may be negative", st_rd_prio, st_wr_prio },
+    { "on_failure",            GPTPS_SETTING_ENUM, 0, 0, 0, ONFAIL_CHOICES,
+      "once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it",
+      st_rd_onfail, st_wr_onfail },
+};
+#define N_TASK_KEYS (sizeof TASK_KEYS / sizeof TASK_KEYS[0])
+
+static const task_key *task_key_find(const char *leaf)
+{
+    size_t i;
+    for (i = 0; i < N_TASK_KEYS; ++i) if (strcmp(TASK_KEYS[i].leaf, leaf) == 0) return &TASK_KEYS[i];
+    return NULL;
+}
+
+static void reg_task_setting(gptps *e, gptps_reg *r, const task_key *k)
 {
     gptps_setting_def d;
     char key[320];
     memset(&d, 0, sizeof d);
-    snprintf(key, sizeof key, "tasks.%s.%s", r->name, leaf);
-    d.struct_size = sizeof d; d.key = key; d.type = type; d.hot = 1; d.desc = "per-task policy";
-    d.choices = choices; d.target = r; d.read = rd; d.write = wr;
+    snprintf(key, sizeof key, "tasks.%s.%s", r->name, k->leaf);
+    d.struct_size = sizeof d; d.key = key; d.type = k->type; d.hot = 1; d.desc = k->desc;
+    d.has_range = k->has_range; d.min = k->min; d.max = k->max;
+    d.choices = k->choices; d.target = r; d.read = k->rd; d.write = k->wr;
     gptps_settings_add_owned(e->settings, &d, r);   /* key is copied by add() */
 }
 
-/* register the six per-task knobs for a freshly-registered task (after e->m unlocked) */
+/* register the per-task knobs for a freshly-registered task (after e->m unlocked) */
 static void register_task_settings(gptps *e, gptps_reg *r)
 {
-    reg_task_setting(e, r, "timeout_seconds",       GPTPS_SETTING_UINT, NULL,           st_rd_timeout, st_wr_timeout);
-    reg_task_setting(e, r, "max_retries",           GPTPS_SETTING_UINT, NULL,           st_rd_retries, st_wr_retries);
-    reg_task_setting(e, r, "retry_backoff_seconds", GPTPS_SETTING_UINT, NULL,           st_rd_backoff, st_wr_backoff);
-    reg_task_setting(e, r, "mem_bytes",             GPTPS_SETTING_UINT, NULL,           st_rd_mem,     st_wr_mem);
-    reg_task_setting(e, r, "priority",              GPTPS_SETTING_INT,  NULL,           st_rd_prio,    st_wr_prio);
-    reg_task_setting(e, r, "on_failure",            GPTPS_SETTING_ENUM, ONFAIL_CHOICES, st_rd_onfail,  st_wr_onfail);
+    size_t i;
+    for (i = 0; i < N_TASK_KEYS; ++i) reg_task_setting(e, r, &TASK_KEYS[i]);
 }
 
 /* ------------------------------------------------------------------------- */
 /* generic settings: engine-stored global knobs + per-task setting schemas    */
 /* ------------------------------------------------------------------------- */
+
+/* A default as given, less any white space around it - for anything but a string,
+ * as a live set reads what is typed (settings.c): " 5" is 5. */
+static const char *trim_default(gptps_setting_type type, const char *v, char *buf, size_t cap)
+{
+    size_t n;
+    if (type == GPTPS_SETTING_STRING || !v || strlen(v) >= cap) return v;
+    while (*v && strchr(" \t\r\n\v\f", *v)) ++v;
+    n = strlen(v);
+    while (n && strchr(" \t\r\n\v\f", v[n - 1])) --n;
+    memcpy(buf, v, n); buf[n] = 0;
+    return buf;
+}
 
 /* Validate a value against a schema the same way the registry does, so a bad
  * default_val is rejected at define time (returns 1 ok, 0 invalid). */
@@ -2020,6 +2128,11 @@ static int gval_ok(gptps_setting_type type, int has_range, double mn, double mx,
     /* Every engine-owned type stores its textual representation in one fixed
      * cell, not just STRING. Reject input loss before accepting a default. */
     if (!v || strlen(v) >= GPTPS_SETTINGS_VALUE_MAX) return 0;
+    /* the number grammar valid_value() holds every write to: no spaces, hex, inf
+     * or nan - nothing a save would write that the file could not read back */
+    if ((type == GPTPS_SETTING_INT || type == GPTPS_SETTING_UINT || type == GPTPS_SETTING_DOUBLE) &&
+        !gptps_settings_plain_number(v, type != GPTPS_SETTING_DOUBLE))
+        return 0;
     switch (type) {
         /* errno, not just the end pointer: strtoll/strtoull SATURATE at their
          * limits and report it only through ERANGE, so without this a nonsense
@@ -2046,8 +2159,9 @@ static int gval_ok(gptps_setting_type type, int has_range, double mn, double mx,
             return !(has_range && ((double)x < mn || (double)x > mx));
         }
         case GPTPS_SETTING_DOUBLE: {
-            double x = strtod(v, &end);
+            double x = gptps_strtod_c(v, &end);
             if (end == v || *end) return 0;
+            if (!(x == x) || x > DBL_MAX || x < -DBL_MAX) return 0;   /* 1e999 is inf */
             return !(has_range && (x < mn || x > mx));
         }
         case GPTPS_SETTING_BOOL:
@@ -2085,8 +2199,8 @@ static int parse_range(const char *c, int *has_range, double *mn, double *mx)
     if (!c || !*c) return 1;
     dd = strstr(c, "..");
     if (!dd) return 0;
-    *mn = strtod(c, NULL);
-    *mx = strtod(dd + 2, NULL);
+    *mn = gptps_strtod_c(c, NULL);
+    *mx = gptps_strtod_c(dd + 2, NULL);
     *has_range = 1;
     return 1;
 }
@@ -2241,25 +2355,34 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
 
     /* core settings (read live engine state; hot ones apply immediately) */
     reg_core_setting(e, "limits.max_memory_bytes", GPTPS_SETTING_UINT, 1, 0, 0, 0,
-                     "admission memory budget in bytes (0 = auto)", sc_rd_maxmem, sc_wr_maxmem);
+                     "memory the running tasks may declare at once, in bytes (each task's mem_bytes); admission waits for room. 0 = 3/4 of the machine's memory", sc_rd_maxmem, sc_wr_maxmem);
     /* 0 is in range: it means auto, as in the file - and reloading a file that says
      * so (the shipped gptps.example.toml does) used to fail with GPTPS_E_CONFIG. */
     reg_core_setting(e, "limits.max_concurrent_tasks", GPTPS_SETTING_UINT, 0, 1, 0, 65536,
-                     "worker pool size (restart to apply; 0 = auto)", sc_rd_conc, sc_wr_conc);
+                     "tasks that run at once: the worker pool. 0 = one per logical CPU", sc_rd_conc, sc_wr_conc);
     /* has_range is not decoration on these four: each write callback casts to
      * uint32_t, so without a declared ceiling "4294967296" validated fine and then
      * truncated to 0 - which for max_intake_depth means the bound the operator just
      * set silently became "unbounded". The range makes the setting refuse instead. */
     reg_core_setting(e, "limits.max_intake_depth", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
-                     "max queued (un-admitted) items before submit returns E_FULL (0 = unbounded)", sc_rd_intake, sc_wr_intake);
+                     "items that may wait to be admitted; past it gptps_submit returns GPTPS_E_FULL. 0 = no limit", sc_rd_intake, sc_wr_intake);
     reg_core_setting(e, "limits.shutdown_grace_ms", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
-                     "ms gptps_shutdown lets in-flight work drain before cancelling it (0 = wait forever)", sc_rd_grace, sc_wr_grace);
+                     "how long gptps_shutdown lets running work finish before it cancels it, in ms. 0 = wait forever", sc_rd_grace, sc_wr_grace);
     reg_core_setting(e, "limits.max_dead_letters", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
-                     "max retained dead-lettered items; oldest is evicted past this (0 = unbounded)", sc_rd_dlcap, sc_wr_dlcap);
+                     "dead letters kept; past it the oldest is dropped and counted in stats.dead_letters_evicted. 0 = no limit", sc_rd_dlcap, sc_wr_dlcap);
     reg_core_setting(e, "stats.dead_letters_evicted", GPTPS_SETTING_UINT, 1, 0, 0, 0,
-                     "dead-letter entries dropped by limits.max_dead_letters (write to reset)", sc_rd_devict, sc_wr_devict);
+                     "dead letters dropped because limits.max_dead_letters was reached; write 0 to reset it", sc_rd_devict, sc_wr_devict);
+    gptps_settings_nosave(e->settings, "stats.dead_letters_evicted");   /* a count, not configuration */
     reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
-                     "scheduler starvation guard (backfill skips before reserving)", sc_rd_resv, sc_wr_resv);
+                     "times smaller work may pass a waiting top-priority task that does not fit, before the scheduler holds room for it. 0 = strict priority order", sc_rd_resv, sc_wr_resv);
+    reg_core_setting(e, "bounded.max_items", GPTPS_SETTING_UINT, 0, 1, 0, 4294967295.0,
+                     "items alive at once in bounded mode: queued, retrying, running, dead-lettered "
+                     "(docs/BOUNDED.md); 0 = the classic engine", sb_rd_items, sb_wr_items);
+    reg_core_setting(e, "bounded.max_payload_bytes", GPTPS_SETTING_UINT, 0, 1, 0, 4294967295.0,
+                     "bounded mode: each item's payload slot; a longer payload is refused", sb_rd_payload, sb_wr_payload);
+    reg_core_setting(e, "bounded.max_result_bytes", GPTPS_SETTING_UINT, 0, 1, 0, 4294967295.0,
+                     "bounded mode: each executing thread's result buffer; a longer result is refused",
+                     sb_rd_result, sb_wr_result);
 
     if (cfg && cfg->config_path) {   /* remember the open path for save/reload defaults */
         size_t L = strlen(cfg->config_path) + 1;
@@ -2275,6 +2398,7 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
         e->pool_m = gptps_mutex_create();
         if (!e->pool_m) { s = GPTPS_E_NOMEM; goto fail; }
     }
+    e->bnext_items = e->max_items; e->bnext_payload = e->max_payload; e->bnext_result = e->max_result;
 
     e->manual = (cfg && cfg->mode == GPTPS_RUN_MANUAL);
     if (e->manual) {
@@ -2332,37 +2456,638 @@ fail:
 
 /* Apply a single config table's task overrides onto a task def. Values present
  * in the file override the def's compiled-in defaults (file wins). */
-static void apply_task_table(const gptps_toml *t, const char *section,
-                             gptps_task_def *def, int32_t *priority)
+/* ------------------------------------------------------------------------- */
+/* the config file (docs/CONFIG.md)                                          */
+/* ------------------------------------------------------------------------- */
+/* One validation path. A value from the file passes exactly the checks a live
+ * gptps_settings_set makes - the same parser, ranges and choices - and every
+ * problem names the file, the line, the key and what is wrong, through the log
+ * sink. What the engine can judge at open fails the open: a line that does not
+ * parse, a value out of range or of the wrong type, a key no engine-owned table
+ * has. A key only a later definition can claim - a task registered after open, a
+ * plug-in's or the host's own setting - waits for it: gptps_config_check()
+ * reports whatever nothing claimed, and the first submit logs it, once.
+ *
+ * The file used to be read leniently and cast. A line it could not parse was
+ * skipped, `max_retries = -1` became 4294967295 retries and `priority =
+ * 3000000000` wrapped to -1294967296 - while the same values set live were
+ * refused. */
+
+/* One entry, copied out of the file: a reload may swap and free the file while a
+ * value from it is being applied. */
+typedef struct {
+    char key[384];
+    char text[GPTPS_SETTINGS_VALUE_MAX];
+    char path[256];
+    int  line;
+    int  usable;      /* a single value whose text fits `text` */
+    gptps_toml_kind kind;   /* as the file wrote it: a number, true/false, a "string", a list */
+} cfg_item;
+
+static void cfg_item_at(const gptps_toml *t, size_t i, cfg_item *it)
 {
-    long long ll;
-    const char *s;
-    if (gptps_toml_int(t, section, "timeout_seconds", &ll))       def->default_policy.timeout_seconds = (uint32_t)ll;
-    if (gptps_toml_int(t, section, "max_retries", &ll))           def->default_policy.max_retries = (uint32_t)ll;
-    if (gptps_toml_int(t, section, "retry_backoff_seconds", &ll)) def->default_policy.retry_backoff_seconds = (uint32_t)ll;
-    if (gptps_toml_int(t, section, "mem_bytes", &ll))             def->default_cost.mem_bytes = (uint64_t)ll;
-    if (gptps_toml_int(t, section, "priority", &ll))              *priority = (int32_t)ll;
-    s = gptps_toml_str(t, section, "on_failure");
-    if (s) {
-        if      (strcmp(s, "drop") == 0)        def->default_policy.on_failure = GPTPS_ON_FAILURE_DROP;
-        else if (strcmp(s, "requeue") == 0)     def->default_policy.on_failure = GPTPS_ON_FAILURE_REQUEUE;
-        else if (strcmp(s, "dead_letter") == 0) def->default_policy.on_failure = GPTPS_ON_FAILURE_DEAD_LETTER;
+    const char *x = gptps_toml_text_at(t, i);
+    gptps_toml_dotted_at(t, i, it->key, sizeof it->key);
+    snprintf(it->path, sizeof it->path, "%s", gptps_toml_path(t));
+    it->line = gptps_toml_line_at(t, i);
+    it->kind = gptps_toml_kind_at(t, i);
+    it->usable = x && strlen(x) < sizeof it->text;
+    snprintf(it->text, sizeof it->text, "%s", x ? x : "");
+}
+
+static void cfg_say(gptps_log_level lvl, const cfg_item *it, const char *fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    int k = snprintf(msg, sizeof msg, "config %s:%d: %s: ", it->path, it->line, it->key);
+    if (k < 0 || (size_t)k >= sizeof msg) k = 0;
+    va_start(ap, fmt);
+    vsnprintf(msg + k, sizeof msg - (size_t)k, fmt, ap);
+    va_end(ap);
+    gptps_log(NULL, lvl, msg);
+}
+
+/* The parser's messages, one per line of `err`, each logged as an error. */
+static void cfg_say_parse(const char *err)
+{
+    const char *p = err;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        int n = nl ? (int)(nl - p) : (int)strlen(p);
+        char msg[700];
+        snprintf(msg, sizeof msg, "config %.*s", n, p);
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+        p += n + (nl ? 1 : 0);
     }
 }
 
-/* Layer file config over a task def: global [task_defaults] first, then the
- * task-specific [tasks.<name>] table (most specific wins). No-op without a file. */
-static void apply_task_config(const gptps_toml *t, const char *name,
-                              gptps_task_def *def, int32_t *priority)
+/* Check one value against a key's shape; on refusal, `why` says why. */
+/* Whether the file wrote the kind of value the key takes: a number for a number,
+ * true or false for a switch, a "string" for text or a choice - so a quoted number
+ * is a string, as TOML has it. 1, or 0 with `why`. */
+static int cfg_kind_ok(gptps_setting_type type, gptps_toml_kind k, const char *text, char *why, size_t cap)
 {
-    char section[300];
-    if (!t) return;
-    apply_task_table(t, "task_defaults", def, priority);
-    if (strlen(name) < sizeof section - 7) {
-        strcpy(section, "tasks.");
-        strcat(section, name);
-        apply_task_table(t, section, def, priority);
+    const char *want = NULL;
+    int text_wanted = 0;
+    switch (type) {
+        case GPTPS_SETTING_INT: case GPTPS_SETTING_UINT: if (k != GPTPS_TOML_INT) want = "a whole number"; break;
+        case GPTPS_SETTING_DOUBLE: if (k != GPTPS_TOML_INT && k != GPTPS_TOML_FLOAT) want = "a number"; break;
+        case GPTPS_SETTING_BOOL:   if (k != GPTPS_TOML_BOOL) want = "true or false"; break;
+        default:                   if (k != GPTPS_TOML_STRING) { want = "a \"string\""; text_wanted = 1; } break;
     }
+    if (!want) return 1;
+    if (k == GPTPS_TOML_ARRAY) {
+        snprintf(why, cap, "expects %s, not a list", want);
+    } else if (k == GPTPS_TOML_STRING) {
+        /* "4" for a number: say what would do. "four": the value is wrong, not the quotes. */
+        int unquoted_ok = type == GPTPS_SETTING_BOOL ? (!strcmp(text, "true") || !strcmp(text, "false"))
+                                                     : gptps_settings_plain_number(text, type != GPTPS_SETTING_DOUBLE);
+        snprintf(why, cap, "expects %s, not the string \"%s\"%s", want, text, unquoted_ok ? " - drop the quotes" : "");
+    } else if (text_wanted) {
+        snprintf(why, cap, "expects a \"string\" - put %s in quotes", text);
+    } else {
+        snprintf(why, cap, "expects %s, not %s", want, text);
+    }
+    return 0;
+}
+
+static int cfg_value_ok(gptps_setting_type type, int has_range, double mn, double mx,
+                        const char *const *choices, const cfg_item *it, char *why, size_t cap)
+{
+    if (!it->usable && it->kind != GPTPS_TOML_ARRAY) {
+        snprintf(why, cap, "expects a single value, not a string of %d characters or more", GPTPS_SETTINGS_VALUE_MAX);
+        return 0;
+    }
+    if (!cfg_kind_ok(type, it->kind, it->text, why, cap)) return 0;
+    if (gval_ok(type, has_range, mn, mx, choices, it->text)) return 1;
+    gptps_settings_explain(type, has_range, mn, mx, choices, it->text, why, cap);
+    return 0;
+}
+
+/* A file's value for a setting, through the registry as a live set would - once it
+ * is the kind of value the setting takes. 0 when no setting has the key (now). */
+static int cfg_set_from_file(gptps *e, const cfg_item *it, gptps_status *st, char *why, size_t cap)
+{
+    gptps_setting_type ty;
+    if (!gptps_settings_type_of(e->settings, it->key, &ty)) return 0;
+    why[0] = 0;
+    if (!it->usable && it->kind != GPTPS_TOML_ARRAY) {
+        snprintf(why, cap, "expects a single value, not a string of %d characters or more", GPTPS_SETTINGS_VALUE_MAX);
+        *st = GPTPS_E_CONFIG;
+    } else if (!cfg_kind_ok(ty, it->kind, it->text, why, cap)) {
+        *st = GPTPS_E_CONFIG;
+    } else {
+        gptps_cb_thread *in = cb_enter(e);  /* it runs a write accessor, and an add-on's watchers:
+                                             * a gptps_shutdown from either is refused */
+        *st = gptps_settings_set_text(e->settings, it->key, it->text, why, cap);
+        cb_leave(in);
+        if (*st == GPTPS_E_NOTFOUND) return 0;          /* removed meanwhile: it waits again */
+    }
+    return 1;
+}
+
+/* A validated per-task value, into the def. */
+static void task_key_put(const task_key *k, const char *v, gptps_task_def *def, int32_t *priority)
+{
+    if      (!strcmp(k->leaf, "timeout_seconds"))       def->default_policy.timeout_seconds = (uint32_t)strtoull(v, NULL, 10);
+    else if (!strcmp(k->leaf, "max_retries"))           def->default_policy.max_retries = (uint32_t)strtoull(v, NULL, 10);
+    else if (!strcmp(k->leaf, "retry_backoff_seconds")) def->default_policy.retry_backoff_seconds = (uint32_t)strtoull(v, NULL, 10);
+    else if (!strcmp(k->leaf, "mem_bytes"))             def->default_cost.mem_bytes = (uint64_t)strtoull(v, NULL, 10);
+    else if (!strcmp(k->leaf, "priority"))              *priority = (int32_t)strtoll(v, NULL, 10);
+    else if (!strcmp(k->leaf, "on_failure"))
+        def->default_policy.on_failure = !strcmp(v, "drop")    ? GPTPS_ON_FAILURE_DROP
+                                       : !strcmp(v, "requeue") ? GPTPS_ON_FAILURE_REQUEUE
+                                       :                         GPTPS_ON_FAILURE_DEAD_LETTER;
+}
+
+/* A task's values from the file, at its registration: [task_defaults], then
+ * [tasks.<name>] - the most specific wins. Validated when the file was read; here
+ * they are only converted, re-checked so nothing unchecked can reach a field. The
+ * [tasks.<name>] entries used are claimed. e->m held. */
+static void apply_task_config(gptps *e, const char *name, gptps_task_def *def, int32_t *priority)
+{
+    gptps_toml *t = e->toml;
+    char key[400];
+    size_t i;
+    if (!t) return;
+    for (i = 0; i < N_TASK_KEYS; ++i) {
+        const task_key *k = &TASK_KEYS[i];
+        const char *v;
+        long j;
+        char no[8];
+        snprintf(key, sizeof key, "task_defaults.%s", k->leaf);
+        if ((j = gptps_toml_find_dotted(t, key)) >= 0 && (v = gptps_toml_text_at(t, (size_t)j)) != NULL &&
+            cfg_kind_ok(k->type, gptps_toml_kind_at(t, (size_t)j), v, no, sizeof no) &&
+            gval_ok(k->type, k->has_range, k->min, k->max, k->choices, v))
+            task_key_put(k, v, def, priority);
+        snprintf(key, sizeof key, "tasks.%s.%s", name, k->leaf);
+        if ((j = gptps_toml_find_dotted(t, key)) >= 0 && (v = gptps_toml_text_at(t, (size_t)j)) != NULL &&
+            cfg_kind_ok(k->type, gptps_toml_kind_at(t, (size_t)j), v, no, sizeof no) &&
+            gval_ok(k->type, k->has_range, k->min, k->max, k->choices, v)) {
+            task_key_put(k, v, def, priority);
+            gptps_toml_claim_at(t, (size_t)j);
+        }
+    }
+}
+
+/* The keys that size the engine, read before it exists: [limits] and [bounded]. An
+ * explicit gptps_config value wins over the file; 0 means "not set" in both.
+ * Returns the number of errors, each one logged. */
+static unsigned cfg_open_keys(gptps_toml *t, gptps_config *c)
+{
+    static const struct { const char *key; int has_range; double max; } K[] = {
+        { "limits.max_concurrent_tasks", 1, 65536.0 },
+        { "limits.max_memory_bytes",     0, 0 },
+        { "limits.max_intake_depth",     1, 4294967295.0 },
+        { "bounded.max_items",           1, 4294967295.0 },
+        { "bounded.max_payload_bytes",   1, 4294967295.0 },
+        { "bounded.max_result_bytes",    1, 4294967295.0 },
+    };
+    unsigned bad = 0;
+    char why[512];
+    cfg_item it;
+    size_t i;
+    long j;
+    for (i = 0; i < sizeof K / sizeof K[0]; ++i) {
+        unsigned long long v;
+        if ((j = gptps_toml_find_dotted(t, K[i].key)) < 0) continue;
+        gptps_toml_claim_at(t, (size_t)j);
+        cfg_item_at(t, (size_t)j, &it);
+        if (!cfg_value_ok(GPTPS_SETTING_UINT, K[i].has_range, 0, K[i].max, NULL, &it, why, sizeof why)) {
+            cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad; continue;
+        }
+        v = strtoull(it.text, NULL, 10);
+        switch (i) {
+            case 0: if (!c->limits.max_concurrent_tasks) c->limits.max_concurrent_tasks = (uint32_t)v; break;
+            case 1: if (!c->limits.max_memory_bytes)     c->limits.max_memory_bytes = (uint64_t)v;     break;
+            case 2: if (!c->limits.max_intake_depth)     c->limits.max_intake_depth = (uint32_t)v;     break;
+            case 3: if (!c->max_items)                   c->max_items = (uint64_t)v;                   break;
+            case 4: if (!c->max_payload_bytes)           c->max_payload_bytes = (uint32_t)v;           break;
+            default: if (!c->max_result_bytes)           c->max_result_bytes = (uint32_t)v;            break;
+        }
+    }
+    /* max_memory_gb: the file's other spelling of max_memory_bytes, which wins if both are set */
+    if ((j = gptps_toml_find_dotted(t, "limits.max_memory_gb")) >= 0) {
+        gptps_toml_claim_at(t, (size_t)j);
+        cfg_item_at(t, (size_t)j, &it);
+        if (!cfg_value_ok(GPTPS_SETTING_DOUBLE, 1, 0, 1e9, NULL, &it, why, sizeof why)) {
+            cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+        } else if (!c->limits.max_memory_bytes) {
+            c->limits.max_memory_bytes = (uint64_t)(gptps_strtod_c(it.text, NULL) * 1073741824.0);
+        }
+    }
+    return bad;
+}
+
+/* A key is judged by its dotted form, never by how the file spelt it: [limits] x,
+ * [limits.y] x and a quoted "limits.x" all start with the table "limits". */
+static size_t cfg_first_len(const char *key)
+{
+    const char *dot = strchr(key, '.');
+    return dot ? (size_t)(dot - key) : strlen(key);
+}
+
+static int cfg_first_is(const char *key, const char *table)
+{
+    size_t fl = cfg_first_len(key);
+    return strlen(table) == fl && strncmp(key, table, fl) == 0;
+}
+
+/* The engine's own tables: a key in one that no setting has is a mistake, not a key
+ * some later definition may claim. */
+static int cfg_core_key(const char *key)
+{
+    if (!key[cfg_first_len(key)]) return 0;      /* no table part: see the near misses */
+    return cfg_first_is(key, "limits") || cfg_first_is(key, "scheduler") ||
+           cfg_first_is(key, "stats") || cfg_first_is(key, "bounded");
+}
+
+/* [resources]: the dotted key past "resources." is the resource's name. */
+static int cfg_is_resource(const char *key)
+{
+    return strncmp(key, "resources.", 10) == 0 && key[10];
+}
+
+/* Every table the engine reads. */
+static const char *const CFG_OWN[] = { "limits", "scheduler", "stats", "bounded", "resources",
+                                       "task_defaults", "tasks", 0 };
+
+/* The engine table `first` is a near miss of - one or two letters off, and longer
+ * than three - or NULL. With `d`, how far off. */
+static const char *cfg_near_table(const char *first, size_t *d)
+{
+    size_t m, fl = strlen(first), bestd = 3;
+    const char *best = NULL;
+    if (fl <= 3) return NULL;
+    for (m = 0; CFG_OWN[m]; ++m) {                /* the nearest: [taks] is [tasks], not [stats] */
+        size_t dist;
+        if (!strcmp(first, CFG_OWN[m])) return NULL;
+        dist = gptps_edit_distance(first, CFG_OWN[m], 2);
+        if (dist >= 1 && dist < bestd) { bestd = dist; best = CFG_OWN[m]; }
+    }
+    if (best && d) *d = bestd;
+    return best;
+}
+
+/* Whether `rest`, the key past its first part, is one of `table`'s keys or close to
+ * one: what makes a near miss of the table's name a typo - [limit]
+ * max_concurrent_tasks - rather than a table of the host's - [status] code. */
+static int cfg_typo_evidence(gptps *e, const char *table, const char *rest, size_t d)
+{
+    const char *leaf = strrchr(rest, '.');
+    leaf = leaf ? leaf + 1 : rest;
+    if (!strcmp(table, "resources")) return d == 1;      /* any name may be a resource's: [resource] gpu */
+    if (!strcmp(table, "tasks") || !strcmp(table, "task_defaults")) {
+        size_t m;
+        if (strstr(rest, ".resources.")) return 1;
+        for (m = 0; m < N_TASK_KEYS; ++m) if (gptps_edit_distance(leaf, TASK_KEYS[m].leaf, 2) <= 2) return 1;
+        return 0;
+    }
+    {
+        char fixed[512], near[384];
+        size_t tl = strlen(table);
+        snprintf(fixed, sizeof fixed, "%s.%s", table, rest);
+        if (gptps_settings_has(e->settings, fixed)) return 1;
+        return gptps_settings_closest(e->settings, fixed, near, sizeof near) &&
+               strncmp(near, table, tl) == 0 && near[tl] == '.';
+    }
+}
+
+static void cfg_claim(gptps *e, gptps_toml *t, size_t i)
+{
+    gptps_mutex_lock(e->m);
+    gptps_toml_claim_at(t, i);
+    gptps_mutex_unlock(e->m);
+}
+
+static int cfg_claimed(gptps *e, const gptps_toml *t, size_t i)
+{
+    int c;
+    gptps_mutex_lock(e->m);
+    c = gptps_toml_claimed_at(t, i);
+    gptps_mutex_unlock(e->m);
+    return c;
+}
+
+/* Apply a parsed file to a live engine - at open, after cfg_open_keys took the keys
+ * that size it, or at a reload. Returns the number of errors, each one logged. No
+ * engine lock is held across a set: the registry's write accessors take it. */
+static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
+{
+    unsigned bad = 0;
+    size_t i, n = gptps_toml_count(t);
+    char why[512], hint[448];   /* " (did you mean <a key>?)" */
+    cfg_item it;
+
+    /* At a reload, the file's other spelling of max_memory_bytes; at open,
+     * cfg_open_keys took it. And addons: they load at open, so a reload only checks
+     * the key's shape - a changed list takes effect at the next start. */
+    if (!at_open) {
+        long j = gptps_toml_find_dotted(t, "addons");
+        if (j >= 0) {
+            cfg_claim(e, t, (size_t)j);
+            if (gptps_toml_text_at(t, (size_t)j)) {
+                cfg_item_at(t, (size_t)j, &it);
+                cfg_say(GPTPS_LOG_ERROR, &it, "expects a [\"list\"] of add-on paths"); ++bad;
+            }
+        }
+        j = gptps_toml_find_dotted(t, "limits.max_memory_gb");
+        if (j >= 0) {
+            cfg_claim(e, t, (size_t)j);
+            cfg_item_at(t, (size_t)j, &it);
+            if (!cfg_value_ok(GPTPS_SETTING_DOUBLE, 1, 0, 1e9, NULL, &it, why, sizeof why)) {
+                cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+            } else if (gptps_toml_find_dotted(t, "limits.max_memory_bytes") < 0) {
+                char v[32];
+                snprintf(v, sizeof v, "%llu", (unsigned long long)(gptps_strtod_c(it.text, NULL) * 1073741824.0));
+                if (gptps_settings_set_text(e->settings, "limits.max_memory_bytes", v, why, sizeof why) != GPTPS_OK) {
+                    cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+                }
+            }
+        }
+    }
+    /* [resources]: the operator names them. Each key defines one; a name already
+     * defined is re-budgeted. */
+    for (i = 0; i < n; ++i) {
+        gptps_status st;
+        if (cfg_claimed(e, t, i)) continue;
+        cfg_item_at(t, i, &it);
+        if (!cfg_is_resource(it.key)) continue;
+        cfg_claim(e, t, i);
+        if (!cfg_value_ok(GPTPS_SETTING_UINT, 0, 0, 0, NULL, &it, why, sizeof why)) {
+            cfg_say(GPTPS_LOG_ERROR, &it, "a resource's budget: %s", why); ++bad; continue;
+        }
+        st = gptps_define_resource(e, it.key + 10, (uint64_t)strtoull(it.text, NULL, 10));
+        if (st != GPTPS_OK) { cfg_say(GPTPS_LOG_ERROR, &it, "the resource could not be defined: %s", gptps_strerror(st)); ++bad; }
+    }
+    /* every key that names a setting, through the registry, as a live set would */
+    for (i = 0; i < n; ++i) {
+        gptps_status st;
+        if (cfg_claimed(e, t, i)) continue;
+        cfg_item_at(t, i, &it);
+        if (!cfg_set_from_file(e, &it, &st, why, sizeof why)) continue;
+        cfg_claim(e, t, i);
+        if (st != GPTPS_OK) { cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad; }
+    }
+    /* per-task keys: checked now, applied when the task registers (or above, through
+     * the registry, if it already has). By the dotted key, which is the same however
+     * the file spells it: [tasks.x] max_retries, or a quoted "tasks.x.max_retries". */
+    for (i = 0; i < n; ++i) {
+        const task_key *k;
+        const char *leaf;
+        int defaults;
+        if (cfg_claimed(e, t, i)) continue;
+        cfg_item_at(t, i, &it);
+        defaults = !strncmp(it.key, "task_defaults.", 14);
+        if (!defaults && strncmp(it.key, "tasks.", 6) != 0) continue;
+        if (!defaults) {                    /* a leaf a plug-in or the host defined: np.priority */
+            const gptps_task_schema *sc, *best = NULL;
+            size_t kl = strlen(it.key), bl = 0;
+            gptps_setting_type ty = GPTPS_SETTING_UINT;
+            int hr = 0; double mn = 0, mx = 0;
+            const char *const *ch = NULL;
+            gptps_mutex_lock(e->m);         /* schemas are freed only at shutdown */
+            for (sc = e->task_schemas; sc; sc = sc->next) {
+                size_t ll = strlen(sc->leaf);
+                if (ll > bl && kl > 6 + ll + 1 && it.key[kl - ll - 1] == '.' && !strcmp(it.key + kl - ll, sc->leaf))
+                    { best = sc; bl = ll; }
+            }
+            if (best) { ty = best->type; hr = best->has_range; mn = best->min; mx = best->max;
+                        ch = (const char *const *)best->choices; }
+            gptps_mutex_unlock(e->m);
+            if (best) {     /* the longest defined leaf wins: np.priority over the built-in priority */
+                /* checked now against its definition; applied when the task registers */
+                if (!cfg_value_ok(ty, hr, mn, mx, ch, &it, why, sizeof why)) {
+                    cfg_claim(e, t, i); cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+                }
+                continue;
+            }
+        }
+        if (!defaults && strstr(it.key + 6, ".resources.")) {          /* what a run costs of a resource */
+            if (!cfg_value_ok(GPTPS_SETTING_UINT, 0, 0, 0, NULL, &it, why, sizeof why)) {
+                cfg_claim(e, t, i); cfg_say(GPTPS_LOG_ERROR, &it, "a resource cost: %s", why); ++bad;
+            }
+            continue;
+        }
+        leaf = defaults ? it.key + 14 : strrchr(it.key, '.') + 1;
+        k = task_key_find(leaf);
+        if (k && !defaults && (size_t)(leaf - 1 - (it.key + 6)) != strcspn(it.key + 6, ".")) {
+            /* tasks.<a.b>.priority: a task named a.b, or a plug-in leaf b.priority that
+             * is not defined yet - which, only a later definition says. It waits, and is
+             * checked when it is applied. */
+            continue;
+        }
+        if (!k) {
+            if (defaults) {
+                size_t m, best = 99;
+                hint[0] = 0;
+                for (m = 0; m < N_TASK_KEYS; ++m) {
+                    size_t d = gptps_edit_distance(leaf, TASK_KEYS[m].leaf, 3);
+                    if (d <= 3 && d < best) { best = d; snprintf(hint, sizeof hint, " (did you mean %s?)", TASK_KEYS[m].leaf); }
+                }
+                cfg_claim(e, t, i);
+                cfg_say(GPTPS_LOG_ERROR, &it, "[task_defaults] has no such key%s", hint); ++bad;
+            }
+            continue;       /* [tasks.<name>]: a host's or plug-in's per-task setting, claimed when it is defined */
+        }
+        if (defaults) cfg_claim(e, t, i);
+        if (!cfg_value_ok(k->type, k->has_range, k->min, k->max, k->choices, &it, why, sizeof why)) {
+            if (!defaults) cfg_claim(e, t, i);
+            cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+        }
+    }
+    /* the engine's own tables: a key no setting has is a typo, so it fails now */
+    for (i = 0; i < n; ++i) {
+        char near[384];
+        if (cfg_claimed(e, t, i)) continue;
+        cfg_item_at(t, i, &it);
+        if (!cfg_core_key(it.key)) continue;
+        cfg_claim(e, t, i);
+        hint[0] = 0;
+        if (gptps_settings_closest(e->settings, it.key, near, sizeof near)) snprintf(hint, sizeof hint, " (did you mean %s?)", near);
+        cfg_say(GPTPS_LOG_ERROR, &it, "[%.*s] has no such key%s", (int)cfg_first_len(it.key), it.key, hint); ++bad;
+    }
+    /* A value named like one of the engine's tables is a mistake: those hold keys.
+     * And a key whose first part is a letter or two from one of them is a typo when
+     * the rest of it is that table's - [limit] max_concurrent_tasks, [task.resize]
+     * priority, [resource] gpu. Any other table may be the host's or a plug-in's -
+     * [status], [tags] - and waits for its definition; if none comes, the report of
+     * unused keys names the near miss. */
+    for (i = 0; i < n; ++i) {
+        char first[64];
+        const char *own;
+        size_t fl, d = 0, m;
+        if (cfg_claimed(e, t, i)) continue;
+        cfg_item_at(t, i, &it);
+        fl = cfg_first_len(it.key);
+        if (fl >= sizeof first) continue;
+        memcpy(first, it.key, fl); first[fl] = 0;
+        if (!it.key[fl]) {
+            for (m = 0; CFG_OWN[m]; ++m)
+                if (!strcmp(first, CFG_OWN[m])) {
+                    cfg_claim(e, t, i);
+                    cfg_say(GPTPS_LOG_ERROR, &it, "is one of the engine's tables, not a key - its keys go under [%s]", first);
+                    ++bad;
+                    break;
+                }
+            continue;
+        }
+        if ((own = cfg_near_table(first, &d)) == NULL || !cfg_typo_evidence(e, own, it.key + fl + 1, d)) continue;
+        cfg_claim(e, t, i);
+        cfg_say(GPTPS_LOG_ERROR, &it, "there is no [%s] table (did you mean [%s]?)", first, own);
+        ++bad;
+    }
+    return bad;
+}
+
+/* Apply the file's values for settings that exist now - a task just registered, a
+ * plug-in's or the host's setting just defined. `prefix` is one key, a subtree when
+ * it ends in '.', or every key when it is "". An entry that names no setting yet
+ * keeps waiting. Each one applied is claimed; one that fails is logged, and
+ * gptps_config_check reports it. Takes e->m and the registry in turn, never both. */
+static void cfg_apply_pending(gptps *e, const char *prefix)
+{
+    size_t from = 0, pl = strlen(prefix);
+    int all = pl == 0, subtree = pl && prefix[pl - 1] == '.';
+    uint32_t seen = 0;
+    int started = 0;
+    for (;;) {
+        cfg_item it;
+        char why[512];
+        size_t i = 0, n;
+        uint32_t gen;
+        int found = 0;
+        gptps_status st;
+        gptps_mutex_lock(e->m);
+        if (e->toml_reloading) { gptps_mutex_unlock(e->m); return; }   /* the reload applies its file */
+        /* Inside an add-on's setup, its file values wait: the loader applies them when
+         * it returns, so the watcher the add-on registers hears them. Only on the setup
+         * thread - another thread's definitions keep their values, as a task's costs
+         * must (setup-time calls on other threads meanwhile are outside the contract,
+         * gptps.h THREADING). */
+        if (e->setup_on && e->setup_tid == gptps_hal_thread_id()) { gptps_mutex_unlock(e->m); return; }
+        n = gptps_toml_count(e->toml);
+        gen = e->toml_gen;
+        if (started && gen != seen) from = 0;      /* a reload swapped the file: its indexes are new */
+        seen = gen; started = 1;
+        for (i = from; i < n; ++i) {
+            if (gptps_toml_claimed_at(e->toml, i)) continue;
+            cfg_item_at(e->toml, i, &it);
+            if (all || (subtree ? strncmp(it.key, prefix, pl) == 0 : strcmp(it.key, prefix) == 0)) { found = 1; break; }
+        }
+        gptps_mutex_unlock(e->m);
+        if (!found) return;
+        from = i + 1;
+        if (!cfg_set_from_file(e, &it, &st, why, sizeof why)) continue;
+        gptps_mutex_lock(e->m);
+        if (e->toml_gen == gen && i < gptps_toml_count(e->toml)) {
+            gptps_toml_claim_at(e->toml, i);
+            if (st != GPTPS_OK) e->cfg_late_errors += 1;   /* the current file's, not the one before */
+        }
+        gptps_mutex_unlock(e->m);
+        if (st != GPTPS_OK) cfg_say(GPTPS_LOG_ERROR, &it, "%s", why);
+    }
+}
+
+/* Every entry nothing has claimed, through the log sink, with a guess at what was
+ * meant. Returns how many there were. */
+static unsigned cfg_report(gptps *e, gptps_log_level lvl, const char *tail, int hints)
+{
+    unsigned count = 0;
+    size_t from = 0;
+    for (;;) {
+        cfg_item it;
+        char what[640], near[384];
+        size_t i = 0, n;
+        int found = 0;
+        what[0] = 0;
+        gptps_mutex_lock(e->m);
+        n = gptps_toml_count(e->toml);
+        for (i = from; i < n; ++i) if (!gptps_toml_claimed_at(e->toml, i)) { found = 1; break; }
+        if (found) {
+            cfg_item_at(e->toml, i, &it);
+            if (!strncmp(it.key, "tasks.", 6)) {
+                /* Whose table is it? A registered task whose name the key starts
+                 * with - or else the registered name nearest its first part. */
+                gptps_reg *r, *mine = NULL, *best = NULL;
+                size_t bd = 4, nl;
+                char cand[256];
+                for (r = e->registry; r; r = r->next) {
+                    nl = strlen(r->name);
+                    if (!strncmp(it.key + 6, r->name, nl) && it.key[6 + nl] == '.') { mine = r; break; }
+                }
+                if (mine && !strncmp(it.key + 6 + strlen(mine->name), ".resources.", 11)) {
+                    /* a cost of a resource nobody defined - or one an add-on owns, whose
+                     * costs the add-on sets: it has no settings to take a file's value */
+                    const char *rn = it.key + 6 + strlen(mine->name) + 11;
+                    size_t ri;
+                    int addon_res = 0;
+                    for (ri = 0; ri < e->nres; ++ri)
+                        if (!strcmp(e->resources[ri].name, rn)) { addon_res = e->resources[ri].addon; break; }
+                    if (addon_res)
+                        snprintf(what, sizeof what, "the resource %s belongs to an add-on, which sets what a task "
+                                 "costs of it - a config file cannot", rn);
+                    else
+                        snprintf(what, sizeof what, "no resource named %s is defined - add it under [resources], "
+                                 "or define it with gptps_define_resource", rn);
+                }
+                if (!mine) {
+                    const char *dot = strchr(it.key + 6, '.');
+                    size_t cl = dot ? (size_t)(dot - (it.key + 6)) : strlen(it.key + 6);
+                    if (cl >= sizeof cand) cl = sizeof cand - 1;
+                    memcpy(cand, it.key + 6, cl); cand[cl] = 0;
+                    for (r = e->registry; r; r = r->next) {
+                        size_t d = gptps_edit_distance(cand, r->name, 3);
+                        if (d < bd) { bd = d; best = r; }
+                    }
+                    if (best) snprintf(what, sizeof what, "no task named %s is registered (did you mean %s?)", cand, best->name);
+                    else      snprintf(what, sizeof what, "no task named %s is registered", cand);
+                }
+            }
+        }
+        gptps_mutex_unlock(e->m);
+        if (!found) return count;
+        from = i + 1;
+        ++count;
+        if (!what[0]) {
+            char first[64];
+            const char *own = NULL;
+            size_t fl = cfg_first_len(it.key);
+            if (fl < sizeof first && it.key[fl]) { memcpy(first, it.key, fl); first[fl] = 0; own = cfg_near_table(first, NULL); }
+            if (hints && gptps_settings_closest(e->settings, it.key, near, sizeof near))
+                snprintf(what, sizeof what, "nothing has used this key (did you mean %s?)", near);
+            else if (own)
+                snprintf(what, sizeof what, "nothing has used this key (is [%s] meant to be [%s]?)", first, own);
+            else
+                snprintf(what, sizeof what, "nothing has used this key");
+        }
+        cfg_say(lvl, &it, "%s%s", what, tail);
+    }
+}
+
+/* The report the first submit asked for (cfg_report_due). `hints` would consult the
+ * settings registry for a near miss; none of its callers does - the dispatcher, the
+ * stepper standing in for it, shutdown - since a setting's write accessor may hold
+ * the registry's lock while it waits for a task one of them has to start.
+ * gptps_config_check gives every hint. */
+static void cfg_report_first_submit(gptps *e, int hints)
+{
+    cfg_report(e, GPTPS_LOG_WARN, " - seen at the first submit; gptps_config_check() after setup fails on it", hints);
+}
+
+gptps_status gptps_config_check(gptps *e)
+{
+    unsigned n, late;
+    if (!e) return GPTPS_E_INVAL;
+    GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
+    gptps_mutex_lock(e->m);
+    e->cfg_reported = 1;                 /* the first submit need not repeat it */
+    gptps_mutex_unlock(e->m);
+    n = cfg_report(e, GPTPS_LOG_ERROR, "", 1);
+    gptps_mutex_lock(e->m);
+    late = e->cfg_late_errors;
+    gptps_mutex_unlock(e->m);
+    return (n || late) ? GPTPS_E_CONFIG : GPTPS_OK;
 }
 
 /* A config file is read here, whichever entry point named it. gptps_open_ex used
@@ -2375,10 +3100,11 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     gptps_config c;
     gptps_toml *t;
     gptps_status s;
+    gptps *e;
     const char *const *addons;
-    char err[128];
-    long long ll;
-    double gb;
+    char err[4096];                      /* the parser's messages, a line each */
+    unsigned bad = 0;
+    long j;
     int n, k;
 
     if (!out_engine) return GPTPS_E_INVAL;
@@ -2389,62 +3115,65 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     memcpy(&c, cfg, cfg->struct_size < sizeof c ? cfg->struct_size : sizeof c);
     c.struct_size = sizeof c;
     t = gptps_toml_parse_file(c.config_path, err, sizeof err);
-    if (!t) { *out_engine = NULL; return GPTPS_E_CONFIG; }
-    /* [limits]: a file value fills a limit the caller left 0 - the header's rule is
-     * that explicit cfg values win over the file, and 0 means "not set" in both. */
-    /* RANGE-check, do not cast. `max_concurrent_tasks = -1` used to become
-     * 4294967295 and the engine then tried to start that many OS threads;
-     * `max_memory_bytes = -1` silently turned the operator's memory limit into
-     * no limit at all. A sign test alone is not enough either - a positive value
-     * wider than the destination truncates (4294967296 -> 0 -> unbounded) - so
-     * each key is checked against the width AND the meaning of its field, and a
-     * violation is reported as GPTPS_E_CONFIG rather than clamped. The live
-     * settings surface for the same keys already enforces exactly this. A bad
-     * value is an error even where the caller's own value would win. */
-    if (gptps_toml_int(t, "limits", "max_concurrent_tasks", &ll)) {
-        if (ll < 0 || ll > 65536) { gptps_toml_free(t); *out_engine = NULL; return GPTPS_E_CONFIG; }
-        if (!c.limits.max_concurrent_tasks) c.limits.max_concurrent_tasks = (uint32_t)ll;
+    if (!t) {
+        char msg[400];
+        cfg_say_parse(err);
+        snprintf(msg, sizeof msg, "config %s: the file does not parse - the engine was not opened", c.config_path);
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+        *out_engine = NULL;
+        return GPTPS_E_CONFIG;
     }
-    if (gptps_toml_int(t, "limits", "max_memory_bytes", &ll)) {
-        if (ll < 0) { gptps_toml_free(t); *out_engine = NULL; return GPTPS_E_CONFIG; }
-        if (!c.limits.max_memory_bytes) c.limits.max_memory_bytes = (uint64_t)ll;
-    } else if (gptps_toml_double(t, "limits", "max_memory_gb", &gb) && gb > 0.0) {
-        if (!c.limits.max_memory_bytes) c.limits.max_memory_bytes = (uint64_t)(gb * 1073741824.0);
-    }
-    if (gptps_toml_int(t, "limits", "max_intake_depth", &ll)) {
-        if (ll < 0 || ll > 4294967295LL) { gptps_toml_free(t); *out_engine = NULL; return GPTPS_E_CONFIG; }
-        if (!c.limits.max_intake_depth) c.limits.max_intake_depth = (uint32_t)ll;
-    }
+    /* [limits] and [bounded]: they size the engine. A value refused here is left out
+     * and the engine opens all the same - only so that the rest of the file is
+     * checked too, and every mistake in it reported at once rather than one per
+     * attempt. The open is refused below. */
+    bad = cfg_open_keys(t, &c);
 
     s = open_engine(&c, out_engine);
     if (s != GPTPS_OK) { gptps_toml_free(t); return s; }
+    e = *out_engine;
+    e->toml = t;                         /* retained for register-time task overrides */
+    e->cfg_opening = 1;                  /* no other thread has the engine yet */
 
-    (*out_engine)->toml = t;                /* retained for register-time task overrides */
-    /* [limits]: knobs that live on the engine rather than in gptps_limits (which
-     * cannot grow - it sits BEFORE `mode` inside gptps_config, so appending to it
-     * would move `mode` and break the frozen GPTPS_CONFIG_MIN_SIZE). */
-    if (gptps_toml_int(t, "limits", "shutdown_grace_ms", &ll) && ll >= 0 && ll <= 4294967295LL)
-        (*out_engine)->shutdown_grace_ms = (uint32_t)ll;
-    if (gptps_toml_int(t, "limits", "max_dead_letters", &ll) && ll >= 0 && ll <= 4294967295LL)
-        (*out_engine)->max_dead_letters = (uint32_t)ll;
-    /* [scheduler]: starvation-guard knob (0 => reserve immediately, no backfill) */
-    if (gptps_toml_int(t, "scheduler", "reserve_after_skips", &ll) && ll >= 0 && ll <= 4294967295LL)
-        (*out_engine)->reserve_after_skips = (uint32_t)ll;
-    /* top-level addons = ["lib1.so", ...]. A failure here is NOT silent: the
-     * add-on is a policy carrier (a constraint that enforces a quota, say), and
-     * "ran without it" is exactly the outcome an operator must not discover from
-     * behaviour alone. Report it and keep going - the engine itself is valid. */
-    n = gptps_toml_str_array(t, "", "addons", &addons);
-    for (k = 0; k < n; ++k) {
-        gptps_status as = gptps_load_addon(*out_engine, addons[k]);
-        if (as != GPTPS_OK) {
-            char msg[256];
-            snprintf(msg, sizeof msg, "add-on '%s' from %s failed to load: %s",
-                     addons[k], c.config_path, gptps_strerror(as));
-            gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+    /* top-level addons = ["lib1.so", ...]. One that does not load fails the open,
+     * like any other mistake in the file: an add-on is a policy carrier (a
+     * constraint that enforces a quota, say), and "ran without it" is exactly the
+     * outcome an operator must not discover from behaviour alone. */
+    if ((j = gptps_toml_find_dotted(t, "addons")) >= 0) {
+        cfg_item it;
+        gptps_toml_claim_at(t, (size_t)j);
+        cfg_item_at(t, (size_t)j, &it);
+        if (gptps_toml_text_at(t, (size_t)j)) {
+            cfg_say(GPTPS_LOG_ERROR, &it, "expects a [\"list\"] of add-on paths");
+            ++bad;
+        }
+        n = gptps_toml_str_array(t, "", "addons", &addons);
+        for (k = 0; k < n; ++k) {
+            gptps_status as = gptps_load_addon(e, addons[k]);
+            if (as != GPTPS_OK) {
+                cfg_say(GPTPS_LOG_ERROR, &it, "the add-on %s did not load (%s)", addons[k], gptps_strerror(as));
+                ++bad;
+            }
         }
     }
-    return GPTPS_OK;
+    bad += cfg_apply(e, t, 1);           /* everything else: the same checks as a live set */
+    gptps_mutex_lock(e->m);
+    bad += e->cfg_late_errors;           /* a plug-in's key, refused as the add-on defined it */
+    e->cfg_late_errors = 0;
+    e->cfg_opening = 0;
+    gptps_mutex_unlock(e->m);
+    if (!bad) return GPTPS_OK;
+    gptps_shutdown(e);                   /* frees the file with the engine */
+    t = NULL;
+    {
+        char msg[400];
+        snprintf(msg, sizeof msg, "config %s: %u error%s - the engine was not opened",
+                 c.config_path, bad, bad == 1 ? "" : "s");
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+    }
+    gptps_toml_free(t);
+    *out_engine = NULL;
+    return GPTPS_E_CONFIG;
 }
 
 gptps_status gptps_open(const char *config_path, gptps **out_engine)
@@ -2617,7 +3346,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     r->priority = 0;
     r->enabled = true;
     r->engine = e;
-    apply_task_config(e->toml, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
+    apply_task_config(e, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
     r->service = (svc_flags & GPTPS_TASK_SERVICE) != 0;
     r->retire_on_ok = (svc_flags & GPTPS_TASK_RETIRE_ON_OK) != 0; /* service only; consulted on a clean OK exit */
     if (r->service) {
@@ -2636,6 +3365,23 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
      * registry add takes settings->m then e->m, preserving the lock order) */
     register_task_settings(e, r);
     register_task_local_settings(e, r);   /* + any generic per-task settings defined so far */
+    {   /* what one run costs of each named resource, as settings */
+        size_t ri;
+        for (ri = 0; ; ++ri) {
+            const char *rname;
+            int addon;
+            gptps_mutex_lock(e->m);
+            if (ri >= e->nres) { gptps_mutex_unlock(e->m); break; }
+            rname = e->resources[ri].name; addon = e->resources[ri].addon;   /* stable: never freed before shutdown */
+            gptps_mutex_unlock(e->m);
+            if (!addon) res_add_cost_setting(e, r, ri, rname);
+        }
+    }
+    {   /* the file's values for this task's settings that only exist now */
+        char pre[320];
+        snprintf(pre, sizeof pre, "tasks.%s.", name);
+        cfg_apply_pending(e, pre);
+    }
     return GPTPS_OK;
 }
 
@@ -2652,10 +3398,47 @@ gptps_status gptps_set_task_priority(gptps *e, const char *task_name, int priori
 }
 
 /* ---- named resource budgets (generic admission limits) ---- */
+/* The settings a named resource is reached by - resources.<name>, its budget, and
+ * tasks.<task>.resources.<name>, its cost to one task - so the config file, the
+ * dashboard and gptps_settings_set reach it like any other knob. Not made for a
+ * resource an add-on defined: the add-on exposes it its own way (gpu_quota_plugin's
+ * gpuq.total_units), and two settings would fight over one budget. No lock held. */
+static void res_add_budget_setting(gptps *e, size_t ri, const char *name)
+{
+    gptps_setting_def d;
+    char key[320];
+    gptps_res_cell *x = (gptps_res_cell *)gptps_calloc(1, sizeof *x);
+    if (!x) return;
+    x->e = e; x->ri = ri;
+    snprintf(key, sizeof key, "resources.%s", name);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = key; d.type = GPTPS_SETTING_UINT; d.hot = 1;
+    d.desc = "a named resource's budget: how much of it the running tasks may hold at once";
+    d.target = x; d.read = rs_rd_budget; d.write = rs_wr_budget;
+    if (gptps_settings_add(e->settings, &d) != GPTPS_OK) { gptps_free(x); return; }
+    gptps_mutex_lock(e->m); x->next = e->res_cells; e->res_cells = x; gptps_mutex_unlock(e->m);
+}
+
+static void res_add_cost_setting(gptps *e, gptps_reg *r, size_t ri, const char *rname)
+{
+    gptps_setting_def d;
+    char key[384];
+    gptps_res_cell *x = (gptps_res_cell *)gptps_calloc(1, sizeof *x);
+    if (!x) return;
+    x->e = e; x->r = r; x->ri = ri;
+    snprintf(key, sizeof key, "tasks.%s.resources.%s", r->name, rname);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = key; d.type = GPTPS_SETTING_UINT; d.hot = 1;
+    d.desc = "how much of the named resource one run of this task holds while it runs";
+    d.target = x; d.read = rs_rd_cost; d.write = rs_wr_cost;
+    if (gptps_settings_add_owned(e->settings, &d, r) != GPTPS_OK) { gptps_free(x); return; }
+    gptps_mutex_lock(e->m); x->next = r->res_cells; r->res_cells = x; gptps_mutex_unlock(e->m);
+}
+
 gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
 {
-    size_t i, oldn;
-    gptps_reg *r;
+    size_t i, oldn, ri, nsnap = 0, cap = 0;
+    gptps_reg *r, **snap = NULL;
     char *nm;
     if (!e || !name || !*name) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
@@ -2704,8 +3487,40 @@ gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
     e->resources[e->nres].name = nm;
     e->resources[e->nres].budget = budget;
     e->resources[e->nres].reserved = 0;
+    e->resources[e->nres].addon = (e->cur_ns && e->cur_ns_tid == gptps_hal_thread_id());
+    ri = e->nres;
     e->nres += 1;
+    if (e->resources[ri].addon) { gptps_mutex_unlock(e->m); return GPTPS_OK; }
+
+    /* Its settings: the budget, and its cost to each task registered so far. The
+     * tasks are pinned while that is done, as gptps_define_task_setting pins them,
+     * and a task being unregistered is passed over as it does: its unregister's last
+     * sweep of owned settings counts on no define adding one after it. */
+    for (r = e->registry; r; r = r->next) {
+        if (r->removed) continue;
+        if (nsnap == cap) {
+            size_t nc = cap ? cap * 2 : 8;
+            gptps_reg **ns = (gptps_reg **)gptps_realloc(snap, nc * sizeof *ns);
+            if (!ns) break;                         /* best effort: what was captured */
+            snap = ns; cap = nc;
+        }
+        snap[nsnap++] = r;
+    }
+    e->active_defines += 1;
     gptps_mutex_unlock(e->m);
+    res_add_budget_setting(e, ri, nm);
+    for (i = 0; i < nsnap; ++i) res_add_cost_setting(e, snap[i], ri, nm);
+    gptps_mutex_lock(e->m);
+    e->active_defines -= 1;
+    gptps_cond_broadcast(e->cv_drain);
+    gptps_mutex_unlock(e->m);
+    gptps_free(snap);
+    {   /* the file's values for the settings just made */
+        char key[320];
+        snprintf(key, sizeof key, "resources.%s", nm);
+        cfg_apply_pending(e, key);
+        cfg_apply_pending(e, "tasks.");
+    }
     return GPTPS_OK;
 }
 
@@ -2914,7 +3729,9 @@ static void registry_unlink(gptps *e, gptps_reg *r)
 static void reg_destroy(gptps_reg *r)
 {
     gptps_task_local *L = r->locals;
+    gptps_res_cell *x = r->res_cells;
     while (L) { gptps_task_local *n = L->next; gptps_free(L); L = n; }
+    while (x) { gptps_res_cell *n = x->next; gptps_free(x); x = n; }
     if (r->argv_copy) { char **a = r->argv_copy; while (*a) gptps_free(*a++); gptps_free(r->argv_copy); }
     gptps_free(r->res_cost);
     gptps_free(r->name);
@@ -3226,6 +4043,7 @@ gptps_status gptps_define_global(gptps *e, const char *key, gptps_setting_type t
     int has_range = 0; double mn = 0, mx = 0;
     char **choices = NULL;
     const char *dv;
+    char dvbuf[GPTPS_SETTINGS_VALUE_MAX];
     gptps_status st;
     size_t klen;
 
@@ -3247,6 +4065,7 @@ gptps_status gptps_define_global(gptps *e, const char *key, gptps_setting_type t
         if (!parse_range(constraint, &has_range, &mn, &mx)) return GPTPS_E_CONFIG;
     }
     dv = default_val ? default_val : gtype_zero(type, (const char *const *)choices);
+    dv = trim_default(type, dv, dvbuf, sizeof dvbuf);
     if (!gval_ok(type, has_range, mn, mx, (const char *const *)choices, dv)) { free_choices(choices); return GPTPS_E_CONFIG; }
 
     o = (gptps_owned_setting *)gptps_calloc(1, sizeof *o);
@@ -3275,6 +4094,7 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
     int has_range = 0; double mn = 0, mx = 0;
     char **choices = NULL;
     const char *dv;
+    char dvbuf[GPTPS_SETTINGS_VALUE_MAX];
     gptps_reg **snap = NULL; size_t nsnap = 0, cap = 0, i;
     gptps_reg *r;
 
@@ -3313,6 +4133,7 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
         if (!parse_range(constraint, &has_range, &mn, &mx)) return GPTPS_E_CONFIG;
     }
     dv = default_val ? default_val : gtype_zero(type, (const char *const *)choices);
+    dv = trim_default(type, dv, dvbuf, sizeof dvbuf);
     if (!gval_ok(type, has_range, mn, mx, (const char *const *)choices, dv)) { free_choices(choices); return GPTPS_E_CONFIG; }
 
     sc = (gptps_task_schema *)gptps_calloc(1, sizeof *sc);
@@ -3354,6 +4175,7 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
     gptps_mutex_unlock(e->m);
 
     gptps_free(snap);
+    cfg_apply_pending(e, "tasks.");      /* the file's values for the settings it made */
     return GPTPS_OK;
 }
 
@@ -3406,7 +4228,18 @@ gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def)
         gptps_mutex_unlock(e->m);
         if (bad) return GPTPS_E_INVAL;
     }
-    return gptps_settings_add(e->settings, def);
+    {
+        gptps_status st = gptps_settings_add(e->settings, def);
+        const void *tag = NULL;
+        if (st == GPTPS_OK) {
+            gptps_mutex_lock(e->m);         /* an add-on's, inside its setup: undone if that fails */
+            if (e->setup_on && e->setup_tid == gptps_hal_thread_id()) tag = e->setup_tag;
+            gptps_mutex_unlock(e->m);
+            if (tag) gptps_settings_set_tag(e->settings, def->key, tag);
+            cfg_apply_pending(e, def->key);   /* the file's value for it, if any */
+        }
+        return st;
+    }
 }
 /* These forward straight into the settings registry, which carries its OWN mutex -
  * also inherited across a fork, also possibly held by a thread that did not
@@ -3421,51 +4254,155 @@ gptps_status gptps_settings_get(gptps *e, const char *key, char *buf, size_t cap
  * a gptps_shutdown from one would free the registry this call is still walking. */
 gptps_status gptps_settings_set(gptps *e, const char *key, const char *value)
 {
+    return gptps_settings_set_ex(e, key, value, NULL, 0);
+}
+
+gptps_status gptps_settings_set_ex(gptps *e, const char *key, const char *value, char *why, size_t cap)
+{
     gptps_status st;
     gptps_cb_thread *in;
+    if (why && cap) why[0] = 0;
     if (!e) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     in = cb_enter(e);
-    st = gptps_settings_set_by(e->settings, key, value);
+    st = gptps_settings_set_live(e->settings, key, value, why, cap);
     cb_leave(in);
+    if (st == GPTPS_E_NOTFOUND && why && cap) {
+        char near[384];
+        if (gptps_settings_closest(e->settings, key, near, sizeof near))
+            snprintf(why, cap, "no setting is named %s (did you mean %s?)", key, near);
+        else
+            snprintf(why, cap, "no setting is named %s", key);
+    }
     return st;
+}
+
+/* The value the loaded config file gives a setting: by its key, as max_memory_gb,
+ * or for a task through [task_defaults]. 1 and `val`, or 0. A save to a new file
+ * writes these. The registry calls it with its lock held, and settings->m -> e->m
+ * is the order. */
+static int cfg_in_file(const char *key, void *ud, char *val, size_t cap)
+{
+    gptps *e = (gptps *)ud;
+    const gptps_toml *t;
+    const char *x = NULL;
+    long j = -1;
+    gptps_mutex_lock(e->m);
+    if ((t = e->toml) != NULL) {
+        if ((j = gptps_toml_find_dotted(t, key)) >= 0) x = gptps_toml_text_at(t, (size_t)j);
+        else if (!strcmp(key, "limits.max_memory_bytes")) {
+            if ((j = gptps_toml_find_dotted(t, "limits.max_memory_gb")) >= 0 && (x = gptps_toml_text_at(t, (size_t)j)) != NULL) {
+                snprintf(val, cap, "%llu", (unsigned long long)(gptps_strtod_c(x, NULL) * 1073741824.0));
+                gptps_mutex_unlock(e->m);
+                return 1;
+            }
+        } else if (!strncmp(key, "tasks.", 6) && !strstr(key + 6, ".resources.")) {
+            const char *leaf = strrchr(key, '.') + 1;
+            char d[400];
+            if (task_key_find(leaf)) {
+                snprintf(d, sizeof d, "task_defaults.%s", leaf);
+                if ((j = gptps_toml_find_dotted(t, d)) >= 0) x = gptps_toml_text_at(t, (size_t)j);
+            }
+        }
+    }
+    if (x) snprintf(val, cap, "%s", x);
+    gptps_mutex_unlock(e->m);
+    return x != NULL;
 }
 
 gptps_status gptps_settings_save(gptps *e, const char *path)
 {
+    char base[1024];
     if (!e) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     if (!path) path = e->config_path;
     if (!path) return GPTPS_E_INVAL;
-    return gptps_settings_save_to(e->settings, path);
+    gptps_mutex_lock(e->m);                  /* the file last loaded, at open or a reload */
+    if (e->toml_reloading) {
+        /* A reload is applying a file whose values are not all in yet: a save now
+         * would write a live value it is about to replace over the file it reads. */
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_BUSY;
+    }
+    base[0] = 0;
+    if (e->toml) snprintf(base, sizeof base, "%s", gptps_toml_path(e->toml));
+    gptps_mutex_unlock(e->m);
+    return gptps_settings_save_to(e->settings, path, base[0] ? base : NULL, cfg_in_file, e);
 }
 
 gptps_status gptps_settings_reload(gptps *e, const char *path)
 {
     gptps_toml *t, *old;
-    gptps_status st;
     gptps_cb_thread *in;
+    char err[4096];                      /* the parser's messages, a line each */
+    unsigned bad;
     if (!e) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     if (!path) path = e->config_path;
     if (!path) return GPTPS_E_INVAL;
-    t = gptps_toml_parse_file(path, NULL, 0);
-    if (!t) return GPTPS_E_CONFIG;
-    in = cb_enter(e);                                  /* runs host write accessors */
-    st = gptps_settings_apply_toml(e->settings, t);   /* re-apply known keys (validated) */
+    gptps_mutex_lock(e->m);
+    /* One at a time; and not while an add-on's setup runs, whose settings must take
+     * their values when it returns, for its watcher to hear them. Marked before the
+     * file is read, so a save meanwhile is refused rather than rewrite it under us. */
+    if (e->toml_reloading || e->setup_on) {
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_BUSY;
+    }
+    e->toml_reloading = 1;               /* definitions meanwhile leave this file to us; a save waits */
+    gptps_mutex_unlock(e->m);
+    t = gptps_toml_parse_file(path, err, sizeof err);
+    if (!t) {
+        char msg[400];
+        cfg_say_parse(err);
+        snprintf(msg, sizeof msg, "config %s: the file does not parse - nothing was reloaded", path);
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+        gptps_mutex_lock(e->m);
+        e->toml_reloading = 0;
+        gptps_mutex_unlock(e->m);
+        cfg_apply_pending(e, "");        /* what was defined meanwhile, from the file that stands */
+        return GPTPS_E_CONFIG;
+    }
+    gptps_mutex_lock(e->m);
+    e->cfg_late_errors = 0;              /* the old file's: this one replaces it */
+    gptps_mutex_unlock(e->m);
+    in = cb_enter(e);                    /* runs host write accessors */
+    bad = cfg_apply(e, t, 0);            /* the same checks as at open, and as a live set */
     cb_leave(in);
-    gptps_mutex_lock(e->m);                            /* swap so future task registrations see it */
-    old = e->toml; e->toml = t;
+    gptps_mutex_lock(e->m);              /* swap so future task registrations see it */
+    old = e->toml; e->toml = t; e->toml_gen += 1; e->toml_reloading = 0;
+    e->cfg_late_errors += bad;           /* gptps_config_check reports them while this file stands */
     gptps_mutex_unlock(e->m);
     gptps_toml_free(old);
-    return st;
+    cfg_apply_pending(e, "");            /* anything defined while it was being applied */
+    if (bad) {
+        char msg[400];
+        snprintf(msg, sizeof msg, "config %s: %u error%s in the reload; the valid values were applied",
+                 path, bad, bad == 1 ? "" : "s");
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+    }
+    return bad ? GPTPS_E_CONFIG : GPTPS_OK;
 }
 
 gptps_status gptps_settings_watch(gptps *e, gptps_settings_cb cb, void *user_data)
 {
     if (!e) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);   /* settings->m is inherited too */
-    return gptps_settings_watch_add(e->settings, cb, user_data);
+    return gptps_settings_watch_add(e->settings, cb, user_data, 0, NULL);
+}
+
+/* The host table's settings_watch: an add-on's watcher hears a config file's values
+ * as well as live sets, since that is how a plug-in learns its configuration. It
+ * cannot reload, save or shut down from the host table, so hearing a reload cannot
+ * recurse into one. */
+static gptps_status api_settings_watch(gptps *e, gptps_settings_cb cb, void *user_data)
+{
+    const void *tag = NULL;
+    if (!e) return GPTPS_E_INVAL;
+    GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
+    gptps_mutex_lock(e->m);
+    if (e->setup_on && e->setup_tid == gptps_hal_thread_id()) tag = e->setup_tag;
+    gptps_mutex_unlock(e->m);
+    return gptps_settings_watch_add(e->settings, cb, user_data, 1, tag);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3528,7 +4465,7 @@ static const gptps_api_routines G_API = {
     /* configuration + diagnostics: what a purely config-driven add-on needs */
     gptps_settings_get,
     gptps_settings_set,
-    gptps_settings_watch,
+    api_settings_watch,
     gptps_set_task_priority,
     gptps_strerror,
     gptps_version,
@@ -3688,6 +4625,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         gptps_reg        *reg0;
         gptps_sched_fn    sched0;
         void             *schedud0;
+        const void       *tag;          /* this load's: what its setup registers carries it */
         char              owner0[32];   /* copy: e->sched_owner is a buffer, not a pointer */
 
         gptps_mutex_lock(e->m);
@@ -3697,15 +4635,30 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         /* Open the namespace window, pinned to this thread. */
         e->cur_ns = ns; e->cur_ns_len = ns ? strlen(ns) : 0;
         e->cur_ns_tid = gptps_hal_thread_id();
+        e->setup_tid = e->cur_ns_tid; e->setup_on = 1;
+        e->setup_tag = (const void *)++e->load_seq;   /* never 0, never reused in this engine */
+        tag = e->setup_tag;
         in = cb_enter_locked(e);     /* setup() and what it emits run on this thread */
         gptps_mutex_unlock(e->m);
 
         s = addon->setup(e, &G_API, &err);
         cb_leave(in);
 
+        /* A failed add-on's code must not run again: the setup that would have made it
+         * ready did not finish. Its watchers hear nothing more, and the settings it
+         * registered go - their accessors and targets are its own. Done while the load
+         * still counts as running, so no value applied meanwhile reaches either. */
+        if (s != GPTPS_OK) gptps_settings_forget_tag(e->settings, tag);
         gptps_mutex_lock(e->m);
         e->cur_ns = NULL; e->cur_ns_len = 0; e->cur_ns_tid = 0;
+        e->setup_on = 0; e->setup_tid = 0; e->setup_tag = NULL;
         gptps_mutex_unlock(e->m);
+        /* The file's values that waited: for what the add-on defined, now its setup is
+         * done - a plug-in learns its configuration through the watcher it registers
+         * in setup (addons/gptps_gpu_quota_plugin.c), and a value applied while setup
+         * still ran would have reached no watcher - and for whatever another thread
+         * defined meanwhile. */
+        cfg_apply_pending(e, "");
 
         if (s != GPTPS_OK) {
             addon_unwind(e, obs0, con0, reg0, sched0, schedud0, owner0);
@@ -4077,6 +5030,15 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         p.kind = GPTPS_EV_QUEUED; p.handle = h; ev_set_name(p.name, r->def.name);
         p.status = GPTPS_OK; p.attempt = 0; p.mem = mem;
         p.result = NULL; p.result_len = 0; p.flags = 0;
+        /* Once: see "the config file" - and not while the open is still reading it, as
+         * when an add-on submits as it loads, since its keys are not claimed yet. The
+         * report itself is made elsewhere: it consults the settings registry, and this
+         * submit may come from a setting's write accessor, which runs holding the
+         * registry's lock. */
+        if (e->toml && !e->cfg_opening && !e->cfg_reported) {
+            e->cfg_reported = 1;
+            e->cfg_report_due = 1;          /* the dispatcher, signalled above, or gptps_step */
+        }
         if (cb || e->observers) in = cb_enter_locked(e);   /* else nothing to bracket */
         gptps_mutex_unlock(e->m);
         emit_now(e, cb, ud, &p);
@@ -4397,6 +5359,12 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
         gptps_mutex_unlock(e->m); return GPTPS_E_BUSY;
     }
     e->step_tid = gptps_hal_thread_id();
+    if (e->cfg_report_due) {                 /* asked for by the first submit; not in a callback here */
+        e->cfg_report_due = 0;
+        gptps_mutex_unlock(e->m);
+        cfg_report_first_submit(e, 0);       /* the stepper is the dispatcher: see dispatcher_main */
+        gptps_mutex_lock(e->m);
+    }
 
     /* pass A: complete any prior work, promote backoff-ready retries, admit.
      * Repeat while the pass reports work still owed: a terminal event it could not
@@ -4510,6 +5478,12 @@ gptps_status gptps_shutdown(gptps *e)
         gptps_mutex_unlock(e->m);
         return GPTPS_E_BUSY;
     }
+    if (e->cfg_report_due) {            /* a MANUAL engine may never have stepped */
+        e->cfg_report_due = 0;
+        gptps_mutex_unlock(e->m);
+        cfg_report_first_submit(e, 0);
+        gptps_mutex_lock(e->m);
+    }
     /* This thread's own callbacks below (the terminal events of whatever the
      * teardown cancels) are callbacks like any other: a gptps_shutdown from one
      * would run teardown again, inside itself. */
@@ -4590,6 +5564,7 @@ gptps_status gptps_shutdown(gptps *e)
     { gptps_task_schema *s = e->task_schemas; while (s) { gptps_task_schema *n = s->next; free_choices(s->choices); gptps_free(s->leaf); gptps_free(s->defval); gptps_free(s); s = n; } }
     gptps_settings_destroy(e->settings);  /* entries reference e / regs, which are freed above/after; destroy only frees the schema list */
     { size_t i; for (i = 0; i < e->nres; ++i) gptps_free(e->resources[i].name); gptps_free(e->resources); }
+    { gptps_res_cell *x = e->res_cells; while (x) { gptps_res_cell *n = x->next; gptps_free(x); x = n; } }
     gptps_toml_free(e->toml);
     gptps_free(e->config_path);
 

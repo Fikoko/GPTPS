@@ -341,6 +341,9 @@ target_compile_definitions(test_toml PRIVATE ADDON_DEMO_PATH="$<TARGET_FILE:addo
 add_test(NAME toml COMMAND test_toml)
 set_tests_properties(toml PROPERTIES TIMEOUT 30)
 
+# the config file: strict checks, deferred keys, gptps_config_check, reload, and
+# gptps_settings_save editing a file in place
+
 add_executable(test_scheduler tests/test_scheduler.c) # priority + skip-to-fit + reservation
 target_include_directories(test_scheduler
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -473,6 +476,37 @@ set_target_properties(addon_ns PROPERTIES PREFIX "")
 add_library(addon_ns_bad MODULE tests/addon_ns_bad.c)
 target_include_directories(addon_ns_bad PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_target_properties(addon_ns_bad PROPERTIES PREFIX "")
+# Add-ons for test_config_strict: one that submits work as it loads, inside
+# gptps_open; one whose setup fails after it registered a watcher and a setting
+# (namespaced, and not); one whose setup waits for the host.
+add_library(addon_submit MODULE tests/addon_submit.c)
+target_include_directories(addon_submit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_submit PROPERTIES PREFIX "")
+add_library(addon_failwatch MODULE tests/addon_failwatch.c)
+target_include_directories(addon_failwatch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_failwatch PROPERTIES PREFIX "")
+add_library(addon_failwatch_plain MODULE tests/addon_failwatch.c)
+target_include_directories(addon_failwatch_plain PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(addon_failwatch_plain PRIVATE FW_PLAIN=1)
+set_target_properties(addon_failwatch_plain PROPERTIES PREFIX "")
+add_library(addon_waiter MODULE tests/addon_waiter.c)
+target_include_directories(addon_waiter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_waiter PROPERTIES PREFIX "")
+
+# the config file: strict checks, deferred keys, gptps_config_check, reload, and
+# gptps_settings_save editing a file in place
+add_executable(test_config_strict tests/test_config_strict.c)
+target_include_directories(test_config_strict PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_config_strict PRIVATE gptps)
+add_dependencies(test_config_strict addon_ns addon_submit addon_failwatch addon_failwatch_plain addon_waiter)
+target_compile_definitions(test_config_strict PRIVATE
+    ADDON_NS_PATH="$<TARGET_FILE:addon_ns>"
+    ADDON_SUBMIT_PATH="$<TARGET_FILE:addon_submit>"
+    ADDON_FAILWATCH_PATH="$<TARGET_FILE:addon_failwatch>"
+    ADDON_FAILWATCH_PLAIN_PATH="$<TARGET_FILE:addon_failwatch_plain>"
+    ADDON_WAITER_PATH="$<TARGET_FILE:addon_waiter>")
+add_test(NAME config_strict COMMAND test_config_strict)
+set_tests_properties(config_strict PROPERTIES TIMEOUT 60)
 
 # The SAME policy as addons/gpu_quota.c, shipped as a binary plug-in. Built as a
 # MODULE precisely because that is its tier: the host never calls into it.

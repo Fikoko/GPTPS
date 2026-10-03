@@ -37,7 +37,10 @@ extern "C" {
 typedef struct {
     unsigned cpu_count;  /* online logical CPUs, always >= 1 */
     uint64_t ram_bytes;  /* total physical RAM; 0 if undetectable */
-    bool     has_gpu;    /* best-effort; false when unknown (needs a GPU add-on) */
+    bool     has_gpu;    /* NOT part of the contract: the core never reads it, and the
+                          * bundled HALs leave it false. A GPU, like any device a task
+                          * holds, is a named resource the host or the config file
+                          * defines ([resources] gpu = 4). Kept for ABI layout. */
 } gptps_hwinfo;
 
 gptps_status gptps_hal_detect(gptps_hwinfo *out);
@@ -162,7 +165,8 @@ void      gptps_dl_release(gptps_dl *h);
  * Atomically replace `final_path` with `tmp_path` (rename on POSIX, MoveFileEx
  * on Windows so it works when the target already exists). GPTPS_OK / GPTPS_E_IO.
  * A HAL without a filesystem returns GPTPS_E_IO, and settings save is then
- * unavailable. */
+ * unavailable. Recommended, not required: keep the replaced file's permissions, as
+ * the bundled POSIX HAL does - save edits an operator's config file in place. */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path);
 
 /* --- still pending (later increment): OS memory cap (out-of-process

@@ -126,6 +126,13 @@ static gptps_status gpuq_setup(gptps *e, const gptps_api_routines *api, char **e
         !api->settings_watch || !api->define_global || !api->define_task_setting)
         return GPTPS_E_ABI;
 
+    /* The watcher first: it is how this plug-in is configured - from the config file
+     * as well as live (docs/PLUGINS.md) - so it should be listening before anything
+     * it watches exists. The cookie carries the engine, so a second load into a second
+     * engine cannot steal the first engine's settings (see on_setting). */
+    st = api->settings_watch(e, on_setting, e);
+    if (st != GPTPS_OK) return st;
+
     /* The budget. Reserved and released by the ENGINE under the same lock that makes
      * the admission decision, so the reserve/release pair cannot drift - the failure
      * mode the pre-ABI-2.0 constraint+observer implementation had.
@@ -142,12 +149,7 @@ static gptps_status gpuq_setup(gptps *e, const gptps_api_routines *api, char **e
 
     /* Applies to every task type registered now OR LATER - so a task added after
      * this plug-in loaded still gets its quota knob. */
-    st = api->define_task_setting(e, GPUQ_LEAF, GPTPS_SETTING_UINT, "0", 0, 0);
-    if (st != GPTPS_OK) return st;
-
-    /* the cookie carries the engine, so a second load into a second engine cannot
-     * steal the first engine's settings (see on_setting). */
-    return api->settings_watch(e, on_setting, e);
+    return api->define_task_setting(e, GPUQ_LEAF, GPTPS_SETTING_UINT, "0", 0, 0);
 }
 
 /* Stop participating: widen the budget until it constrains nothing.

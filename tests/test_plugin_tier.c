@@ -11,6 +11,12 @@
  * That last part is what makes this a test rather than a demo. A plug-in that loads
  * and registers knobs nobody reads would pass a weaker check; here the quota has to
  * genuinely throttle admission.
+ *
+ * Then the same again with nothing but a config file: `addons`, the budget and the
+ * per-task cost all in TOML, which docs/PLUGINS.md promises a plug-in can be
+ * configured by. The plug-in learns them through the watcher it registers in its
+ * setup, which is why an add-on's own keys take the file's values when its setup
+ * returns - and the quota must bite exactly as before.
  */
 #include "gptps.h"
 #include <stdio.h>
@@ -23,9 +29,35 @@
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
+#define TOML_PATH "plugin_tier.toml"
+
 static int g_release, g_ran;
 static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+
+/* Six render tasks against a budget of 4 at 2 a task: exactly two run at once. */
+static void quota_bites(gptps *e)
+{
+    gptps_handle h;
+    int i;
+    __atomic_store_n(&g_release, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_ran, 0, __ATOMIC_SEQ_CST);
+    for (i = 0; i < 6; ++i)
+        CHECK(gptps_submit(e, "render", NULL, 0, &h) == GPTPS_OK);
+    {   /* wait for the quota to fill, then confirm it does not exceed */
+        uint64_t t0 = gptps_now_ms(NULL), reserved = 0, budget = 0;
+        while (get(&g_ran) < 2 && gptps_now_ms(NULL) - t0 < 3000) { }
+        CHECK(get(&g_ran) == 2);          /* two admitted... */
+        gptps_resource_usage(e, "gpuq.units", &reserved, &budget);
+        CHECK(reserved == 4);             /* ...consuming the whole budget */
+        /* Hold long enough that a broken quota would let a third in. Concurrency is
+         * 8, so nothing but the quota is stopping them. */
+        t0 = gptps_now_ms(NULL);
+        while (gptps_now_ms(NULL) - t0 < 200) { }
+        CHECK(get(&g_ran) == 2);          /* still exactly two */
+    }
+    __atomic_store_n(&g_release, 1, __ATOMIC_SEQ_CST);
+}
 
 /* Occupies its quota until released, so "is admission actually throttled?" is
  * observable rather than inferred from timing. */
@@ -42,8 +74,6 @@ int main(void)
     gptps *e = NULL;
     gptps_config cfg;
     gptps_task_def d;
-    gptps_handle h;
-    int i;
 
     memset(&cfg, 0, sizeof cfg);
     cfg.struct_size = sizeof cfg;
@@ -75,26 +105,7 @@ int main(void)
     }
 
     /* ===== the policy BITES: 4 units / 2 per task => at most 2 concurrent ===== */
-    __atomic_store_n(&g_release, 0, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&g_ran, 0, __ATOMIC_SEQ_CST);
-    for (i = 0; i < 6; ++i)
-        CHECK(gptps_submit(e, "render", NULL, 0, &h) == GPTPS_OK);
-
-    {   /* wait for the quota to fill, then confirm it does not exceed */
-        uint64_t t0 = gptps_now_ms(NULL), reserved = 0, budget = 0;
-        while (get(&g_ran) < 2 && gptps_now_ms(NULL) - t0 < 3000) { }
-        CHECK(get(&g_ran) == 2);          /* two admitted... */
-        gptps_resource_usage(e, "gpuq.units", &reserved, &budget);
-        CHECK(reserved == 4);             /* ...consuming the whole budget */
-
-        /* Hold long enough that a broken quota would let a third in. Concurrency is
-         * 8, so nothing but the quota is stopping them. */
-        t0 = gptps_now_ms(NULL);
-        while (gptps_now_ms(NULL) - t0 < 200) { }
-        CHECK(get(&g_ran) == 2);          /* still exactly two */
-    }
-
-    __atomic_store_n(&g_release, 1, __ATOMIC_SEQ_CST);
+    quota_bites(e);
 
     /* ===== introspection sees it, and disable turns the policy off ===== */
     {
@@ -116,6 +127,31 @@ int main(void)
     }
 
     gptps_shutdown(e);
+
+    /* ===== the same, configured from nothing but a file ===== */
+    {
+        FILE *f = fopen(TOML_PATH, "wb");
+        CHECK(f != NULL);
+        if (f) {
+            fprintf(f, "addons = [\"%s\"]\n"
+                       "[limits]\nmax_concurrent_tasks = 8\nshutdown_grace_ms = 500\n"
+                       "[gpuq]\ntotal_units = 4\n"
+                       "[tasks.render]\n\"gpuq.units\" = 2      # the Readme's example\n", ADDON_GPUQ_PATH);
+            fclose(f);
+        }
+        e = NULL;
+        CHECK(gptps_open(TOML_PATH, &e) == GPTPS_OK);
+        if (e) {
+            uint64_t budget = 0;
+            CHECK(gptps_resource_usage(e, "gpuq.units", NULL, &budget) == GPTPS_OK);
+            CHECK(budget == 4);                       /* the plug-in heard its budget */
+            CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+            CHECK(gptps_config_check(e) == GPTPS_OK); /* every key in the file was used */
+            quota_bites(e);                           /* and the cost, at registration */
+            gptps_shutdown(e);
+        }
+        remove(TOML_PATH);
+    }
 
     if (fails) { printf("%d plugin-tier check(s) FAILED\n", fails); return 1; }
     printf("all plugin tier checks passed\n");

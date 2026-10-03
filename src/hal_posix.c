@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <signal.h>   /* sig_atomic_t: the pthread_atfork child flag */
+#include <sys/stat.h> /* the replaced file's permission bits, kept by atomic_replace */
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
 #  include <sched.h>   /* sched_getaffinity / CPU_COUNT (container CPU bound) */
@@ -380,7 +381,15 @@ void  gptps_dl_close(gptps_dl *h) { if (h) { dlclose(h->handle); free(h); } }
 /* Drop the wrapper, keep the mapping (see gptps_hal.h). */
 void  gptps_dl_release(gptps_dl *h) { free(h); }
 
+/* The replaced file's permission bits carry over to its replacement. A save edits
+ * the operator's config file: one they kept to themselves must not come back
+ * readable by others, nor one kept read-only to the group come back writable by it -
+ * the file can name add-ons to load, so write access to it is code execution. */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
-{ return rename(tmp_path, final_path) == 0 ? GPTPS_OK : GPTPS_E_IO; }
+{
+    struct stat st;
+    if (stat(final_path, &st) == 0) (void)chmod(tmp_path, st.st_mode & 07777);
+    return rename(tmp_path, final_path) == 0 ? GPTPS_OK : GPTPS_E_IO;
+}
 
 #endif /* !_WIN32 */
