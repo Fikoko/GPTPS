@@ -15,8 +15,8 @@
  * with the reason the core needs it, and tests/test_hal_conformance.c holds every
  * backend to it (CTest runs it against the HAL of every build). The contract also
  * leaves freedoms - spurious wakeups, a coarse clock, signals that wake more than
- * one - and tests/hal_chaos.c takes all of them while the whole suite runs on it,
- * which shows the core needs nothing more. The external-program executor is
+ * one - and tests/hal_chaos.c takes all of them while the suite runs on it (all but
+ * the timing gates), which shows the core needs nothing more. The external-program executor is
  * platform code too but not HAL (exec_oop_posix.c / exec_win.c); the forked
  * EXEC_OOP kind is POSIX-only (no fork() on Windows).
  */

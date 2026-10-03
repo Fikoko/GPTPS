@@ -19,7 +19,10 @@
  * Build the suite on it and run it - CI's hal_chaos job does exactly this:
  *
  *   cmake -S . -B build-chaos -DGPTPS_HAL_SOURCE=$PWD/tests/hal_chaos.c
- *   cmake --build build-chaos -j && ctest --test-dir build-chaos
+ *   cmake --build build-chaos -j && ctest --test-dir build-chaos -E '_perf$'
+ *
+ * The *_perf gates are left out: they time a curve on the HAL's clock, which this
+ * HAL coarsens and perturbs on purpose, so they would measure the chaos.
  *
  * One in GPTPS_CHAOS_RATE calls (default 4) takes the freedom, choosing by a
  * counter mixed with GPTPS_CHAOS_SEED. The interleavings still vary run to run:

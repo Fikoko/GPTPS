@@ -363,6 +363,9 @@ jobs:
   # contract leaves (spurious and early wakeups, signals that wake everyone, a 16 ms
   # clock, late thread starts) - so the core is shown to need nothing more. A new
   # seed each run; the log names it, and GPTPS_CHAOS_SEED replays the same choices.
+  # The three *_perf gates are left out: they time the shape of a curve on the HAL's
+  # own clock, which this HAL coarsens and perturbs on purpose, so there they measure
+  # the chaos rather than the engine (one failed that way, at 3.33, on a loaded run).
   hal_chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -376,7 +379,7 @@ jobs:
         run: |
           export GPTPS_CHAOS_SEED=${{ github.run_number }}
           echo "chaos seed $GPTPS_CHAOS_SEED, one call in 4"
-          ctest --test-dir build-chaos --output-on-failure --no-tests=error
+          ctest --test-dir build-chaos --output-on-failure --no-tests=error -E '_perf$'
 
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER

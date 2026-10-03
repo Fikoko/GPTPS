@@ -36,8 +36,10 @@ the release version and is documented in `include/gptps.h`.
   - a clock that moves in 16 ms steps;
   - locks that yield first, and threads that start late.
 
-  The whole suite passes on it: 11 runs here, up to one call in two. CI's new
-  `hal_chaos` job runs it with a new seed each time. With the conformance test, that
+  The suite passes on it, except the three `*_perf` timing gates: they time a
+  curve on the HAL's own clock, which this HAL coarsens and perturbs on purpose, and
+  one failed that way on a loaded run. CI's new `hal_chaos` job leaves them out and
+  runs everything else with a new seed each time. With the conformance test, that
   checks both sides of the contract: a HAL keeps it, and the core needs nothing more.
 - **`docs/HAL.md`** gives the contract clause by clause, with why the core needs each
   clause and the check that holds a HAL to it. It also lists what the test cannot

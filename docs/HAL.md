@@ -62,9 +62,11 @@ The contract leaves these free, and the core must cope with every one:
 
 [`tests/hal_chaos.c`](../tests/hal_chaos.c) is a HAL that takes every one of these
 freedoms, often (one call in four by default). It passes the conformance test, and CI's
-`hal_chaos` job builds the whole suite on it and runs it with a new seed each time. That
-is the other half of the contract: the conformance test shows a HAL keeps it, and the
-chaos run shows the core needs nothing more.
+`hal_chaos` job builds the whole suite on it and runs it with a new seed each time. The
+exceptions are the three `*_perf` gates: they time a curve on the HAL's own clock, which
+this HAL coarsens and perturbs on purpose. That is the other half of the contract: the
+conformance test shows a HAL keeps it, and the chaos run shows the core needs nothing
+more.
 
 ## What the test cannot show
 
