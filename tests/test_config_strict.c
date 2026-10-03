@@ -1034,6 +1034,139 @@ static void test_watch_while_setting(void)
     gptps_shutdown(g_wl_engine);
 }
 
+/* Where save puts a value, held to the byte: each case is one a mutation run
+ * (tools/mutate.py) showed no test pinned. */
+static void save_case(const char *file, const char *key, const char *value, const char *want)
+{
+    gptps *e = NULL;
+    put(CFG2, file);
+    CHECK(gptps_open(CFG2, &e) == GPTPS_OK);
+    if (!e) return;
+    if (!strcmp(key, "verbose")) CHECK(gptps_define_global(e, "verbose", GPTPS_SETTING_BOOL, "false", NULL, 0) == GPTPS_OK);
+    if (!strncmp(key, "tasks.render.", 13)) {
+        CHECK(reg(e, "render") == GPTPS_OK);
+        CHECK(gptps_define_resource(e, "cpu", 8) == GPTPS_OK);
+    }
+    CHECK(gptps_settings_set(e, key, value) == GPTPS_OK);
+    CHECK(gptps_settings_save(e, NULL) == GPTPS_OK);
+    if (strcmp(slurp(CFG2), want) != 0) printf("  saved:\n%s---\n  wanted:\n%s---\n", slurp(CFG2), want);
+    CHECK(strcmp(slurp(CFG2), want) == 0);
+    gptps_shutdown(e);
+    e = NULL;
+    CHECK(gptps_open(CFG2, &e) == GPTPS_OK);                   /* and it reopens */
+    if (e) gptps_shutdown(e);
+}
+
+static void test_save_placement(void)
+{
+    /* next to a sibling written as a dotted key, in that key's table */
+    save_case("[resources]\ngpu = 1\n[tasks.render]\nresources.gpu = 1\n", "tasks.render.resources.cpu", "3",
+              "[resources]\ngpu = 1\n[tasks.render]\nresources.gpu = 1\nresources.cpu = 3\n");
+    /* next to a sibling at the top level, on the file's first line, not after what follows */
+    save_case("limits.max_intake_depth = 5\n# note\n", "limits.shutdown_grace_ms", "700",
+              "limits.max_intake_depth = 5\nlimits.shutdown_grace_ms = 700\n# note\n");
+    /* but not next to a key that only has its dot in the same place */
+    save_case("resources.gpu = 1\n", "scheduler.reserve_after_skips", "3",
+              "resources.gpu = 1\n\n[scheduler]\nreserve_after_skips = 3\n");
+    /* after the table's last key - even when that key is the file's first entry */
+    save_case("[limits]\nmax_intake_depth = 5\n[scheduler]\nreserve_after_skips = 4\n", "limits.shutdown_grace_ms", "700",
+              "[limits]\nmax_intake_depth = 5\nshutdown_grace_ms = 700\n[scheduler]\nreserve_after_skips = 4\n");
+    /* under a table with no keys that is the file's last line, newline or not */
+    save_case("[limits]\nmax_intake_depth = 5\n[scheduler]", "scheduler.reserve_after_skips", "3",
+              "[limits]\nmax_intake_depth = 5\n[scheduler]\nreserve_after_skips = 3\n");
+    /* a table the file lacks: at the end, after a blank line */
+    save_case("[limits]\nmax_intake_depth = 5\n", "scheduler.reserve_after_skips", "3",
+              "[limits]\nmax_intake_depth = 5\n\n[scheduler]\nreserve_after_skips = 3\n");
+    /* a key with no table: above the first table and the comment on it... */
+    save_case("# settings\n[limits]\nmax_intake_depth = 5\n", "verbose", "true",
+              "verbose = true\n\n# settings\n[limits]\nmax_intake_depth = 5\n");
+    /* ...or at the end of a file with no table at all */
+    save_case("# just a note\n", "verbose", "true", "# just a note\nverbose = true\n");
+    /* the byte count where the file has neither of its spellings... */
+    save_case("[limits]\nmax_intake_depth = 5\n", "limits.max_memory_bytes", "1073741824",
+              "[limits]\nmax_intake_depth = 5\nmax_memory_bytes = 1073741824\n");
+    /* ...and in GiB where that is the file's first entry */
+    save_case("[limits]\nmax_memory_gb = 2\n", "limits.max_memory_bytes", "1073741824",
+              "[limits]\nmax_memory_gb = 1\n");
+    /* with both spellings the byte count wins, so only its line changes */
+    save_case("limits.max_memory_bytes = 2147483648\nlimits.max_memory_gb = 2\n", "limits.max_memory_bytes", "1073741824",
+              "limits.max_memory_bytes = 1073741824\nlimits.max_memory_gb = 2\n");
+}
+
+/* The parser's edges, as the same mutation run found them unpinned. */
+static void test_parser_edges(void)
+{
+    static const struct { const char *esc, *bytes; } UTF8[] = {
+        { "\\u0080", "\xc2\x80" }, { "\\u07FF", "\xdf\xbf" }, { "\\u0800", "\xe0\xa0\x80" },
+        { "\\uD7FF", "\xed\x9f\xbf" }, { "\\uE000", "\xee\x80\x80" }, { "\\uFFFF", "\xef\xbf\xbf" },
+        { "\\U00010000", "\xf0\x90\x80\x80" }, { "\\U0010FFFF", "\xf4\x8f\xbf\xbf" },
+    };
+    static const char *const NOT_CHARS[] = { "\\uD800", "\\uDFFF", "\\U00110000", "\\u0000" };
+    gptps *e = NULL;
+    char text[600], name[300];
+    size_t i;
+    for (i = 0; i < sizeof UTF8 / sizeof UTF8[0]; ++i) {        /* each code point's UTF-8, to the byte */
+        snprintf(text, sizeof text, "[app]\ns = \"%s\"\n", UTF8[i].esc);
+        put(CFG, text);
+        CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+        if (!e) continue;
+        CHECK(gptps_define_global(e, "app.s", GPTPS_SETTING_STRING, "", NULL, 0) == GPTPS_OK);
+        CHECK(has_value(e, "app.s", UTF8[i].bytes));
+        gptps_shutdown(e); e = NULL;
+    }
+    for (i = 0; i < sizeof NOT_CHARS / sizeof NOT_CHARS[0]; ++i) {  /* surrogates, past U+10FFFF, NUL */
+        snprintf(text, sizeof text, "[app]\ns = \"%s\"\n", NOT_CHARS[i]);
+        refused(text, "a \\u escape that is not a character");
+    }
+    /* numbers as a file may spell them */
+    put(CFG, "[app]\nn = +8\nf = .5\ni = -1\nbig = 18446744073709551615\n");
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_define_global(e, "app.n", GPTPS_SETTING_UINT, "0", NULL, 0) == GPTPS_OK);
+        CHECK(gptps_define_global(e, "app.f", GPTPS_SETTING_DOUBLE, "0", NULL, 0) == GPTPS_OK);
+        CHECK(gptps_define_global(e, "app.i", GPTPS_SETTING_INT, "0", NULL, 0) == GPTPS_OK);
+        CHECK(gptps_define_global(e, "app.big", GPTPS_SETTING_UINT, "0", NULL, 0) == GPTPS_OK);
+        CHECK(has_value(e, "app.n", "+8") && has_value(e, "app.f", ".5") && has_value(e, "app.i", "-1"));
+        CHECK(has_value(e, "app.big", "18446744073709551615"));            /* 2^64 - 1 */
+        CHECK(gptps_config_check(e) == GPTPS_OK);
+        gptps_shutdown(e); e = NULL;
+    }
+    put(CFG, "[app]\nf = 1.7976931348623157e308\ng = -1.7976931348623157e308\n");   /* +-DBL_MAX */
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (e) { gptps_shutdown(e); e = NULL; }
+    refused("f = 1.8e308\n", CFG ":1: f: 1.8e308 is too large a number");
+    refused("big = 18446744073709551616\n", CFG ":1: big: 18446744073709551616 is too large a number");   /* 2^64 */
+    refused("big = -9223372036854775809\n", "is too large a number");
+    /* an empty part of a key or table, where the empty part comes first */
+    refused(".a = 1\n", CFG ":1: the key has an empty part");
+    refused("[.a]\nk = 1\n", CFG ":1: the table name has an empty part");
+    /* a table name as long as the parser holds, and one past it */
+    memset(name, 'n', sizeof name);
+    name[255] = 0;
+    snprintf(text, sizeof text, "[%s]\nk = 1\n", name);
+    put(CFG, text);
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);                    /* 255 bytes: kept, waiting */
+    if (e) { gptps_shutdown(e); e = NULL; }
+    name[255] = 'n'; name[256] = 0;
+    snprintf(text, sizeof text, "[%s]\nk = 1\n", name);
+    refused(text, CFG ":1: the table name is too long");
+    /* a key set twice at the top level, not only in a table */
+    refused("x = 1\nx = 2\n", CFG ":2: x is set twice (first on line 1)");
+    /* a line with no key, said two ways */
+    refused("= 1\n", CFG ":1: missing key before =");
+    refused("!x = 1\n", CFG ":1: expected key = value");
+    /* every bad line shown: no "and N more" */
+    refused("[limits\n[scheduler\n", CFG ":2: the table name has no closing ]");
+    CHECK(logged(CFG ":1: the table name has no closing ]") && !logged("more line"));
+    /* an empty file, and one of comments, are a config that sets nothing */
+    put(CFG, "");
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (e) { gptps_shutdown(e); e = NULL; }
+    put(CFG, "# nothing yet\n\n");
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (e) { gptps_shutdown(e); e = NULL; }
+}
+
 static void test_set_ex(void)
 {
     gptps *e = NULL;
@@ -1047,6 +1180,22 @@ static void test_set_ex(void)
     CHECK(gptps_settings_set_ex(e, "limits.max_concurrent_tasks", "4", why, sizeof why) == GPTPS_OK);
     CHECK(why[0] == 0);
     CHECK(gptps_settings_set_ex(e, "limits.max_concurrent_tasks", "5", NULL, 0) == GPTPS_OK);
+    /* the edges a mutation run (tools/mutate.py) found untested: a NULL argument; a
+     * string's own spaces, which only a number loses; a value as long as the buffer
+     * the trim copies it into */
+    CHECK(gptps_settings_set_ex(e, NULL, "4", why, sizeof why) == GPTPS_E_INVAL);
+    CHECK(gptps_settings_set_ex(e, "limits.max_concurrent_tasks", NULL, why, sizeof why) == GPTPS_E_INVAL);
+    CHECK(gptps_define_global(e, "app.label", GPTPS_SETTING_STRING, "x", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_settings_set_ex(e, "app.label", "  padded  ", why, sizeof why) == GPTPS_OK);
+    CHECK(has_value(e, "app.label", "  padded  "));
+    {
+        char longv[GPTPS_SETTINGS_VALUE_MAX + 1];
+        memset(longv, '1', GPTPS_SETTINGS_VALUE_MAX);
+        longv[GPTPS_SETTINGS_VALUE_MAX] = 0;                  /* 256 digits: past the buffer by one */
+        CHECK(gptps_settings_set_ex(e, "limits.max_concurrent_tasks", longv, why, sizeof why) == GPTPS_E_CONFIG);
+        longv[GPTPS_SETTINGS_VALUE_MAX - 1] = 0;              /* 255: fits, and still out of range */
+        CHECK(gptps_settings_set_ex(e, "limits.max_concurrent_tasks", longv, why, sizeof why) == GPTPS_E_CONFIG);
+    }
     /* a live set refuses what would truncate: the per-task keys declare their width */
     CHECK(reg(e, "t") == GPTPS_OK);
     CHECK(gptps_settings_set_ex(e, "tasks.t.timeout_seconds", "4294967296", why, sizeof why) == GPTPS_E_CONFIG);
@@ -1074,6 +1223,8 @@ int main(void)
     test_callback_mark();
     test_addon_lifecycle();
     test_watch_while_setting();
+    test_save_placement();
+    test_parser_edges();
     gptps_set_log_sink(NULL, NULL);
     remove(CFG);
     if (fails) { printf("%d config check(s) FAILED\n", fails); return 1; }

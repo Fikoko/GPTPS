@@ -120,6 +120,24 @@ Two kinds of test are especially welcome, because they catch what unit tests do 
   curve (does doubling `n` double the time?) rather than an absolute rate, so it means
   the same thing on a laptop and a loaded runner.
 
+**Does the test notice when the code is wrong?** A test that passes against a broken
+build checks nothing. `tools/mutate.py` finds out: it breaks the code you changed, one
+small change at a time - `==` for `!=`, `&&` for `||`, a negated `if` - and runs the
+tests that should notice:
+
+```sh
+python3 tools/mutate.py --since origin/main --test 'config_strict|toml'
+python3 tools/mutate.py --file src/settings.c --lines 600-780 --test config_strict \
+        --cmake-args "-DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS=-fsanitize=address,undefined"
+python3 tools/mutate.py --file src/engine.c --sample 200 --test . --exclude '_perf$|bench'
+```
+
+It works on a copy of your tree and lists each change that no test caught. Read every
+survivor: it is either a weak test, or a change that makes no difference (`<` for `<=`
+on a value that is never equal). With a sanitizer build it also catches what only shows
+as memory damage, such as an off-by-one copy. A file like `engine.c` has over a thousand
+such changes; `--sample` tests a random few hundred and estimates the score from them.
+
 Register a test in `CMakeLists.txt` with a `TIMEOUT`. POSIX-only tests go inside the
 `if(UNIX)` block. If you add a test that cannot run under QEMU (fork/exec, `dlopen`,
 TTY), add its name to the `cross` job's exclusion list in `.github/workflows/ci.yml` —
