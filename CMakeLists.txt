@@ -839,6 +839,19 @@ add_test(NAME tui COMMAND test_tui)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 endif()
 
+# docs/CONFIG.md is generated from the settings registry (tools/gptps_config_reference.c);
+# this fails while the two disagree. It reads the shipped add-ons' keys too, so it
+# needs them built.
+if(TARGET gptps_tui AND TARGET gptps_gpu_quota)
+add_executable(gptps_config_reference tools/gptps_config_reference.c)
+target_include_directories(gptps_config_reference
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(gptps_config_reference PRIVATE gptps_tui gptps_gpu_quota)
+add_test(NAME config_reference
+         COMMAND gptps_config_reference --check ${CMAKE_CURRENT_SOURCE_DIR}/docs/CONFIG.md)
+set_tests_properties(config_reference PROPERTIES TIMEOUT 30)
+endif()
+
 endif() # GPTPS_BUILD_TESTS
 
 if(GPTPS_BUILD_EXAMPLES)
