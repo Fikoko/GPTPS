@@ -16,6 +16,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <locale.h>   /* the decimal point, for numbers shown as they are typed */
 #include <stdarg.h>
 #include <stdint.h>
 
@@ -112,7 +113,7 @@ struct gptps_tui {
     int              prompt_kind;   /* TUI_PK_*: active text prompt / confirm */
     char             prompt_name[128];  /* stash carried across prompt steps (clone/new/delete target) */
     char             edit_key[320]; /* settings key being edited in the detail pane */
-    char             status[160];   /* last save/validation message + dashboard action toast */
+    char             status[320];   /* last save/validation message + dashboard action toast */
     uint64_t         status_ms;     /* when the toast was set (it fades after a few seconds) */
     int              cols, rows;    /* terminal size: run() refreshes it; 80x24 headless default */
     int              quit, show_tasks, show_recent;
@@ -296,32 +297,187 @@ static const char *a_ud(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\
 static const char *a_lt(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x90"             : "Left";  }
 static const char *a_rt(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x92"             : "Right"; }
 
+/* terminal width clamped to a sane drawing range */
+static int draw_width(const gptps_tui *t) { int W = t->cols > 0 ? t->cols : 80; if (W < 24) W = 24; if (W > 200) W = 200; return W; }
+
+/* A number with '.' for its decimal point whatever the locale: the form a value is
+ * typed in, and the form a config file holds. */
+static void fmt_num(char *b, size_t cap, double v)
+{
+    const char *dp = localeconv()->decimal_point;
+    char *at;
+    int p;
+    if (v > -1e15 && v < 1e15 && (double)(long long)v == v) {
+        snprintf(b, cap, "%.0f", v);       /* a whole number as one: 10, not 1e+01 */
+    } else {
+        for (p = 1; p <= 17; ++p) {        /* the shortest that reads back: 0.1, not 0.10000000000000001 */
+            snprintf(b, cap, "%.*g", p, v);
+            if (strtod(b, NULL) == v) break;
+        }
+    }
+    if (dp && *dp && strcmp(dp, ".") != 0 && (at = strstr(b, dp)) != NULL) {
+        size_t dl = strlen(dp);
+        *at = '.';
+        memmove(at + 1, at + dl, strlen(at + dl) + 1);
+    }
+}
+
+/* What a setting takes, in words: "whole number, 0 to 65536", "one of: drop requeue". */
+static void setting_kind(const gptps_setting_info *in, char *out, size_t cap)
+{
+    char range[96];
+    range[0] = 0;
+    if (in->has_range) {
+        char a[40], b[40];
+        fmt_num(a, sizeof a, in->min);
+        fmt_num(b, sizeof b, in->max);
+        snprintf(range, sizeof range, ", %s to %s", a, b);
+    }
+    switch (in->type) {
+        case GPTPS_SETTING_INT:    snprintf(out, cap, "whole number%s", range); break;
+        case GPTPS_SETTING_UINT:   snprintf(out, cap, "whole number%s", *range ? range : ", 0 or more"); break;
+        case GPTPS_SETTING_DOUBLE: snprintf(out, cap, "number%s", range); break;
+        case GPTPS_SETTING_BOOL:   snprintf(out, cap, "true or false"); break;
+        case GPTPS_SETTING_STRING: snprintf(out, cap, "text"); break;
+        case GPTPS_SETTING_ENUM: default: {
+            const char *const *c;
+            size_t k = (size_t)snprintf(out, cap, "one of:");
+            for (c = in->choices; c && *c && k < cap; ++c) k += (size_t)snprintf(out + k, cap - k, " %s", *c);
+            break;
+        }
+    }
+}
+
+/* " (46.9 GiB)" after a *_bytes value of 1 KiB or more; "" otherwise. */
+static void bytes_hint(const char *key, const char *v, char *out, size_t cap)
+{
+    static const char *const U[] = { "KiB", "MiB", "GiB", "TiB", "PiB", "EiB" };
+    size_t kl = strlen(key);
+    double x;
+    int u = -1;
+    out[0] = 0;
+    if (kl < 6 || strcmp(key + kl - 6, "_bytes") != 0) return;
+    x = strtod(v, NULL);
+    while (x >= 1024.0 && u < 5) { x /= 1024.0; ++u; }
+    if (u >= 0) snprintf(out, cap, " (%.1f %s)", x, U[u]);
+}
+
+/* The selected setting, explained: its key, what it does (word-wrapped to the
+ * width, three lines at most), what it takes, its default, and when it applies. */
+static size_t setting_details(gptps_tui *t, char *buf, size_t cap, size_t pos, const gptps_setting_info *in)
+{
+    int color = t->cfg.color, W = draw_width(t) - 4, lines = 0;
+    const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
+    const char *p = in->desc ? in->desc : "";
+    char kind[320];
+    if (W < 20) W = 20;
+    pos = appendf(buf, cap, pos, "\n  %s%s%s\n", B, in->key, X);
+    while (*p && lines < 3) {                       /* word wrap */
+        int n = (int)strlen(p);
+        if (n > W) {
+            n = W;
+            while (n > 0 && p[n] != ' ') --n;
+            if (n == 0) n = W;
+            if (lines == 2) {                       /* the last line: cut, and say so */
+                pos = appendf(buf, cap, pos, "  %.*s...\n", n, p);
+                break;
+            }
+        }
+        pos = appendf(buf, cap, pos, "  %.*s\n", n, p);
+        p += n;
+        while (*p == ' ') ++p;
+        ++lines;
+    }
+    setting_kind(in, kind, sizeof kind);
+    pos = appendf(buf, cap, pos, "  %s%s \xc2\xb7 default %s \xc2\xb7 %s%s\n", D, kind, in->defval[0] ? in->defval : "(empty)",
+                  in->hot ? "applies at once" : "applies at the next start (save with w, then restart)", X);
+    return pos;
+}
+
+/* The rows a settings list may use: what the terminal has, less the title, the
+ * details, the edit and status lines and the key legend. */
+static int list_rows(const gptps_tui *t)
+{
+    int r = (t->rows > 0 ? t->rows : 24) - 13;
+    return r < 3 ? 3 : r;
+}
+
 /* Settings pane (no t->mu: reads only run-thread-local pane state + the registry,
  * whose get_info takes its own locks - holding t->mu here would deadlock the tui
- * read_fns). */
+ * read_fns). The list scrolls to keep the selection in view; the selected
+ * setting is explained under it. */
 static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0, i, n;
-    int color = t->cfg.color;
+    int color = t->cfg.color, kw = 20, rows = list_rows(t), first;
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
+    gptps_setting_info info, sel;
+    int have_sel = 0;
+    memset(&sel, 0, sizeof sel);
     n = gptps_settings_count(t->e);
     if (t->sel < 0) t->sel = 0;
     if (n && (size_t)t->sel >= n) t->sel = (int)n - 1;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s settings%s  (%lu)\n\n", B, t->cfg.title, X, (unsigned long)n);
-    for (i = 0; i < n; ++i) {
-        gptps_setting_info info;
+    for (i = 0; i < n; ++i) {                       /* the key column fits the longest key */
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        if (gptps_settings_get_info(t->e, i, &info) == GPTPS_OK && (int)strlen(info.key) > kw) kw = (int)strlen(info.key);
+    }
+    if (kw > 44) kw = 44;
+    first = t->sel - rows / 2;
+    if (first > (int)n - rows) first = (int)n - rows;
+    if (first < 0) first = 0;
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 settings%s  %s(%d of %lu)%s\n\n", B, t->cfg.title, X,
+                  D, n ? t->sel + 1 : 0, (unsigned long)n, X);
+    for (i = (size_t)first; i < n && (int)(i - (size_t)first) < rows; ++i) {
+        char hint[32];
         memset(&info, 0, sizeof info); info.struct_size = sizeof info;
         if (gptps_settings_get_info(t->e, i, &info) != GPTPS_OK) continue;
-        pos = appendf(buf, cap, pos, "%s%s%-32s = %-18s %s%s\n",
+        bytes_hint(info.key, info.value, hint, sizeof hint);
+        if (i == (size_t)t->sel) { sel = info; have_sel = 1; }
+        pos = appendf(buf, cap, pos, "%s%s%-*s = %s%s%s %s%s\n",
                       (i == (size_t)t->sel) ? INV : "", (i == (size_t)t->sel) ? "> " : "  ",
-                      info.key, info.value, info.hot ? "" : "(restart)", X);
+                      kw, info.key, info.value, hint, X, info.hot ? "" : "(restart)", X);
     }
-    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_\n", B, X, t->editbuf);
+    if (have_sel) pos = setting_details(t, buf, cap, pos, &sel);
+    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_  %s(Enter applies, Esc cancels)%s\n", B, X, t->editbuf, D, X);
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
+}
+
+/* After a set: what happened, in the status line. */
+static void set_status(gptps_tui *t, const char *key, const char *value, gptps_status st, const char *why)
+{
+    if (st == GPTPS_OK) {
+        gptps_setting_info info;
+        size_t i, n = gptps_settings_count(t->e);
+        int hot = 1;
+        for (i = 0; i < n; ++i) {
+            memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+            if (gptps_settings_get_info(t->e, i, &info) == GPTPS_OK && !strcmp(info.key, key)) { hot = info.hot; break; }
+        }
+        snprintf(t->status, sizeof t->status, "set %.80s = %.80s%s", key, value,
+                 hot ? "" : " - applies at the next start; w saves it");
+    } else {
+        snprintf(t->status, sizeof t->status, "not set: %.240s", why && *why ? why : gptps_strerror(st));
+    }
+    t->status_ms = gptps_now_ms(NULL);
+}
+
+/* After w: where it went, or why it did not. */
+static void save_status(gptps_tui *t, gptps_status st)
+{
+    const char *where = t->cfg.settings_path ? t->cfg.settings_path : "the config file";
+    switch (st) {
+        case GPTPS_OK:       snprintf(t->status, sizeof t->status, "saved your changes to %.200s", where); break;
+        case GPTPS_E_INVAL:  snprintf(t->status, sizeof t->status, "nowhere to save: the engine has no config file "
+                                      "(set gptps_tui_config.settings_path)"); break;
+        case GPTPS_E_CONFIG: snprintf(t->status, sizeof t->status, "not saved: %.160s has an error (see the log); "
+                                      "it was left as it is", where); break;
+        default:             snprintf(t->status, sizeof t->status, "not saved: %s", gptps_strerror(st)); break;
+    }
+    t->status_ms = gptps_now_ms(NULL);
 }
 
 /* set a transient action message ("toast") shown briefly on the dashboard */
@@ -334,8 +490,6 @@ static void toast(gptps_tui *t, const char *fmt, ...)
     t->status_ms = gptps_now_ms(NULL);
 }
 
-/* terminal width clamped to a sane drawing range */
-static int draw_width(const gptps_tui *t) { int W = t->cols > 0 ? t->cols : 80; if (W < 24) W = 24; if (W > 200) W = 200; return W; }
 
 /* full-width inverse title bar (color mode): left title, right-aligned stats */
 static size_t titlebar(char *buf, size_t cap, size_t pos, gptps_tui *t, int W, double up, double rate)
@@ -343,7 +497,7 @@ static size_t titlebar(char *buf, size_t cap, size_t pos, gptps_tui *t, int W, d
     char line[256], stats[64];
     int len, sl;
     if (W > (int)sizeof line - 1) W = (int)sizeof line - 1;
-    len = snprintf(line, sizeof line, " GPTPS  %s", t->cfg.title ? t->cfg.title : "tasks");
+    len = snprintf(line, sizeof line, " GPTPS  %s", t->cfg.title);
     if (len < 0) len = 0;
     sl = snprintf(stats, sizeof stats, "up %.1fs  %.1f done/s ", up, rate);
     if (sl > 0 && len + 2 + sl <= W) { while (len < W - sl) line[len++] = ' '; memcpy(line + len, stats, (size_t)sl); len += sl; }
@@ -368,8 +522,7 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     size_t pos = 0;
     int color = t->cfg.color;
     const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
-    const char *title = t->cfg.title ? t->cfg.title : "tasks";
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 help%s\n\n", B, title, X);
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 help%s\n\n", B, t->cfg.title, X);
     pos = appendf(buf, cap, pos, "%sDashboard%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s submit its task\n", "<hotkey>");
     pos = appendf(buf, cap, pos, "  %-9s scroll the event log (older / newer)\n", "k / j");
@@ -382,9 +535,10 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "  %-9s quit\n", "q / Esc");
     pos = appendf(buf, cap, pos, "  %s%-9s Up/Down move, Right select, Left back (= k / j / Enter / Esc)%s\n\n", D, "Arrows", X);
     pos = appendf(buf, cap, pos, "%sSettings editor%s\n", B, X);
-    pos = appendf(buf, cap, pos, "  %-9s move selection\n", "k / j");
-    pos = appendf(buf, cap, pos, "  %-9s edit value (Enter commit, Esc cancel)\n", "Enter");
-    pos = appendf(buf, cap, pos, "  %-9s save settings to file\n", "w");
+    pos = appendf(buf, cap, pos, "  %-9s move; the selected setting is explained under the list\n", "k / j");
+    pos = appendf(buf, cap, pos, "  %-9s edit its value (Enter applies, Esc cancels)\n", "Enter");
+    pos = appendf(buf, cap, pos, "  %-9s save the values you changed into the config file, in place\n", "w");
+    pos = appendf(buf, cap, pos, "  %-9s %s(the file keeps its comments and the lines you did not change)%s\n", "", D, X);
     pos = appendf(buf, cap, pos, "  %-9s back to dashboard\n", "s / Esc");
     pos = appendf(buf, cap, pos, "\n%sTask manager%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s inspect a task's settings\n", "Enter");
@@ -491,27 +645,44 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
 static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0;
-    int color = t->cfg.color, c = 0, shown;
+    int color = t->cfg.color, c = 0, shown, kw = 16, rows = list_rows(t), first, have_sel = 0;
     char prefix[160];   /* "tasks.<name>." - sized for the full detail_task buffer */
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
     size_t i, n = gptps_settings_count(t->e), plen;
+    gptps_setting_info info, sel;
+    memset(&sel, 0, sizeof sel);
     snprintf(prefix, sizeof prefix, "tasks.%s.", t->detail_task);
     plen = strlen(prefix);
     shown = count_prefixed(t, prefix);
     if (t->detail_sel < 0) t->detail_sel = 0;
     if (shown && t->detail_sel >= shown) t->detail_sel = shown - 1;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 task '%s'%s  (%d settings)\n\n", B, t->detail_task, X, shown);
+    for (i = 0; i < n; ++i) {
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        if (gptps_settings_get_info(t->e, i, &info) == GPTPS_OK && strncmp(info.key, prefix, plen) == 0 &&
+            (int)strlen(info.key + plen) > kw) kw = (int)strlen(info.key + plen);
+    }
+    if (kw > 40) kw = 40;
+    first = t->detail_sel - rows / 2;
+    if (first > shown - rows) first = shown - rows;
+    if (first < 0) first = 0;
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 task '%s'%s  %s(%d settings)%s\n\n", B, t->detail_task, X, D, shown, X);
     if (shown == 0) pos = appendf(buf, cap, pos, "  %s(task no longer present)%s\n", D, X);
     for (i = 0; i < n; ++i) {
-        gptps_setting_info info; memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        char hint[32];
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
         if (gptps_settings_get_info(t->e, i, &info) != GPTPS_OK) continue;
         if (strncmp(info.key, prefix, plen) != 0) continue;
-        pos = appendf(buf, cap, pos, "%s%s%-22s = %-18s %s%s\n",
-                      (c == t->detail_sel) ? INV : "", (c == t->detail_sel) ? "> " : "  ",
-                      info.key + plen, info.value, info.hot ? "" : "(restart)", X);
+        if (c == t->detail_sel) { sel = info; have_sel = 1; }
+        if (c >= first && c < first + rows) {
+            bytes_hint(info.key, info.value, hint, sizeof hint);
+            pos = appendf(buf, cap, pos, "%s%s%-*s = %s%s%s %s%s\n",
+                          (c == t->detail_sel) ? INV : "", (c == t->detail_sel) ? "> " : "  ",
+                          kw, info.key + plen, info.value, hint, X, info.hot ? "" : "(restart)", X);
+        }
         ++c;
     }
-    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_\n", B, X, t->editbuf);
+    if (have_sel) pos = setting_details(t, buf, cap, pos, &sel);
+    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_  %s(Enter applies, Esc cancels)%s\n", B, X, t->editbuf, D, X);
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
@@ -662,9 +833,12 @@ static int settings_press(gptps_tui *t, int key)
         if (key == '\r' || key == '\n') {                                                 /* commit */
             memset(&info, 0, sizeof info); info.struct_size = sizeof info;
             if (gptps_settings_get_info(t->e, (size_t)t->sel, &info) == GPTPS_OK) {
-                gptps_status st = gptps_settings_set(t->e, info.key, t->editbuf);
-                if (st == GPTPS_OK) snprintf(t->status, sizeof t->status, "set %.70s = %.70s", info.key, t->editbuf);
-                else                snprintf(t->status, sizeof t->status, "rejected: %s", gptps_strerror(st));
+                char why[256], key[320];
+                gptps_status st;
+                /* info.key lives as long as the setting: another thread may remove it */
+                snprintf(key, sizeof key, "%s", info.key);
+                st = gptps_settings_set_ex(t->e, key, t->editbuf, why, sizeof why);
+                set_status(t, key, t->editbuf, st, why);
             }
             t->editing = 0; t->editbuf[0] = 0; t->editlen = 0;
             return 4;
@@ -685,11 +859,7 @@ static int settings_press(gptps_tui *t, int key)
                 t->editlen = (int)strlen(t->editbuf); t->editing = 1;
             }
             return 4;
-        case 'w': case 'W': {
-            gptps_status st = gptps_settings_save(t->e, t->cfg.settings_path);
-            snprintf(t->status, sizeof t->status, st == GPTPS_OK ? "saved" : "save failed: %s", gptps_strerror(st));
-            return 4;
-        }
+        case 'w': case 'W': save_status(t, gptps_settings_save(t->e, t->cfg.settings_path)); return 4;
         default: return 4;
     }
 }
@@ -829,9 +999,9 @@ static int detail_press(gptps_tui *t, int key)
     if (t->editing) {
         if (key == 27) { t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; return 4; }
         if (key == '\r' || key == '\n') {
-            gptps_status st = gptps_settings_set(t->e, t->edit_key, t->editbuf);
-            if (st == GPTPS_OK) toast(t, "set %.60s = %.60s", t->edit_key, t->editbuf);
-            else                toast(t, "rejected: %s", gptps_strerror(st));
+            char why[256];
+            gptps_status st = gptps_settings_set_ex(t->e, t->edit_key, t->editbuf, why, sizeof why);
+            set_status(t, t->edit_key, t->editbuf, st, why);
             t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; return 4;
         }
         if (key == 8 || key == 127) { if (t->editlen > 0) t->editbuf[--t->editlen] = 0; return 4; }
@@ -850,12 +1020,7 @@ static int detail_press(gptps_tui *t, int key)
                 t->editlen = (int)strlen(t->editbuf); t->editing = 1;
             }
             return 4;
-        case 'w': case 'W': {
-            gptps_status st = gptps_settings_save(t->e, t->cfg.settings_path);
-            if (st == GPTPS_OK) toast(t, "saved");
-            else                toast(t, "save failed: %s", gptps_strerror(st));
-            return 4;
-        }
+        case 'w': case 'W': save_status(t, gptps_settings_save(t->e, t->cfg.settings_path)); return 4;
         default: return 4;
     }
 }
@@ -1130,6 +1295,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     mu_init(&t->mu);
     t->e = e;
     if (cfg) t->cfg = *cfg;
+    if (!t->cfg.title) t->cfg.title = "tasks";   /* every pane prints it */
     if (!t->cfg.out) t->cfg.out = stdout;
     if (t->cfg.refresh_ms == 0) t->cfg.refresh_ms = 250;
     if (t->cfg.color < 0)       t->cfg.color = fd_is_tty(t->cfg.out);

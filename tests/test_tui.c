@@ -258,6 +258,29 @@ int main(void)
         } else { gptps_shutdown(e2); }
     }
 
+    /* ---- no title: every pane says "tasks", none prints "(null)" ---- */
+    {
+        gptps *e3; gptps_tui *t3; gptps_tui_config c3;
+        memset(&c3, 0, sizeof c3); c3.struct_size = sizeof c3;
+        c3.color = 0; c3.interactive = 0;                 /* title left NULL */
+        CHECK(gptps_open(NULL, &e3) == GPTPS_OK);
+        t3 = gptps_tui_install(e3, &c3);
+        CHECK(t3 != NULL);
+        if (t3) {
+            static const int keys[] = { 0, 's', 27, 't', 27, 'l', 27, '?' };
+            size_t k;
+            char f3[8192];
+            for (k = 0; k < sizeof keys / sizeof keys[0]; ++k) {
+                if (keys[k]) gptps_tui_press(t3, keys[k]);
+                gptps_tui_render(t3, f3, sizeof f3);
+                CHECK(strstr(f3, "(null)") == NULL);
+                CHECK(strstr(f3, "tasks") != NULL);
+            }
+            gptps_shutdown(e3);
+            gptps_tui_close(t3);
+        } else { gptps_shutdown(e3); }
+    }
+
     /* ---- Settings pane: open, navigate, edit inline, save (headless) ---- */
     {
         int guard;
@@ -272,6 +295,12 @@ int main(void)
             gptps_tui_press(t, 'j');
         }
         CHECK(strstr(frame, "> scheduler.reserve_after_skips") != NULL);
+        /* the selected setting is explained under the list: what it does, what it
+         * takes, its default, and when it applies */
+        CHECK(strstr(frame, "smaller work may pass") != NULL);
+        CHECK(strstr(frame, "whole number, 0 to 4294967295") != NULL);
+        CHECK(strstr(frame, "default 8") != NULL);
+        CHECK(strstr(frame, "applies at once") != NULL);
         /* edit it to 7 */
         CHECK(gptps_tui_press(t, '\r') == 4);            /* begin edit (loads current value) */
         gptps_tui_press(t, 127); gptps_tui_press(t, 127); /* backspace existing */
@@ -291,9 +320,11 @@ int main(void)
             CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", b, sizeof b) == GPTPS_OK && strcmp(b, "7") == 0);
         }
         gptps_tui_render(t, frame, sizeof frame);
-        CHECK(strstr(frame, "rejected") != NULL);
+        CHECK(strstr(frame, "not set: x must be a whole number") != NULL);   /* and says why */
         /* save to the configured path, then back to the dashboard */
         CHECK(gptps_tui_press(t, 'w') == 4);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "saved your changes to tui_settings.toml") != NULL);
         { FILE *sf = fopen("tui_settings.toml", "rb"); CHECK(sf != NULL); if (sf) fclose(sf); remove("tui_settings.toml"); }
         CHECK(gptps_tui_press(t, 's') == 4);             /* back to dashboard */
         gptps_tui_render(t, frame, sizeof frame);
