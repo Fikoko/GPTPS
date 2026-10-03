@@ -1,8 +1,11 @@
 # The HAL: what a port must do, and how it is checked
 
 The HAL, [`include/gptps_hal.h`](../include/gptps_hal.h), is GPTPS's only platform
-seam: 28 functions for the clock, threads, locks, a cancel flag, an acquire/release
-pair, fork safety, hardware detection, dynamic loading and an atomic file replace.
+seam: 24 functions for the clock, threads, locks, an acquire/release pair, fork
+safety, hardware detection, dynamic loading and an atomic file replace. (Four more,
+`gptps_flag_*`, are still declared so existing backends build, but the core no longer
+calls them: each item's cancel flag is a word in the item, on the acquire/release
+pair.)
 Everything else in the core is ISO C99 — it compiles under `-std=c99
 -pedantic-errors` — and calls nothing else of the platform. Two more files are
 platform code without being HAL: the executors for forked and external-program
@@ -33,8 +36,7 @@ CI platform.
 |---|---|---|
 | **The clock never decreases**, on any thread. | Deadlines, backoff and the shutdown grace are differences of readings; a reading that goes back fires a deadline late or waits a backoff twice. | `clock: never decreases`, and `... across threads` |
 | **The clock runs at the rate of real time, in milliseconds.** Any step is fine (Win32's is about 16 ms). | Task timeouts, retry backoff and the grace are configured in real units. An RTOS tick count passed off as milliseconds is the classic port bug. | `clock: runs at the rate of real time` (2 s of `time()`, within 25%) |
-| **A flag reads back the last value set**, and a set on one thread is seen by a read on another. | A timeout or a cancel sets it; the task body polls it through `gptps_is_cancelled`. | `flag: ...` (three checks) |
-| **Acquire/release.** A store-release is seen, with everything before it, by a load-acquire that reads it. | The per-thread callback-depth records pass between threads without a lock. | `acquire/release: a released write is seen ...` (see the limits below) |
+| **Acquire/release.** A store-release is seen, with everything before it, by a load-acquire that reads it, and a polling load sees a store promptly. | Each item's cancel word: a cancel, a deadline or a removal raises it, and the task body polls it through `gptps_is_cancelled`. And the per-thread callback-depth records, which pass between threads without a lock. | `acquire/release: a released write is seen ...` (see the limits below), `... seen by a polling load on another (the cancel path)` |
 | **Mutual exclusion**, with unlock-to-lock ordering. The core never locks a mutex it holds, so a recursive mutex (Win32's `CRITICAL_SECTION`) conforms as well as a non-recursive one. | Every queue and counter in the engine is under one mutex. | `mutex: mutual exclusion` |
 | **A wait releases the mutex while it blocks and holds it again when it returns.** A signal wakes at least one waiter; a broadcast wakes every current waiter. | The worker pool's idle wait and the dispatcher's sleep. | `cond: wait/signal hand-off ...`, `cond: one broadcast wakes every waiter` |
 | **A wait may return spuriously, but not as a rule.** | The core re-checks every predicate in a loop. A wait that returns at once nearly every time turns the worker pool and the dispatcher into spinning loops. | `cond_wait: blocks until a signal, and does not spin`; the `cond_timedwait` checks count calls |

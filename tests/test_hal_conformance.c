@@ -179,28 +179,11 @@ static void check_clock(int freestanding)
     }
 }
 
-/* --- cancel flag, and the acquire/release pair (single thread) ---------------- */
+/* --- the acquire/release pair and the thread id (single thread) ---------------- */
 
-static void check_flag_single(void)
+static void check_word_single(void)
 {
-    gptps_flag *f = gptps_flag_create(false), *g = gptps_flag_create(true);
     uint32_t word = 0;
-    snprintf(why, sizeof why, "gptps_flag_create returned NULL");
-    expect(f && g, "flag: create");
-    if (!f || !g) { gptps_flag_destroy(f); gptps_flag_destroy(g); return; }
-    snprintf(why, sizeof why, "create(false) read %d, create(true) read %d", (int)gptps_flag_get(f), (int)gptps_flag_get(g));
-    expect(!gptps_flag_get(f) && gptps_flag_get(g), "flag: starts at its initial value");
-    gptps_flag_set(f, true);
-    snprintf(why, sizeof why, "read the wrong value back");
-    {
-        int ok = gptps_flag_get(f);
-        gptps_flag_set(f, false);
-        ok = ok && !gptps_flag_get(f);
-        expect(ok, "flag: get returns the last value set");
-    }
-    gptps_flag_destroy(f);
-    gptps_flag_destroy(g);
-
     gptps_hal_store_release_u32(&word, 0xA5A5A5A5u);
     snprintf(why, sizeof why, "stored 0xA5A5A5A5, loaded 0x%08lX", (unsigned long)gptps_hal_load_acquire_u32(&word));
     expect(gptps_hal_load_acquire_u32(&word) == 0xA5A5A5A5u, "acquire/release: a load returns the stored value");
@@ -657,32 +640,34 @@ static void check_message_passing(void)
     expect(t && bad == 0, "acquire/release: a released write is seen after the acquiring load");
 }
 
-/* cancel flag across threads: the watchdog sets it, the task polls it. */
-typedef struct { gptps_flag *f; uint64_t seen_at; } poller;
+/* The cancel path: a cancel, a deadline or a removal stores an item's cancel word
+ * with release on one thread, and the task body polls it with acquire on another
+ * (gptps_is_cancelled). The poll must see the store, promptly. */
+typedef struct { uint32_t word; uint64_t seen_at; } poller;
 
-static void *poll_flag(void *arg)
+static void *poll_word(void *arg)
 {
     poller *p = (poller *)arg;
-    while (!gptps_flag_get(p->f)) nap(1);
+    while (!gptps_hal_load_acquire_u32(&p->word)) nap(1);
     p->seen_at = now();
     return NULL;
 }
 
-static void check_flag_threads(void)
+static void check_cancel_word(void)
 {
     poller p;
     gptps_thread *t;
     uint64_t set_at;
-    watch("flag: a set on one thread is seen by a poll on another");
-    p.f = gptps_flag_create(false); p.seen_at = 0;
-    t = gptps_thread_start(poll_flag, &p);
+    const char *what = "acquire/release: a store on one thread is seen by a polling load on another (the cancel path)";
+    watch(what);
+    p.word = 0; p.seen_at = 0;
+    t = gptps_thread_start(poll_word, &p);
     nap(50);
     set_at = now();
-    gptps_flag_set(p.f, true);
+    gptps_hal_store_release_u32(&p.word, 1u);
     if (t) gptps_thread_join(t);
-    gptps_flag_destroy(p.f);
-    snprintf(why, sizeof why, "seen %lld ms after it was set", (long long)(p.seen_at - set_at));
-    expect(t && p.seen_at - set_at <= 5000, "flag: a set on one thread is seen by a poll on another");
+    snprintf(why, sizeof why, "seen %lld ms after it was stored", (long long)(p.seen_at - set_at));
+    expect(t && p.seen_at - set_at <= 5000, what);
 }
 
 /* The clock across threads: a reading taken after another thread's (ordered by the
@@ -753,7 +738,7 @@ int main(int argc, char **argv)
     }
     check_detect();
     check_clock(freestanding);
-    check_flag_single();
+    check_word_single();
     check_locks_single();
     check_fork(freestanding);
     if (module) check_dl(freestanding, module);
@@ -791,7 +776,7 @@ int main(int argc, char **argv)
             check_wake(UINT64_MAX, "cond_timedwait(UINT64_MAX): a signal wakes it, and it does not spin");
             check_thread_ids();
             check_message_passing();
-            check_flag_threads();
+            check_cancel_word();
             gptps_mutex_lock(wd_m); wd_stop = 1; gptps_cond_signal(wd_c); gptps_mutex_unlock(wd_m);
             gptps_thread_join(wd);
         }

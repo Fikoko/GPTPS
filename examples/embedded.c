@@ -6,9 +6,10 @@
  * The "bare-metal shape": NO worker/dispatcher threads (GPTPS_RUN_MANUAL, driven
  * by gptps_step) and a static-arena allocator (gptps_set_allocator routes every
  * CORE allocation into the arena instead of the libc heap). Built as a hosted
- * program so CI can run it, it still links the stock POSIX HAL, whose own
- * primitives (the per-item cancel flag, the mutex) use libc malloc - so this
- * particular binary is not literally libc-heap-free. A real MCU/RTOS port swaps
+ * program so CI can run it, it still links the stock POSIX HAL, whose mutex and
+ * condition variables, created at open, use libc malloc - so this particular
+ * binary is not literally libc-heap-free (no allocation per item reaches libc:
+ * each item's cancel flag lives inside the item). A real MCU/RTOS port swaps
  * in a HAL backend (hal_<target>.c); for a genuinely no-libc-heap, no-pthread/dl
  * build see the freestanding/ reference (stub HAL + static pool, -ffreestanding).
  *

@@ -299,8 +299,9 @@ The only platform-specific seam. Pure C99 interface; each backend uses the best
 primitive its platform offers, and **all atomics are confined to the backend**
 so the core never includes an `_Atomic` type.
 
-Surface: hardware detection (CPU/RAM/GPU hint), monotonic clock, the cancel flag
-(opaque, atomic inside), mutex / condvar / thread, dynamic loading, and atomic
+Surface: hardware detection (CPU/RAM/GPU hint), monotonic clock, an acquire/release
+`u32` pair (each item's cancel flag is a word in the item, read and written through
+it), mutex / condvar / thread, dynamic loading, and atomic
 file replace (`gptps_hal_atomic_replace`, for the settings save). Its contract —
 clause by clause, with what the core needs each clause for — is in
 [`docs/HAL.md`](HAL.md), and `tests/test_hal_conformance.c` holds every backend to
@@ -323,8 +324,8 @@ this interface, build it in with `-DGPTPS_HAL_SOURCE=<file>`, and run
 `ctest -R hal_conformance`: [`docs/HAL.md`](HAL.md) is the checklist. In MANUAL
 mode (§3.1) the required subset is small, because a single-threaded host calls no
 wait and starts no thread: mutex and condvar create/destroy/lock/unlock/signal/
-broadcast (no-ops will do), the cancel flag, the monotonic clock, the thread id and
-the acquire/release `u32` pair (a constant and plain accesses will do), the
+broadcast (no-ops will do), the monotonic clock, the thread id and the
+acquire/release `u32` pair (a constant and plain accesses will do), the
 fork-guard pair (a constant), and hardware detection (return `cpu_count = 1`).
 `dlopen` and `atomic_replace` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use
 dynamic add-ons or settings persistence. `freestanding/hal_stub.c` is exactly that,

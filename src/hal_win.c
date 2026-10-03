@@ -44,7 +44,7 @@ uint64_t gptps_hal_monotonic_ms(void)
     return (uint64_t)GetTickCount64(); /* ms since boot; monotonic, never wraps in practice */
 }
 
-/* --- cancel flag (atomic LONG) ------------------------------------------- */
+/* --- cancel flag (atomic LONG): no longer called by the core; see gptps_hal.h */
 struct gptps_flag { volatile LONG v; };
 
 gptps_flag *gptps_flag_create(bool initial)

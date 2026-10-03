@@ -11,7 +11,7 @@
 #include "gptps_internal.h"
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len)
 {
     (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel;
@@ -21,7 +21,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 }
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len)
 {
     (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel;

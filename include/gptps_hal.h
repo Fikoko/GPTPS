@@ -49,13 +49,11 @@ gptps_status gptps_hal_detect(gptps_hwinfo *out);
  * the engine, but its deadlines and backoff are then not in milliseconds. */
 uint64_t gptps_hal_monotonic_ms(void);
 
-/* --- cancel flag --------------------------------------------------------- *
- * Opaque + heap-allocated so the _Atomic / __atomic storage stays confined to
- * the HAL implementation. The watchdog thread calls _set(); the task thread
- * polls via gptps_is_cancelled() which reads _get(). _get returns the last value
- * set (or the initial one), and a set on one thread is seen by a _get on another.
- * Correct under the C memory model on the real path (compiler atomics); see
- * hal_posix.c for the pre-builtin fallback caveat.
+/* --- cancel flag: NO LONGER CALLED BY THE CORE --------------------------- *
+ * The core keeps each item's cancel flag inside the item, as a word it writes and
+ * reads with gptps_hal_store_release_u32 / gptps_hal_load_acquire_u32 below, so a
+ * submit allocates nothing in the HAL. These four stay declared so existing
+ * backends still build; a new backend may leave them out.
  */
 typedef struct gptps_flag gptps_flag;
 

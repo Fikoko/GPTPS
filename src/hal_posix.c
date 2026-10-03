@@ -43,7 +43,8 @@
 #endif
 
 /* ------------------------------------------------------------------------- */
-/* cancel flag                                                               */
+/* cancel flag - the core no longer calls these (see gptps_hal.h); kept so     */
+/* anything built against the older contract still links                      */
 /* ------------------------------------------------------------------------- */
 
 struct gptps_flag {

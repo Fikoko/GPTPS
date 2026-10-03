@@ -73,7 +73,7 @@
  * success. Callers must refuse to interpret wstatus when *reaped is 0.
  * Returns GPTPS_OK if the child exited on its own, else why it had to be killed. */
 static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group,
-                                 uint64_t deadline, gptps_flag *cancel)
+                                 uint64_t deadline, const uint32_t *cancel)
 {
     gptps_status why = GPTPS_OK;
     int waited = 0;
@@ -89,7 +89,7 @@ static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group
         if (why == GPTPS_OK) {
             uint64_t now = gptps_hal_monotonic_ms();
             if (deadline && now >= deadline)              why = GPTPS_E_TIMEOUT;
-            else if (cancel && gptps_flag_get(cancel))    why = GPTPS_E_CANCELLED;
+            else if (cancel && gptps_hal_load_acquire_u32(cancel))    why = GPTPS_E_CANCELLED;
             else if (waited >= GPTPS_EXEC_EXIT_GRACE_MS)  why = GPTPS_E_TIMEOUT;
             if (why != GPTPS_OK) { if (group) kill(-pid, SIGKILL); else kill(pid, SIGKILL); }
         }
@@ -309,7 +309,7 @@ static int read_all(int fd, void *buf, size_t n)
 }
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len)
 {
     int p[2];
@@ -392,7 +392,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             pr = poll(&pfd, 1, slice);
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
-            if (cancel && gptps_flag_get(cancel)) { kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
+            if (cancel && gptps_hal_load_acquire_u32(cancel)) { kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
             /* a genuine poll error must kill (killed=1 skips the blocking read_all below,
              * which would otherwise hang this worker on a still-live child). */
             if (pr < 0) { if (errno == EINTR) continue; kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_IO; break; }
@@ -452,7 +452,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #define GPTPS_PROG_RESULT_CAP GPTPS_EXEC_RESULT_CAP /* max captured stdout */
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len)
 {
     const char *const *argv = def ? def->argv : NULL;
@@ -581,7 +581,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             pr = poll(pfd, (nfds_t)nfd, slice);
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
-            if (cancel && gptps_flag_get(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; kill(-pid, SIGKILL); break; }
+            if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; kill(-pid, SIGKILL); break; }
             /* a genuine poll error (e.g. ENOMEM) must still kill the child, or the
              * blocking waitpid below would hang this worker on a still-live child -
              * the very thing this executor promises never to do. */

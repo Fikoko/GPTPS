@@ -34,7 +34,7 @@
 #endif
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len)
 {
     (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel;
@@ -122,7 +122,7 @@ static DWORD WINAPI reader_proc(LPVOID p)
 }
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len)
 {
     const char *const *argv = def ? def->argv : NULL;
@@ -212,7 +212,7 @@ return GPTPS_E_NOMEM; }
             if (waited == WAIT_OBJECT_0) break;                       /* child exited */
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
-            if (cancel && gptps_flag_get(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
+            if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
             if (waited == WAIT_FAILED) { killed = 1; kill_st = GPTPS_E_IO; break; } /* defensive: never spin */
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }

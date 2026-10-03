@@ -8,7 +8,7 @@
 #define GPTPS_INTERNAL_H
 
 #include "gptps.h"
-#include "gptps_hal.h"   /* gptps_flag (executor cancel), gptps_hal_monotonic_ms */
+#include "gptps_hal.h"   /* the acquire/release pair (executor cancel), gptps_hal_monotonic_ms */
 
 #include <stddef.h>   /* offsetof */
 
@@ -118,7 +118,7 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
  * cancel is never mistaken for a deadline breach. A child that stops talking without
  * exiting is reaped with a bounded grace period, never an unbounded waitpid(). */
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len);
 
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
@@ -171,7 +171,7 @@ size_t          gptps_settings_remove_task(gptps_settings *r, const void *owner,
  * child closed its output, NOT that it exited, so the reap is bounded: a program that
  * goes silent and keeps running is SIGKILLed after a grace period. */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, gptps_flag *cancel,
+                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len);
 
 #endif /* GPTPS_INTERNAL_H */

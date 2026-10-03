@@ -368,6 +368,18 @@ target_link_libraries(test_admission_perf PRIVATE gptps)
 add_test(NAME admission_perf COMMAND test_admission_perf)
 set_tests_properties(admission_perf PROPERTIES TIMEOUT 120)
 
+# White-box: the handle index's open addressing, against a reference model. It
+# includes engine.c (the index is static), so it links the rest of the core beside it.
+set(_gptps_src_but_engine ${GPTPS_SRC})
+list(REMOVE_ITEM _gptps_src_but_engine src/engine.c)
+add_executable(test_hidx tests/test_hidx.c ${_gptps_src_but_engine})
+target_include_directories(test_hidx
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_hidx PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+add_test(NAME hidx COMMAND test_hidx)
+set_tests_properties(hidx PROPERTIES TIMEOUT 120)
+
 # The same kind of gate for gptps_cancel: finding and unlinking an item stays O(1) in
 # queue depth, in intake and in `delayed`, and a cancel never costs the next submit.
 add_executable(test_cancel_perf tests/test_cancel_perf.c)

@@ -9,7 +9,7 @@ the release version and is documented in `include/gptps.h`.
 
 ### Added — a conformance test for the HAL, and a HAL that takes every freedom it allows
 
-- **`tests/test_hal_conformance.c` holds a HAL to its contract.** It has 40 checks:
+- **`tests/test_hal_conformance.c` holds a HAL to its contract.** It has 37 checks:
   - the clock never decreases, on any thread, and runs at the rate of real time,
     measured against `time()`;
   - mutual exclusion;
@@ -42,6 +42,22 @@ the release version and is documented in `include/gptps.h`.
 - **`docs/HAL.md`** gives the contract clause by clause, with why the core needs each
   clause and the check that holds a HAL to it. It also lists what the test cannot
   show: memory ordering on x86, wall-clock steps, a failed thread start.
+
+### Changed — an item's cancel flag lives in the item
+
+- **A submit no longer allocates in the HAL, so every per-item allocation goes through
+  `gptps_set_allocator`.** Each item's cancel flag was a separate block that the HAL
+  allocated with libc `malloc` on POSIX and Windows. That bypassed the allocator hook,
+  so a host with a static arena still touched the libc heap on every submit. The flag
+  is now a word inside the item, read and written through the HAL's acquire/release
+  pair. The core no longer calls the HAL's four `gptps_flag_*` functions: a new port
+  can leave them out, and an existing one still builds. The conformance test checks
+  the acquire/release pair on the cancel path instead.
+- **The handle index leaves no tombstones.** A deletion closes its gap by moving later
+  entries of the probe run back, so the index never has to be rebuilt just to clear
+  deleted slots. `tests/test_hidx.c` drives it against a reference model, on small
+  tables where probe runs wrap past the end; dropping the shift, an off-by-one in it,
+  or mishandling the wrap each fails it.
 
 ### Fixed — the POSIX HAL's timed wait
 
