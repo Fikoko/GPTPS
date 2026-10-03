@@ -40,9 +40,17 @@
  *
  * MANUAL mode keeps every callback on this thread, which makes the ledger
  * race-free WITHOUT locks and the example deterministic. A threaded host
- * needs the same guards PLUS one lock around the ledger: events arrive on
- * engine threads while the drain runs on yours. The late-event section at
- * the bottom replays, on purpose, the delivery a threaded host can see.
+ * needs the same guards PLUS one lock around the ledger, since events arrive
+ * on engine threads while the drain runs on yours - and it must hold that
+ * lock from BEFORE gptps_submit until the row has the handle it returned, for
+ * the night's submits and for every re-drive. In THREADED mode an item can
+ * finish, and its event arrive, before gptps_submit returns: the lookup by
+ * handle would find no row and drop the event as a late one, and the row
+ * would stay open. Held across the submit, the lock makes that event wait
+ * until the row is there. Take it in observe() only AFTER the kind check:
+ * QUEUED is delivered inside gptps_submit, on the thread holding the lock.
+ * The late-event section at the bottom replays, on purpose, the delivery a
+ * threaded host can see.
  *
  *   cc item_ledger.c gptps.c -lpthread -ldl   (amalgamation; macOS: drop -ldl)
  */

@@ -5,6 +5,20 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Documentation
+
+- **`examples/item_ledger.c`: what a threaded host must add.** In THREADED mode an
+  item can finish, and its event reach the observer, before `gptps_submit` returns its
+  handle. The example's lookup by handle then finds no row, drops the event as a late
+  one, and the row stays open. The example's note told threaded hosts only to put a lock
+  around the ledger. It now says to hold that lock from before `gptps_submit` until the
+  row has its handle, and to take it in the observer only after the kind check, since
+  `QUEUED` is delivered inside `gptps_submit` on the thread holding it. In a threaded
+  run of the example's pattern, with a no-op task and 16 workers, the old advice left
+  6-10 rows in 100,000 open; the new one left none.
+
 ## [1.5.0] - 2026-10-02
 
 ### Upgrading from 1.4
