@@ -2744,12 +2744,12 @@ static int cfg_typo_evidence(gptps *e, const char *table, const char *rest, size
         return 0;
     }
     {
-        char fixed[512], near[384];
+        char fixed[512], guess[384];
         size_t tl = strlen(table);
         snprintf(fixed, sizeof fixed, "%s.%s", table, rest);
         if (gptps_settings_has(e->settings, fixed)) return 1;
-        return gptps_settings_closest(e->settings, fixed, near, sizeof near) &&
-               strncmp(near, table, tl) == 0 && near[tl] == '.';
+        return gptps_settings_closest(e->settings, fixed, guess, sizeof guess) &&
+               strncmp(guess, table, tl) == 0 && guess[tl] == '.';
     }
 }
 
@@ -2898,13 +2898,13 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
     }
     /* the engine's own tables: a key no setting has is a typo, so it fails now */
     for (i = 0; i < n; ++i) {
-        char near[384];
+        char guess[384];               /* not "near": a macro in <windows.h> */
         if (cfg_claimed(e, t, i)) continue;
         cfg_item_at(t, i, &it);
         if (!cfg_core_key(it.key)) continue;
         cfg_claim(e, t, i);
         hint[0] = 0;
-        if (gptps_settings_closest(e->settings, it.key, near, sizeof near)) snprintf(hint, sizeof hint, " (did you mean %s?)", near);
+        if (gptps_settings_closest(e->settings, it.key, guess, sizeof guess)) snprintf(hint, sizeof hint, " (did you mean %s?)", guess);
         cfg_say(GPTPS_LOG_ERROR, &it, "[%.*s] has no such key%s", (int)cfg_first_len(it.key), it.key, hint); ++bad;
     }
     /* A value named like one of the engine's tables is a mistake: those hold keys.
@@ -2997,7 +2997,7 @@ static unsigned cfg_report(gptps *e, gptps_log_level lvl, const char *tail, int 
     size_t from = 0;
     for (;;) {
         cfg_item it;
-        char what[640], near[384];
+        char what[640], guess[384];
         size_t i = 0, n;
         int found = 0;
         what[0] = 0;
@@ -3054,8 +3054,8 @@ static unsigned cfg_report(gptps *e, gptps_log_level lvl, const char *tail, int 
             const char *own = NULL;
             size_t fl = cfg_first_len(it.key);
             if (fl < sizeof first && it.key[fl]) { memcpy(first, it.key, fl); first[fl] = 0; own = cfg_near_table(first, NULL); }
-            if (hints && gptps_settings_closest(e->settings, it.key, near, sizeof near))
-                snprintf(what, sizeof what, "nothing has used this key (did you mean %s?)", near);
+            if (hints && gptps_settings_closest(e->settings, it.key, guess, sizeof guess))
+                snprintf(what, sizeof what, "nothing has used this key (did you mean %s?)", guess);
             else if (own)
                 snprintf(what, sizeof what, "nothing has used this key (is [%s] meant to be [%s]?)", first, own);
             else
@@ -4268,9 +4268,9 @@ gptps_status gptps_settings_set_ex(gptps *e, const char *key, const char *value,
     st = gptps_settings_set_live(e->settings, key, value, why, cap);
     cb_leave(in);
     if (st == GPTPS_E_NOTFOUND && why && cap) {
-        char near[384];
-        if (gptps_settings_closest(e->settings, key, near, sizeof near))
-            snprintf(why, cap, "no setting is named %s (did you mean %s?)", key, near);
+        char guess[384];
+        if (gptps_settings_closest(e->settings, key, guess, sizeof guess))
+            snprintf(why, cap, "no setting is named %s (did you mean %s?)", key, guess);
         else
             snprintf(why, cap, "no setting is named %s", key);
     }
