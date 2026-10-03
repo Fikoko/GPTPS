@@ -56,6 +56,9 @@ struct gptps_ctx {
     void            (*result_free)(void *);
     bool              result_is_copy;    /* true => core allocated a copy; free it */
     bool              result_set;
+    bool              bounded;           /* bounded engine: _set copies into result_buf */
+    unsigned char    *result_buf;        /* bounded: this executing thread's buffer */
+    size_t            result_cap;        /* bounded: its size, max_result_bytes */
 };
 
 typedef struct gptps_item {
@@ -95,6 +98,7 @@ typedef struct gptps_item {
     struct gptps_item    *prev;      /* every queue is doubly linked: see "finding an item" */
     unsigned char         where;     /* GPTPS_Q_*: the engine queue holding it, NONE in a local list */
     unsigned char         indexed;   /* in the handle index: gptps_cancel can still reach it */
+    unsigned char         pooled;    /* a bounded engine's: freeing returns it to the pool */
 } gptps_item;
 
 /* One instance value of a generic per-task setting (see gptps_define_task_setting).
@@ -173,6 +177,11 @@ typedef struct { gptps_item *head, *tail; size_t count; unsigned char id; } gptp
 #define GPTPS_Q_RUNNING 4
 #define GPTPS_Q_DONE    5
 #define GPTPS_Q_DEAD    6
+#define GPTPS_Q_POOL    7      /* bounded: back in the pool, free */
+
+/* What a worker thread starts with: its engine, and its index - which picks its
+ * result buffer on a bounded engine. */
+typedef struct gptps_worker { struct gptps *e; unsigned idx; } gptps_worker;
 
 /* One slot of the handle index: h == 0 empty. Deletion leaves no tombstone (see hidx_del). */
 typedef struct { gptps_handle h; gptps_item *it; } gptps_hslot;
@@ -278,6 +287,24 @@ struct gptps {
     gptps_thread  *dispatcher;
     gptps_thread **workers;
     unsigned       nworkers;
+    struct gptps_worker *worker_args;   /* one per worker: the engine, and the worker's index */
+
+    /* BOUNDED MODE (docs/BOUNDED.md). max_items == 0: the classic engine. Otherwise
+     * the first submit (bounded_seal) allocates the working set below, and nothing on
+     * the work path allocates after it. */
+    uint64_t       max_items;
+    uint32_t       max_payload, max_result;
+    uint32_t       sealed;            /* stored with release once the working set exists */
+    gptps_mutex   *pool_m;            /* guards free_items; made at open */
+    gptps_item    *pool;              /* max_items items */
+    gptps_item    *free_items;        /* the free ones, linked through ->next */
+    unsigned char *payload_arena;     /* a payload slot per item, payload_stride apart */
+    size_t         payload_stride;
+    uint64_t      *snap_arena;        /* a named-resource snapshot slot per item, pool_nres wide */
+    size_t         pool_nres;
+    unsigned char *result_arena;      /* a result buffer per executing thread, result_stride apart */
+    size_t         result_stride;
+    struct gptps_cb_thread *cb_spare; /* callback-thread records made at the seal, unused yet */
 
     bool           stopping;
     /* Shutdown drain bound. gptps_shutdown waits for in-flight work to finish; an
@@ -539,6 +566,7 @@ static void index_drop_list(gptps *e, gptps_fifo *q)
  * growing is. One that cannot allocate leaves the old table. e->m held. */
 static void hidx_trim(gptps *e)
 {
+    if (e->max_items) return;               /* bounded: made at its final size, never rebuilt */
     if (e->nhidx > 64 && e->hidx_live * 8 < e->nhidx)
         (void)hidx_rebuild(e, hidx_size_for(e->hidx_live));
 }
@@ -738,15 +766,34 @@ static const char *item_name(const gptps_item *it)
     return it->def ? it->def->name : "?";
 }
 
+/* A bounded engine past its first submit: setup that would allocate is refused. */
+static int bounded_sealed(const gptps *e)
+{ return e->max_items && gptps_hal_load_acquire_u32(&e->sealed); }
+
 /* The cancel word (gptps_item.cancel): raised by a cancel, a deadline or a removal,
  * polled by the body through gptps_is_cancelled and by the process executors. */
 static void cancel_raise(gptps_item *it)        { gptps_hal_store_release_u32(&it->cancel, 1u); }
 static void cancel_clear(gptps_item *it)        { gptps_hal_store_release_u32(&it->cancel, 0u); }
 static int  cancel_raised(const gptps_item *it) { return gptps_hal_load_acquire_u32(&it->cancel) != 0; }
 
-static void item_free(gptps_item *it)
+static void item_free(gptps *e, gptps_item *it)
 {
     if (!it) return;
+    if (it->pooled) {                       /* bounded: its storage is the pool's */
+        gptps_free(it->name_owned);         /* never made once sealed; never leaked either */
+        it->name_owned = NULL;
+        gptps_mutex_lock(e->pool_m);
+        /* A second free must not link the item in twice: two submits would then share
+         * it. Where the classic engine has ASan to catch a double free, this keeps the
+         * pool whole. */
+        if (it->where != GPTPS_Q_POOL) {
+            it->where = GPTPS_Q_POOL;
+            it->next = e->free_items;
+            e->free_items = it;
+        }
+        gptps_mutex_unlock(e->pool_m);
+        return;
+    }
     gptps_free(it->payload);
     gptps_free(it->name_owned);
     gptps_free(it->res_reserved);
@@ -758,7 +805,7 @@ static void item_free(gptps_item *it)
 static void item_drop(gptps *e, gptps_item *it)
 {
     hidx_del(e, it);
-    item_free(it);
+    item_free(e, it);
 }
 
 static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p)
@@ -826,6 +873,13 @@ gptps_status gptps_result_set(gptps_ctx *ctx, const void *bytes, size_t len)
     if (!ctx) return GPTPS_E_INVAL;
     ctx_clear_result(ctx);
     if (len == 0) { ctx->result = NULL; ctx->result_len = 0; ctx->result_is_copy = false; ctx->result_set = true; return GPTPS_OK; }
+    if (ctx->bounded) {                     /* bounded: the thread's buffer; nothing allocates */
+        if (len > ctx->result_cap || !ctx->result_buf) return GPTPS_E_INVAL;
+        memcpy(ctx->result_buf, bytes, len);
+        ctx->result = ctx->result_buf; ctx->result_len = len; ctx->result_free = NULL;
+        ctx->result_is_copy = false; ctx->result_set = true;
+        return GPTPS_OK;
+    }
     copy = gptps_malloc(len);
     if (!copy) return GPTPS_E_NOMEM;
     memcpy(copy, bytes, len);
@@ -876,7 +930,9 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
 
 /* cb/ud are snapshotted under the lock by the caller so a concurrent
  * gptps_set_event_cb cannot pair a new callback with a stale user_data. */
-static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *ud)
+/* `slot` is the executing thread's: a worker's index, or nworkers for gptps_step. It
+ * picks the thread's result buffer on a bounded engine. */
+static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *ud, unsigned slot)
 {
     gptps_pending_ev p;
     gptps_status st;
@@ -896,6 +952,11 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         ctx.engine = e; ctx.reg = it->reg; ctx.handle = it->handle; ctx.task_name = it->def->name;
         ctx.payload = it->payload; ctx.payload_len = it->payload_len;
         ctx.deadline_ms = it->deadline_ms; ctx.cancel = &it->cancel;
+        if (e->max_items) {                /* bounded: results go into this thread's buffer */
+            ctx.bounded = true;
+            ctx.result_cap = e->max_result;
+            ctx.result_buf = e->result_arena ? e->result_arena + (size_t)slot * e->result_stride : NULL;
+        }
         st = it->def->run(&ctx, it->def->user_data);
         raised = cancel_raised(it);
         if (raised) {
@@ -982,7 +1043,7 @@ static int engine_is_reentrant(const gptps *e, uint64_t tid)
  * this is the only way in - from any chain, moved to tid's. NULL if none. Caller
  * holds e->m. A record whose thread escaped a callback is never idle, so it is
  * never taken. */
-static gptps_cb_thread *cb_take_idle(gptps *e, uint64_t tid)
+static gptps_cb_thread *cb_take_idle(gptps *e, uint64_t tid, int any)
 {
     size_t home = cb_bucket(tid), k;
     for (k = 0; k < GPTPS_CB_BUCKETS; ++k) {
@@ -998,7 +1059,7 @@ static gptps_cb_thread *cb_take_idle(gptps *e, uint64_t tid)
             t->tid = tid;
             return t;
         }
-        if (e->n_cb_threads < GPTPS_CB_THREADS_MAX) break;   /* own chain only, then allocate */
+        if (!any && e->n_cb_threads < GPTPS_CB_THREADS_MAX) break;   /* own chain only, then allocate */
     }
     return NULL;
 }
@@ -1014,8 +1075,21 @@ static gptps_cb_thread *cb_enter_locked(gptps *e)
     gptps_cb_thread **head = &e->cb_threads[cb_bucket(tid)];
     gptps_cb_thread *t;
     for (t = *head; t && t->tid != tid; t = t->next) { }
-    if (!t) t = cb_take_idle(e, tid);
-    if (!t && e->n_cb_threads < GPTPS_CB_THREADS_MAX &&
+    if (!t) t = cb_take_idle(e, tid, 0);
+    if (!t && e->max_items && gptps_hal_load_acquire_u32(&e->sealed)) {
+        /* Bounded and sealed: nothing allocates. A record made at the seal, else any
+         * idle one; with neither, the callback runs unguarded (docs/BOUNDED.md). */
+        if ((t = e->cb_spare) != NULL) {
+            e->cb_spare = t->next;
+            t->tid = tid;
+            t->next = *head;
+            *head = t;
+            e->n_cb_threads += 1;
+        } else {
+            t = cb_take_idle(e, tid, 1);
+        }
+    }
+    else if (!t && e->n_cb_threads < GPTPS_CB_THREADS_MAX &&
         (t = (gptps_cb_thread *)gptps_calloc(1, sizeof *t)) != NULL) {
         t->tid = tid;
         t->next = *head;
@@ -1071,7 +1145,8 @@ static uint64_t attempt_deadline(const gptps_item *it)
 
 static void *worker_main(void *arg)
 {
-    gptps *e = (gptps *)arg;
+    gptps_worker *w = (gptps_worker *)arg;
+    gptps *e = w->e;
     engine_note_own_thread(e);
     gptps_mutex_lock(e->m);
     for (;;) {
@@ -1103,7 +1178,7 @@ static void *worker_main(void *arg)
         gptps_cond_signal(e->cv_disp);     /* let dispatcher track the new deadline */
         gptps_mutex_unlock(e->m);
 
-        eff = execute(e, it, cb, ud);
+        eff = execute(e, it, cb, ud, w->idx);
 
         gptps_mutex_lock(e->m);
         fifo_remove(&e->running_items, it);
@@ -1165,7 +1240,7 @@ static void dead_letter_push(gptps *e, gptps_item *it)
         if (!old) break;
         e->dead_letter_count -= 1;
         e->dead_evicted += 1;
-        item_free(old);
+        item_free(e, old);
     }
     fifo_push(&e->dead_letter, it);
     e->dead_letter_count += 1;
@@ -1281,7 +1356,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                 /* free the snapshot NOW (symmetric with the admit-time alloc) so a
                  * re-admitted item - a retry, or a service's REQUEUE restart - cannot
                  * overwrite a live pointer and leak it. item_free tolerates NULL. */
-                gptps_free(it->res_reserved);
+                if (!it->pooled) gptps_free(it->res_reserved);   /* bounded: a slot, not a block */
                 it->res_reserved = NULL;
                 it->res_n = 0;
             }
@@ -1714,8 +1789,12 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
              * resource budget stopped being enforced at all while the item ran
              * anyway. Fail closed instead: leave the item queued and retry shortly. */
             if (e->nres && best->reg && best->reg->res_cost) {
-                snap = (uint64_t *)gptps_malloc(e->nres * sizeof(uint64_t));
-                if (!snap) { next_wake = min_nonzero(next_wake, now + 50); break; }
+                if (best->pooled) {        /* bounded: its own slot (no resource is new since the seal) */
+                    snap = e->snap_arena + (size_t)(best - e->pool) * e->pool_nres;
+                } else {
+                    snap = (uint64_t *)gptps_malloc(e->nres * sizeof(uint64_t));
+                    if (!snap) { next_wake = min_nonzero(next_wake, now + 50); break; }
+                }
             }
             if (best != top) top->skips += 1;            /* charge the skipped higher-priority task */
             intake_unlink(e, best);
@@ -2188,6 +2267,15 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
         if (e->config_path) memcpy(e->config_path, cfg->config_path, L);
     }
 
+    /* Bounded mode (ABI 2.4): read only what the caller's struct has. */
+    if (cfg && GPTPS_STRUCT_HAS(gptps_config, cfg, max_items)) e->max_items = cfg->max_items;
+    if (e->max_items) {
+        if (GPTPS_STRUCT_HAS(gptps_config, cfg, max_payload_bytes)) e->max_payload = cfg->max_payload_bytes;
+        if (GPTPS_STRUCT_HAS(gptps_config, cfg, max_result_bytes))  e->max_result  = cfg->max_result_bytes;
+        e->pool_m = gptps_mutex_create();
+        if (!e->pool_m) { s = GPTPS_E_NOMEM; goto fail; }
+    }
+
     e->manual = (cfg && cfg->mode == GPTPS_RUN_MANUAL);
     if (e->manual) {
         /* MANUAL: no dispatcher/worker threads; the caller drives via gptps_step().
@@ -2198,6 +2286,8 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
         e->nworkers = e->limits.max_concurrent_tasks;
         e->workers = (gptps_thread **)gptps_calloc(e->nworkers, sizeof *e->workers);
         if (!e->workers) { s = GPTPS_E_NOMEM; goto fail; }
+        e->worker_args = (gptps_worker *)gptps_calloc(e->nworkers, sizeof *e->worker_args);
+        if (!e->worker_args) { s = GPTPS_E_NOMEM; goto fail; }
 
         /* Room for every thread this engine owns (dispatcher + workers) to record
          * its own id, so gptps_shutdown can refuse a call made from one of them. */
@@ -2208,7 +2298,9 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
         e->dispatcher = gptps_thread_start(dispatcher_main, e);
         if (!e->dispatcher) { s = GPTPS_E_NOMEM; goto fail; }
         for (i = 0; i < e->nworkers; ++i) {
-            e->workers[i] = gptps_thread_start(worker_main, e);
+            e->worker_args[i].e = e;
+            e->worker_args[i].idx = (unsigned)i;
+            e->workers[i] = gptps_thread_start(worker_main, &e->worker_args[i]);
             if (!e->workers[i]) { s = GPTPS_E_NOMEM; goto fail_threads; }
         }
     }
@@ -2227,6 +2319,8 @@ fail:
     gptps_free(e->config_path);   /* copied before the workers/threads that failed */
     if (e->settings) gptps_settings_destroy(e->settings);
     if (e->workers) gptps_free(e->workers);
+    gptps_free(e->worker_args);
+    if (e->pool_m) gptps_mutex_destroy(e->pool_m);
     if (e->owned_tids) gptps_free(e->owned_tids);
     if (e->cv_drain) gptps_cond_destroy(e->cv_drain);
     if (e->cv_work) gptps_cond_destroy(e->cv_work);
@@ -2432,6 +2526,8 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     uint64_t svc_flags;
 
     if (!e || !def || !def->name) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
+    if (e->max_items && def->exec != GPTPS_EXEC_INPROC) return GPTPS_E_INVAL;   /* bounded: in-process only */
     if (def->struct_size < GPTPS_TASK_DEF_MIN_SIZE) return GPTPS_E_INVAL; /* ABI: below the frozen minimum */
     /* Bound the name HERE, where it can still be reported. Past this length the
      * fixed-size "tasks.<name>.<leaf>" buffers truncate: the six per-task settings
@@ -2584,6 +2680,10 @@ gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
             gptps_mutex_unlock(e->m);
             return GPTPS_OK;
         }
+    if (bounded_sealed(e)) {                /* bounded: a NEW resource would need a snapshot slot */
+        gptps_mutex_unlock(e->m);
+        return GPTPS_E_BUSY;
+    }
     if (e->nres == e->rescap) {
         size_t nc = e->rescap ? e->rescap * 2 : 4;
         gptps_resource *nr = (gptps_resource *)gptps_realloc(e->resources, nc * sizeof *nr);
@@ -2700,7 +2800,7 @@ static unsigned fifo_detach_reg_admitted(gptps *e, gptps_fifo *q, const gptps_re
                 size_t ri;
                 for (ri = 0; ri < it->res_n && ri < e->nres; ++ri)
                     e->resources[ri].reserved -= it->res_reserved[ri];
-                gptps_free(it->res_reserved);
+                if (!it->pooled) gptps_free(it->res_reserved);
                 it->res_reserved = NULL;
                 it->res_n = 0;
             }
@@ -2742,13 +2842,13 @@ static void drain_cancelled(gptps *e, gptps_fifo *q, gptps_event_cb cb, void *ud
     gptps_item *it;
     while ((it = fifo_pop(q)) != NULL) {
         gptps_pending_ev p;
-        if (terminal_reported(it)) { item_free(it); continue; }
+        if (terminal_reported(it)) { item_free(e, it); continue; }
         p.kind = GPTPS_EV_FAILED; p.handle = it->handle;
         ev_set_name(p.name, item_name(it));
         p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
         p.result = NULL; p.result_len = 0; p.flags = 0;
         emit_now(e, cb, ud, &p);
-        item_free(it);
+        item_free(e, it);
     }
 }
 
@@ -2936,6 +3036,7 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
     gptps_cb_thread *in;
 
     if (!e || !task_name) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
     if (strlen(task_name) > GPTPS_TASK_NAME_MAX) return GPTPS_E_INVAL;   /* never registrable */
 
     dropped.head = dropped.tail = NULL; dropped.count = 0; dropped.id = GPTPS_Q_NONE;
@@ -3129,6 +3230,7 @@ gptps_status gptps_define_global(gptps *e, const char *key, gptps_setting_type t
     size_t klen;
 
     if (!e || !key || !*key) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
     {   /* namespaced add-on: globals must live under "<ns>." too */
         int bad;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
@@ -3177,6 +3279,7 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
     gptps_reg *r;
 
     if (!e || !leaf || !*leaf) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
     {   /* A leaf is normally a BARE key - no dots - because it is materialized as
          * "tasks.<task>.<leaf>". A namespaced add-on is the one exception: it must
          * prefix, so it gets exactly one dot, as "<ns>.<bare>". That round-trips
@@ -3293,6 +3396,7 @@ gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out)
 gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def)
 {
     if (!e || !def) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
     {   /* namespaced add-on: its settings keys must live under "<ns>." */
         int bad;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
@@ -3505,6 +3609,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
     gptps_cb_thread *in;
 
     if (!e || !path) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
 
     /* Claim the loader. Serialising the whole load is what makes the namespace
      * window and the token claim actually hold: there is one window, so two
@@ -3750,6 +3855,96 @@ gptps_status gptps_addon_disable(gptps *e, const char *ns_or_name)
     return GPTPS_OK;
 }
 
+/* ------------------------------------------------------------------------- */
+/* bounded mode (docs/BOUNDED.md)                                            */
+/* ------------------------------------------------------------------------- */
+#define GPTPS_BOUNDED_HOST_THREADS 32u      /* callback records for host threads */
+
+static int size_mul(size_t a, size_t b, size_t *out)    /* a * b, or -1 on overflow */
+{
+    if (a && b > (size_t)-1 / a) return -1;
+    *out = a * b;
+    return 0;
+}
+
+/* The first submit to a bounded engine allocates its whole working set, here, sized
+ * by the config and by what setup defined: max_items items, each owning a payload
+ * slot and a named-resource snapshot slot at its own index; the handle index at its
+ * final size (at least twice max_items, so its load stays at most a half, and
+ * deletion leaves no tombstone - it is never rebuilt); a result buffer per executing
+ * thread; and callback-thread records for every engine thread plus
+ * GPTPS_BOUNDED_HOST_THREADS host threads. All or nothing: a failure frees what this
+ * call made and leaves the engine unsealed. Slots are 16-byte aligned, so a task may
+ * read a payload as a struct. e->m held. */
+static gptps_status bounded_seal(gptps *e)
+{
+    size_t n, items_sz, pay_sz, snap_sz, res_sz, nn = 64, i, ncb;
+    gptps_hslot *idx = NULL;
+    if (e->sealed) return GPTPS_OK;
+    if (e->max_items > (uint64_t)((size_t)-1 / 4)) return GPTPS_E_NOMEM;
+    n = (size_t)e->max_items;
+    e->payload_stride = ((size_t)e->max_payload + 15u) / 16u * 16u;
+    e->result_stride  = ((size_t)e->max_result + 15u) / 16u * 16u;
+    e->pool_nres = e->nres;
+    if (size_mul(n, sizeof *e->pool, &items_sz) || size_mul(n, e->payload_stride, &pay_sz) ||
+        size_mul(n, e->pool_nres, &snap_sz) || size_mul(snap_sz, sizeof(uint64_t), &snap_sz) ||
+        size_mul((size_t)e->nworkers + 1u, e->result_stride, &res_sz))
+        return GPTPS_E_NOMEM;
+    while (nn < 2 * n) nn <<= 1;
+    ncb = (size_t)e->nworkers + 1u + GPTPS_BOUNDED_HOST_THREADS;
+
+    e->pool          = (gptps_item *)gptps_calloc(n, sizeof *e->pool);
+    e->payload_arena = pay_sz  ? (unsigned char *)gptps_malloc(pay_sz)  : NULL;
+    e->snap_arena    = snap_sz ? (uint64_t *)gptps_malloc(snap_sz)      : NULL;
+    e->result_arena  = res_sz  ? (unsigned char *)gptps_malloc(res_sz)  : NULL;
+    idx              = (gptps_hslot *)gptps_calloc(nn, sizeof *idx);
+    if (!e->pool || (pay_sz && !e->payload_arena) || (snap_sz && !e->snap_arena) ||
+        (res_sz && !e->result_arena) || !idx)
+        goto fail;
+    for (i = 0; i < ncb; ++i) {
+        gptps_cb_thread *t = (gptps_cb_thread *)gptps_calloc(1, sizeof *t);
+        if (!t) goto fail;
+        t->next = e->cb_spare;
+        e->cb_spare = t;
+    }
+    for (i = n; i-- > 0; ) {
+        e->pool[i].next = e->free_items;
+        e->free_items = &e->pool[i];
+    }
+    gptps_free(e->hidx);                    /* none yet: nothing was submitted before the seal */
+    e->hidx = idx; e->nhidx = nn; e->hidx_live = 0;
+    gptps_hal_store_release_u32(&e->sealed, 1u);
+    return GPTPS_OK;
+
+fail:
+    while (e->cb_spare) { gptps_cb_thread *t = e->cb_spare; e->cb_spare = t->next; gptps_free(t); }
+    gptps_free(idx);
+    gptps_free(e->result_arena);  e->result_arena = NULL;
+    gptps_free(e->snap_arena);    e->snap_arena = NULL;
+    gptps_free(e->payload_arena); e->payload_arena = NULL;
+    gptps_free(e->pool);          e->pool = NULL;
+    return GPTPS_E_NOMEM;
+}
+
+/* A free item from a bounded engine's pool, zeroed, owning its payload slot; NULL
+ * when all are in use. Its own lock, not e->m: the caller copies the payload before
+ * it takes e->m, as the classic submit copies before it does. */
+static gptps_item *pool_take(gptps *e)
+{
+    gptps_item *it;
+    size_t i;
+    gptps_mutex_lock(e->pool_m);
+    it = e->free_items;
+    if (it) e->free_items = it->next;
+    gptps_mutex_unlock(e->pool_m);
+    if (!it) return NULL;
+    i = (size_t)(it - e->pool);
+    memset(it, 0, sizeof *it);
+    it->pooled = 1;
+    it->payload = e->payload_arena ? e->payload_arena + i * e->payload_stride : NULL;
+    return it;
+}
+
 static gptps_status submit_internal(gptps *e, const char *task_name,
                                     const void *payload, size_t len,
                                     const gptps_submit_options *opts,
@@ -3768,50 +3963,74 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
      * unaffected. */
     if (e->fork_gen != gptps_hal_fork_generation()) return GPTPS_E_SHUTDOWN;
 
-    /* Copy the payload + allocate the item OUTSIDE the engine lock: none of it needs engine state, and keeping it off-lock shortens
-     * the critical section every producer contends on - a real win for large
-     * payloads / many concurrent submitters (and for each pool shard). item_free
-     * cleans up uniformly if a check below rejects the submit. (A reject now does a
-     * wasted copy, but rejects are the rare path; the common accept path wins.) */
-    if (len) {
-        pcopy = gptps_malloc(len);
-        if (!pcopy) return GPTPS_E_NOMEM;
-        memcpy(pcopy, payload, len);
+    /* Copy the payload + allocate the item OUTSIDE the engine lock: none of it needs
+     * engine state, and keeping it off-lock shortens the critical section every
+     * producer contends on - a real win for large payloads / many concurrent
+     * submitters (and for each pool shard). item_free cleans up uniformly if a check
+     * below rejects the submit. (A reject now does a wasted copy, but rejects are the
+     * rare path; the common accept path wins.) A bounded engine takes the item from
+     * its pool instead, and copies into the item's own slot: nothing allocates. */
+    if (e->max_items) {
+        if (len > e->max_payload) return GPTPS_E_INVAL;
+        if (!gptps_hal_load_acquire_u32(&e->sealed)) {
+            /* The first submit that names a task allocates it all. One that names
+             * no registered task seals nothing: a typo in it must not end setup. */
+            gptps_status ss;
+            gptps_reg *r0;
+            gptps_mutex_lock(e->m);
+            r0 = e->stopping ? NULL : registry_find(e, task_name);
+            ss = e->stopping            ? GPTPS_E_SHUTDOWN
+               : (!r0 || !r0->enabled)  ? GPTPS_E_NOTFOUND
+               :                          bounded_seal(e);
+            gptps_mutex_unlock(e->m);
+            if (ss != GPTPS_OK) return ss;
+        }
+        it = pool_take(e);
+        if (!it) return GPTPS_E_FULL;
+        if (len) memcpy(it->payload, payload, len);
+        else     it->payload = NULL;
+        it->payload_len = len;
+    } else {
+        if (len) {
+            pcopy = gptps_malloc(len);
+            if (!pcopy) return GPTPS_E_NOMEM;
+            memcpy(pcopy, payload, len);
+        }
+        it = (gptps_item *)gptps_calloc(1, sizeof *it);   /* zeroed: the cancel word starts clear */
+        if (!it) { gptps_free(pcopy); return GPTPS_E_NOMEM; }
+        it->payload = pcopy;          /* set now so item_free frees it on any reject below */
+        it->payload_len = len;
     }
-    it = (gptps_item *)gptps_calloc(1, sizeof *it);   /* zeroed: the cancel word starts clear */
-    if (!it) { gptps_free(pcopy); return GPTPS_E_NOMEM; }
-    it->payload = pcopy;          /* set now so item_free frees it on any reject below */
-    it->payload_len = len;
 
     gptps_mutex_lock(e->m);
-    if (e->stopping) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_SHUTDOWN; }
+    if (e->stopping) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_SHUTDOWN; }
 
     r = registry_find(e, task_name);
-    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_NOTFOUND; } /* unknown, draining, or paused */
+    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_NOTFOUND; } /* unknown, draining, or paused */
 
     cost = r->def.default_cost;
     if (r->def.cost) {
         gptps_status cs = r->def.cost(payload, len, &cost, r->def.user_data);
-        if (cs != GPTPS_OK) { gptps_mutex_unlock(e->m); item_free(it); return cs; }
+        if (cs != GPTPS_OK) { gptps_mutex_unlock(e->m); item_free(e, it); return cs; }
     }
     if (cost.mem_bytes > e->limits.max_memory_bytes) {
-        gptps_mutex_unlock(e->m); item_free(it);
+        gptps_mutex_unlock(e->m); item_free(e, it);
         return GPTPS_E_BUDGET; /* never-fits: reject at submit */
     }
     if (e->nres && r->res_cost) {           /* a resource cost that can never fit its budget */
         size_t ri;
         for (ri = 0; ri < e->nres; ++ri)
-            if (r->res_cost[ri] > e->resources[ri].budget) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_BUDGET; }
+            if (r->res_cost[ri] > e->resources[ri].budget) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_BUDGET; }
     }
     /* backpressure: bound the intake queue so an overproducing client cannot grow
      * it without limit (max_memory_bytes bounds only the RUNNING set). 0 = off. */
     if (e->limits.max_intake_depth && e->intake.count >= e->limits.max_intake_depth) {
-        gptps_mutex_unlock(e->m); item_free(it);
+        gptps_mutex_unlock(e->m); item_free(e, it);
         return GPTPS_E_FULL;
     }
     /* Room in the handle index first (see "finding an item"): past this point the
      * item is reachable, and a failure would leave it uncancellable. */
-    if (hidx_reserve(e) != 0) { gptps_mutex_unlock(e->m); item_free(it); return GPTPS_E_NOMEM; }
+    if (hidx_reserve(e) != 0) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_NOMEM; }
 
     it->handle = e->next_handle++;
     it->def = &r->def;
@@ -4017,6 +4236,7 @@ gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_dat
 {
     gptps_observer *o;
     if (!e || !fn) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
     o = (gptps_observer *)gptps_calloc(1, sizeof *o);
     if (!o) return GPTPS_E_NOMEM;
     o->fn = fn; o->ud = user_data;
@@ -4072,6 +4292,7 @@ gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn fn, void *u
 {
     gptps_constraint *c;
     if (!e || !fn) return GPTPS_E_INVAL;
+    if (bounded_sealed(e)) return GPTPS_E_BUSY;   /* bounded: setup ended at the first submit */
     c = (gptps_constraint *)gptps_calloc(1, sizeof *c);
     if (!c) return GPTPS_E_NOMEM;
     c->fn = fn; c->ud = user_data;
@@ -4113,8 +4334,10 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
      * normally give them an owned name before their task type is freed. The
      * callback below runs with the lock released and is explicitly allowed to
      * re-enter the engine - including gptps_unregister_task on the very type these
-     * items came from - so resolve every name NOW, while the regs are still alive. */
-    fifo_self_own_names(&local, NULL);
+     * items came from - so resolve every name NOW, while the regs are still alive.
+     * A sealed bounded engine refuses that unregister, so its regs outlive the
+     * callback, and the copies - an allocation per item - are not needed there. */
+    if (!bounded_sealed(e)) fifo_self_own_names(&local, NULL);
     if (cb) in = cb_enter_locked(e);
     gptps_mutex_unlock(e->m);
 
@@ -4131,7 +4354,7 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
             dl.payload_len = it->payload_len;
             cb(&dl, user_data);
         }
-        item_free(it);
+        item_free(e, it);
         ++n;
     }
     cb_leave(in);
@@ -4204,7 +4427,7 @@ gptps_status gptps_step(gptps *e, size_t *out_ran)
         fifo_push(&e->running_items, it);
         gptps_mutex_unlock(e->m);
 
-        eff = execute(e, it, cb, ud);       /* STARTED + FINISHED/FAILED emitted here */
+        eff = execute(e, it, cb, ud, e->nworkers);   /* STARTED + FINISHED/FAILED emitted here */
 
         gptps_mutex_lock(e->m);
         fifo_remove(&e->running_items, it);
@@ -4351,7 +4574,7 @@ gptps_status gptps_shutdown(gptps *e)
     /* Retained dead letters are the one queue the host is not required to drain and
      * whose items have ALREADY had their terminal event; free them without another.
      * The work queues were emptied and reported above, before the add-on unload. */
-    while ((it = fifo_pop(&e->dead_letter)) != NULL) item_free(it);
+    while ((it = fifo_pop(&e->dead_letter)) != NULL) item_free(e, it);
 
     r = e->registry;
     while (r) {
@@ -4372,7 +4595,15 @@ gptps_status gptps_shutdown(gptps *e)
 
     gptps_free(e->hidx);
     gptps_free(e->workers);
+    gptps_free(e->worker_args);
     gptps_free(e->owned_tids);
+    /* bounded: every item is back in the pool by now (item_free) */
+    while (e->cb_spare) { gptps_cb_thread *t = e->cb_spare; e->cb_spare = t->next; gptps_free(t); }
+    gptps_free(e->result_arena);
+    gptps_free(e->snap_arena);
+    gptps_free(e->payload_arena);
+    gptps_free(e->pool);
+    if (e->pool_m) gptps_mutex_destroy(e->pool_m);
     {   size_t b;
         for (b = 0; b < GPTPS_CB_BUCKETS; ++b) {
             gptps_cb_thread *t = e->cb_threads[b];

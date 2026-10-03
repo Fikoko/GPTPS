@@ -368,6 +368,17 @@ target_link_libraries(test_admission_perf PRIVATE gptps)
 add_test(NAME admission_perf COMMAND test_admission_perf)
 set_tests_properties(admission_perf PROPERTIES TIMEOUT 120)
 
+# Bounded mode (docs/BOUNDED.md): once the first submit has sealed the engine, the
+# work path neither allocates nor frees - a counting allocator holds it to that, in
+# MANUAL and THREADED mode.
+add_executable(test_bounded tests/test_bounded.c)
+target_include_directories(test_bounded
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_bounded PRIVATE gptps)
+add_test(NAME bounded COMMAND test_bounded)
+set_tests_properties(bounded PROPERTIES TIMEOUT 120)
+
 # White-box: the handle index's open addressing, against a reference model. It
 # includes engine.c (the index is static), so it links the rest of the core beside it.
 set(_gptps_src_but_engine ${GPTPS_SRC})

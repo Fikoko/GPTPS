@@ -7,6 +7,43 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — bounded mode: no allocation once work starts (ABI 2.4)
+
+- **`gptps_config.max_items`, `max_payload_bytes` and `max_result_bytes`.** With
+  `max_items` set, the first submit that names a registered task allocates the
+  engine's whole working set, and the work path neither allocates nor frees after it:
+  - items come from a fixed pool, each with its own payload slot and named-resource
+    snapshot slot;
+  - the handle index is made at its final size and never rebuilt;
+  - each executing thread owns one result buffer;
+  - the callback-thread records are made in advance.
+
+  Every operation's cost is then bounded by the configured maxima. A full engine
+  answers `GPTPS_E_FULL`. A payload or a `gptps_result_set` past its maximum is
+  `GPTPS_E_INVAL`. Setup that would allocate is `GPTPS_E_BUSY` after the seal, and
+  process-based task kinds are refused, since starting a process allocates by nature.
+  A submit that names no registered task seals nothing, so a typo in the first one
+  does not end setup. For a static arena, the seal took 339 bytes per item at 256
+  items (64-byte payloads, 32-byte results, two named resources). Measured against
+  the classic mode, with both limited to 4,096 items: latency is the same, one
+  producer is 5-10% faster, and four producers are 5-10% slower, because the pool has
+  its own lock. `max_items` is a `uint64_t` so that it grows `gptps_config` on every
+  ABI: a caller built against an older header never appears to have set it.
+  `docs/BOUNDED.md` has the rules, sizing and speed.
+- **`tests/test_bounded.c` holds it to that.** A counting allocator drives a sealed
+  engine through the work path, in MANUAL and THREADED mode: payloads, results,
+  retries, backoff, a deadline, dead letters and their drain, eviction, named
+  resources, a constraint that defers, cancels, settings writes, and a full pool and
+  its reuse. It fails on any allocation or free after the seal. Removing any one of
+  the pool, the result buffer, the snapshot slot, the callback records, the fixed
+  index, the drain's skip of name copies, or a setup refusal makes it fail.
+  - Writing it found two bugs before they shipped. The dead-letter drain copied every
+    item's name. Those copies are needed only so a callback can unregister the task
+    type, which a sealed engine refuses, so the drain no longer makes them there.
+    And a pooled item went back to the pool without its name copy, which leaked.
+  - As an experiment, the whole suite was run with every engine made bounded. Of 74
+    tests, 50 passed, and each of the 24 that failed stopped at a documented refusal.
+
 ### Added — a conformance test for the HAL, and a HAL that takes every freedom it allows
 
 - **`tests/test_hal_conformance.c` holds a HAL to its contract.** It has 37 checks:

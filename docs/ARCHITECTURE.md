@@ -170,8 +170,31 @@ and can be redirected process-wide to a custom `malloc`/`realloc`/`free`
 (SQLite-style) — e.g. a static pool on a host with no libc heap. Install it once
 before the first `gptps_open` (the override is configuration, not runtime state).
 The **HAL deliberately uses libc directly**: it is the platform seam you replace
-wholesale on an exotic target, and it owns its thread/sync structs there. MANUAL
-mode + a custom allocator is the bare-metal shape; see `examples/embedded.c`.
+wholesale on an exotic target, and it owns its thread/sync structs there. It
+allocates only in its create calls, at open; nothing per item (each item's cancel
+flag lives inside the item). MANUAL mode + a custom allocator is the bare-metal
+shape; see `examples/embedded.c`.
+
+### 3.3 Bounded mode (`gptps_config.max_items`)
+
+The allocator seam decides where memory comes from, not how much or when. Bounded
+mode decides both. With `max_items` set, the first submit that names a registered task
+allocates the engine's whole working set, sized by the config and by what setup
+defined, and the work path neither allocates nor frees after it:
+
+- items come from a fixed pool, each owning a payload slot and a named-resource
+  snapshot slot at its own index;
+- the handle index is made at its final size, and deletion leaves no tombstones
+  ("finding an item" in `src/engine.c`), so it is never rebuilt;
+- each executing thread owns one result buffer;
+- the callback-thread records are made in advance.
+
+Setup that would allocate is refused after that seal (`GPTPS_E_BUSY`), and so are
+process-based task kinds, which allocate by nature. Every operation's cost is then
+bounded by the configured maxima, with no amortized rebuild on any path.
+[`docs/BOUNDED.md`](BOUNDED.md) gives the rules, sizing and speed;
+`tests/test_bounded.c` holds the engine to it with a counting allocator, in MANUAL and
+THREADED mode.
 
 ---
 

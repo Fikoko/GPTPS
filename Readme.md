@@ -5,7 +5,8 @@ Link one library, register a task, submit work. GPTPS runs it on a worker pool u
 declared resource budgets, with retries / timeouts / dead-letter, and gives you the
 result back — plus an optional **live terminal dashboard** to watch and steer it. No
 server, no broker, no mandatory dependency. Runs on Linux, macOS, and Windows, and can
-even run **single-threaded with no libc heap** for embedded / bare-metal targets.
+even run **single-threaded with no libc heap** for embedded / bare-metal targets — and,
+in [bounded mode](docs/BOUNDED.md), allocate nothing at all once work starts.
 
 Long-running **services** are supervised (restart-on-exit, stopped cleanly at shutdown),
 and scale is **opt-in and by composition** — shard across engines, route across worker
@@ -23,7 +24,7 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
-- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
+- Reference: [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Bounded mode](docs/BOUNDED.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
 - [Safety artifacts (commercial)](#safety-artifacts-commercial) · [License](#license)
 
 ## Quick start
@@ -426,11 +427,12 @@ gptps_pool_close(pool);
 ```
 
 The router's only shared state is a round-robin cursor (keyed routing is lock-free); each
-shard is a full engine. [`examples/bench_pool`](examples/bench_pool.c) measures it: on a
-32-core box at 400k items, aggregate tiny-task throughput rose from ~15k/s at 1 shard to
-~290k/s at 8 (≈19×) — the single-writer ceiling, then composition breaking past it. Use a
-large item count if you rerun it: the CI-quick default of 40k finishes in ~20ms and is
-noise-dominated.
+shard is a full engine. [`examples/bench_pool`](examples/bench_pool.c) measures it. On a
+32-thread desktop (i9-14900K), 400k no-op tasks from 8 producers ran at ~270k/s on 1 shard,
+~520k/s on 2, ~910k/s on 4 and ~2.09M/s on 8 (7.7×): the single-writer ceiling, then
+composition breaking past it. One producer reaches ~520k/s on a single engine, about 2 µs
+a task end to end. Use a large item count if you rerun it: the CI-quick default of 40k
+finishes in ~20ms and is noise-dominated.
 
 **Scale out — worker processes (`gptps_xport`).** Fork N persistent worker *processes*,
 **each running its own engine**, and ship each request to one over a multiplexed IPC
@@ -600,8 +602,18 @@ Pair it with **`gptps_set_allocator()`** to take GPTPS off the libc heap entirel
 point it at a static pool (SQLite-style; covers all core allocation). Together,
 MANUAL mode + a custom allocator are the **bare-metal shape**: zero threads, fixed
 RAM. The only thing a real MCU/RTOS port adds is a HAL backend (`hal_<target>.c`)
-for the mutex/clock/flag primitives — MANUAL mode never calls `gptps_thread_start`
-or `cond_wait`. Worked end-to-end in [`examples/embedded.c`](examples/embedded.c).
+for the mutex and clock primitives — MANUAL mode never calls `gptps_thread_start`
+or `cond_wait`. [docs/HAL.md](docs/HAL.md) is the contract a backend keeps, and
+`ctest -R hal_conformance` checks it. Worked end-to-end in
+[`examples/embedded.c`](examples/embedded.c).
+
+**Bounded mode** goes one step further: set `cfg.max_items` (and the payload and
+result maxima), and the first submit allocates everything the engine will ever need.
+After that the work path neither allocates nor frees, every operation's cost is
+bounded by the maxima, and a full engine answers `GPTPS_E_FULL` instead of growing.
+It runs in-process tasks only, and setup must come before the first submit. A
+counting allocator in `tests/test_bounded.c` holds it to that, in both modes;
+[docs/BOUNDED.md](docs/BOUNDED.md) has the details, sizing and speed.
 
 > Caveat: a MANUAL task runs to completion on your thread, so a wall-clock timeout
 > can't preempt it — cooperative tasks should poll `gptps_is_cancelled()` /
@@ -734,7 +746,7 @@ gptps/
 │   ├── PACKAGING.md     getting GPTPS + a subset of its add-ons
 │   ├── SAFETY.md        the planned commercial safety-artifacts package and how it is licensed
 │   └── SECURITY.md      trust boundary and non-guarantees
-├── tests/               ← CTest suite (73 tests) + consumer/ (an out-of-tree find_package consumer)
+├── tests/               ← CTest suite (74 tests) + consumer/ (an out-of-tree find_package consumer)
 ├── tools/
 │   ├── amalgamate.sh    single-file gptps.c + gptps.h, and one .c/.h pair per add-on
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
@@ -769,7 +781,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **73** tests · **13** CI runs (12 job definitions; `build-test` is a 2-way
+plug-in · **74** tests · **13** CI runs (12 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

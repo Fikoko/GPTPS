@@ -76,10 +76,11 @@ extern "C" {
  *
  * 2.x: 2.1 the plug-in tier seams; 2.2 appends `flags` to gptps_task_info and adds
  * gptps_task_flags, so a caller can finally see whether a registered type is a
- * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*). Additive, and the
- * loader compares MAJOR only, so no existing add-on is refused. */
+ * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*); 2.4 appends the
+ * bounded-mode fields to gptps_config. Additive, and the loader compares MAJOR only,
+ * so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 3u
+#define GPTPS_ABI_VERSION_MINOR 4u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -125,7 +126,7 @@ typedef enum {
     GPTPS_E_NOTFOUND,     /* unknown task name */
     GPTPS_E_DUP,          /* task name already registered */
     GPTPS_E_BUDGET,       /* declared cost can never fit max budget (reject at submit) */
-    GPTPS_E_FULL,         /* queue full */
+    GPTPS_E_FULL,         /* queue full, or every item of a bounded engine in use */
     GPTPS_E_TIMEOUT,      /* task exceeded timeout_seconds */
     GPTPS_E_CANCELLED,    /* task observed cancellation */
     GPTPS_E_ABI,          /* add-on ABI magic/version/size mismatch */
@@ -139,7 +140,8 @@ typedef enum {
                            * that would wait, from a task body or a callback on an engine
                            * thread), gptps_shutdown / gptps_step from a task body or any
                            * callback, or an add-on's call that would wait on its own
-                           * callback thread (gptps_xport_submit) */
+                           * callback thread (gptps_xport_submit), or a setup call on a
+                           * bounded engine after its first submit (docs/BOUNDED.md) */
 } gptps_status;
 
 GPTPS_API const char *gptps_strerror(gptps_status s);
@@ -212,6 +214,8 @@ GPTPS_API void        gptps_log(gptps_ctx *ctx, gptps_log_level lvl, const char 
 /* Result delivery goes through the ctx so ownership is UNIFORM across the
  * in-process and out-of-process paths (the OOP path marshals bytes anyway).
  *   _set        : core copies your bytes (valid only during this call) and frees its copy.
+ *                 On a bounded engine the copy goes into a buffer of max_result_bytes,
+ *                 and more than that is GPTPS_E_INVAL (the attempt keeps no result).
  *   _set_nocopy : you transfer ownership; the core calls free_cb after delivery (zero-copy
  *                 escape hatch for large results). A NULL free_cb means the buffer is
  *                 BORROWED (caller/static-owned) and the core will NOT free it.
@@ -474,6 +478,20 @@ typedef struct {
                                     * _reload. NULL => limits below + defaults */
     gptps_limits  limits;          /* explicit values win over auto-tune & file */
     gptps_run_mode mode;           /* v1.6: THREADED (default) or MANUAL (gptps_step) */
+    /* ABI 2.4: BOUNDED MODE (docs/BOUNDED.md). 0, the default, keeps the classic
+     * engine, which allocates as it goes. Nonzero: at most this many items are alive at
+     * once - queued, waiting to retry, running or dead-lettered - and the FIRST SUBMIT
+     * that names a registered task allocates everything the work path will ever need
+     * (one that names no task seals nothing); after it, nothing on the work
+     * path allocates, and the setup calls that would have to (registering tasks,
+     * observers, constraints or new named resources, defining settings, loading
+     * add-ons) return GPTPS_E_BUSY. In-process tasks only. A uint64_t so it grows
+     * sizeof on every ABI: a caller built against an older header never seems to have
+     * it (see task_def.flags). */
+    uint64_t       max_items;
+    uint32_t       max_payload_bytes;  /* bounded: each item's payload slot; longer is GPTPS_E_INVAL */
+    uint32_t       max_result_bytes;   /* bounded: each executing thread's result buffer;
+                                        * a longer gptps_result_set is GPTPS_E_INVAL */
 } gptps_config;
 
 GPTPS_API gptps_status gptps_open(const char *config_path, gptps **out_engine);
@@ -668,7 +686,11 @@ GPTPS_API gptps_status gptps_addon_disable(gptps *e, const char *ns_or_name);
  * in the HOST-TABLE ABI section below. */
 
 /* Enqueue work. Rejects with GPTPS_E_BUDGET at submit time if the task's
- * declared cost can NEVER fit max_memory_bytes (it would otherwise starve). */
+ * declared cost can NEVER fit max_memory_bytes (it would otherwise starve).
+ * On a bounded engine (gptps_config.max_items): a payload longer than
+ * max_payload_bytes is GPTPS_E_INVAL, GPTPS_E_FULL means every item is in use, and
+ * the first submit - which allocates the engine's whole working set - can return
+ * GPTPS_E_NOMEM, leaving the engine unsealed. */
 GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,
                                     const void *payload, size_t len,
                                     gptps_handle *out_handle);
