@@ -348,6 +348,26 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   handled on both. The Windows change is compiled by CI but not run, since the test
   is Linux-only.
 
+### Added — a randomized stress of the public API
+
+- **`tests/test_stress_api.c` searches where two features meet on two threads.** Eight
+  threads draw operations at random, from one logged seed, out of what the threading
+  contract lets run at once: submit and cancel; settings get, set, reload, save and
+  check, against a config file other threads keep rewriting; pause, clone, unregister
+  and register again, in-process and PROGRAM; re-budgeting; the dead-letter drain; an
+  add-on load that fails. The callbacks re-enter as the contract invites. Rounds vary
+  THREADED and MANUAL, classic and bounded. It checks that every handle gets exactly
+  one terminal event; that cancelling closes every open one and leaves nothing queued,
+  running or reserved; that no setting outlives its task and no live task lacks one;
+  that a saved file reopens; that a drain calls back once for each dead letter it
+  takes; that shutdown keeps its grace; and the sanitizers. A hang fails it too: a
+  watchdog names what each thread was doing, before CTest's timeout. Each round prints
+  its seed: `--seed S --rounds 1` runs it again, and `--replay` runs its operations on
+  one thread, in order. The seed comes from the clock unless `GPTPS_STRESS_SEED` or
+  `--seed` pins it. By default it runs six rounds of 1.5 s; `GPTPS_STRESS_MS` makes it
+  a soak. It found the four defects below, and reviewing their fixes found more of the
+  same kind, fixed with them.
+
 ### Fixed — defects the stress test found
 
 - **Two saves at once failed, and could put a cut-off file in place.** Every save to a

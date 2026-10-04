@@ -864,6 +864,18 @@ target_link_libraries(test_reconcile PRIVATE gptps)
 add_test(NAME reconcile COMMAND test_reconcile)
 set_tests_properties(reconcile PROPERTIES TIMEOUT 60)
 
+# --- the public API at random, from many threads, against its invariants ---
+# A logged seed drives every operation; the file says how to replay one. About 10 s
+# here; GPTPS_STRESS_MS (or --ms) makes it a long local run, and GPTPS_STRESS_SEED (or
+# --seed) pins the seed, which is otherwise taken from the clock.
+add_executable(test_stress_api tests/test_stress_api.c)
+target_include_directories(test_stress_api PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_stress_api PRIVATE gptps)
+target_compile_definitions(test_stress_api PRIVATE ADDON_UNWIND_PATH="$<TARGET_FILE:addon_unwind>")
+add_dependencies(test_stress_api addon_unwind)
+add_test(NAME stress_api COMMAND test_stress_api)
+set_tests_properties(stress_api PROPERTIES TIMEOUT 120)
+
 # real-time terminal dashboard add-on (portable; headless-tested)
 if(TARGET gptps_tui)
 add_executable(test_tui tests/test_tui.c)
