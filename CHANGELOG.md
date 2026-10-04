@@ -7,6 +7,45 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+### Added — an edge-AI demo: admission against a board's shared memory
+
+- **`examples/edge_ai/`: several AI jobs on one board's memory.** On a Jetson the CPU and
+  the GPU share one pool of DRAM. A detector, a segmenter, a small LLM and a few
+  classifiers started together can need more of it than the board has, and the kernel's
+  OOM killer then ends one of them. `edge_admission`, a host on the public API only, reads
+  a jobs file - a name, a declared peak, a share of a resource named `gpu`, a timeout,
+  retries and a command on each line - and registers each job as a PROGRAM task, its
+  peak as `default_cost.mem_bytes`. GPTPS starts a job only when its peak fits
+  `limits.max_memory_bytes` (`--budget-mb`, what the board can spare) and its share fits
+  the `gpu` budget (`--gpu-slots`), and queues the rest. A failure is retried, then
+  dead-lettered, and a job that outgrows its declaration is capped, alone. The report
+  gives each job's start and end, its attempts and how it ended, and the declared memory
+  in flight against the budget. `--naive` starts every job at once without GPTPS, and
+  reports which jobs were killed, by what signal, and how many the kernel OOM-killed.
+- **It runs anywhere.** `fake_infer` stands in for a model: it takes and touches N MB,
+  holds it, and can fail its first attempt or keep allocating. `jobs.txt` is a night of
+  eight such jobs that declare 2.5 times a 768 MB budget, one flaky and one a runaway.
+  `run_demo.sh` builds the demo and runs both modes in a container with 1 GB of memory
+  and no swap, so the naive run's OOM kills land in the container. Without Docker it
+  offers GPTPS mode on the host, and runs naive mode there only with `--unsafe-host`. In
+  the run the README shows, GPTPS mode finished seven of the eight jobs, the flaky one on
+  its retry, and dead-lettered the runaway, with at most 660 MB declared in flight; naive
+  mode finished four, and the OOM killer took three.
+- **What it does not fix, said in its README:** a single model too big for the board,
+  which GPTPS refuses at submit with `GPTPS_E_BUDGET` but cannot make fit, and GPU memory
+  too fragmented for CUDA to find a contiguous block while tegrastats shows RAM free. The
+  README also says that without `GPTPS_CGROUP_PARENT` the cap is `RLIMIT_AS`, which
+  CUDA's start-up reservation of address space does not fit, so real CUDA jobs need the
+  cgroup mode, and how to set that up. `jobs.jetson.txt` is a template for real jobs,
+  with `mem_mb` left to be measured with tegrastats. Nothing was run on a Jetson.
+- **The `example_edge_ai` test** (Linux) runs a tiny night in about 0.2 s, with neither
+  Docker nor cgroups, and checks that the normal jobs finish, the flaky one after a retry,
+  the runaway as a dead letter stopped by its cap, a job too big for the budget refused,
+  and the declared memory in flight within the budget. `fake_infer` is built without
+  sanitizers, since their start-up reservation of address space cannot fit under
+  `RLIMIT_AS`. The test forks, so the s390x leg leaves it out and the `hal_sim` job runs it
+  paced, with the other tests about child processes (`docs/HAL.md`).
+
 ### Documentation
 
 - **What 0 means, key by key.** In `gptps_config` and its `limits`, 0 always means not

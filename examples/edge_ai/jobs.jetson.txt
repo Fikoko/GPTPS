@@ -1,0 +1,42 @@
+# A template for real jobs on a Jetson. Every job line is commented out, and its
+# mem_mb is ???: nothing here was measured, and a declaration is only as good as
+# the measurement behind it. A line uncommented with ??? still in it is refused.
+#
+# For each job:
+#   1. Run it alone on the board, the way it will run in production, with
+#      tegrastats in another terminal:
+#          sudo tegrastats --interval 500
+#      Note the RAM figure (the "RAM used/total MB" field) before the job starts,
+#      and the highest it reaches while the job runs. The difference is the job's
+#      peak. On a Jetson that one figure covers the CPU side and the GPU side: they
+#      are the same DRAM. Run it a few times; inputs change the peak.
+#   2. Put the peak plus a margin in mem_mb, and uncomment the line.
+#   3. Give --budget-mb what the board can spare for these jobs: the RAM total less
+#      what tegrastats shows with everything else that will be running - the OS,
+#      the desktop if there is one, the always-on part of your pipeline.
+#
+# gpu_units are yours to define: they count GPU work, not GPU memory, which mem_mb
+# already holds. Give every GPU job 1 and run with --gpu-slots N to allow N at a
+# time, or weigh the heavier engines more. A CPU-only job can have 0.
+#
+# A command is split at spaces and run without a shell: no quoting, redirection,
+# globbing or ~, and `#` ends the line here too. Anything more goes in a script.
+# GPTPS buffers a job's stdout (up to 16 MiB; past that the job fails with
+# GPTPS_E_IO), so a chatty tool's output belongs in a file its script writes.
+#
+# Before running CUDA jobs, read "Real CUDA jobs need the cgroup mode" in
+# README.md: without GPTPS_CGROUP_PARENT each job runs under RLIMIT_AS set to its
+# mem_mb, and CUDA cannot initialise under that.
+#
+# The paths below are placeholders for your own engines, scripts and data, and the
+# timeouts and retries are starting points, not advice: a timeout a few times the
+# job's usual run, and retries only for a job that can fail and then succeed.
+#
+# name            mem_mb  gpu  timeout_s  retries  command
+#detect_cam0         ???    1        600        1  /usr/src/tensorrt/bin/trtexec --loadEngine=/opt/models/detector_cam0.engine --iterations=2000
+#detect_cam1         ???    1        600        1  /usr/src/tensorrt/bin/trtexec --loadEngine=/opt/models/detector_cam1.engine --iterations=2000
+#segment_yard        ???    1        900        1  /usr/src/tensorrt/bin/trtexec --loadEngine=/opt/models/segmenter.engine --iterations=500
+#classify_plates     ???    1        300        2  python3 /opt/pipeline/infer.py --model /opt/models/plates.onnx --input /data/night/plates
+#classify_ppe        ???    1        300        2  python3 /opt/pipeline/infer.py --model /opt/models/ppe.onnx --input /data/night/ppe
+#llm_summary         ???    1       1800        0  python3 /opt/pipeline/summarize.py --model /opt/models/llm --events /data/night/events.json
+#export_report       ???    0        120        3  /opt/pipeline/export_report.sh /data/night

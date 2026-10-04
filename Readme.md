@@ -134,8 +134,9 @@ See [Live terminal dashboard](#live-terminal-dashboard) for what it shows and ho
 ctest --test-dir build --output-on-failure   # full suite (should be 100%)
 ```
 
-More in [`examples/`](examples/): `external_program` (run any binary as a task) and
-`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below).
+More in [`examples/`](examples/): `external_program` (run any binary as a task),
+`wasm_program` (run a `.wasm` module via a wasm runtime CLI — see WebAssembly below), and
+[`edge_ai/`](examples/edge_ai/) (AI jobs sharing one board's memory, as on a Jetson, each started only when it fits).
 
 **4. Embed it in your own program.** Generate the amalgamation — two files for the core, plus
 a self-contained `.c`/`.h` pair for each add-on you ask for, and no build system — drop the
@@ -830,7 +831,8 @@ gptps/
 │   └── CMakeLists.txt   one library + header + .pc per add-on
 ├── templates/plugin/    ← a complete, copyable binary plug-in (built out-of-tree by CI)
 ├── examples/            ← runnable examples (demo, config_file, task_control, success_gate, item_ledger,
-│                          external_program, dashboard, embedded, wasm_program, bench_pool, bench_balance)
+│                          external_program, dashboard, embedded, wasm_program, bench_pool, bench_balance,
+│                          edge_ai/)
 ├── gptps.example.toml   ← annotated sample config file
 ├── docs/
 │   ├── ARCHITECTURE.md  how it works inside

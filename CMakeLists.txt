@@ -1120,6 +1120,32 @@ if(UNIX)
     target_link_libraries(example_wasm PRIVATE gptps)
     add_test(NAME example_wasm COMMAND example_wasm)
     set_tests_properties(example_wasm PROPERTIES TIMEOUT 20)
+
+    # edge AI: jobs admitted against a board's shared memory (examples/edge_ai/).
+    # fake_infer is the JOB, not the host, and GPTPS runs it under RLIMIT_AS - which a
+    # sanitizer's start-up reservation of address space (terabytes, for ASan's and
+    # TSan's shadow memory) can never fit. So it is built without one, whatever
+    # CMAKE_C_FLAGS asks for; edge_admission, the host, keeps them.
+    add_executable(fake_infer examples/edge_ai/fake_infer.c)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(fake_infer PRIVATE -fno-sanitize=all)
+        target_link_options(fake_infer PRIVATE -fno-sanitize=all)
+    endif()
+    add_executable(edge_admission examples/edge_ai/edge_admission.c)
+    target_include_directories(edge_admission PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(edge_admission PRIVATE gptps)
+    add_dependencies(edge_admission fake_infer)
+    # The smoke test checks that the runaway job is stopped by its cap: Linux only,
+    # since macOS does not enforce RLIMIT_AS (test_oop's case C is Linux-only too).
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME example_edge_ai
+                 COMMAND ${CMAKE_COMMAND}
+                         -DEDGE_ADMISSION=$<TARGET_FILE:edge_admission>
+                         -DFAKE_INFER_DIR=$<TARGET_FILE_DIR:fake_infer>
+                         -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/examples/edge_ai/smoke_test.cmake)
+        set_tests_properties(example_edge_ai PROPERTIES TIMEOUT 30)
+    endif()
 endif()
 
 endif() # GPTPS_BUILD_EXAMPLES

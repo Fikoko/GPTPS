@@ -1,0 +1,21 @@
+# A synthetic night on a 1 GB board: a detector for each of two cameras, a
+# segmenter, a small LLM writing the night's summary, two classifiers, a
+# re-identification job that fails its first attempt, and a tracker that leaks.
+#
+# fake_infer stands in for each model (see fake_infer.c): --mb is the memory it
+# really takes, and mem_mb is what the job declares - its peak plus a margin, as
+# you would declare a real job's measured peak. All at once the jobs declare
+# 1920 MB: 2.5x the 768 MB budget run_demo.sh gives a 1 GB board.
+#
+# The runaway is declared at 100 MB and does not stop at its --mb 64: GPTPS's cap
+# on the job stops it, and only it.
+#
+# name           mem_mb  gpu  timeout_s  retries  command
+detect_cam0         300    2         30        1  fake_infer --mb 280 --ms 2000
+detect_cam1         300    2         30        1  fake_infer --mb 280 --ms 2000
+segment_yard        360    2         30        1  fake_infer --mb 340 --ms 2500
+llm_summary         460    3         60        1  fake_infer --mb 440 --ms 3000
+classify_plates     120    1         20        1  fake_infer --mb 100 --ms 1200
+classify_ppe        120    1         20        1  fake_infer --mb 100 --ms 1200
+reid_flaky          160    1         20        2  fake_infer --mb 140 --ms 1000 --fail-first /tmp/edge_ai_reid.mark
+track_runaway       100    1         20        1  fake_infer --mb 64 --ms 1500 --runaway
