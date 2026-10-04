@@ -77,7 +77,9 @@ static const struct { const char *section, *intro; } SECTIONS[] = {
       "Top-level keys, before any `[table]`." },
     { "limits",
       "The engine's size and its admission budget. The keys that size the engine are read at "
-      "open, and a value the host passes in `gptps_config` wins over the file's." },
+      "open, and a value the host passes in `gptps_config` wins over the file's. So does a "
+      "`max_dead_letters` or `shutdown_grace_ms` passed there, where 0 means not set and "
+      "`GPTPS_LIMIT_NONE` means no limit, which is 0 here." },
     { "scheduler",
       "How the dispatcher chooses among work that waits." },
     { "bounded",

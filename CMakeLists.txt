@@ -412,6 +412,16 @@ target_link_libraries(test_deadletter PRIVATE gptps)
 add_test(NAME deadletter COMMAND test_deadletter)
 set_tests_properties(deadletter PROPERTIES TIMEOUT 30)
 
+# gptps_config.max_dead_letters and .shutdown_grace_ms: 0 = not set, GPTPS_LIMIT_NONE =
+# no limit, an older caller's struct, and the config file's precedence (#15).
+add_executable(test_open_limits tests/test_open_limits.c)
+target_include_directories(test_open_limits
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_open_limits PRIVATE gptps)
+add_test(NAME open_limits COMMAND test_open_limits)
+set_tests_properties(open_limits PROPERTIES TIMEOUT 60)
+
 add_executable(test_settings tests/test_settings.c) # unified settings registry
 target_include_directories(test_settings
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src

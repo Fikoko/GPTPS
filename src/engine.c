@@ -2359,6 +2359,14 @@ static void register_task_local_settings(gptps *e, gptps_reg *r)
     if (snap != stack_snap) gptps_free(snap);
 }
 
+/* A gptps_config limit whose 0 means "not set" (ABI 2.4): 0 keeps `dflt`,
+ * GPTPS_LIMIT_NONE is the engine's 0 ("no limit"), and anything else is the limit. */
+static uint32_t open_limit(uint32_t v, uint32_t dflt)
+{
+    if (v == 0) return dflt;
+    return v == GPTPS_LIMIT_NONE ? 0u : v;
+}
+
 /* The engine itself, from a config whose file (if any) has already been read. */
 static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
 {
@@ -2443,6 +2451,14 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
         if (!e->pool_m) { s = GPTPS_E_NOMEM; goto fail; }
     }
     e->bnext_items = e->max_items; e->bnext_payload = e->max_payload; e->bnext_result = e->max_result;
+
+    /* ABI 2.4: the two limits whose 0 means something of its own, read only when the
+     * caller's struct has them. With a config file, cfg_open_keys has already left
+     * the file's value out if the struct sets one, and cfg_apply sets it otherwise. */
+    if (cfg && GPTPS_STRUCT_HAS(gptps_config, cfg, max_dead_letters))
+        e->max_dead_letters = open_limit(cfg->max_dead_letters, e->max_dead_letters);
+    if (cfg && GPTPS_STRUCT_HAS(gptps_config, cfg, shutdown_grace_ms))
+        e->shutdown_grace_ms = open_limit(cfg->shutdown_grace_ms, e->shutdown_grace_ms);
 
     e->manual = (cfg && cfg->mode == GPTPS_RUN_MANUAL);
     if (e->manual) {
@@ -2676,7 +2692,10 @@ static void apply_task_config(gptps *e, const char *name, gptps_task_def *def, i
 
 /* The keys that size the engine, read before it exists: [limits] and [bounded]. An
  * explicit gptps_config value wins over the file; 0 means "not set" in both.
- * Returns the number of errors, each one logged. */
+ * gptps_config.max_dead_letters and .shutdown_grace_ms win the same way, but their 0
+ * ("not set") is not the file's 0 ("no limit"): when the struct sets one, the file's
+ * value is only checked here; when it does not, cfg_apply sets the file's value as a
+ * live set would. Returns the number of errors, each one logged. */
 static unsigned cfg_open_keys(gptps_toml *t, gptps_config *c)
 {
     static const struct { const char *key; int has_range; double max; } K[] = {
@@ -2708,6 +2727,15 @@ static unsigned cfg_open_keys(gptps_toml *t, gptps_config *c)
             case 3: if (!c->max_items)                   c->max_items = (uint64_t)v;                   break;
             case 4: if (!c->max_payload_bytes)           c->max_payload_bytes = (uint32_t)v;           break;
             default: if (!c->max_result_bytes)           c->max_result_bytes = (uint32_t)v;            break;
+        }
+    }
+    for (i = 0; i < 2; ++i) {      /* the two limits whose 0 is the file's "no limit" */
+        if (!(i ? c->shutdown_grace_ms : c->max_dead_letters)) continue;
+        if ((j = gptps_toml_find_dotted(t, i ? "limits.shutdown_grace_ms" : "limits.max_dead_letters")) < 0) continue;
+        gptps_toml_claim_at(t, (size_t)j);
+        cfg_item_at(t, (size_t)j, &it);
+        if (!cfg_value_ok(GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL, &it, why, sizeof why)) {
+            cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
         }
     }
     /* max_memory_gb: the file's other spelling of max_memory_bytes, which wins if both are set */

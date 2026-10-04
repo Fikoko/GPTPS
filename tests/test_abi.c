@@ -114,6 +114,28 @@ int main(void)
         CHECK(sizeof(gptps_event) >= offsetof(gptps_event, flags) + sizeof(uint32_t));
     }
 
+    /* 4) What 2.4 appends to gptps_config GROWS it, on every ABI: each new field
+     *    starts at or past the sizeof of the struct before it, never in that struct's
+     *    tail padding, where struct_size could not tell an older caller's leftover
+     *    bytes from a value. The older layouts, rebuilt from the same members: */
+    {
+        typedef struct { size_t struct_size; const char *config_path; gptps_limits limits;
+                         gptps_run_mode mode; } config_1_5;
+        typedef struct { size_t struct_size; const char *config_path; gptps_limits limits;
+                         gptps_run_mode mode; uint64_t max_items; uint32_t max_payload_bytes;
+                         uint32_t max_result_bytes; } config_bounded;
+        typedef char max_items_grows[
+            (offsetof(gptps_config, max_items) >= sizeof(config_1_5)) ? 1 : -1];
+        typedef char dead_letters_grows[
+            (offsetof(gptps_config, max_dead_letters) >= sizeof(config_bounded)) ? 1 : -1];
+        typedef char grace_inside[
+            (offsetof(gptps_config, shutdown_grace_ms) + sizeof(uint32_t) <= sizeof(gptps_config)) ? 1 : -1];
+        (void)sizeof(max_items_grows);
+        (void)sizeof(dead_letters_grows);
+        (void)sizeof(grace_inside);
+        CHECK(GPTPS_LIMIT_NONE == 0xFFFFFFFFu);
+    }
+
     if (fails) { printf("%d abi check(s) FAILED\n", fails); return 1; }
     printf("all abi (append-safe guard) checks passed\n");
     return 0;

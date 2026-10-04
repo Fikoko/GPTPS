@@ -99,8 +99,8 @@ The engine is bounded by construction, and the bounds are the defence:
 | Queued (un-admitted) items | `limits.max_intake_depth` | unbounded — **set this** if submitters are untrusted |
 | Concurrently running items | `limits.max_concurrent_tasks` | one per online logical CPU |
 | Memory admitted at once | `limits.max_memory_bytes` | ~0.75 × detected RAM |
-| Retained dead letters | `limits.max_dead_letters` | 1024, oldest evicted |
-| Shutdown drain | `limits.shutdown_grace_ms` | 30s, then in-flight work is cancelled and waiting work is ended by policy |
+| Retained dead letters | `limits.max_dead_letters` (`gptps_config.max_dead_letters` at open) | 1024, oldest evicted |
+| Shutdown drain | `limits.shutdown_grace_ms` (`gptps_config.shutdown_grace_ms` at open) | 30s, then in-flight work is cancelled and waiting work is ended by policy |
 | Bytes buffered from a child | *(compile-time)* | 16 MiB per result |
 
 The one default that is deliberately permissive is `max_intake_depth`: unbounded

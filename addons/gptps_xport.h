@@ -48,8 +48,8 @@
  *
  * Teardown: gptps_xport_close() is a graceful drain. It closes the request side of
  * every link; a worker in engine mode sees EOF, runs gptps_shutdown on its engine
- * (bounded by that engine's limits.shutdown_grace_ms - set it in `engine_cfg` if
- * the default 30s is too long for you), sends the remaining replies, and exits.
+ * (bounded by that engine's limits.shutdown_grace_ms - set engine_cfg->shutdown_grace_ms
+ * if the default 30s is too long for you), sends the remaining replies, and exits.
  * Blocking submits outstanding at close time therefore get real answers; async
  * ones get their callback. Only then are the readers joined and the pids reaped.
  */

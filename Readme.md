@@ -274,7 +274,8 @@ change — see [Scaling](#scaling-opt-in-by-composition).
 `gptps_open("gptps.toml", &e)` tunes the engine from a config file — no recompile to
 re-tune for a new machine or change a task's failure policy. Pass `NULL` to skip it and
 auto-tune. `gptps_open_ex` reads the same file when `cfg.config_path` is set, and an
-explicit value in `cfg.limits` wins over the file's. A subset of TOML is supported
+explicit value in `cfg.limits`, `cfg.max_dead_letters` or `cfg.shutdown_grace_ms` wins
+over the file's. A subset of TOML is supported
 (tables, `int`/`float`/`bool`/`"string"` and single-line string arrays, `"quoted"` parts in
 keys and table names such as `[tasks."resize v2"]`, `#` comments). **[docs/CONFIG.md](docs/CONFIG.md) lists every key** with its type,
 range, default and when a change applies; it is generated from the code, and a test
@@ -323,6 +324,17 @@ gpu = 1
 
 Precedence for a task's policy: compiled-in `def` defaults → `[task_defaults]` → `[tasks.<name>]`
 (most specific wins). Explicit `[limits]` values win over auto-tune. See `gptps.example.toml`.
+
+Two limits have a `0` of their own: `limits.max_dead_letters` (`0` keeps every dead
+letter) and `limits.shutdown_grace_ms` (`0` waits forever). Neither default is `0`, and
+a `0` in `cfg.limits` means "not set", so they are fields of their own at the end of
+`gptps_config` (ABI 2.4). There, too, `0` means not set: the default, or the file's
+value. `GPTPS_LIMIT_NONE` means no limit, and any other value is the limit:
+
+```c
+cfg.max_dead_letters  = GPTPS_LIMIT_NONE;  /* keep every dead letter (default 1024)        */
+cfg.shutdown_grace_ms = 5000;              /* cancel running work after 5 s (default 30 s) */
+```
 
 **The file is checked as it is read.** `gptps_open` fails with `GPTPS_E_CONFIG` on a line
 that does not parse, a value out of range or of the wrong type (TOML's types: `"4"` in
@@ -706,8 +718,9 @@ counting allocator in `tests/test_bounded.c` holds it to that, in both modes;
   `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
   the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
   The list is capped at `limits.max_dead_letters` (default 1024, oldest evicted, `0` =
-  unbounded); `stats.dead_letters_evicted` counts anything the cap dropped, so a host
-  that never drains gets bounded memory instead of silent growth.
+  unbounded; at open, `cfg.max_dead_letters`, where `GPTPS_LIMIT_NONE` is unbounded);
+  `stats.dead_letters_evicted` counts anything the cap dropped, so a host that never
+  drains gets bounded memory instead of silent growth.
 - **Durability (optional):** `addons/gptps_durable_queue.c` journals submissions to disk (fsync before
   enqueue) and replays survivors after a crash — at-least-once delivery. See `addons/README.md`.
 - **Runtime task management:** enumerate, pause/resume, clone, and unregister task types
@@ -858,7 +871,8 @@ hang it hangs your host's exit path — so these are contractual, and
 [`tests/test_hang.c`](tests/test_hang.c) enforces them with a hard test timeout:
 
 - `gptps_shutdown` always returns. In-flight work drains for at most
-  `limits.shutdown_grace_ms` (default 30s; `0` opts back into waiting forever), then
+  `limits.shutdown_grace_ms` (default 30s; `0`, or `GPTPS_LIMIT_NONE` in
+  `cfg.shutdown_grace_ms` at open, opts back into waiting forever), then
   gets cancelled, and work still queued or in backoff is ended by its policy with
   `GPTPS_E_SHUTDOWN` — an external child with no timeout of its own cannot wedge
   teardown, and neither can a constraint that keeps deferring.

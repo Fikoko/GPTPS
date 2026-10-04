@@ -17,7 +17,7 @@ certified; see [SAFETY.md](SAFETY.md).
 
 ## Turning it on
 
-Three fields at the end of `gptps_config` (ABI 2.4):
+Three fields of `gptps_config` (ABI 2.4):
 
 ```c
 gptps_config cfg;
@@ -63,7 +63,7 @@ so a caller built against an older header never appears to have set it.
 
 | Situation | Bounded mode |
 |---|---|
-| All `max_items` items are alive | `gptps_submit` returns `GPTPS_E_FULL`. Dead letters hold their items until they are drained or evicted (`limits.max_dead_letters`). |
+| All `max_items` items are alive | `gptps_submit` returns `GPTPS_E_FULL`. Dead letters hold their items until they are drained or evicted, so they hold at most `limits.max_dead_letters` of them (default 1024). With no cap (`cfg.max_dead_letters = GPTPS_LIMIT_NONE`, or `0` live or in the file), none is evicted, and dead letters nobody drains can fill the pool. |
 | A payload longer than `max_payload_bytes` | `gptps_submit` returns `GPTPS_E_INVAL`. |
 | `gptps_result_set` with more than `max_result_bytes` | Returns `GPTPS_E_INVAL`, and the attempt keeps no result. `gptps_result_set_nocopy` copies nothing and works as before. |
 | Setup after the seal | `register_task`, `unregister_task`, a new name in `define_resource`, `define_global`, `define_task_setting`, `register_setting`, `register_observer`, `register_constraint` and `load_addon` return `GPTPS_E_BUSY`. Re-budgeting an existing resource, `set_task_resource_cost` and `set_scheduler` still work, because they allocate nothing. |

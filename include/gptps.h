@@ -76,9 +76,10 @@ extern "C" {
  *
  * 2.x: 2.1 the plug-in tier seams; 2.2 appends `flags` to gptps_task_info and adds
  * gptps_task_flags, so a caller can finally see whether a registered type is a
- * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*); 2.4 appends the
- * bounded-mode fields to gptps_config. Additive, and the loader compares MAJOR only,
- * so no existing add-on is refused. */
+ * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*); 2.4 appends to
+ * gptps_config the bounded-mode fields, then max_dead_letters and shutdown_grace_ms
+ * (with GPTPS_LIMIT_NONE). Additive, and the loader compares MAJOR only, so no
+ * existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 4u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
@@ -478,6 +479,15 @@ typedef struct {
      * bounding memory an overproducing client can pin (max_memory_bytes caps only
      * the RUNNING set). Also tunable live via the "limits.max_intake_depth" setting. */
     uint32_t max_intake_depth;
+    /* Not here: limits.max_dead_letters and limits.shutdown_grace_ms. For both, 0
+     * already means something - keep every dead letter, wait forever - while the
+     * default is not 0 (1024, 30000 ms), and in this struct 0 means "not set". Nor
+     * can this struct take a field for them: gptps_config embeds it by value, with
+     * fields after it. A field appended here would move those fields on i386 Linux,
+     * and on 64-bit and the other 32-bit ABIs land in this struct's 4 bytes of tail
+     * padding, where struct_size cannot tell an older caller's leftover bytes from a
+     * value. They are at the end of gptps_config instead, where 0 means "not set"
+     * and GPTPS_LIMIT_NONE means no limit. */
 } gptps_limits;
 
 /* Execution model. THREADED (default, 0) spawns a dispatcher + worker pool and
@@ -489,6 +499,16 @@ typedef enum {
     GPTPS_RUN_THREADED = 0,        /* default: dispatcher + worker pool */
     GPTPS_RUN_MANUAL   = 1         /* no threads; pump via gptps_step() */
 } gptps_run_mode;
+
+/* "No limit", in a gptps_config field whose 0 means "not set" (max_dead_letters,
+ * shutdown_grace_ms; ABI 2.4). The engine keeps it as the 0 that the setting and the
+ * config file use for "no limit", so the setting reads back "0". Being the largest
+ * uint32_t, it cannot also mean a limit of 4294967295, and that costs nothing: so
+ * many dead letters would need more memory than a 32-bit process can address, and
+ * over 890 GB on x86-64, at 208 bytes an item before its payload; a grace of
+ * 4294967295 ms is 49.7 days. Either limit can still be set to exactly that, live
+ * or in the file. */
+#define GPTPS_LIMIT_NONE 0xFFFFFFFFu
 
 typedef struct {
     size_t        struct_size;     /* = sizeof(gptps_config) */
@@ -513,6 +533,22 @@ typedef struct {
     uint32_t       max_payload_bytes;  /* bounded: each item's payload slot; longer is GPTPS_E_INVAL */
     uint32_t       max_result_bytes;   /* bounded: each executing thread's result buffer;
                                         * a longer gptps_result_set is GPTPS_E_INVAL */
+    /* ABI 2.4: two limits whose 0 already means something, which is why they are not
+     * in `limits` (see the note there). Here 0 means "not set": the default, or the
+     * config file's value. GPTPS_LIMIT_NONE means no limit. Any other value is the
+     * limit. An explicit value wins over the file, as `limits` does; a later
+     * gptps_settings_set, or a reload of a file that sets the key, changes it as
+     * before. Read only when struct_size covers them, so an older caller has neither;
+     * two uint32_t grow sizeof on every ABI, as max_items did. */
+    uint32_t       max_dead_letters;   /* "limits.max_dead_letters": dead letters kept;
+                                        * past it the oldest is dropped and counted in
+                                        * stats.dead_letters_evicted. 0 = 1024.
+                                        * GPTPS_LIMIT_NONE = keep every one (a bounded
+                                        * engine still holds at most max_items) */
+    uint32_t       shutdown_grace_ms;  /* "limits.shutdown_grace_ms": how long
+                                        * gptps_shutdown lets running work finish before
+                                        * it cancels it. 0 = 30000.
+                                        * GPTPS_LIMIT_NONE = wait forever */
 } gptps_config;
 
 GPTPS_API gptps_status gptps_open(const char *config_path, gptps **out_engine);
@@ -775,7 +811,8 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
 /* Drain in-flight + queued work, join the threads, free the engine.
  *
  * BOUNDED: in-flight work gets `limits.shutdown_grace_ms` (default 30000, live-
- * settable, 0 = wait forever) to finish on its own, after which every running
+ * settable, 0 = wait forever; at open, gptps_config.shutdown_grace_ms, where
+ * GPTPS_LIMIT_NONE waits forever) to finish on its own, after which every running
  * item's cancel flag is raised - the enforced executors then hard-kill their child
  * within ~200ms. Without that bound a single external child that ignores its
  * (absent) deadline would hang the HOST's exit path forever and be orphaned when
@@ -918,7 +955,8 @@ GPTPS_API gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *use
  * or re-submit them. gptps_shutdown() frees any that were never drained.
  *
  * BOUNDED: this is the one queue a host is not required to drain, so it is capped
- * at `limits.max_dead_letters` (default 1024, live-settable, 0 = unbounded) and
+ * at `limits.max_dead_letters` (default 1024, live-settable, 0 = unbounded; at
+ * open, gptps_config.max_dead_letters, where GPTPS_LIMIT_NONE is unbounded) and
  * the OLDEST entry is evicted past the cap - otherwise a long-running host with a
  * persistently failing task grew forever, each entry pinning its original payload.
  * The truncation is never silent: the `stats.dead_letters_evicted` setting counts
@@ -1109,8 +1147,10 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * While a reload is applying a file, save() returns GPTPS_E_BUSY: try again. So
  * does reload() while another reload runs, or while an add-on's setup does.
  * reload() re-reads the file and applies it with the same checks as gptps_open, as
- * set() would, so a key the file sets overrides a limit the host passed in
- * cfg->limits at open, and a 0 there means auto. A file that does not parse applies
+ * set() would, so a key the file sets overrides a limit the host passed at open in
+ * cfg->limits, cfg->max_dead_letters or cfg->shutdown_grace_ms, and a 0 in the file
+ * means what the setting's 0 means: auto for max_concurrent_tasks and
+ * max_memory_bytes, no limit for the rest. A file that does not parse applies
  * nothing; otherwise every valid value is applied, each problem is logged, and the
  * result is GPTPS_E_CONFIG if there was any. For both, path==NULL uses the path the
  * engine was opened with (GPTPS_E_INVAL if none). */

@@ -94,6 +94,50 @@ Four changes can need a change in a host. The first three are about the config f
   - As an experiment, the whole suite was run with every engine made bounded. Of 74
     tests, 50 passed, and each of the 24 that failed stopped at a documented refusal.
 
+### Added — the dead-letter cap and the shutdown grace at open (ABI 2.4)
+
+- **`gptps_config.max_dead_letters`, `gptps_config.shutdown_grace_ms` and
+  `GPTPS_LIMIT_NONE`.** A host that configured through `gptps_open_ex` could not set
+  either limit at open. Neither was in `gptps_limits`, where 0 means "not set", while
+  for these two 0 already means something - keep every dead letter, wait forever -
+  and the defaults are 1024 and 30000 ms. Only a config file or a live
+  `gptps_settings_set` reached them. In the report, 5,000 failures overnight left
+  1,024 dead letters, and the other 3,976 were evicted, counted only in
+  `stats.dead_letters_evicted`; the new test measures the same.
+  - The two `uint32_t` fields are appended to `gptps_config`, after the bounded-mode
+    ones. 0 means not set: the default, or the config file's value.
+    `GPTPS_LIMIT_NONE` (`0xFFFFFFFFu`) means no limit, and becomes the 0 the settings
+    and the file use for it. Any other value is the limit. So the struct cannot ask
+    for a limit of exactly 4,294,967,295, which no host could reach: that many dead
+    letters would need over 890 GB on x86-64, at 208 bytes an item before its payload,
+    and that grace is 49.7 days. The setting and the file still take the number.
+  - An explicit value wins over the config file, as `cfg.limits` does, and the file's
+    value is still checked. A live set or a reload changes either one as before.
+  - They are read only when `struct_size` covers them, so a caller built against an
+    older header has neither. Two `uint32_t` grow `gptps_config` by 8 bytes on every
+    ABI checked (from 72 to 80 bytes on x86-64, from 48 to 56 on i386), and
+    `tests/test_abi.c` asserts that each field appended to it starts at or past the
+    size of the struct before it.
+  - `gptps_limits` could not take them. `gptps_config` embeds it by value with fields
+    after it, so a field appended to it would move `mode` on i386 Linux, and on 64-bit
+    and the other 32-bit ABIs land in its 4 bytes of tail padding, where
+    `limits.struct_size` cannot tell an older caller's leftover bytes from a value. A
+    note in `gptps_limits` now says where the two limits are, and why.
+  - A bounded engine with no cap keeps every dead letter until the pool is full, and
+    `gptps_submit` then returns `GPTPS_E_FULL` until a drain frees them.
+    `docs/BOUNDED.md` says so.
+
+  Reported by @nightops00dev in #15.
+- **`tests/test_open_limits.c`** checks the defaults, explicit values,
+  `GPTPS_LIMIT_NONE`, an older caller whose struct ends at `max_result_bytes` with
+  garbage after it, the struct against the file both ways, a live set and a reload
+  afterwards, and a bounded engine. It runs the report's night: 5,000 failures keep
+  1,024 dead letters and evict 3,976 by default, and keep all 5,000, oldest first, with
+  `GPTPS_LIMIT_NONE`. With an explicit 30 ms grace, shutdown cancels a running body;
+  with `GPTPS_LIMIT_NONE`, it waits for the body to finish. Each of ten deliberately
+  broken builds fails it: one reads the struct without its size check, one stores
+  `GPTPS_LIMIT_NONE` as itself, one lets the file win, and so on.
+
 ### Added — a conformance test for the HAL, and a HAL that takes every freedom it allows
 
 - **`tests/test_hal_conformance.c` holds a HAL to its contract.** It has 37 checks:
