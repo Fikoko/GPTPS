@@ -402,6 +402,7 @@ struct gptps {
     gptps_toml    *toml;          /* parsed config file (NULL if opened without one) */
     uint32_t       toml_gen;      /* bumped each time a reload swaps `toml` */
     int            toml_reloading;/* a reload is applying a file not yet in `toml` */
+    int            toml_saving;   /* saves copying `toml`'s file: a reload waits for them */
     unsigned       cfg_late_errors;   /* file values found invalid after open (gptps_config_check) */
     int            cfg_reported;  /* the unclaimed-key report was made (first submit, or the check) */
     int            cfg_opening;   /* gptps_open_ex is still reading the file: no report yet */
@@ -4760,6 +4761,7 @@ static int cfg_refused(const char *key, const char *text, void *ud)
 gptps_status gptps_settings_save(gptps *e, const char *path)
 {
     char base[1024];
+    gptps_status st;
     if (!e) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     if (!path) path = e->config_path;
@@ -4773,8 +4775,17 @@ gptps_status gptps_settings_save(gptps *e, const char *path)
     }
     base[0] = 0;
     if (e->toml) snprintf(base, sizeof base, "%s", gptps_toml_path(e->toml));
+    /* Until the save is done, `toml` stays the file named in `base`: cfg_refused asks
+     * it which of the copied values the engine refused. A reload that swapped in
+     * another file meanwhile had it answer for the wrong file, so a value the engine
+     * refused was copied as it was, and the new file did not open again. */
+    e->toml_saving += 1;
     gptps_mutex_unlock(e->m);
-    return gptps_settings_save_to(e->settings, path, base[0] ? base : NULL, cfg_in_file, cfg_refused, e);
+    st = gptps_settings_save_to(e->settings, path, base[0] ? base : NULL, cfg_in_file, cfg_refused, e);
+    gptps_mutex_lock(e->m);
+    e->toml_saving -= 1;
+    gptps_mutex_unlock(e->m);
+    return st;
 }
 
 gptps_status gptps_settings_reload(gptps *e, const char *path)
@@ -4789,10 +4800,11 @@ gptps_status gptps_settings_reload(gptps *e, const char *path)
     if (!path) path = e->config_path;
     if (!path) return GPTPS_E_INVAL;
     gptps_mutex_lock(e->m);
-    /* One at a time; and not while an add-on's setup runs, whose settings must take
-     * their values when it returns, for its watcher to hear them. Marked before the
+    /* One at a time; not while an add-on's setup runs, whose settings must take their
+     * values when it returns, for its watcher to hear them; and not while a save copies
+     * the file this one would replace (see gptps_settings_save). Marked before the
      * file is read, so a save meanwhile is refused rather than rewrite it under us. */
-    if (e->toml_reloading || e->setup_on) {
+    if (e->toml_reloading || e->setup_on || e->toml_saving) {
         gptps_mutex_unlock(e->m);
         return GPTPS_E_BUSY;
     }

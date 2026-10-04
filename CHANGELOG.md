@@ -710,6 +710,15 @@ EINVAL, and checks a directory the process may write but not read (mode 0300).
   "auto", on x86-64. The new file now gets the setting's current value in place of a
   refused one, and leaves out a refused key no setting has. A save in place still
   keeps what the file's author wrote. `tests/test_config_strict.c`.
+- **A reload during a save could still copy a refused value.** The save named the
+  loaded file, released the engine lock, and then asked of each value it copied
+  whether the engine refused it - of whatever file was loaded by then. A reload of
+  another file in between had that file answer, and a refused value went into the
+  copy as it was. A loop of saves against a thread reloading two files met it twice in
+  about 47,000; the stress test met it with its config file briefly missing. A reload
+  now returns `GPTPS_E_BUSY` while a save runs, as a save already did while a reload
+  ran. `tests/test_save_window.c` runs a reload in that window with the linker's
+  `--wrap` (Linux): without the fix, 20 of 20 copies kept the refused value.
 
 ### Fixed — out of memory, found by failing each allocation in turn
 

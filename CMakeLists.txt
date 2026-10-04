@@ -917,6 +917,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_tests_properties(exec_faults PROPERTIES TIMEOUT 120)
 endif()
 
+# --- a reload cannot swap the loaded file out from under a save --------------
+# The window is between two locks, so --wrap puts a wrapper in front of the static
+# library's gptps_mutex_lock and runs a reload inside it; Linux, as above. A build where
+# the wrap does not take (a shared libgptps) fails the test's count of reloads run.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_save_window tests/test_save_window.c)
+    target_include_directories(test_save_window PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_save_window PRIVATE gptps)
+    target_link_options(test_save_window PRIVATE "LINKER:--wrap=gptps_mutex_lock")
+    add_test(NAME save_window COMMAND test_save_window)
+    set_tests_properties(save_window PROPERTIES TIMEOUT 60)
+endif()
+
 if(UNIX)
     # The core again, with the callback-record cap cut to 4 so a test can pass it.
     add_executable(test_cb_cap tests/test_cb_cap.c ${GPTPS_SRC})

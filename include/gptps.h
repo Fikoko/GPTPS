@@ -1177,7 +1177,8 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * reading the loaded file for a new path's copy, which a save without it would leave
  * out.
  * While a reload is applying a file, save() returns GPTPS_E_BUSY: try again. So
- * does reload() while another reload runs, or while an add-on's setup does.
+ * does reload() while another reload runs, while a save runs, or while an add-on's
+ * setup does.
  * reload() re-reads the file and applies it with the same checks as gptps_open, as
  * set() would, so a key the file sets overrides a limit the host passed at open in
  * cfg->limits, cfg->max_dead_letters or cfg->shutdown_grace_ms, and a 0 in the file
