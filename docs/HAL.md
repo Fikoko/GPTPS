@@ -68,6 +68,124 @@ this HAL coarsens and perturbs on purpose. That is the other half of the contrac
 conformance test shows a HAL keeps it, and the chaos run shows the core needs nothing
 more.
 
+## Searching schedules: the simulation HAL
+
+A failure on `hal_chaos` may never come back. [`tests/hal_sim.c`](../tests/hal_sim.c)
+makes the interleaving a function of a seed, so a failure is a number that replays:
+
+- **One thread at a time.** Every engine thread is a real OS thread, but they pass a
+  baton, and every HAL call - lock, unlock, wait, signal, broadcast, timed wait, the
+  acquire load and release store, thread start and join, the clock - is a point where
+  a PRNG seeded from `GPTPS_SIM_SEED` picks who runs next.
+- **Virtual time.** When every thread waits, the clock jumps to the earliest deadline:
+  a 30 s shutdown grace costs nothing, and a timeout fires at the same point of the
+  schedule every run. While the threads that can run only poll, it creeps a ms per 32
+  polls; and work costs a ms per 1000 scheduling points, so a loop that waits for time
+  while it locks and unlocks still sees it pass.
+- **Deadlocks are reported, not hung on.** Every thread waiting and none with a timeout
+  aborts with each thread's state and its last call, as `file+offset` for
+  `addr2line -e`. So does a HAL contract broken on the spot: unlocking a mutex the
+  thread does not hold, destroying a mutex or a cond in use.
+- **The add-ons' own pthreads too.** The add-ons and some tests lock, wait, start
+  threads, sleep and read `clock_gettime` with libc directly. A thread blocked there
+  would hold the baton and stall every other, so `hal_sim.c` defines those functions
+  as well and runs them through the same scheduler. `time()` stays real.
+- **A forked child** steps out of the simulation: there it is the POSIX HAL. It runs
+  on real time, so from the parent's first fork on, the parent's clock keeps to real
+  time as well, as `GPTPS_SIM_PACE=1` below makes it do from the start. Before that, a
+  wait would jump the clock over seconds while the child had yet to be scheduled: a
+  shutdown grace ran out on a child about to exit.
+
+It passes the conformance test except for one check, which cannot hold by design:
+**the clock runs at the rate of real time**. Virtual time runs ahead while everything
+waits and stands still while a thread computes. With `GPTPS_SIM_PACE=1` the clock
+keeps to real time - a jump waits for it, and every scheduling point catches the clock
+up with it - and then every check passes. Paced, a thread that has held the baton for
+10 ms of real time, as one blocked in `poll()` on a child's pipe does, lets another
+go first, as the end of a time slice would.
+
+```sh
+cmake -S . -B build-sim -DGPTPS_HAL_SOURCE=$PWD/tests/hal_sim.c
+cmake --build build-sim -j
+```
+
+**Reproduce a seed.** The log names it at start and at exit, with a hash of every
+decision the scheduler made. Run the failing test's binary with the seed from the log
+(`ctest -V` shows the same lines):
+
+```sh
+GPTPS_SIM_SEED=5 GPTPS_SIM_CPUS=4 build-sim/test_orch
+# hal_sim: seed 5 (switch 1 in 16, freedoms 1 in 16, 4 cpus)
+# all orch checks passed
+# hal_sim: seed 5: 3450 steps, 173 switches, 10 ms of virtual time, trace 60a470e157d89776
+```
+
+The numbers change with the code, but on one tree the same seed and the same CPU count
+give the same run, and the same trace hash. `GPTPS_SIM_CPUS` matters because the worker
+pool is sized from the CPU count; CI pins it to 4. If the hash differs, something
+outside the simulation decided. The exit line warns of what it can see, with a reason
+after `(may not replay: ...)`: the run forked a child process, which runs on real time
+(`1 child process ran on real time`); real time moved a paced clock; or the run met a
+thread the simulation did not start, or a pthread mutex held outside it. A forked
+child is only a warning: a parent that polls its child or holds it to a deadline does
+not replay, but one that only waits for it to exit does. It cannot see a test that
+reads `time()` and acts on it. `GPTPS_SIM_VERBOSE=1` logs every switch, including the
+one a thread makes as it exits, and every time jump. Run the test binary itself under a
+debugger the same way: the schedule does not change.
+
+**Search seeds.** Each seed also picks the style of its schedule - switching at one
+point in 1, 4, 16 or 64, with or without the contract's freedoms (spurious wakeups, a
+signal that wakes everyone) - so a range of seeds covers more than one kind of run.
+CI's two commands, for each seed in turn:
+
+```sh
+for s in $(seq 1 500); do
+  GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$s GPTPS_STRESS_MS=1500 \
+    ctest --test-dir build-sim -j4 --no-tests=error \
+    -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|xport|xport_engine|gptps_bench_pool|gptps_bench_balance)$' \
+    > sim-$s.log 2>&1 || echo "seed $s failed: see sim-$s.log"
+  GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 \
+    ctest --test-dir build-sim --no-tests=error \
+    -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm)$' \
+    > sim-paced-$s.log 2>&1 || echo "seed $s failed paced: see sim-paced-$s.log"
+done
+```
+
+The tests the first command leaves out, and why:
+
+| Test | Why |
+|---|---|
+| `*_perf` | They time a curve on the HAL clock, which is virtual here. |
+| `gptps_bench_pool`, `gptps_bench_balance` | They time throughput on the same clock, and assert nothing. On a seed that switches at every point, `gptps_bench_pool` makes 5.4 million real thread switches and took 71 to 87 s, against its 60 s CTest timeout. |
+| `hal_conformance` | Its real-time rate check, above. The second command runs it paced. |
+| `oop`, `program`, `program_helper`, `exec_faults`, `durable_crash`, `hang`, `example_program`, `example_wasm` | They are about child processes, which live in real time: the executor polls a child in real 200 ms slices and holds it to deadlines and shutdown graces. Every run of them forks, so none replays, and the second command runs them once, paced from the start. Before a run was paced from its first fork they failed unpaced: `exec_faults` with every undisturbed run timed out, `example_program` in 18 of 400 runs under load. The seed still draws every switch, but real time moves the clock. (`example_wasm` runs a child only where a wasm runtime is installed; without one it skips. `durable_crash` forks a child for each of its about 11,800 crash and power-cut runs; it passes unpaced too, in 37-41 s on three seeds that switch at every point, but runs once, paced.) |
+| `xport`, `xport_engine` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
+
+`stress_api` runs in the first command, shortened to one round of 1.5 s by
+`GPTPS_STRESS_MS=1500`. Its rounds last 1.5 s of the clock. Once a round runs one of
+its PROGRAM tasks the run is paced, and a round takes about 1.5 s; until then the clock
+is virtual, work moves it a ms per 1000 scheduling points, and on a seed that switches
+at every point a round took 9 to 20 s. Its default of six rounds took 10 to 32 s, but
+it ran past its 120 s CTest timeout on seed 19 before runs were paced from their first
+fork, and a seed whose rounds fork nothing would still do so. `GPTPS_STRESS_SEED` pins
+the round to the simulation's seed, so a re-run draws the same operations. A round
+that forks does not replay: to repeat a failing one, use the `reproduce:` line it
+prints, with `--replay` to run it on one thread.
+
+Other knobs, read once at start: `GPTPS_SIM_SWITCH` and `GPTPS_SIM_SPURIOUS` override the
+style the seed picked (one point in n; 0 turns the freedoms off), `GPTPS_SIM_HORIZON_S`
+is how long virtual time may run with no thread waking another before a possible hang is
+reported (it is reported once, and the run goes on: a test that naps until `time()` says
+so looks the same), and `GPTPS_SIM_STALL_S` is how many real seconds without a
+scheduling point before the threads are printed - a thread that computes, blocks in a
+call the simulation does not see, or spins on memory with no call in its loop. A test's
+own busy-wait needs a call the simulation sees in its loop - `gptps_now_ms(NULL)` will
+do - or the spinning thread keeps the baton and every other waits.
+
+CI's `hal_sim` job runs both commands: the first for three seeds a run, from the run
+number, and the second for the first of them. A re-run of a job keeps its run number,
+so it runs the same seeds again.
+
 ## What the test cannot show
 
 - **Memory ordering on x86.** The hardware orders plain accesses itself, so a HAL that

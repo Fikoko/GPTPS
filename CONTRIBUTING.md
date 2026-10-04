@@ -143,6 +143,28 @@ Register a test in `CMakeLists.txt` with a `TIMEOUT`. POSIX-only tests go inside
 TTY), add its name to the `cross` job's exclusion list in `.github/workflows/ci.yml` —
 the list is anchored and explicit, so a test not named there runs.
 
+The `hal_sim` job has two such lists, anchored the same way. It runs the suite on
+`tests/hal_sim.c`, where one thread runs at a time and the clock is virtual, so check
+a new test against it ([`docs/HAL.md`](docs/HAL.md) has the commands):
+- A test about child processes, every run of which forks, as `exec_faults` does, goes
+  in the paced step's `-R` list, and in the main step's `-E` list so it runs only
+  there: its runs cannot replay, and the paced step keeps its clock to real time from
+  the start. So does a test that needs real time before it forks. A test that forks
+  now and then can stay in the main step: a run is paced from its first fork.
+- A test that blocks in a call the simulation cannot see, such as a `read()` on a
+  socket another thread of the process writes, or that only times throughput on the
+  clock, goes in the `-E` list alone.
+- A busy-wait in a test needs a call the simulation sees in its loop -
+  `gptps_now_ms(NULL)` will do, as in `test_taskmgmt.c`'s `rw_wr` - or the spinning
+  thread keeps the baton, every other thread waits, and the job stalls on every seed.
+- A test that keeps busy for a stretch of the clock, as a soak or a benchmark does,
+  pays for each virtual millisecond in real thread switches. Time it on a seed that
+  switches at every point, such as 6, against its `TIMEOUT`.
+
+docs/HAL.md's table gives the reason for each test on a list: add yours there too. A
+test that fails on a seed may have found a race - the job found one in `test_orch.c` -
+so read the seed's log before you exclude it.
+
 ## Writing an add-on or a binary plug-in
 
 See [`docs/PLUGINS.md`](docs/PLUGINS.md). Prove it before shipping:

@@ -381,6 +381,50 @@ jobs:
           echo "chaos seed $GPTPS_CHAOS_SEED, one call in 4"
           ctest --test-dir build-chaos --output-on-failure --no-tests=error -E '_perf$'
 
+  # The same suite on tests/hal_sim.c, where only one thread runs at a time and a
+  # seed picks every switch, with virtual time. hal_chaos finds a failure; this one
+  # keeps it: the log names the seed, and docs/HAL.md says how to replay it (the
+  # trace hash at exit must match; the exit line warns when a child process or
+  # real time may have decided). Three seeds a run, from the run number,
+  # so a re-run replays them. The CPU count is pinned because the worker pool is
+  # sized from it: without that, a seed replays only on a machine with the
+  # runner's count.
+  #   Two lists, ANCHORED like the cross job's, with the reason for each test in
+  # docs/HAL.md's table. Left out of the main step: the *_perf gates and the two
+  # benchmarks, which time the HAL clock - virtual here - and on a seed that
+  # switches at every point bench_pool ran past its 60 s timeout; the conformance
+  # test and the tests about child processes, which the paced step runs paced from
+  # the start (any other run is paced from its first fork); and xport and
+  # xport_engine, which cannot run on it at all: a reader thread blocks in read()
+  # holding the baton. A test named on neither list runs on three seeds.
+  #   stress_api runs one 1.5 s round a seed, its seed pinned to the simulation's:
+  # until a round forks, its time is virtual, and on a seed that switches at every
+  # point six rounds ran past its 120 s timeout.
+  hal_sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the suite on the simulation HAL
+        run: |
+          cmake -S . -B build-sim -DGPTPS_HAL_SOURCE="$PWD/tests/hal_sim.c"
+          cmake --build build-sim -j
+      - name: Run it, three seeds
+        run: |
+          export GPTPS_SIM_CPUS=4 GPTPS_STRESS_MS=1500
+          for k in 0 1 2; do
+            export GPTPS_SIM_SEED=$(( ${{ github.run_number }} * 3 + k ))
+            export GPTPS_STRESS_SEED=$GPTPS_SIM_SEED
+            echo "sim seed $GPTPS_SIM_SEED (replay: GPTPS_SIM_SEED=$GPTPS_SIM_SEED GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$GPTPS_SIM_SEED GPTPS_STRESS_MS=1500)"
+            ctest --test-dir build-sim --output-on-failure --no-tests=error \
+              -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|xport|xport_engine|gptps_bench_pool|gptps_bench_balance)$'
+          done
+      - name: The tests on real processes, paced to real time
+        run: |
+          export GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 GPTPS_SIM_SEED=$(( ${{ github.run_number }} * 3 ))
+          ctest --test-dir build-sim --output-on-failure --no-tests=error \
+            -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm)$'
+
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
   # (s390x, 64-bit big-endian, run under QEMU). The journal/TOML/settings

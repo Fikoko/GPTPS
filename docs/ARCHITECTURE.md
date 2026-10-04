@@ -568,13 +568,15 @@ fault injection into the out-of-process executors (`tests/test_exec_faults.c`), 
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
 **self-skip** where the facility is absent rather than failing (cgroup delegation, a
-wasm runtime CLI). CI runs twelve jobs: `build-test` (Linux + macOS, a 2-way matrix),
+wasm runtime CLI). CI runs thirteen jobs: `build-test` (Linux + macOS, a 2-way matrix),
 `werror` (`-O2 -Wall -Wextra -Werror`), `package` (installs, then builds a plug-in
 out-of-tree against the installed package), `windows` (mingw-w64), `msvc` (cl.exe),
 `amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan), `tsan`,
 `hal_fast`, `hal_chaos` (the whole suite on the weakest HAL the contract allows),
-`cross` (i386 + big-endian s390x under QEMU), and `freestanding`. The `tsan` and `cross` jobs select tests with an EXCLUDE list, so
-a newly added test is covered by default rather than silently skipped.
+`hal_sim` (the suite on a simulation HAL where a seed picks every thread switch, so a
+failure replays), `cross` (i386 + big-endian s390x under QEMU), and `freestanding`.
+The `tsan`, `hal_chaos`, `hal_sim` and `cross` jobs select tests with an EXCLUDE
+list, so a newly added test is covered by default rather than silently skipped.
 
 ---
 

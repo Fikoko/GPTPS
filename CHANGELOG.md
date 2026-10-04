@@ -200,6 +200,45 @@ the last three about the `durable_queue` add-on:
   clause and the check that holds a HAL to it. It also lists what the test cannot
   show: memory ordering on x86, wall-clock steps, a failed thread start.
 
+### Added — a simulation HAL: a schedule is a seed, and a failure replays
+
+- **`tests/hal_sim.c` makes the interleaving of threads a function of a seed.** Every
+  engine thread is a real OS thread, but only one runs at a time. At each HAL call, and
+  at each pthread, sleep and `clock_gettime` call of the add-ons and tests, a PRNG
+  seeded from `GPTPS_SIM_SEED` picks the thread that runs next. Time is virtual: when
+  every thread waits, the clock jumps to the earliest deadline, so a 30 s shutdown
+  grace costs nothing and a timeout fires at the same point of the schedule every run.
+  A deadlock, or a HAL contract broken on the spot, is reported with each thread's
+  state and last call instead of hanging. At exit it prints the seed and a hash of
+  every decision it made, and the same seed and CPU count print the same hash. A
+  forked child runs on real time, so from a run's first fork on the clock keeps to
+  real time too, and the exit line says such a run may not replay. It passes the
+  conformance test except the check that the clock keeps to real time; with
+  `GPTPS_SIM_PACE=1`, which paces a run from the start, it passes that one too.
+  `docs/HAL.md` says how to replay a seed and search many, and which tests cannot run
+  on it, and why.
+- **CI's new `hal_sim` job** builds the suite on it and runs it on three seeds a run,
+  from the run number, with the CPU count pinned to 4. The conformance test and the
+  tests about child processes run in a second step, paced from the start. The first
+  step leaves out the `*_perf` gates and the two benchmarks, which time a clock that
+  is virtual here: on a seed that switches threads at every point, `gptps_bench_pool`
+  took 71 to 87 s, against its 60 s timeout. It runs `stress_api` for one 1.5 s round,
+  with its seed pinned to the simulation's: until a round forks, its 1.5 s are
+  virtual, and the default six rounds ran past the test's 120 s timeout on such a
+  seed.
+- **`orch` failed now and then: the test raced its own worker.**
+  `check_unsatisfiable_gate` submits a dependency, then makes a gate on it with
+  `gptps_orch_after`. If a worker ran the dependency in between, `gptps_orch_after`
+  took its documented fast path: with every dependency already terminal, it submitted
+  the gated task, `no_such_task`, at once and returned the engine's
+  `GPTPS_E_NOTFOUND`. The engine was right, but the test counted that as a failed
+  check without saying which, so all it showed was an occasional
+  `1 orch check(s) FAILED`. On a loaded machine that was 12 of 200 runs under
+  ThreadSanitizer and 2 of 300 of a RelWithDebInfo build, and every run with a 50 ms
+  pause put between the two calls. The simulation HAL lost the race on 4 of seeds
+  1-100. The dependency now waits until the gate exists, and the test passed 300 runs,
+  50 under ThreadSanitizer, every run with the pause, and seeds 1-200.
+
 ### Added — a config file can describe a whole deployment, and says what is wrong with it
 
 - **`[resources]`, `[tasks.<name>.resources]` and `[bounded]` in the file.** Named
