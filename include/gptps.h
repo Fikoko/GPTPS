@@ -1153,7 +1153,12 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * max_memory_bytes, no limit for the rest. A file that does not parse applies
  * nothing; otherwise every valid value is applied, each problem is logged, and the
  * result is GPTPS_E_CONFIG if there was any. For both, path==NULL uses the path the
- * engine was opened with (GPTPS_E_INVAL if none). */
+ * engine was opened with (GPTPS_E_INVAL if none).
+ * On Windows a file cannot be replaced while another handle has it open, nor opened
+ * while it is being replaced. A save that lands while something else reads the file
+ * fails with GPTPS_E_IO. A reload, or an open, that lands while an editor or another
+ * process is replacing the file cannot open it: "cannot open the file" in the log,
+ * and GPTPS_E_CONFIG. Neither ever applies or writes part of a file: try again. */
 GPTPS_API gptps_status gptps_settings_save(gptps *e, const char *path);
 GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
 

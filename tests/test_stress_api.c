@@ -64,7 +64,10 @@
 #  define HAVE_PROGRAM 0   /* the PROGRAM types run /bin/sh */
 /* Windows refuses to replace a file another handle has open, so a save - or this
  * test's rewrite - that lands while a reload or a reopen is reading the file fails
- * with GPTPS_E_IO there. The reader never sees half a file, which is what matters. */
+ * with GPTPS_E_IO there. The other way round, a reload or a reopen that lands while
+ * the file is being replaced cannot open it: "cannot open the file (Permission
+ * denied)", and the call fails with GPTPS_E_CONFIG (RACED_A_REPLACE). Either way the
+ * reader never sees half a file, which is what matters. */
 #  define REPLACE_MAY_FAIL 1
 #else
 #  define HAVE_PROGRAM 1
@@ -149,7 +152,7 @@ static struct {
     int submit_ok, live, svc_live, last_handle;
     int untracked;      /* an event for a handle outside the table */
     int sets_ok, watched, go_writes, drained, resubmits, flaky;
-    int reload_ok, reload_busy, save_ok, save_busy, reopened;
+    int reload_ok, reload_busy, reload_raced, save_ok, save_busy, reopened;
     int reg_ok, unreg_ok, unreg_busy, unreg_cb_tried, unreg_cb, clone_ok, throttled, throttled_live, loads;
     int quiesce;        /* the round is winding down: callbacks start nothing new */
     int sealed;         /* a bounded engine took its first submit */
@@ -254,14 +257,47 @@ static int busy_for(gptps_ctx *c, unsigned ms)
 static gptps_mutex *g_logm;
 static char g_logring[16][320];
 static int  g_logn;
+/* Windows cannot open a file while another handle replaces it, so there a reload
+ * or a reopen that meets one of the writers' replaces fails to open the file. The
+ * sink counts those failures per thread: an open counts as having raced a replace
+ * only if its own thread logged "cannot open the file" during the call. */
+static struct { uint64_t tid; unsigned n; } g_ofail[64];
+static int g_nofail;
+static unsigned *ofail_slot(uint64_t tid)          /* caller holds g_logm */
+{
+    int i;
+    for (i = 0; i < g_nofail; ++i) if (g_ofail[i].tid == tid) return &g_ofail[i].n;
+    if (g_nofail == (int)(sizeof g_ofail / sizeof g_ofail[0])) return NULL;
+    g_ofail[g_nofail].tid = tid;
+    g_ofail[g_nofail].n = 0;
+    return &g_ofail[g_nofail++].n;
+}
 static void sink(gptps_log_level lvl, const char *msg, void *ud)
 {
     (void)lvl; (void)ud;
     gptps_mutex_lock(g_logm);
     snprintf(g_logring[g_logn % 16], sizeof g_logring[0], "%s", msg);
     ++g_logn;
+    if (strstr(msg, "cannot open the file")) {
+        unsigned *n = ofail_slot(gptps_hal_thread_id());
+        if (n) ++*n;
+    }
     gptps_mutex_unlock(g_logm);
 }
+/* How many times this thread has failed to open a config file so far. */
+static unsigned open_failures_here(void)
+{
+    unsigned n, *slot;
+    gptps_mutex_lock(g_logm);
+    slot = ofail_slot(gptps_hal_thread_id());
+    n = slot ? *slot : 0u;
+    gptps_mutex_unlock(g_logm);
+    return n;
+}
+/* A failed open is allowed only where a replace can block it, and only when this
+ * thread's open of the file is what failed. */
+#define RACED_A_REPLACE(st, before) \
+    (REPLACE_MAY_FAIL && (st) == GPTPS_E_CONFIG && open_failures_here() != (before))
 static void dump_log(void)
 {
     int i, from;
@@ -733,13 +769,16 @@ static void check_reopens(const char *path, const char *what)
     gptps *x = NULL;
     gptps_config c;
     gptps_status st;
+    unsigned of0;
     memset(&c, 0, sizeof c);
     c.struct_size = sizeof c;
     c.limits.struct_size = sizeof c.limits;
     c.limits.max_concurrent_tasks = 1;
     c.mode = GPTPS_RUN_MANUAL;
     c.config_path = path;
+    of0 = open_failures_here();
     st = gptps_open_ex(&c, &x);
+    if (st != GPTPS_OK && RACED_A_REPLACE(st, of0)) { inc(&g_n.reload_raced); return; }
     CHECKF(st == GPTPS_OK, "%s: %s does not reopen (%d)", what, path, (int)st);
     if (st != GPTPS_OK) { print_file(path); dump_log(); }
     else inc(&g_n.reopened);
@@ -1044,12 +1083,13 @@ static void do_op_inner(tstate *ts)
             st = gptps_settings_reload(g_e, g_bad[r[2] & 1u]);      /* refused, in part or whole */
             CHECKF(st == GPTPS_E_CONFIG || st == GPTPS_E_BUSY, "reload(%s) = %d", g_bad[r[2] & 1u], st);
         } else {
+            unsigned of0 = open_failures_here();
             st = gptps_settings_reload(g_e, NULL);
-            if (st != GPTPS_OK && st != GPTPS_E_BUSY) {
+            if (st != GPTPS_OK && st != GPTPS_E_BUSY && !RACED_A_REPLACE(st, of0)) {
                 failed(__FILE__, __LINE__, "reload of a valid file = %d", st);
                 dump_log();
             }
-            inc(st == GPTPS_OK ? &g_n.reload_ok : &g_n.reload_busy);
+            inc(st == GPTPS_OK ? &g_n.reload_ok : st == GPTPS_E_BUSY ? &g_n.reload_busy : &g_n.reload_raced);
         }
         break;
     case OP_SAVE: {
@@ -1465,6 +1505,9 @@ static void run_round(const round_opts *o, int round)
 
     memset(&g_n, 0, sizeof g_n);
     memset(g_h, 0, H_CAP * sizeof *g_h);
+    gptps_mutex_lock(g_logm);
+    g_nofail = 0;                       /* this round's threads are new ones */
+    gptps_mutex_unlock(g_logm);
     g_manual = o->manual;
     g_bounded = o->bounded;
     snprintf(g_cfg, sizeof g_cfg, "stress_api_%08x.toml", (unsigned)(o->seed & 0xffffffffu));
@@ -1563,10 +1606,10 @@ static void run_round(const round_opts *o, int round)
     check_reopens(g_cfg, "the config file the round left");
 
     for (i = 0, nops = 0; i < g_nthreads; ++i) nops += g_ts[i].nops;
-    printf("  ops %d, submits %d (%d throttled), reloads %d (+%d busy), saves %d (+%d busy), reopened %d, "
+    printf("  ops %d, submits %d (%d throttled), reloads %d (+%d busy, +%d raced a replace), saves %d (+%d busy), reopened %d, "
            "registers %d, clones %d, unregisters %d (+%d busy; from callbacks %d of %d), drained %d, resubmits %d, "
            "accessor writes %d, failed loads unwound %d, shutdown %llu ms\n",
-           nops, get(&g_n.submit_ok), get(&g_n.throttled), get(&g_n.reload_ok), get(&g_n.reload_busy),
+           nops, get(&g_n.submit_ok), get(&g_n.throttled), get(&g_n.reload_ok), get(&g_n.reload_busy), get(&g_n.reload_raced),
            get(&g_n.save_ok), get(&g_n.save_busy), get(&g_n.reopened), get(&g_n.reg_ok), get(&g_n.clone_ok),
            get(&g_n.unreg_ok), get(&g_n.unreg_busy), get(&g_n.unreg_cb), get(&g_n.unreg_cb_tried), get(&g_n.drained),
            get(&g_n.resubmits), get(&g_n.go_writes), get(&g_n.loads), (unsigned long long)dt);
