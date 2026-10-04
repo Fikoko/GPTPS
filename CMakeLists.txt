@@ -465,6 +465,27 @@ target_link_libraries(test_alloc PRIVATE gptps)
 add_test(NAME alloc COMMAND test_alloc)
 set_tests_properties(alloc PROPERTIES TIMEOUT 30)
 
+# every allocation fails in turn, and the engine copes (the add-ons it loads are
+# defined below; a cross build runs it without them, as it runs no dlopen test). The
+# s390x job runs it under QEMU: it forks nothing, and there loads nothing; its
+# two-thread race checks what holds however far the other thread got; and under
+# valgrind, which serialises its threads, it took 22 s of its 120.
+add_executable(test_oom tests/test_oom.c)
+target_include_directories(test_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_oom PRIVATE gptps)
+if(TARGET gptps_durable_queue)
+    target_link_libraries(test_oom PRIVATE gptps_durable_queue)
+    target_compile_definitions(test_oom PRIVATE OOM_WITH_DQ=1)
+endif()
+if(NOT CMAKE_CROSSCOMPILING)
+    target_compile_definitions(test_oom PRIVATE
+        ADDON_DEMO_PATH="$<TARGET_FILE:addon_demo>"
+        ADDON_NS_PATH="$<TARGET_FILE:addon_ns>")
+    add_dependencies(test_oom addon_demo addon_ns)
+endif()
+add_test(NAME oom COMMAND test_oom)
+set_tests_properties(oom PROPERTIES TIMEOUT 120)
+
 # add-on shared libraries (compiled against the frozen header; no core link)
 add_library(addon_demo MODULE tests/addon_demo.c)
 target_include_directories(addon_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

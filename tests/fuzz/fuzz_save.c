@@ -191,7 +191,7 @@ static void check_saved(const gptps_toml *before, const char *text, const char *
 
     saved = fz_slurp(path, &saved_len);
     FZ_ASSERT(saved != NULL, "the saved file cannot be read");
-    after = gptps_toml_parse_text("saved.toml", saved, err, sizeof err);
+    after = gptps_toml_parse_text("saved.toml", saved, err, sizeof err, NULL);
     if (!after) fprintf(stderr, "the saved file:\n---\n%s---\n%s\n", saved, err);
     FZ_ASSERT(after != NULL, "a file that parsed does not parse after a save");
 
@@ -299,7 +299,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (size) memcpy(text, data, size);
     text[size] = 0;
     if (strlen(text) != size) { free(text); return 0; }     /* a NUL: no file that parses has one */
-    before = gptps_toml_parse_text("before.toml", text, NULL, 0);
+    before = gptps_toml_parse_text("before.toml", text, NULL, 0, NULL);
     if (!before) { free(text); return 0; }                  /* refused: fuzz_config holds a save to that */
     {   /* A file that names add-ons is not opened - the loader would dlopen whatever
          * the fuzzer wrote - but an engine opened without it still saves into it. */

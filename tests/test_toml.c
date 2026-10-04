@@ -20,6 +20,7 @@
 #define CFG_PATH "gptps_toml_test.toml"
 #define ESC_PATH "gptps_toml_esc.toml"
 #define BAD_PATH "gptps_toml_bad.toml"
+#define WHY_PATH "gptps_toml_why.toml"
 
 /* Any single allocation the parser makes is bounded by the file-size cap it
  * enforces (16 MiB); this is that, with generous headroom. It is a REGRESSION
@@ -191,6 +192,63 @@ static void test_dir_as_config_path(void)
 
     CHECK(gptps_set_allocator(NULL) == GPTPS_OK);
     CHECK(a_peak <= SANE_ALLOC_MAX);   /* the ~8 EiB request must never have happened */
+}
+
+/* gptps_toml_parse_file_ex says why it returned NULL - the text, the file, or memory -
+ * so the engine can word its message, and keep memory running out apart from a
+ * mistake in the file. A file that parses leaves `why` as it was, and without one
+ * (gptps_toml_parse_file) nothing is written through it. */
+static void *none_malloc(size_t n, void *ud) { (void)n; (void)ud; return NULL; }
+static void *none_realloc(void *p, size_t n, void *ud) { (void)p; (void)n; (void)ud; return NULL; }
+static void put_why(const char *bytes, size_t n)
+{
+    FILE *f = fopen(WHY_PATH, "wb");
+    CHECK(f != NULL);
+    if (!f) return;
+    fwrite(bytes, 1, n, f);
+    fclose(f);
+}
+static void test_why_it_failed(void)
+{
+    gptps_allocator a;
+    gptps_toml *t;
+    char err[256];
+    int why;
+
+    why = -1;                                           /* parses: left alone */
+    t = gptps_toml_parse_file_ex(CFG_PATH, err, sizeof err, &why);
+    CHECK(t != NULL && why == -1);
+    gptps_toml_free(t);
+
+    why = -1;
+    CHECK(gptps_toml_parse_file_ex("/no/such/dir/none.toml", err, sizeof err, &why) == NULL);
+    CHECK(why == GPTPS_TOML_UNREAD);
+    why = -1;
+    CHECK(gptps_toml_parse_file_ex(".", err, sizeof err, &why) == NULL);   /* a directory */
+    CHECK(why == GPTPS_TOML_UNREAD);
+
+    put_why("[unterminated\nk = 1\n", 20);
+    why = -1;
+    CHECK(gptps_toml_parse_file_ex(WHY_PATH, err, sizeof err, &why) == NULL);
+    CHECK(why == GPTPS_TOML_BAD);
+    CHECK(gptps_toml_parse_file(WHY_PATH, err, sizeof err) == NULL);
+
+    put_why("k = 1\n\0j = 2\n", 13);                  /* a NUL byte */
+    why = -1;
+    CHECK(gptps_toml_parse_file_ex(WHY_PATH, err, sizeof err, &why) == NULL);
+    CHECK(why == GPTPS_TOML_BAD);
+    CHECK(gptps_toml_parse_file(WHY_PATH, err, sizeof err) == NULL);
+
+    memset(&a, 0, sizeof a);                            /* no memory at all */
+    a.struct_size = sizeof a;
+    a.malloc_fn = none_malloc; a.realloc_fn = none_realloc; a.free_fn = rec_free;
+    CHECK(gptps_set_allocator(&a) == GPTPS_OK);
+    why = -1;
+    t = gptps_toml_parse_file_ex(CFG_PATH, err, sizeof err, &why);
+    CHECK(gptps_set_allocator(NULL) == GPTPS_OK);
+    CHECK(t == NULL && why == GPTPS_TOML_NOMEM);
+    gptps_toml_free(t);
+    remove(WHY_PATH);
 }
 
 /* strip_comment() used to flip its in-string flag on the ESCAPED quote of
@@ -369,6 +427,7 @@ int main(void)
 
     /* 1.1.0 config hardening (each pins a fix that shipped with its own repro) */
     test_dir_as_config_path();
+    test_why_it_failed();
     test_comment_escapes();
     test_limits_range();
     test_open_ex_reads_its_file();

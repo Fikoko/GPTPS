@@ -346,6 +346,18 @@ typedef struct {
  * ordinary malloc/realloc/free semantics; returning NULL surfaces as
  * GPTPS_E_NOMEM rather than crashing. malloc_fn may be called with size 0 and must
  * return a non-NULL, free-able pointer for it.
+ * GPTPS_E_NOMEM comes from the call that needed the memory, and that call, made
+ * again with memory to spare, returns what it would have. A setup call refused so -
+ * gptps_open/_open_ex, gptps_register_task, gptps_define_resource,
+ * gptps_define_task_setting, gptps_define_global - has changed nothing, and no other
+ * thread could see or use any part of what it made: only the name a registration
+ * holds while it runs (THREADING, below). A config file is not reported as wrong when
+ * memory ran out reading it (see gptps_settings_reload). Three places absorb a
+ * failure instead: gptps_dead_letter_drain, which returns a count, stops short (see
+ * there); gptps_step leaves an admission it cannot allocate for its next pass; and
+ * the record that lets the engine refuse a gptps_shutdown made from inside one of its
+ * own callbacks is made as it is needed, so without memory for it that callback runs
+ * without the check.
  * ==========================================================================*/
 typedef struct {
     size_t struct_size;                              /* = sizeof(gptps_allocator) */
@@ -514,7 +526,8 @@ typedef struct {
     size_t        struct_size;     /* = sizeof(gptps_config) */
     const char   *config_path;     /* optional TOML path, read at open exactly as
                                     * gptps_open(path) reads it: it must exist and
-                                    * parse, or the open fails with GPTPS_E_CONFIG. Also
+                                    * parse, or the open fails with GPTPS_E_CONFIG
+                                    * (GPTPS_E_NOMEM if memory ran out). Also
                                     * the default path for gptps_settings_save /
                                     * _reload. NULL => limits below + defaults */
     gptps_limits  limits;          /* explicit values win over auto-tune & file */
@@ -557,7 +570,10 @@ GPTPS_API gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine
 /* Registration paths (BOTH covered by the ABI regression test):
  *   - direct  : gptps_register_task() with in-process function pointers (the
  *               `cc gptps.c yourapp.c` headline path; does not cross the ABI).
- *   - dlopen  : add-ons attach via the host-table ABI (see below). */
+ *   - dlopen  : add-ons attach via the host-table ABI (see below).
+ * A task type comes with its settings - tasks.<name>.* for the built-in knobs, each
+ * gptps_define_task_setting leaf and each named resource's cost - all of them, or, on
+ * GPTPS_E_NOMEM, no type and no setting. */
 GPTPS_API gptps_status gptps_register_task(gptps *e, const gptps_task_def *def);
 
 /* Set a task type's scheduling priority (higher runs first; default 0, may be
@@ -591,7 +607,10 @@ GPTPS_API gptps_status gptps_set_task_priority(gptps *e, const char *task_name, 
  * admission on, and a cost above the budget dead-letters them as a cut does.
  * ==========================================================================*/
 
-/* Declare (or, if it already exists, re-budget - live-safe) a named resource. */
+/* Declare (or, if it already exists, re-budget - live-safe) a named resource. A new one
+ * comes with its settings - resources.<name>, and tasks.<task>.resources.<name> for
+ * each task - all of them, or, on GPTPS_E_NOMEM, no resource and no setting. One
+ * defined by another thread while this call runs is re-budgeted, as if defined first. */
 GPTPS_API gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget);
 
 /* Set a task type's per-item cost against a named resource (0 = no cost). The
@@ -980,7 +999,11 @@ typedef void (*gptps_dead_letter_cb)(const gptps_dead_letter *dl, void *user_dat
 /* Drain all retained dead-lettered tasks. For each, `cb` is invoked (the payload
  * is valid only for that call) and the item is then freed. The callback runs
  * with the engine lock RELEASED, so it MAY re-submit (e.g. gptps_submit) to retry
- * the work. Pass cb == NULL to simply discard them. Returns the number drained. */
+ * the work. Pass cb == NULL to simply discard them. Returns the number drained.
+ * Each dead letter's task_name is copied before any callback runs, since a callback
+ * may unregister the type. If memory runs out for a copy, the drain stops at that
+ * dead letter: it and those after it stay retained, in order, for the next drain,
+ * and the count returned is less than gptps_dead_letter_count said. */
 GPTPS_API size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_data);
 
 /* ============================================================================
@@ -1073,7 +1096,9 @@ GPTPS_API gptps_status gptps_define_global(gptps *e, const char *key, gptps_sett
 /* A PER-TASK knob schema. The engine materializes `tasks.<name>.<leaf>` for every
  * registered task (existing and future), each task instance carrying its own value
  * (defaulted from `default_val`, overridable via TOML or the settings API). `leaf`
- * must be a bare key with no dots. GPTPS_E_DUP if the leaf is already defined.
+ * must be a bare key with no dots. GPTPS_E_DUP if the leaf is already defined, or is
+ * defined by another thread while this call runs. Every task gets the setting, or, on
+ * GPTPS_E_NOMEM, none does and the leaf is not defined.
  * Like task registration, this is a SETUP-time call: it walks the registry to
  * apply the schema to existing tasks, so do not run it concurrently with
  * gptps_unregister_task / gptps_clone_task on this engine. */
@@ -1126,6 +1151,8 @@ GPTPS_API gptps_status gptps_settings_set_ex(gptps *e, const char *key, const ch
  * gptps_open / gptps_open_ex fail with GPTPS_E_CONFIG on a line that does not parse,
  * a value out of range or of the wrong type, or a key no engine-owned table has -
  * and log each problem, naming the file, the line and the key, through the log sink.
+ * Memory that runs out reading or applying the file is not a mistake in it: the open
+ * fails with GPTPS_E_NOMEM, and the open made again says what else there was.
  * A key only a later definition can claim (a [tasks.<name>] table for a task not yet
  * registered, a plug-in's or the host's own setting) waits for it. Call this once
  * setup is done: it logs every key nothing has claimed, and every value found invalid
@@ -1145,6 +1172,9 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * with the live changes made in it; without one, the values changed live and those
  * the loaded file set. Either way no value the engine refused goes in: the setting's
  * current value takes its place, and a refused key no setting has is left out.
+ * Memory that runs out is GPTPS_E_NOMEM, with the file left as it was - also while
+ * reading the loaded file for a new path's copy, which a save without it would leave
+ * out.
  * While a reload is applying a file, save() returns GPTPS_E_BUSY: try again. So
  * does reload() while another reload runs, or while an add-on's setup does.
  * reload() re-reads the file and applies it with the same checks as gptps_open, as
@@ -1153,8 +1183,11 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * means what the setting's 0 means: auto for max_concurrent_tasks and
  * max_memory_bytes, no limit for the rest. A file that does not parse applies
  * nothing; otherwise every valid value is applied, each problem is logged, and the
- * result is GPTPS_E_CONFIG if there was any. For both, path==NULL uses the path the
- * engine was opened with (GPTPS_E_INVAL if none).
+ * result is GPTPS_E_CONFIG if there was any. Memory that runs out is not a problem
+ * with the file: the result is GPTPS_E_NOMEM - nothing applied if it ran out reading
+ * the file, every other value if it ran out applying one - and the reload, made
+ * again, applies that value and reports anything else. For both, path==NULL uses the
+ * path the engine was opened with (GPTPS_E_INVAL if none).
  * On Windows a file cannot be replaced while another handle has it open, nor opened
  * while it is being replaced. A save that lands while something else reads the file
  * fails with GPTPS_E_IO. A reload, or an open, that lands while an editor or another

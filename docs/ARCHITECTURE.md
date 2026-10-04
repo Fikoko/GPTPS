@@ -175,6 +175,27 @@ allocates only in its create calls, at open; nothing per item (each item's cance
 flag lives inside the item). MANUAL mode + a custom allocator is the bare-metal
 shape; see `examples/embedded.c`.
 
+A hook that returns NULL surfaces as `GPTPS_E_NOMEM` from the call that needed the
+memory, and that call, made again, returns what it would have. A setup call that
+makes several things - `gptps_register_task` a task's settings,
+`gptps_define_resource` and `gptps_define_task_setting` a setting for every task -
+makes all of them first, then publishes them together, under the locks, after its last
+allocation; refused, it has published nothing, so another thread never sees half of it.
+The one trace is the name a registration holds while it runs. Memory that runs out
+reading or applying a config file - to open, reload or save - is `GPTPS_E_NOMEM`, not a
+mistake in the file.
+
+Three places absorb a failure, by design: the dead-letter drain, which returns a
+count, stops short and leaves the rest retained; `gptps_step` leaves an admission it
+cannot allocate for its next pass; and the per-thread record that lets the engine
+refuse a `gptps_shutdown` from inside its own callback is made as it is needed, so a
+callback that runs without memory for it runs without that check.
+`tests/test_oom.c` fails each allocation of six scenarios in turn and holds them to
+all of this: the work path, a config file, the settings API, a bounded engine's
+seal, the durable queue, and definitions and registrations racing on two threads.
+A seventh, a THREADED engine failing allocations at random, checks only that
+nothing crashes, leaks, hangs or loses an event.
+
 ### 3.3 Bounded mode (`gptps_config.max_items`)
 
 The allocator seam decides where memory comes from, not how much or when. Bounded
@@ -278,9 +299,12 @@ Per-task `gptps_failure_policy`: `timeout_seconds`, `max_retries`,
     the handle;
   - `requeue` — re-enqueued for another cycle (bodies MUST be idempotent; never
     re-admitted during shutdown, to avoid an always-failing task hanging the drain).
-- **Dead-letter drain** — `gptps_dead_letter_drain()` detaches the retained list
-  under the lock, then hands each item to a callback with the lock released (so it
-  may re-submit). A constraint `DENY` is also retained, with status `GPTPS_E_DENIED`.
+- **Dead-letter drain** — `gptps_dead_letter_drain()` takes the retained list under
+  the lock, each item with its own copy of its task's name (the callback may remove
+  the type), then hands each item to a callback with the lock released (so it may
+  re-submit). A name that cannot be copied stops it there: that item and the rest
+  stay retained for the next drain. A constraint `DENY` is also retained, with status
+  `GPTPS_E_DENIED`.
 
 ---
 

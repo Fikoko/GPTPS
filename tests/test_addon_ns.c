@@ -77,7 +77,7 @@ int main(void)
         CHECK(gptps_addon_get_info(e, 0, &info) == GPTPS_OK);
         CHECK(info.ns && strcmp(info.ns, "nstest") == 0);
         CHECK(info.name && strcmp(info.name, "ns test") == 0);
-        CHECK(info.path && strstr(info.path, "addon_ns") != NULL);
+        CHECK(info.path && strcmp(info.path, ADDON_NS_PATH) == 0);   /* the path it was loaded by, whole */
         CHECK(info.abi_version_major == GPTPS_ABI_VERSION_MAJOR);
         CHECK(info.enabled == 1);
         CHECK(gptps_addon_get_info(e, 99, &info) == GPTPS_E_NOTFOUND);

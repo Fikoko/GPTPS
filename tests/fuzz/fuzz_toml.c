@@ -23,12 +23,12 @@ static void parse_small_errbuf(const char *text, size_t cap, int parsed)
     char *err = cap ? (char *)malloc(cap) : NULL;
     gptps_toml *t;
     if (cap && !err) return;
-    t = gptps_toml_parse_text("fuzz.toml", text, err, cap);
+    t = gptps_toml_parse_text("fuzz.toml", text, err, cap, NULL);
     FZ_ASSERT((t != NULL) == parsed, "the size of the error buffer changes whether a file parses");
     if (cap) FZ_ASSERT(memchr(err, 0, cap) != NULL, "the error message is not terminated within its buffer");
     gptps_toml_free(t);
     free(err);
-    t = gptps_toml_parse_text("fuzz.toml", text, NULL, 0);
+    t = gptps_toml_parse_text("fuzz.toml", text, NULL, 0, NULL);
     FZ_ASSERT((t != NULL) == parsed, "parsing without an error buffer changes whether a file parses");
     gptps_toml_free(t);
 }
@@ -155,7 +155,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (size) memcpy(text, data, size);
     text[size] = 0;                     /* a NUL inside ends the text: gptps_toml_read_file refuses those */
     err[0] = 0;
-    t = gptps_toml_parse_text("fuzz.toml", text, err, sizeof err);
+    t = gptps_toml_parse_text("fuzz.toml", text, err, sizeof err, NULL);
     if (t) {
         check_entries(t, text);
         gptps_toml_free(t);

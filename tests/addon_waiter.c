@@ -56,4 +56,7 @@ static gptps_status setup(gptps *e, const gptps_api_routines *api, char **err)
     return GPTPS_OK;
 }
 
-GPTPS_ADDON_INIT("waiter", GPTPS_SEAM_TASK, setup, 0)
+/* Namespaced, so that what a host thread does while its setup runs is told apart from
+ * what the setup does by thread, not by name: a host's resource defined meanwhile is
+ * the host's, with its settings. */
+GPTPS_ADDON_INIT_NS("waiter", "waiter", GPTPS_SEAM_TASK, setup, 0, 0)

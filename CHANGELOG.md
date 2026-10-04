@@ -9,7 +9,7 @@ the release version and is documented in `include/gptps.h`.
 
 ### Upgrading from 1.5
 
-Nine changes can need a change in a host. The first three are about the config file,
+Ten changes can need a change in a host. The first three are about the config file,
 the last four about the `durable_queue` add-on:
 
 - **A config file with a mistake in it fails `gptps_open`.** 1.5 used what it
@@ -57,6 +57,26 @@ the last four about the `durable_queue` add-on:
   the registration has returned. On the registering thread - in an add-on's watcher
   that hears the type's file values - the type is there, but removing it returns
   `GPTPS_E_BUSY`.
+- **Out of memory is `GPTPS_E_NOMEM`, from the call that ran out.** 1.5 went on without
+  what it could not allocate, or reported something else. A host that reads
+  `GPTPS_E_CONFIG` as "fix the file", or takes `GPTPS_OK` from a setup call as final,
+  should make a call refused with `GPTPS_E_NOMEM` again:
+  - `gptps_open` and `gptps_open_ex` fail where 1.5 opened an engine without one of its
+    own settings, or without the config path that save and reload default to.
+  - `gptps_register_task`, `gptps_define_resource` and `gptps_define_task_setting`
+    return `GPTPS_E_NOMEM` and have changed nothing, where 1.5 returned `GPTPS_OK`
+    without some of the settings they make. For an enum whose choices could not be
+    copied, `gptps_define_task_setting` and `gptps_define_global` return it where 1.5
+    returned `GPTPS_E_CONFIG`.
+  - `gptps_settings_save` returns it, and writes nothing, when memory runs out reading
+    the file it edits - or, for a new path, the loaded config file it copies.
+  - `GPTPS_E_CONFIG` and `GPTPS_E_IO` from `gptps_open`, `gptps_open_ex`,
+    `gptps_settings_reload` and `gptps_settings_save` no longer cover memory running
+    out. It is `GPTPS_E_NOMEM` even when the file has mistakes of its own, which the
+    call made again reports; nothing is logged about the file until then.
+  - `gptps_dead_letter_drain` can return fewer than `gptps_dead_letter_count` said: it
+    stops at a dead letter whose task name it cannot copy and leaves the rest
+    retained for the next drain, where 1.5 handed it to the callback named `"?"`.
 
 - **`gptps_dq_open` returns NULL where 1.5 lost records.** It does so for a journal it
   cannot read - one that exists but will not open for reading, or a read that fails -
@@ -676,6 +696,73 @@ EINVAL, and checks a directory the process may write but not read (mode 0300).
   "auto", on x86-64. The new file now gets the setting's current value in place of a
   refused one, and leaves out a refused key no setting has. A save in place still
   keeps what the file's author wrote. `tests/test_config_strict.c`.
+
+### Fixed — out of memory, found by failing each allocation in turn
+
+`tests/test_oom.c` installs an allocator that fails the Nth allocation of a scenario,
+for every N - the work path, a config file, the settings API, a bounded engine's seal,
+the durable queue add-on - and holds the engine to what `gptps_set_allocator`
+promises: `GPTPS_E_NOMEM` from the call that got the failure, the same call made again
+returning what it would have, no leak, and what the scenario observes the same as with
+no failure. A THREADED engine, with one allocation in 50 failing at random, must not
+crash, leak, hang or lose an event. A last scenario has two threads: one defines a
+resource or a per-task setting, or registers a task, and stops at each of its
+allocations in turn, failing it or not; the other registers or defines meanwhile, and
+where the first registers, its own allocations fail in turn too. Against the code
+before these fixes nothing crashed, leaked or hung, in a plain build and under ASan,
+but these calls did not keep the promise:
+
+- **A failed add-on load could leave the add-on running.** `gptps_load_addon` made its
+  own bookkeeping after the add-on's `setup()` had succeeded. When that allocation
+  failed it returned `GPTPS_E_NOMEM`, but the tasks, observers, constraints, settings
+  and scheduler the add-on had registered stayed live, and loading it again failed
+  with `GPTPS_E_DUP` on its own task. The bookkeeping is now made before `setup()`.
+- **Setup calls returned `GPTPS_OK` without the settings they make.** `gptps_open`
+  left out any of the engine's own settings it could not register,
+  `gptps_register_task` any of a task's `tasks.<name>.*` settings,
+  `gptps_define_task_setting` the setting on some tasks, and `gptps_define_resource`
+  the budget's setting or a task's cost. Each missing one refused every live set and
+  took no value from the config file: a `[tasks.<name>.resources]` cost went
+  unapplied, so that budget went unenforced, and a file setting one of the engine's
+  own keys failed with "has no such key". Each call now makes everything first - every
+  setting, a resource's name and room for its slot - and then publishes it all in one
+  critical section, after its last allocation. Refused for memory, it has published
+  nothing, so no other thread saw any of it - a registration holds its name while it
+  runs, as before - and it can be made again. A task
+  registered while a definition runs gets the setting from one or the other. Of two
+  definitions of one leaf at once, the first to publish defines it and the other
+  returns `GPTPS_E_DUP`; of two of one resource, the second re-budgets it.
+- **Out of memory reading a config file was reported as a mistake in it.** `gptps_open`,
+  `gptps_open_ex` and `gptps_settings_reload` returned `GPTPS_E_CONFIG` - "the file
+  does not parse" - and so did an open or a reload whose add-on, `[resources]` entry
+  or a value's write accessor ran out. `gptps_settings_save` returned `GPTPS_E_CONFIG`
+  or `GPTPS_E_IO` for the file in place, and saving to a new path wrote the file
+  without the copy of the loaded config it promises and returned `GPTPS_OK`. All of
+  them now return `GPTPS_E_NOMEM` (see "Upgrading from 1.5"). An open that could not
+  copy its config path now fails too, rather than open without it: save and reload
+  with no path refused with `GPTPS_E_INVAL`.
+- **A dead letter could reach the drain's callback named `"?"`.** The drain copies each
+  dead letter's task name before it runs a callback, which may unregister the type,
+  and `gptps_unregister_task` copies its type's names before it frees it. A copy that
+  could not be made left the name `"?"`. The drain now stops at that dead letter,
+  leaving it and those after it retained, in order, for the next drain; it makes no
+  copies without a callback. An unregister keeps the type's record, out of the
+  registry, until shutdown, so its dead letter still names it.
+- **An enum setting whose choices could not be copied was `GPTPS_E_CONFIG`** from
+  `gptps_define_global` and `gptps_define_task_setting`, as if none had been given.
+  It is `GPTPS_E_NOMEM`.
+- **`gptps_step` could return 0 with work admitted.** An admission that cannot
+  allocate its named-resource snapshot leaves the item for the next pass. When that
+  was the step's first pass, its second admitted the item and the step returned with
+  it waiting and `*out_ran` 0, so the drain loop the header shows stopped, and a
+  `gptps_shutdown` after it cancelled the work. A step that has run nothing now runs
+  what its second pass admits.
+
+Three places still absorb a failure, by design, and the test accepts them: the drain
+above; `gptps_step`, which leaves an admission it cannot allocate for its next pass;
+and the record that lets the engine refuse a `gptps_shutdown` from inside one of its
+own callbacks, which is made as it is needed, so a callback without memory for it runs
+without that check.
 
 ### Documentation
 

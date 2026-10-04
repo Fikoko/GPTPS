@@ -383,6 +383,8 @@ file — add-ons, `[task_defaults]`, comments and all — with the live changes 
 and the engine's own value wherever it refused the file's.
 Whatever save writes reads back as it was: a setting takes only numbers a file can hold
 (no `nan`, `inf` or hex), and a string is written with every control character escaped.
+Memory that runs out is not a mistake in the file: open, reload and save return
+`GPTPS_E_NOMEM` then, and the same call made again reports whatever else there is.
 
 ## Settings (runtime, introspectable, persistable)
 
@@ -717,7 +719,8 @@ counting allocator in `tests/test_bounded.c` holds it to that, in both modes;
   `retry_backoff_seconds`, `on_failure` = `dead_letter` (default) / `drop` / `requeue`.
 - **Dead letter:** tasks that exhaust retries (or that a constraint denies) are retained.
   `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
-  the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest).
+  the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest);
+  if memory runs out copying a task's name, it stops there and leaves the rest for the next drain.
   The list is capped at `limits.max_dead_letters` (default 1024, oldest evicted, `0` =
   unbounded; at open, `cfg.max_dead_letters`, where `GPTPS_LIMIT_NONE` is unbounded);
   `stats.dead_letters_evicted` counts anything the cap dropped, so a host that never

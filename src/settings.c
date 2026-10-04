@@ -174,6 +174,49 @@ gptps_status gptps_settings_add_owned(gptps_settings *r, const gptps_setting_def
     return GPTPS_OK;
 }
 
+/* ---- settings made first, published at once (gptps_internal.h) ---- */
+gptps_status gptps_settings_prepare(const gptps_setting_def *def, const void *owner,
+                                    const char *defval, gptps_setting_prep **out)
+{
+    gptps_setting_entry *e;
+    if (!out) return GPTPS_E_INVAL;
+    *out = NULL;
+    if (!def || !def->key || !def->read || !def->write) return GPTPS_E_INVAL;
+    e = (gptps_setting_entry *)gptps_calloc(1, sizeof *e);
+    if (e) { e->key = dupz(def->key); e->desc = dupz(def->desc ? def->desc : ""); e->defval = (char *)gptps_malloc(GPTPS_SETTINGS_VALUE_MAX); }
+    if (!e || !e->key || !e->desc || !e->defval) {
+        gptps_settings_prep_free(e);
+        return GPTPS_E_NOMEM;
+    }
+    e->type = def->type; e->hot = def->hot; e->has_range = def->has_range;
+    e->min = def->min; e->max = def->max; e->choices = def->choices;
+    e->target = def->target; e->read = def->read; e->write = def->write;
+    e->owner = owner;
+    e->defval[0] = 0;
+    if (defval) snprintf(e->defval, GPTPS_SETTINGS_VALUE_MAX, "%s", defval);
+    else        e->read(e->target, e->defval, GPTPS_SETTINGS_VALUE_MAX);   /* no lock held */
+    *out = e;
+    return GPTPS_OK;
+}
+
+void gptps_settings_prep_free(gptps_setting_prep *p)
+{
+    if (!p) return;
+    gptps_free(p->key); gptps_free(p->desc); gptps_free(p->defval); gptps_free(p);
+}
+
+void gptps_settings_lock(gptps_settings *r)   { gptps_mutex_lock(r->m); }
+void gptps_settings_unlock(gptps_settings *r) { gptps_mutex_unlock(r->m); }
+
+int gptps_settings_publish_locked(gptps_settings *r, gptps_setting_prep *p)
+{
+    if (setting_find(r, p->key)) return 0;      /* someone else's: it stays theirs */
+    p->next = NULL;
+    if (r->tail) r->tail->next = p; else r->head = p;
+    r->tail = p; r->n += 1;
+    return 1;
+}
+
 size_t gptps_settings_size(gptps_settings *r)
 {
     size_t n;
@@ -955,7 +998,7 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
     gptps_log_level lvl = GPTPS_LOG_ERROR;
     size_t tn;
     FILE *f;
-    int made = 0, copy = 0;
+    int made = 0, copy = 0, oom = 0, why = 0;
     gptps_status st = GPTPS_OK;
     if (!r || !path) return GPTPS_E_INVAL;
     msg[0] = 0;                            /* what to log, once the lock is released */
@@ -977,9 +1020,12 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
         /* A new file starts as a copy of the config file the engine loaded - its
          * add-ons, [task_defaults], comments and all - with the live changes made
          * in it as in place. If that file cannot be read or no longer parses, the
-         * settings alone are written, as for an engine opened without a file. */
-        text = gptps_toml_read_file(base, err, sizeof err);
-        if (text && !(t = gptps_toml_parse_text(base, text, err, sizeof err))) { gptps_free(text); text = NULL; }
+         * settings alone are written, as for an engine opened without a file. Not
+         * when memory ran out reading it: the file is fine, and the copy would be
+         * left out of a save that reported success. */
+        text = gptps_toml_read_file(base, err, sizeof err, &why);
+        if (text && !(t = gptps_toml_parse_text(base, text, err, sizeof err, &oom))) { gptps_free(text); text = NULL; }
+        if (oom || why == GPTPS_TOML_NOMEM) { st = GPTPS_E_NOMEM; goto out; }   /* not a return: r->m is held */
         copy = t != NULL;
         if (!t) {
             char *nl = strchr(err, '\n');
@@ -990,14 +1036,18 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
         }
     } else if (f) {
         fclose(f);
-        text = gptps_toml_read_file(path, err, sizeof err);
-        if (text) t = gptps_toml_parse_text(path, text, err, sizeof err);
+        text = gptps_toml_read_file(path, err, sizeof err, &why);
+        if (text) t = gptps_toml_parse_text(path, text, err, sizeof err, &oom);
         if (!t) {
-            char *nl = strchr(err, '\n');    /* the first problem says enough */
+            char *nl;
+            /* Out of memory reading it is not a file that does not parse: the file may
+             * be fine, so there is nothing to say about it. */
+            st = (oom || why == GPTPS_TOML_NOMEM) ? GPTPS_E_NOMEM : text ? GPTPS_E_CONFIG : GPTPS_E_IO;
+            if (st == GPTPS_E_NOMEM) goto out;
+            nl = strchr(err, '\n');          /* the first problem says enough */
             if (nl) *nl = 0;
             snprintf(msg, sizeof msg, "settings not saved: %.700s%s - the file was left as it is; "
                      "fix it, or save to another path", err, nl ? " (and more)" : "");
-            st = text ? GPTPS_E_CONFIG : GPTPS_E_IO;
             goto out;
         }
     } else if (errno != ENOENT) {

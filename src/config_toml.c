@@ -64,6 +64,7 @@ struct gptps_toml {
     toml_table *tb;      /* every [table] line, in order (gptps_settings_save edits by them) */
     size_t      ntb, captb;
     char       *path;
+    int         oom;     /* a line failed because memory ran out, not because of its text */
 };
 
 /* A settings file is kilobytes. The cap exists because fopen() on a DIRECTORY
@@ -354,6 +355,7 @@ static int parse_dotted_value(struct gptps_toml *t, const char *section, const c
 
 oom:
     entry_free(&tmp);
+    t->oom = 1;
     return fail(errbuf, errlen, t->path, line, "out of memory");
 }
 
@@ -367,7 +369,7 @@ static int parse_value(struct gptps_toml *t, const char *section, const char *ke
     size_t n = strlen(section) + strlen(key) + 2;
     char *dotted = (char *)gptps_malloc(n);
     int rc;
-    if (!dotted) return fail(errbuf, errlen, t->path, line, "out of memory");
+    if (!dotted) { t->oom = 1; return fail(errbuf, errlen, t->path, line, "out of memory"); }
     snprintf(dotted, n, "%s%s%s", section, *section ? "." : "", key);
     rc = parse_dotted_value(t, section, key, dotted, val, line, errbuf, errlen);
     gptps_free(dotted);
@@ -439,7 +441,10 @@ static int parse_line(struct gptps_toml *t, char *raw, int line, char *section, 
         char *name;
         if (raw[1] == '[') return fail(errbuf, errlen, t->path, line, "[[arrays of tables]] are not supported");
         p = raw + 1;
-        if (!(name = parse_path(&p, 1, &why))) return fail(errbuf, errlen, t->path, line, "%s", why ? why : "out of memory");
+        if (!(name = parse_path(&p, 1, &why))) {
+            if (!why) t->oom = 1;
+            return fail(errbuf, errlen, t->path, line, "%s", why ? why : "out of memory");
+        }
         if (*p != ']') {
             gptps_free(name);
             return fail(errbuf, errlen, t->path, line, *p ? "unexpected text in the table name" : "the table name has no closing ]");
@@ -453,7 +458,7 @@ static int parse_line(struct gptps_toml *t, char *raw, int line, char *section, 
         if (t->ntb == t->captb) {
             size_t nc = t->captb ? t->captb * 2 : 8;
             toml_table *g = (toml_table *)gptps_realloc(t->tb, nc * sizeof *g);
-            if (!g) { gptps_free(name); return fail(errbuf, errlen, t->path, line, "out of memory"); }
+            if (!g) { gptps_free(name); t->oom = 1; return fail(errbuf, errlen, t->path, line, "out of memory"); }
             t->tb = g; t->captb = nc;
         }
         t->tb[t->ntb].line = line;
@@ -463,7 +468,10 @@ static int parse_line(struct gptps_toml *t, char *raw, int line, char *section, 
         return 0;
     }
     p = raw;
-    if (!(key = parse_path(&p, 0, &why))) return fail(errbuf, errlen, t->path, line, "%s", why ? why : "out of memory");
+    if (!(key = parse_path(&p, 0, &why))) {
+        if (!why) t->oom = 1;
+        return fail(errbuf, errlen, t->path, line, "%s", why ? why : "out of memory");
+    }
     rest = trim((char *)p);
     if (*rest != '=') {
         int rc = *rest
@@ -482,30 +490,37 @@ static int parse_line(struct gptps_toml *t, char *raw, int line, char *section, 
 
 /* ---- public-ish (internal) API ---- */
 
-char *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen)
+char *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen, int *why)
 {
     FILE *f;
     long sz;
     size_t got;
     char *buf;
 
+#define UNREAD() do { if (why) *why = GPTPS_TOML_UNREAD; } while (0)
     if (errbuf && errlen) errbuf[0] = 0;
     f = fopen(path, "rb");
-    if (!f) { fail(errbuf, errlen, path, 0, "cannot open the file (%s)", strerror(errno)); return NULL; }
+    if (!f) { UNREAD(); fail(errbuf, errlen, path, 0, "cannot open the file (%s)", strerror(errno)); return NULL; }
     /* Each step below is checked AND fills errbuf. Unchecked, a mistyped path
      * surfaced as gptps_open's E_CONFIG with a blank error string - and for the
      * commonest typo of all, a directory, as an ~8 EiB allocation request (see
      * GPTPS_TOML_MAX_BYTES). */
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); fail(errbuf, errlen, path, 0, "cannot size the file"); return NULL; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); UNREAD(); fail(errbuf, errlen, path, 0, "cannot size the file"); return NULL; }
     sz = ftell(f);
     if (sz < 0 || (unsigned long)sz > GPTPS_TOML_MAX_BYTES) {
         fclose(f);
+        UNREAD();
         fail(errbuf, errlen, path, 0, "not a readable config file");
         return NULL;
     }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); fail(errbuf, errlen, path, 0, "cannot rewind the file"); return NULL; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); UNREAD(); fail(errbuf, errlen, path, 0, "cannot rewind the file"); return NULL; }
     buf = (char *)gptps_malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); fail(errbuf, errlen, path, 0, "out of memory reading the file"); return NULL; }
+    if (!buf) {
+        fclose(f);
+        if (why) *why = GPTPS_TOML_NOMEM;
+        fail(errbuf, errlen, path, 0, "out of memory reading the file");
+        return NULL;
+    }
     /* Terminate at what we actually read, not at what ftell promised: an editor
      * that truncates-and-rewrites the file under a SIGHUP-driven reload would
      * otherwise leave the tail of the buffer uninitialised - and parsed. */
@@ -517,6 +532,7 @@ char *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen)
      * succeeds, and only the read fails with EISDIR. */
     if (ferror(f)) {
         fclose(f); gptps_free(buf);
+        UNREAD();
         fail(errbuf, errlen, path, 0, "cannot read the file");
         return NULL;
     }
@@ -526,10 +542,12 @@ char *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen)
      * file - from the loader, and from a save that rewrites the file. */
     if (memchr(buf, 0, got)) {
         gptps_free(buf);
+        if (why) *why = GPTPS_TOML_BAD;
         fail(errbuf, errlen, path, 0, "the file contains a NUL byte - it is not a text file");
         return NULL;
     }
     return buf;
+#undef UNREAD
 }
 
 /* One more message for errbuf, on a line of its own; 0 when it no longer fits. */
@@ -549,7 +567,7 @@ static int add_error(char *errbuf, size_t errlen, size_t *used, const char *msg)
  * gets one message per line, as many as fit. After a [table] line that does not
  * parse, the keys up to the next table are passed over - their table is unknown,
  * and judging them in the one before would only report errors that are not there. */
-static gptps_toml *parse_buf(const char *path, char *buf, char *errbuf, size_t errlen)
+static gptps_toml *parse_buf(const char *path, char *buf, char *errbuf, size_t errlen, int *oom)
 {
     char *line, *save;
     struct gptps_toml *t;
@@ -577,6 +595,7 @@ static gptps_toml *parse_buf(const char *path, char *buf, char *errbuf, size_t e
     t = (struct gptps_toml *)gptps_calloc(1, sizeof *t);
     if (!t || !(t->path = dupn(path, strlen(path)))) {
         gptps_free(t); gptps_free(buf);
+        if (oom) *oom = 1;
         fail(errbuf, errlen, path, 0, "out of memory");
         return NULL;
     }
@@ -612,23 +631,34 @@ static gptps_toml *parse_buf(const char *path, char *buf, char *errbuf, size_t e
                  bad - shown, bad - shown == 1 ? "" : "s", bad - shown == 1 ? "es" : "");
             add_error(errbuf, errlen, &used, one);
         }
+        if (t->oom && oom) *oom = 1;
         gptps_toml_free(t);
         return NULL;
     }
     return t;
 }
 
-gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
+gptps_toml *gptps_toml_parse_file_ex(const char *path, char *errbuf, size_t errlen, int *why)
 {
-    char *buf = gptps_toml_read_file(path, errbuf, errlen);
-    return buf ? parse_buf(path, buf, errbuf, errlen) : NULL;
+    int oom = 0;
+    gptps_toml *t;
+    char *buf = gptps_toml_read_file(path, errbuf, errlen, why);
+    if (!buf) return NULL;
+    t = parse_buf(path, buf, errbuf, errlen, &oom);   /* consumes buf */
+    if (!t && why) *why = oom ? GPTPS_TOML_NOMEM : GPTPS_TOML_BAD;
+    return t;
 }
 
-gptps_toml *gptps_toml_parse_text(const char *path, const char *text, char *errbuf, size_t errlen)
+gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen)
+{
+    return gptps_toml_parse_file_ex(path, errbuf, errlen, NULL);
+}
+
+gptps_toml *gptps_toml_parse_text(const char *path, const char *text, char *errbuf, size_t errlen, int *oom)
 {
     char *buf = dupn(text, strlen(text));
-    if (!buf) { fail(errbuf, errlen, path, 0, "out of memory"); return NULL; }
-    return parse_buf(path, buf, errbuf, errlen);
+    if (!buf) { if (oom) *oom = 1; fail(errbuf, errlen, path, 0, "out of memory"); return NULL; }
+    return parse_buf(path, buf, errbuf, errlen, oom);
 }
 
 void gptps_toml_free(gptps_toml *t)

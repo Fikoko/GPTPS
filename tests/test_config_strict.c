@@ -649,8 +649,12 @@ static void test_open_with_addons(void)
     CHECK(gptps_open(CFG, &e) == GPTPS_OK);
     if (e) {
         uint64_t budget = 0;
+        char v[64];
         CHECK(gptps_resource_usage(e, "nstest.slots", NULL, &budget) == GPTPS_OK && budget == 2);
+        /* nor is it a setting of the engine's: the add-on exposes it its own way */
+        CHECK(gptps_settings_get(e, "resources.nstest.slots", v, sizeof v) == GPTPS_E_NOTFOUND);
         CHECK(reg(e, "t") == GPTPS_OK);
+        CHECK(gptps_settings_get(e, "tasks.t.resources.nstest.slots", v, sizeof v) == GPTPS_E_NOTFOUND);
         clear_log();
         CHECK(gptps_config_check(e) == GPTPS_E_CONFIG);
         CHECK(logged("tasks.t.resources.nstest.slots: the resource nstest.slots belongs to an add-on"));
@@ -1165,6 +1169,11 @@ static void test_addon_lifecycle(void)
         CHECK(gptps_task_exists(e, "waiter.started"));          /* its setup is running */
         CHECK(reg(e, "host") == GPTPS_OK);
         CHECK(has_value(e, "tasks.host.resources.gpu", "1"));  /* now, not when the setup ends */
+        /* a resource the host defines is the host's, though an add-on's setup runs:
+         * it comes with its settings, which an add-on's resource does not */
+        CHECK(gptps_define_resource(e, "hostres", 3) == GPTPS_OK);
+        CHECK(has_value(e, "resources.hostres", "3"));
+        CHECK(has_value(e, "tasks.host.resources.hostres", "0"));
         CHECK(gptps_settings_reload(e, NULL) == GPTPS_E_BUSY);
         CHECK(reg(e, "host.done") == GPTPS_OK);                 /* lets the setup finish */
         if (loader) gptps_thread_join(loader);

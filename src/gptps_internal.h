@@ -124,11 +124,20 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
 typedef struct gptps_toml gptps_toml;
 gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen); /* NULL on error */
-/* The same parse of text already in memory; `path` names it in messages. */
-gptps_toml *gptps_toml_parse_text(const char *path, const char *text, char *errbuf, size_t errlen);
+/* Why parse_file_ex or read_file returned NULL, through their `why` (may be NULL; left
+ * alone on success): the caller words its own message, and memory running out is not
+ * a mistake in the file, which may be fine. */
+#define GPTPS_TOML_BAD    1     /* the text: a line that does not parse, a NUL byte */
+#define GPTPS_TOML_UNREAD 2     /* the file cannot be opened, sized or read */
+#define GPTPS_TOML_NOMEM  3     /* memory ran out */
+gptps_toml *gptps_toml_parse_file_ex(const char *path, char *errbuf, size_t errlen, int *why);
+/* The same parse of text already in memory; `path` names it in messages. When it fails
+ * because memory ran out, *oom (may be NULL) is set to 1; it is left alone otherwise. */
+gptps_toml *gptps_toml_parse_text(const char *path, const char *text, char *errbuf, size_t errlen,
+                                  int *oom);
 /* The file, read with the checks parse_file makes, NUL-terminated (gptps_free it);
- * NULL with errbuf filled when it cannot be. */
-char       *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen);
+ * NULL with errbuf filled, and *why set, when it cannot be. */
+char       *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen, int *why);
 void        gptps_toml_free(gptps_toml *t);
 int         gptps_toml_int(const gptps_toml *t, const char *section, const char *key, long long *out);
 int         gptps_toml_double(const gptps_toml *t, const char *section, const char *key, double *out);
@@ -232,6 +241,24 @@ void            gptps_settings_forget_tag(gptps_settings *r, const void *tag);
  * so callers must NOT hold the engine lock (preserve settings->m -> engine->m). */
 size_t          gptps_settings_remove_task(gptps_settings *r, const void *owner, const char *prefix,
                                            const char *const *keep, size_t nkeep);
+/* Settings made first and published at once, for a call that makes many and must make
+ * all of them or none: a task's registration, gptps_define_resource,
+ * gptps_define_task_setting. prepare() allocates everything one setting needs - its
+ * entry, key, description and default - and nothing can see it yet. It renders the
+ * default with def->read unless `defval` gives it, so the caller holds no lock (the
+ * read takes the target's own). publish_locked() links it into the registry and
+ * allocates nothing, so a batch of them cannot fail part-way: it returns 1, or 0 when
+ * the key is someone else's already, which stays theirs, and `p` is then still the
+ * caller's to free. The caller holds the registry's lock (gptps_settings_lock), and
+ * may take the engine's under it - settings->m comes first - to publish its own state
+ * in the same moment. A prepared setting never published goes with prep_free. */
+typedef struct gptps_setting_entry gptps_setting_prep;
+gptps_status    gptps_settings_prepare(const gptps_setting_def *def, const void *owner,
+                                       const char *defval, gptps_setting_prep **out);
+void            gptps_settings_prep_free(gptps_setting_prep *p);
+void            gptps_settings_lock(gptps_settings *r);
+void            gptps_settings_unlock(gptps_settings *r);
+int             gptps_settings_publish_locked(gptps_settings *r, gptps_setting_prep *p);
 
 /* Out-of-process EXTERNAL PROGRAM executor (POSIX): fork + exec argv[0] under an
  * OS memory cap, feed `payload` on the child's stdin, read its stdout as the
