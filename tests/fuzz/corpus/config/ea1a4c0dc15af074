@@ -1,0 +1,4 @@
+[lim.ts]
+iax_concurrenityseco9ds = 5
+[resourcmemecho.resources]
+gpu = 1

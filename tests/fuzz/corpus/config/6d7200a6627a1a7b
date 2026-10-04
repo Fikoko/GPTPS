@@ -1,0 +1,7 @@
+max_memomax_memory_gbry_gb = 1.5
+priority = 3
+timeout_seconds = 5
+[resourges]
+[tasks.echo.resources]
+gpccu = 2
+gpu = 1

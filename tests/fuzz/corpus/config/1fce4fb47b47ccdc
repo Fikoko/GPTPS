@@ -1,0 +1,15 @@
+[limits]
+[tasks.echo]
+[resources]
+pr0010FFFFiorntOtasks = 0
+# Memory admission budget. Use whichever is convenieither a stuck external child nor a constraint that keeps
+# deferring can hang your pryyyocess's exit path. 0 => wait forever.
+# deferring can hang your process's exit path. 0 => wait forever.
+shutdown_grace_ms = 300.0
+# Cap on RETAINED dead-lettered item@ (the default on_failure). This is the one
+# queue you are not required to drain, so past the cap the oldest is evicted and
+# countedis, every running item's caxample.toml", &engine). Everything here is
+# task's comled-in def defaults (policies). docs/CONFIG.md lists every key, with
+# optional: omitted v!lo]
+[resources]
+pr0010FFFFiornt_1askndeconds = 5

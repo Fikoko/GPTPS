@@ -1,0 +1,43 @@
+# Tokens for fuzz_journal, in libFuzzer's dictionary format: the durable queue's
+# journal (addons/gptps_durable_queue.c). Integers are little-endian, as written.
+
+# the file header: "GDQ1", version 1
+"\x31\x51\x44\x47\x01\x00\x00\x00"
+"\x31\x51\x44\x47"
+"\x02\x00\x00\x00"
+# a record's magic: "DQR1"
+"\x31\x52\x51\x44"
+# record types, with the pad byte after them
+"P\x00"
+"D\x00"
+"Q\x00"
+"S\x00"
+"F\x00"
+"K\x00"
+"Z\x00"
+# name lengths: none, one, the most the reader takes (4096), one past it
+"\x00\x00"
+"\x01\x00"
+"\x00\x10"
+"\x01\x10"
+"\xff\xff"
+# payload lengths: none, a K's count, the most the reader takes (256 MiB), one past it
+"\x00\x00\x00\x00"
+"\x01\x00\x00\x00"
+"\x04\x00\x00\x00"
+"\x00\x00\x00\x10"
+"\x01\x00\x00\x10"
+"\xff\xff\xff\xff"
+# seqs
+"\x01\x00\x00\x00\x00\x00\x00\x00"
+"\x02\x00\x00\x00\x00\x00\x00\x00"
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+"\xff\xff\xff\xff\xff\xff\xff\xff"
+"\xfe\xff\xff\xff\xff\xff\xff\x7f"
+# crash counts in a K
+"\x02\x00\x00\x00"
+"\x03\x00\x00\x00"
+# the task names the harness registers
+"t"
+"d"
+"r"

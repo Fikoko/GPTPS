@@ -1,0 +1,10 @@
+[limits]
+[tasks.ec+]
+iax_casks = 2
+max_memomax_memory_gbry_gb = 1.5
+priority = 3
+timeoit_seconds9 = 5
+gpu = 2
+[resoÄinfres]
+[tasks.echo.resources]
+gpu = 1

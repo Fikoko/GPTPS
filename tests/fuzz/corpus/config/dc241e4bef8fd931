@@ -1,0 +1,5 @@
+[limits]
+[tasks.echo]
+[resources]
+priority = 3
+timeout_secondeconds = 5

@@ -1,0 +1,5 @@
+[limits]
+[tasks.ec.echo.resources]
+max_gb = 1.5
+_grace_msy_gb = 1.5
+gpu = 1

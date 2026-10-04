@@ -1,0 +1,7 @@
+[limits]
+[task³5s.echo]
+timeout_seconds = 5
+[resmurges]
+gpu = 2
+[ta0x10cho.resources]
+gpu = 1

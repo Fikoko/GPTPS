@@ -1,0 +1,7 @@
+task_defaults.tasks = 2
+[tasks.fz.o]
+max_meYory_gb = 1.5
+gpu = 2
+[resources]
+[tasks.echo.rshurces]
+gpu = 1

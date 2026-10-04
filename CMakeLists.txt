@@ -812,6 +812,33 @@ add_test(NAME fuzz COMMAND test_fuzz)
 set_tests_properties(fuzz PROPERTIES TIMEOUT 60)
 endif()
 
+# The coverage-guided harnesses (tests/fuzz, built to fuzz with GPTPS_FUZZ below),
+# replaying the corpus kept in tests/fuzz/corpus: inputs the fuzzers kept because
+# they reached new code, and reproducers of the bugs fuzzing found (regress-*) - each
+# fails without its fix but the stray marker, whose bug only tests/test_durable.c
+# reaches. No fuzzing here, and every platform runs it, so a fixed bug stays fixed.
+# The three that read config files replay each other's inputs too, and need only the
+# core.
+set(_fz_corpus ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/corpus)
+foreach(_fz toml config save)
+    add_executable(fuzz_replay_${_fz} tests/fuzz/fuzz_${_fz}.c tests/fuzz/replay.c)
+    target_include_directories(fuzz_replay_${_fz} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(fuzz_replay_${_fz} PRIVATE gptps)
+endforeach()
+add_test(NAME fuzz_corpus_toml    COMMAND fuzz_replay_toml    ${_fz_corpus}/toml ${_fz_corpus}/config ${_fz_corpus}/save)
+add_test(NAME fuzz_corpus_config  COMMAND fuzz_replay_config  ${_fz_corpus}/config ${_fz_corpus}/toml ${_fz_corpus}/save)
+add_test(NAME fuzz_corpus_save    COMMAND fuzz_replay_save    ${_fz_corpus}/save ${_fz_corpus}/toml ${_fz_corpus}/config)
+set_tests_properties(fuzz_corpus_toml fuzz_corpus_config fuzz_corpus_save PROPERTIES TIMEOUT 120)
+if(TARGET gptps_durable_queue)
+add_executable(fuzz_replay_journal tests/fuzz/fuzz_journal.c tests/fuzz/replay.c)
+target_include_directories(fuzz_replay_journal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(fuzz_replay_journal PRIVATE gptps_durable_queue)
+add_test(NAME fuzz_corpus_journal COMMAND fuzz_replay_journal ${_fz_corpus}/journal)
+set_tests_properties(fuzz_corpus_journal PROPERTIES TIMEOUT 120)
+endif()
+
 # --- cross-platform external-program executor test (POSIX + Windows) -------
 add_executable(prog_helper tests/prog_helper.c)         # tiny portable test binary
 add_executable(test_program_helper tests/test_program_helper.c)
@@ -923,6 +950,71 @@ set_tests_properties(config_reference PROPERTIES TIMEOUT 30)
 endif()
 
 endif() # GPTPS_BUILD_TESTS
+
+# --- fuzzing (tests/fuzz) ---------------------------------------------------
+# GPTPS_FUZZ=ON builds fuzz_toml, fuzz_config, fuzz_save and fuzz_journal: the
+# harnesses, over the core and the durable queue compiled again for them - traced
+# for coverage, under ASan and UBSan by default. The engine is tests/fuzz/driver.c,
+# which needs only -fsanitize-coverage=trace-pc,trace-cmp, so it works with GCC as
+# well as Clang; with Clang, GPTPS_FUZZ_ENGINE=libfuzzer builds the same harnesses
+# against libFuzzer. Both read the same command line - the first directory is where
+# new inputs go, which libFuzzer needs made first and the driver makes itself:
+#     cmake -S . -B build-fuzz -DGPTPS_FUZZ=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+#     cmake --build build-fuzz -j
+#     mkdir -p work/toml
+#     build-fuzz/fuzz_toml -max_total_time=600 -dict=tests/fuzz/toml.dict work/toml tests/fuzz/corpus/toml
+# The environment variable GPTPS_FUZZ_TMPDIR names where the harnesses keep their
+# scratch files; a tmpfs makes the journal's fsyncs free. CI's asan job builds the
+# four with the driver and runs each for a fixed number of inputs.
+option(GPTPS_FUZZ "Build the coverage-guided fuzz targets (tests/fuzz)" OFF)
+set(GPTPS_FUZZ_ENGINE "driver" CACHE STRING
+    "The fuzzing engine: driver (tests/fuzz/driver.c; GCC or Clang) or libfuzzer (Clang)")
+# float-cast-overflow is named because GCC's `undefined` leaves it out, and a double
+# converted to an integer it does not fit is exactly what a config value can cause.
+set(GPTPS_FUZZ_SANITIZE "address,undefined,float-cast-overflow" CACHE STRING
+    "The -fsanitize= list for the fuzz targets; empty for none")
+if(GPTPS_FUZZ)
+    if(WIN32 OR NOT CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "GPTPS_FUZZ needs GCC or Clang on a POSIX system")
+    endif()
+    set(_fz_san "")
+    if(GPTPS_FUZZ_SANITIZE)
+        set(_fz_san -fsanitize=${GPTPS_FUZZ_SANITIZE} -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    endif()
+    if(GPTPS_FUZZ_ENGINE STREQUAL "libfuzzer")
+        if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+            message(FATAL_ERROR "GPTPS_FUZZ_ENGINE=libfuzzer needs Clang (the driver engine works with GCC)")
+        endif()
+        set(_fz_cov  -fsanitize=fuzzer-no-link)
+        set(_fz_link -fsanitize=fuzzer)
+    elseif(GPTPS_FUZZ_ENGINE STREQUAL "driver")
+        set(_fz_cov  -fsanitize-coverage=trace-pc,trace-cmp)
+        set(_fz_link "")
+    else()
+        message(FATAL_ERROR "GPTPS_FUZZ_ENGINE is driver or libfuzzer, not '${GPTPS_FUZZ_ENGINE}'")
+    endif()
+    # The code under test, traced: a library of its own, since the default one is not.
+    add_library(gptps_fuzzcov STATIC ${GPTPS_SRC} addons/gptps_durable_queue.c)
+    target_include_directories(gptps_fuzzcov PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                               ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_compile_options(gptps_fuzzcov PRIVATE ${_fz_cov} ${_fz_san} -g)
+    target_link_libraries(gptps_fuzzcov PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    if(GPTPS_FUZZ_ENGINE STREQUAL "driver")
+        # The driver is never traced: it would count its own work as the target's coverage.
+        add_library(gptps_fuzz_driver OBJECT tests/fuzz/driver.c)
+        target_compile_options(gptps_fuzz_driver PRIVATE ${_fz_san} -g)
+    endif()
+    foreach(_fz toml config save journal)
+        if(GPTPS_FUZZ_ENGINE STREQUAL "driver")
+            add_executable(fuzz_${_fz} tests/fuzz/fuzz_${_fz}.c $<TARGET_OBJECTS:gptps_fuzz_driver>)
+        else()
+            add_executable(fuzz_${_fz} tests/fuzz/fuzz_${_fz}.c)
+        endif()
+        target_compile_options(fuzz_${_fz} PRIVATE ${_fz_cov} ${_fz_san} -g)
+        target_link_options(fuzz_${_fz} PRIVATE ${_fz_san} ${_fz_link})
+        target_link_libraries(fuzz_${_fz} PRIVATE gptps_fuzzcov)
+    endforeach()
+endif()
 
 if(GPTPS_BUILD_EXAMPLES)
 # --- examples (runnable usage; double as smoke tests) ----------------------

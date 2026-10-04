@@ -1,0 +1,5 @@
+tasks = 2
+[limits]
+[tasks.ec.echo.resources]
+max_memomax_memory_gbry_gb = 1.5
+gpu = 1

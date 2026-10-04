@@ -1,0 +1,7 @@
+[limit@]
+iax_concurrent_tasks = 2
+max_memomax_memory_gbry_gb = 1.5
+[tasks.echo]
+ds = 5
+[resourcmemecho.resources]
+gpu = 1

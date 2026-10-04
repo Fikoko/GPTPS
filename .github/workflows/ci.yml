@@ -320,6 +320,20 @@ jobs:
         run: cmake --build build-asan
       - name: Test
         run: ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build-asan --output-on-failure --no-tests=error
+      # The fuzz targets (GPTPS_FUZZ=ON, tests/fuzz), built with the GCC driver under
+      # ASan and UBSan - nothing else builds them - and run from the kept corpus for a
+      # fixed seed and number of inputs, so a run is the same each time: about 20 s.
+      # Every job replays the corpus itself, as the fuzz_corpus_* tests.
+      - name: Fuzz targets build, and run briefly
+        run: |
+          cmake -S . -B build-fuzz -DGPTPS_FUZZ=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DGPTPS_BUILD_TESTS=OFF -DGPTPS_BUILD_EXAMPLES=OFF
+          cmake --build build-fuzz -j --target fuzz_toml fuzz_config fuzz_save fuzz_journal
+          export GPTPS_FUZZ_TMPDIR=/dev/shm
+          build-fuzz/fuzz_toml    -seed=1 -runs=5000 -dict=tests/fuzz/toml.dict    work/toml    tests/fuzz/corpus/toml
+          build-fuzz/fuzz_config  -seed=1 -runs=600  -dict=tests/fuzz/toml.dict    work/config  tests/fuzz/corpus/config
+          build-fuzz/fuzz_save    -seed=1 -runs=600  -dict=tests/fuzz/toml.dict    work/save    tests/fuzz/corpus/save
+          build-fuzz/fuzz_journal -seed=1 -runs=600  -dict=tests/fuzz/journal.dict work/journal tests/fuzz/corpus/journal
 
   # ThreadSanitizer (ASLR disabled for TSan in CI).
   #

@@ -1,0 +1,8 @@
+[limimö««ds]
+max_memory_gb = 1.5
+[tasks.  eCho]
+# settinûs wai\\for whoever defines tps_config_che, an1e-400d work stilconcurrent_tasks = 0
+# Memory admission budget. Use whichever is convenient; bytes wins if bth set.
+# 0 ÿomitted => ~0.75 x detected RAM.
+max_memory_gb = 0.0
+# max_memo

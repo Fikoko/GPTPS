@@ -1,0 +1,8 @@
+[limits]
+max_memory_gb = 1.5
+[sksul.echo]
+[resources]
+priority = 3
+9223372036854775-17gpu = 2
+[tasks.echo.resources]
+gpu = 1

@@ -563,7 +563,9 @@ management + generic settings (new symbols, an appended `GPTPS_E_BUSY` status, a
 Every increment ships with tests and is held to: CTest green on Linux + macOS,
 **AddressSanitizer + UBSan**-clean across the whole suite and **ThreadSanitizer**-
 clean on the concurrent paths (ASLR disabled in CI), stress loops on timing-
-sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), system-call
+sensitive tests, coverage-guided fuzzing of the two hand-rolled parsers (TOML +
+journal) and of the in-place save (`tests/fuzz/`) - the suite replays the inputs
+kept from it, and the `asan` job builds the fuzzers and runs each briefly - system-call
 fault injection into the out-of-process executors (`tests/test_exec_faults.c`), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
@@ -571,7 +573,8 @@ plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforceme
 wasm runtime CLI). CI runs thirteen jobs: `build-test` (Linux + macOS, a 2-way matrix),
 `werror` (`-O2 -Wall -Wextra -Werror`), `package` (installs, then builds a plug-in
 out-of-tree against the installed package), `windows` (mingw-w64), `msvc` (cl.exe),
-`amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan), `tsan`,
+`amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan, and the
+fuzzers), `tsan`,
 `hal_fast`, `hal_chaos` (the whole suite on the weakest HAL the contract allows),
 `hal_sim` (the suite on a simulation HAL where a seed picks every thread switch, so a
 failure replays), `cross` (i386 + big-endian s390x under QEMU), and `freestanding`.

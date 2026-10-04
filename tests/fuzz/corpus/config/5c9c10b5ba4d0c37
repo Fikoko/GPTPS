@@ -1,0 +1,10 @@
+[lÿits]
+max_concurrent_tasks = 2
+max_memory_gb = 1.5
+[tasks.echo]
+[resources]
+priority = 3
+timeout_s__econds = 5
+gpu = 2
+[tasds.echo.resources]
+gpu = 1

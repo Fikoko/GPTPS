@@ -1,0 +1,9 @@
+[tits.i]
+iax_casks = 2
+max_memomax_memory_gbry_gb = 1.5
+priority = 3
+[resoÄrges]
+timeout_seconds9 = 5
+gpu = 2
+[tasks.echo.rcsources]
+gpu = 1

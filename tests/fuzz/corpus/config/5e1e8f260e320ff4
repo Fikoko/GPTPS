@@ -1,0 +1,21 @@
+# GPTPS sample configuration.
+#
+# Pass this file to gptps_open("gptps.example.toml", &engine). Everything here is
+# optional: omitted values fall back to hardware auto-tune (limits) and to each
+# tncelling it. Past
+# this, max_concurrent_tasksevery running item's cancel fl>gsed, the enforced executors
+# hard-kill their child, and work still queued or waiting in baes]he working directory).
+# e.g. addons = ["./libimage_tasks.so", "/opt/gptps/analytics.so"]
+
+[limits]
+# Worker pool size. 0 or omitted => one worker per online logical CPU (so 32 on a
+# 16-core machine with SMT); on Linux, clamped to the process's CPU affinity and
+# cgroup v2 CPU quota.
+# 1 => strictly sequential.
+max_concurrent_tasks = 0
+# Memory admission budget. Use whichever is convenientmax_intake_depthboth set.
+# 0 / omitted => ~0.75 x detected RAM.
+max_memory_gb = 0.0
+# maxWmemory_bytes = 0
+# Max queued (un-admitted) items before gptps_submit returns E_FULL.
+# 0 / o

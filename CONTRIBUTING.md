@@ -165,6 +165,35 @@ docs/HAL.md's table gives the reason for each test on a list: add yours there to
 test that fails on a seed may have found a race - the job found one in `test_orch.c` -
 so read the seed's log before you exclude it.
 
+The code that reads files is fuzzed: the config parser, a config file's whole life
+(open, check, reload, save), the in-place save, and the durable queue's journal. The
+harnesses are in `tests/fuzz/`, and the inputs kept from fuzzing are in
+`tests/fuzz/corpus/<target>/`, which the `fuzz_corpus_*` tests replay in every build.
+To fuzz, with GCC or Clang:
+
+```sh
+cmake -S . -B build-fuzz -DGPTPS_FUZZ=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-fuzz -j
+build-fuzz/fuzz_save -max_total_time=600 -dict=tests/fuzz/toml.dict work/save tests/fuzz/corpus/save
+```
+
+The first directory collects what the run finds, and is made if it is missing; with
+`-DGPTPS_FUZZ_ENGINE=libfuzzer`, make it first. A failure is saved as `crash-<hash>`
+(or `leak-`, `timeout-`). Put it in the target's corpus directory, named
+`regress-<what it broke>`, with the fix, so it fails without the fix and stays fixed;
+a test in `tests/` that fails without the fix belongs with it too. To bring new inputs
+into the corpus, keep the smallest set that reaches every edge they and the corpus
+reach:
+
+```sh
+mkdir merged
+build-fuzz/fuzz_save -merge=1 -edges_only=1 merged tests/fuzz/corpus/save work/save
+```
+
+`merged/` then replaces the corpus directory's hash-named files; the `regress-*` files
+stay. The corpus is replayed under every sanitizer and on every platform, so keep it
+small: tens of kilobytes per target.
+
 ## Writing an add-on or a binary plug-in
 
 See [`docs/PLUGINS.md`](docs/PLUGINS.md). Prove it before shipping:

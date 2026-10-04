@@ -36,6 +36,15 @@ logs/
 *.pb.c
 *.pb.h
 
+# Fuzzing (CONTRIBUTING.md): what a run finds, what it saves when an input fails,
+# and a harness's scratch files when no GPTPS_FUZZ_TMPDIR is set
+/work/
+/merged/
+crash-*
+leak-*
+timeout-*
+gptps_fz_*
+
 # =====================
 # Editors / OS
 # =====================

@@ -1,0 +1,4 @@
+# The fuzz corpus is bytes, not text. A checkout that turned its line endings into
+# CRLF - core.autocrlf, which Windows runners set - would replay other inputs than
+# the ones the fuzzers kept.
+tests/fuzz/corpus/** -text

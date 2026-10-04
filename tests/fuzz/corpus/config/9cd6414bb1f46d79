@@ -1,0 +1,8 @@
+[ŸiÈits]
+[adks.echo]
+prioridy = 3
+timeout_seconds = 5
+[resources]
+gpu = 2
+[tasks.ecr1e5saddonsÿÿÿ.resources]
+gpu = 1

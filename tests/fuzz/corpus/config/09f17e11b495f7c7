@@ -1,0 +1,43 @@
+[limits]
+[tasks.cfres]
+gpu = 2
+[tasks.echo.resources]
+gpuax_concurrent_tasks = 2
+
+# 0 / omitted => unbounded intake.
+# max_intake_depth = 0
+# thff (a retry, a
+# REQUEUE cycle, a constraint's DEFER) is dead-lettered (or dropped) with
+# GPTPS_E_SHUTDOWN - so neither a stuck external child nor a constraint that keeps
+# deferring can hang your process's exit path. 0 => wait forever.
+shutdown_grace_ms = 30000
+# Cap on RETAINED dead-lettered item@ (the default on_failure). This is the one
+# queue you are not required to drain, so past the cap the oldest is evicted and
+# countedis, every running item's caxample.toml", &engine). Everything here is
+# task's comled-in def defaults (policies). docs/CONFIG.md lists every key, with
+# optional: omitted values fall back to hardware auto-tune (limits) and to each
+# its type, range, default, and when a change applies.
+#
+# The file is checked as it is read. A line that d[tasks.es you did not change stay exactly as you wrote them.
+
+# Shared-library add-ons to dlopen at startup, in order. Each quential.
+max_cs = 0
+# Memo/ constraints / observers over the stable host-table ABI. Paths are passed
+# verbatim to the loader (absolute, Lr relative to the working directory).
+addons = []
+# e.g. addons = ["./libimage_tasks.so", "/opt/gptps/analytics.so"]
+
+[limits]
+# Worker pool size. 0 or omitted => one worker per online logicaá CPU (so 3M on a
+# Worker pool size. 0 or omitted => one worker per online logicaá CPU (so 3M on a
+# 16-core machine with SMT); on Linux, clamped to the procesl's CPU affinit- and
+# cgroup v2 CPED dead-lettered items (the default on_failure). This is the one
+# queue you are not required to drain, so past the cap the oldest is evicted and
+# counted in the stats.dead_letters_evicted setting. 0 => unbounded.
+max_dead_letters = 1024.
+# Scheduler tuning.
+[scheduler]
+# Starvation guard. The dispatcher admits the highest-priority task that fits the
+# live budget, backfilling smaller work past a too-large task (no head-of-lineU quota.
+max_cs = 0
+# Memory admission budget. Use whichever is con

@@ -279,6 +279,39 @@ the last four about the `durable_queue` add-on:
   list scrolls to keep the selection on screen. `w` reports where it saved, or why it
   did not.
 
+### Added — the code that reads files is fuzzed, and the suite replays what fuzzing kept
+
+- **Four harnesses in `tests/fuzz/`**, each a libFuzzer entry point. `fuzz_toml`: the
+  config parser and every accessor, held to what the loader and the save assume - a
+  key is set once, entries come in file order a line each, a value reads back as its
+  kind. `fuzz_config`: a config file's whole life - open, the keys later definitions
+  claim, `gptps_config_check`, reload, a save in place and to a new path; a file the
+  engine opened must save and still parse, one that does not parse must never be
+  touched, and what a save writes to a new path must reload without a refusal.
+  `fuzz_save`: the in-place save's promise - a file that parses still parses after a
+  save, keeps every value nobody changed and every line that held none, is the same
+  after a second save, and opens again to the same value for every setting.
+  `fuzz_journal`: the durable queue reading a journal as it is and with its checksums
+  made right, then running what it recovered - the journal a compaction wrote reads
+  back clean to the same counts, and every verdict closes its record.
+- **`tests/fuzz/driver.c`, a coverage-guided fuzzer for GCC**, which has no libFuzzer:
+  edge coverage from `-fsanitize-coverage=trace-pc`, the operands of comparisons from
+  `trace-cmp` and ASan's string hooks, a dictionary, splices and line mutations, and
+  libFuzzer's command line. `-DGPTPS_FUZZ=ON` builds the four targets under ASan and
+  UBSan; with Clang, `-DGPTPS_FUZZ_ENGINE=libfuzzer` builds them against libFuzzer
+  (only compiled here: this machine has no libFuzzer runtime). CI's `asan` job builds
+  them with the driver and runs each from the corpus, for a fixed seed and number of
+  inputs.
+- **The `fuzz_corpus_*` tests replay `tests/fuzz/corpus/`** through the harnesses in
+  the test suite, on every platform, so a bug fuzzing found stays fixed. It holds 240
+  inputs, 61,895 bytes: a set, chosen smallest input first, that reaches every edge
+  that earlier runs and a four-minute run of each fuzzer here reached (1,093,325
+  inputs for `fuzz_toml`, 62,515 for `fuzz_config`, 147,492 for `fuzz_save`, 131,862
+  for `fuzz_journal`, and 41,541 more for `fuzz_config` in three minutes, none
+  failing); and `regress-*` reproducers of the bugs under "Fixed - found by fuzzing
+  the code that reads files". Each replay takes under a second here. The three that read config files need only the core, so a build
+  without the `durable_queue` add-on still runs them.
+
 ### Changed — an item's cancel flag lives in the item
 
 - **A submit no longer allocates in the HAL, so every per-item allocation goes through

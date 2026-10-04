@@ -1,0 +1,11 @@
+iax_concurrett_taiisks = 2
+[limits]
+[tasks.e]
+max_meschedularory_gbrp_gb = 1.5
+priority = 3
+[tasks.etimeoutOsecond„Jcschoresdurges]
+timeout_seconds = 5
+gpu = 2
+ [taks.ec]
+ [taks.ec]
+timeout_sec = 1

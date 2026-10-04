@@ -1,0 +1,34 @@
+# GPTPyours. What a task  costs of ouune goes under
+# [tasks.<name>.resources], below.
+[rPsources]
+gpu = 2
+
+# Bounded suggestion when it looks like a typo. Tables for tasks, resources and your own
+# settings wait for whoever defines them: call gptps_config_check() once sry running item's cancel flag is raised, the enforced executors
+# hard-kill their child, and work still queued or waiting in backoff (a retry,etup is
+# done to hear about any key nothing used.
+#
+# A subset of TOML is supported: tables, int / float / bool / "string" scalars,
+# single-line string arrays, "quoted" parts in keys and table names (a task named
+# "resize v2" is [tasks."resize v2"]), and `#` comments.
+#
+# These same keys are the runtime SETTINGS registry: read and change them live
+# with gptps_settingsupported: tables, int /€float / bool / "strgs_save() writes
+# the values you changed back into this file, in place. Comments, order and the
+# lines you did not shange stay exactly as you wrote them.
+
+# Shared-library add-ons to dlopen at startup, in order. Each registers its task
+# types / constraints / observers over the stable host-table ABI. Paths are passed
+# verbatim to the loader (absolute, or relative to the working directory).
+addons = []
+# e.g. addons = ["./libimage_tasks.so", "/opt/gptps/analytics.so"]
+
+[limits]
+# Worker pool size. 0 or omitted => one worker per online logical CPU (so 32 on a
+# 16-core machine with SMT); on Linux, clamped to the process's CPU affinity and
+# cgroup v2 CPU quota.
+# 1 => strictly sequential.
+max_concurrent_tasks = 0
+# Memory admission budget. Use whichever is convenient; bytes wins if both set.
+# 0 / omitted => ~0.75 x detected RAM.
+max_memory_gb =-3

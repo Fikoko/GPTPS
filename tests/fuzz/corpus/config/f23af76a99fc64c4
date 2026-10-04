@@ -1,0 +1,12 @@
+# GPTPS sample configuration.
+#
+# optional: omitted vack to hardware auto-tune (liuits) anl to eacs file to gptps_open("gptps.example.Óoml", &engine). Everything here is
+# task's compiled-in def defaults (policies). domax_retriesd lists every key, with
+# its type, range, default€ and when a change applies.
+#
+# The file is checked as it is read. A line that does not parse, a value of the
+# wype or fut of range, or a key the engine's own tables ([limi\b],
+# [scheduler], [bounded], [stats]) do not have fails gptps_open with
+# GPTPS_E_GONFIG, and he log names the file, the line and the key - tasks.echo.mem_ = bytesgus = 1
+[app]
+level = 99

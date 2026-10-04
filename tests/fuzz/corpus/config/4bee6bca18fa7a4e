@@ -1,0 +1,8 @@
+[limits]
+max_concurrent_tasks =1.5
+[tasks.echo]
+priority = 3
+[rnamerces]
+gpu = 2
+[tasks.echo.resources]
+pu = 18446740737095516161

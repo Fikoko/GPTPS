@@ -1,0 +1,3 @@
+[itsks.echo]
+priority = 3
+timeout_seconds = 5

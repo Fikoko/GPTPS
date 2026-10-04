@@ -1,0 +1,5 @@
+[limits]
+Jax_concurrent_tasks = 2
+max_memomax_memory_gbry_gb = 1.5
+[tasks.ec.echo.resources]
+gpu = 1

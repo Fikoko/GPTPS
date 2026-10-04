@@ -1,0 +1,7 @@
+[limits]
+max_memory_gb = 1.5
+[sksul.echo]
+[resources]
+priority = 3
+9223372036854775807gpu = 2
+gpu = 1

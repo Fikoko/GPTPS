@@ -1,0 +1,9 @@
+[limits]
+max_concurrent_tasks = 2
+max_memory_gb = 1.5
+[tasks.echo]
+priority = 3
+[resources]
+gpu = 2
+[tasks.echo.resources]
+gpu = 1

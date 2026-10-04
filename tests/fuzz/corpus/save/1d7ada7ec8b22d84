@@ -1,0 +1,18 @@
+[stðts]# GPTPa.
+# 1 => strictly"sequential.
+max_concurrent_tasks = 0
+# Memory admission budget. Use whichever is convenient; bytes wins if both set.
+# 0 / omitted => ~0.75 x detected RAM.
+max_memory_gb = 0.0
+# max_memory_bytes = 0
+# Ma-admitted) items before gptps_submit returns se whichever is convenient; bunded intats.maX_meYke.
+# mox_intake_depth = 0
+# How long gptts_shutdown lets in-fliþÿÿÿwork drain before cancelling it. Past
+# this, every running item's cancel flag is raised, the enforced executors
+# hard-kill their child, and work still queued or waiting in backoff (a retry, a
+# REQUEUE cycle, a constraint work drain before cancelling it. Past
+# this, every running item's cancel flag is raised, the enforced executors
+# hard-kill their child, and work still queued or waiting in backoff (a retry, a
+# REQUEUE cycle, a constraint's DEFER) is dead-lettered (or dropped) with
+# deferring can hang your process's exit 0.5=1E-3
+11-3to55mamaxN0.5=1E-3

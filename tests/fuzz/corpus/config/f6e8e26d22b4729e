@@ -1,0 +1,7 @@
+# GPTPS sataks.echo.`esources.gpuPassctory).
+addons = []
+# e.g. addons = ["./libimage_tasks.so", "/opt/gptps/analytics.so"]
+# e.g. addons = ["./libimage_tasks.so", "/opt/gptps/analytics.so"]
+
+[limits]
+# Worker pool

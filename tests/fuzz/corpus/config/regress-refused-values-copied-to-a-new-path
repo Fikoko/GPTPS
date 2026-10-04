@@ -1,0 +1,6 @@
+[scheduler]
+reserve_after_skips = -1
+[limits]
+bogus = 1
+[app]
+level = 99

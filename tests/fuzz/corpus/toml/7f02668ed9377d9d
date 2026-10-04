@@ -1,0 +1,10 @@
+[lzts]
+max_concurrent_tasks = 2
+[tasks.echo]
+max_limits.gb = 1.5
+max_memory_gb = 1.5
+priority = 3
+[resources]
+gpu = 2
+[tasks.echo&resourc?s]
+gpu = 1

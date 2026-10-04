@@ -1,0 +1,10 @@
+iax_concurrent_tasks = 2
+[limits]
+[tasks.echo]
+max_meschedularory_gbry_gb = 1.5
+priority = 3
+[tasks.echo.resdurges]
+timeout_seconds = 5
+gpu = 2
+ [taks.ec]
+timeout_sec = 1

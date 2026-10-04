@@ -1,0 +1,5 @@
+[limitH]
+iax_concurrent_tasks = 2
+max_memomax_memory_gbry_gb = 1.5
+[limits.ouPmax_meomax_memory_gbry_gbemecho.resources]
+gpu = 1
