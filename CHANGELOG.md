@@ -5,12 +5,16 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.6.0] - 2026-10-04
 
 ### Upgrading from 1.5
 
-Ten changes can need a change in a host. The first three are about the config file,
-the last four about the `durable_queue` add-on:
+No API changed incompatibly. The ABI is 2.4, additive over 1.5.0's 2.3:
+`gptps_config` gains the bounded-mode fields (`max_items`, `max_payload_bytes`,
+`max_result_bytes`) and `max_dead_letters` and `shutdown_grace_ms`, with
+`GPTPS_LIMIT_NONE`; `gptps_config_check` and `gptps_settings_set_ex` are new. Ten
+changes can need a change in a host. The first three are about the config file, the
+last four about the `durable_queue` add-on:
 
 - **A config file with a mistake in it fails `gptps_open`.** 1.5 used what it
   understood and dropped the rest without a word: a misspelt key, a line it could not

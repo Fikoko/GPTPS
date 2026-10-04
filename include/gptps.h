@@ -92,9 +92,9 @@ extern "C" {
  * MAJOR with a documented replacement. The pre-1.0 licence to break things
  * between minors is spent; ABI 2.0 (see above) was the last use of it. */
 #define GPTPS_VERSION_MAJOR 1
-#define GPTPS_VERSION_MINOR 5
+#define GPTPS_VERSION_MINOR 6
 #define GPTPS_VERSION_PATCH 0
-#define GPTPS_VERSION_STRING "1.5.0"
+#define GPTPS_VERSION_STRING "1.6.0"
 
 /* --- export / visibility ------------------------------------------------- */
 /* Default build is a STATIC library, so GPTPS_API is undecorated. Define
