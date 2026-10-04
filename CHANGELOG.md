@@ -626,6 +626,12 @@ EINVAL, and checks a directory the process may write but not read (mode 0300).
   ran and failed again there. In `P1 P7 P2` the search lost record 2, or, once a
   submit had added record 8, record 7. Such a record is now damage too.
   `tests/test_durable.c`, case I.
+- **The config parser compared keys cut to 511 bytes.** Its "set twice" check built
+  the dotted key in a 512-byte buffer and looked that up among the keys read so far,
+  which it kept whole. So the same key of 512 bytes or more set twice was taken, both
+  copies kept; and a key that began with an earlier key of exactly 511 bytes was
+  refused as that key set twice. The key is now compared whole.
+  `tests/test_config_strict.c`.
 
 ### Documentation
 

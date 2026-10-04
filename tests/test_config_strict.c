@@ -1454,6 +1454,27 @@ static void test_parser_edges(void)
     refused(text, CFG ":1: the table name is too long");
     /* a key set twice at the top level, not only in a table */
     refused("x = 1\nx = 2\n", CFG ":2: x is set twice (first on line 1)");
+    /* Keys past 511 bytes are compared whole. The check used to cut the new key to 511
+     * bytes: the same 600-byte key twice was taken, and a 600-byte key after the
+     * 511-byte key it starts with was refused as that key set twice. */
+    {
+        static char big[1300], k600[601], k599x[601], k511[512];
+        memset(k600, 'k', 600); k600[600] = 0;
+        memcpy(k599x, k600, sizeof k599x); k599x[599] = 'x';
+        memcpy(k511, k600, 511); k511[511] = 0;
+        snprintf(big, sizeof big, "%s = 1\n%s = 2\n", k600, k600);
+        refused(big, CFG ":2: kkkkkkkk");       /* the message, cut short, names the line */
+        snprintf(big, sizeof big, "%s = 1\n%s = 2\n", k511, k600);
+        put(CFG, big);
+        clear_log();
+        CHECK(gptps_open(CFG, &e) == GPTPS_OK);                /* two keys, both waiting */
+        if (!e) printf("%s", g_log);
+        if (e) { gptps_shutdown(e); e = NULL; }
+        snprintf(big, sizeof big, "%s = 1\n%s = 2\n", k600, k599x);
+        put(CFG, big);
+        CHECK(gptps_open(CFG, &e) == GPTPS_OK);                /* the last byte tells them apart */
+        if (e) { gptps_shutdown(e); e = NULL; }
+    }
     /* a line with no key, said two ways */
     refused("= 1\n", CFG ":1: missing key before =");
     refused("!x = 1\n", CFG ":1: expected key = value");

@@ -251,17 +251,16 @@ static void entry_free(toml_entry *e)
     if (e->arr) { for (j = 0; j < e->arrn; ++j) gptps_free(e->arr[j]); gptps_free(e->arr); }
 }
 
-/* Parse the value text `val` into a fresh entry. 0 on success; -1 with errbuf set. */
-static int parse_value(struct gptps_toml *t, const char *section, const char *key, char *val,
-                       int line, char *errbuf, size_t errlen)
+/* Parse the value text `val` into a fresh entry, `dotted` being its key as the loader
+ * looks it up. 0 on success; -1 with errbuf set. */
+static int parse_dotted_value(struct gptps_toml *t, const char *section, const char *key,
+                              const char *dotted, char *val, int line, char *errbuf, size_t errlen)
 {
     toml_entry tmp, *e;
     const toml_entry *dup;
     const char *why;
-    char dotted[512];
     memset(&tmp, 0, sizeof tmp);
     tmp.line = line;
-    snprintf(dotted, sizeof dotted, "%s%s%s", section, *section ? "." : "", key);
     val = trim(val);
     if (!*val) return fail(errbuf, errlen, t->path, line, "%s: missing value after =", dotted);
     /* Set twice, however it is spelled: [a.b] c = 1 and [a] "b.c" = 2 are one key. */
@@ -355,6 +354,23 @@ static int parse_value(struct gptps_toml *t, const char *section, const char *ke
 oom:
     entry_free(&tmp);
     return fail(errbuf, errlen, t->path, line, "out of memory");
+}
+
+/* The key's dotted form at its full length. It was cut to a 512-byte buffer, and the
+ * "set twice" check looked the cut key up among the whole ones: the same key of 512
+ * bytes or more set twice was taken, and a key that began with an earlier key of
+ * exactly 511 bytes was refused as that key set twice. */
+static int parse_value(struct gptps_toml *t, const char *section, const char *key, char *val,
+                       int line, char *errbuf, size_t errlen)
+{
+    size_t n = strlen(section) + strlen(key) + 2;
+    char *dotted = (char *)gptps_malloc(n);
+    int rc;
+    if (!dotted) return fail(errbuf, errlen, t->path, line, "out of memory");
+    snprintf(dotted, n, "%s%s%s", section, *section ? "." : "", key);
+    rc = parse_dotted_value(t, section, key, dotted, val, line, errbuf, errlen);
+    gptps_free(dotted);
+    return rc;
 }
 
 /* A dotted path - a.b, "x.y", a."b c".d - read from *pp: its parts joined by '.',
