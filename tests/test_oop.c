@@ -15,15 +15,18 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>              /* nanosleep: bounded naps for case E's ordering */
+#include <unistd.h>            /* write / dup2 / close: case F runs with stdio fds free */
+#include <fcntl.h>             /* fcntl(F_DUPFD, 3): park the saved stdio fds above fd 2 */
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
 static int c_finished, c_failed, c_timeout;
 static char g_result[32]; static size_t g_result_len;
+static gptps_status g_fail_status;     /* the last FAILED's status, for case F's message */
 static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
-static void reset(void) { c_finished = c_failed = c_timeout = 0; g_result[0] = 0; g_result_len = 0; }
+static void reset(void) { c_finished = c_failed = c_timeout = 0; g_result[0] = 0; g_result_len = 0; g_fail_status = GPTPS_OK; }
 
 static void on_ev(const gptps_event *ev, void *ud)
 {
@@ -32,7 +35,7 @@ static void on_ev(const gptps_event *ev, void *ud)
         inc(&c_finished);
         if (ev->result && ev->result_len <= sizeof g_result) { memcpy(g_result, ev->result, ev->result_len); g_result_len = ev->result_len; }
     }
-    else if (ev->kind == GPTPS_EV_FAILED) { inc(&c_failed); if (ev->status == GPTPS_E_TIMEOUT) inc(&c_timeout); }
+    else if (ev->kind == GPTPS_EV_FAILED) { g_fail_status = ev->status; inc(&c_failed); if (ev->status == GPTPS_E_TIMEOUT) inc(&c_timeout); }
 }
 
 /* child_setup runs in the forked OOP child before the task fn: set an env var
@@ -102,6 +105,19 @@ static int wait_pstarted(unsigned ms)
 /* Outlives the PROGRAM task's deadline: with the bug the PROGRAM task can only
  * end at that deadline, so the OOP child must still be alive when it passes. */
 static gptps_status t_sleep4(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; nap_ms(4000); return GPTPS_OK; }
+
+/* ---- case F: a daemonised host's OOP task talks on stdout ------------------- *
+ * The host has closed its stdin and stdout, so pipe() hands the OOP executor those
+ * two numbers - and the child's end of the result pipe used to land on fd 1, the
+ * task's own stdout. Whatever the task printed went into its result record ahead of
+ * the real one: the parent read the text as the record's header and failed the task
+ * with GPTPS_E_IO. user_data is the descriptor the task writes to. */
+static gptps_status t_talk(gptps_ctx *ctx, void *ud)
+{
+    static const char line[] = "task: halfway there\n";
+    if (write(*(const int *)ud, line, sizeof line - 1) < 0) { /* closed: the host's choice */ }
+    return gptps_result_set(ctx, "ok", 2);
+}
 
 static void def_init(gptps_task_def *d, const char *name, gptps_run_fn run,
                      uint32_t timeout_s, uint64_t mem_bytes)
@@ -209,6 +225,42 @@ int main(void)
         CHECK(get(&p_failed) == 0);
         CHECK(p_len == RACE_LEN);              /* every byte round-tripped through cat */
         CHECK(p_sum == sum_bytes(g_race, RACE_LEN));
+    }
+
+    /* F) a daemonised host (see t_talk). Two shapes: fds 0 and 1 free, the task
+     *    writing to stdout; then fds 1 and 2 free, the task writing to stderr, where
+     *    the old executor's pipe was {1, 2}. Either way the result must arrive whole.
+     *    Every descriptor is restored before a single CHECK runs: with fd 1 closed,
+     *    printf would write into nothing, or into the executor's pipe. */
+    {
+        static int talk_fd;
+        int mode;
+        for (mode = 0; mode < 2; ++mode) {
+            int lo = mode, save_lo, save_hi, sub, fin;   /* frees lo and lo + 1 */
+            reset();
+            CHECK(gptps_open(NULL, &e) == GPTPS_OK);   /* opened BEFORE the close: only the
+                                                         * executor's pipe can land low */
+            if (!e) continue;
+            gptps_set_event_cb(e, on_ev, NULL);
+            def_init(&d, "talk", t_talk, 10, 1024 * 1024);
+            talk_fd = lo + 1;                           /* stdout, then stderr */
+            d.user_data = &talk_fd;
+            CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+            /* park both copies above fd 2 BEFORE freeing either (test_program.c case I) */
+            save_lo = fcntl(lo, F_DUPFD, 3);
+            save_hi = fcntl(lo + 1, F_DUPFD, 3);
+            close(lo); close(lo + 1);
+            sub = gptps_submit(e, "talk", NULL, 0, &h);
+            gptps_shutdown(e);                          /* returns once the task is terminal */
+            if (save_lo >= 0) { dup2(save_lo, lo);     close(save_lo); }
+            if (save_hi >= 0) { dup2(save_hi, lo + 1); close(save_hi); }
+            fin = get(&c_finished);
+            CHECK(sub == GPTPS_OK);
+            CHECK(fin == 1);                            /* was 0: FAILED with GPTPS_E_IO */
+            CHECK(g_result_len == 2 && memcmp(g_result, "ok", 2) == 0);
+            if (fin != 1) printf("  case F, fds %d and %d free: the task failed with %s\n",
+                                 lo, lo + 1, gptps_strerror(g_fail_status));
+        }
     }
 
     if (fails) { printf("%d oop check(s) FAILED\n", fails); return 1; }

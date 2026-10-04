@@ -9,7 +9,7 @@ the release version and is documented in `include/gptps.h`.
 
 ### Upgrading from 1.5
 
-Three changes can need a change in a host. All three are about the config file:
+Four changes can need a change in a host. The first three are about the config file:
 
 - **A config file with a mistake in it fails `gptps_open`.** 1.5 used what it
   understood and dropped the rest without a word: a misspelt key, a line it could not
@@ -27,6 +27,12 @@ Three changes can need a change in a host. All three are about the config file:
   loaded file with those changes. A host that saved to dump every setting gets only
   the changed ones; `gptps_settings_count` and `gptps_settings_get_info` still
   enumerate them all.
+- **Some out-of-process tasks end with a different status.** Each was a bug, fixed
+  below, but a host sees the change:
+  - In a host that closed its standard descriptors, as a daemon does, an OOP task that
+    prints now returns its result, where 1.5 failed it with `GPTPS_E_IO`. Such a host
+    needs two free descriptors above fd 2 for each OOP task it starts: without them
+    the attempt fails with `GPTPS_E_IO`, where 1.5 ran a task that printed nothing.
 
 ### Added — bounded mode: no allocation once work starts (ABI 2.4)
 
@@ -267,6 +273,17 @@ Both found while writing the conformance test.
   now relative (`pthread_cond_timedwait_relative_np`), measured on a clock nothing
   moves.
 
+### Fixed — the out-of-process executors
+
+- **An OOP task failed in a daemonised host if it printed.** A host that has closed
+  its stdin and stdout, as a daemon does, gets those numbers back from `pipe()`, so the
+  OOP executor's result pipe was fds 0 and 1, and the child's end of it was the task's
+  own stdout. Whatever the task printed went down the pipe ahead of its result, the
+  parent read that text as the result's header, and the task failed with
+  `GPTPS_E_IO`. With fds 1 and 2 free, a task that wrote to stderr failed the same
+  way. Both ends of the pipe now move above fd 2, as the PROGRAM executor's child
+  already moved its own; if no descriptor is free there, the attempt fails with
+  `GPTPS_E_IO`. `tests/test_oop.c` runs both shapes.
 ### Documentation
 
 - **`examples/item_ledger.c`: what a threaded host must add.** In THREADED mode an

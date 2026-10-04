@@ -134,14 +134,45 @@ static pthread_mutex_t g_execfd_m = PTHREAD_MUTEX_INITIALIZER;
 static int             g_execfd[GPTPS_EXEC_MAX_FDS];
 static unsigned        g_execfd_n = 0;
 
+/* Move a pipe end above fds 0-2, still close-on-exec. Returns the descriptor to use
+ * (`fd` itself when it is above 2 already), or -1 when no higher one is free. Runs
+ * with g_execfd_m held and before the end is published, so no other executor's
+ * fork() can catch the copy unregistered. */
+static int fd_above_stdio(int fd)
+{
+    int n;
+    if (fd > 2) return fd;
+#if defined(F_DUPFD_CLOEXEC)
+    n = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+#else
+    n = fcntl(fd, F_DUPFD, 3);
+    if (n >= 0) (void)fcntl(n, F_SETFD, fcntl(n, F_GETFD) | FD_CLOEXEC);
+#endif
+    if (n >= 0) close(fd);
+    return n;
+}
+
 /* Create a pipe and publish both ends, atomically w.r.t. another executor's fork.
  * On overflow the end simply goes unpublished - degraded to the old behaviour for
- * that one descriptor rather than failing a task. */
-static int exec_pipe(int fds[2])
+ * that one descriptor rather than failing a task. With `high`, both ends are moved
+ * above fd 2 first (gptps_oop_execute says why); a pipe that cannot be kept there
+ * fails as a failed pipe() would. */
+static int exec_pipe(int fds[2], int high)
 {
     int rc;
     pthread_mutex_lock(&g_execfd_m);
     rc = make_pipe_cloexec(fds);
+    if (rc == 0 && high) {
+        int r0 = fd_above_stdio(fds[0]);
+        int r1 = (r0 < 0) ? -1 : fd_above_stdio(fds[1]);
+        if (r1 < 0) {                      /* no descriptor above 2 left */
+            close(r0 < 0 ? fds[0] : r0);
+            close(fds[1]);
+            rc = -1;
+        } else {
+            fds[0] = r0; fds[1] = r1;
+        }
+    }
     if (rc == 0) {
         if (g_execfd_n < GPTPS_EXEC_MAX_FDS) g_execfd[g_execfd_n++] = fds[0];
         if (g_execfd_n < GPTPS_EXEC_MAX_FDS) g_execfd[g_execfd_n++] = fds[1];
@@ -319,7 +350,13 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #endif
 
     *out_result = NULL; *out_len = 0;
-    if (exec_pipe(p) != 0) {
+    /* Both ends above fd 2. A host that daemonised - closed its stdin and stdout, a
+     * standard step - gets them back from pipe() as fds 0 and 1, and the child's end
+     * was then the task's own stdout: whatever the task printed went into the result
+     * record ahead of it, the parent read that text as the record's header, and the
+     * task failed with GPTPS_E_IO. (The PROGRAM child moves its own ends off 0-2,
+     * before its dup2s.) */
+    if (exec_pipe(p, 1) != 0) {
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -469,13 +506,13 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 #endif
         return GPTPS_E_INVAL;
     }
-    if (exec_pipe(inp) != 0) {
+    if (exec_pipe(inp, 0) != 0) {
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
         return GPTPS_E_IO;
     }
-    if (exec_pipe(outp) != 0) {
+    if (exec_pipe(outp, 0) != 0) {
         exec_close(inp[0]); exec_close(inp[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
