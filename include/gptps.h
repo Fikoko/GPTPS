@@ -1077,14 +1077,15 @@ GPTPS_API gptps_status gptps_settings_set_ex(gptps *e, const char *key, const ch
 GPTPS_API gptps_status gptps_config_check(gptps *e);
 
 /* Persistence. save() writes the values set live (gptps_settings_set) into the file,
- * atomically. A file that exists is updated in place: each changed value is
- * rewritten on its own line, which keeps its comment; a changed setting the file
- * lacks is added next to its siblings; every other line - comments, order, values
- * nobody changed, keys that are not settings - stays as it was, so a "0 = auto"
- * stays auto. A file that does not parse is left untouched: save() logs why and
- * returns GPTPS_E_CONFIG. A new path gets a copy of the config file the engine
- * loaded - add-ons, [task_defaults], comments and all - with the live changes made
- * in it; without one, the values changed live and those the loaded file set.
+ * atomically, and saves from several threads take turns. A file that exists is
+ * updated in place: each changed value is rewritten on its own line, which keeps its
+ * comment; a changed setting the file lacks is added next to its siblings; every
+ * other line - comments, order, values nobody changed, keys that are not settings -
+ * stays as it was, so a "0 = auto" stays auto. A file that does not parse is left
+ * untouched: save() logs why and returns GPTPS_E_CONFIG. A new path gets a copy of
+ * the config file the engine loaded - add-ons, [task_defaults], comments and all -
+ * with the live changes made in it; without one, the values changed live and those
+ * the loaded file set.
  * While a reload is applying a file, save() returns GPTPS_E_BUSY: try again. So
  * does reload() while another reload runs, or while an add-on's setup does.
  * reload() re-reads the file and applies it with the same checks as gptps_open, as

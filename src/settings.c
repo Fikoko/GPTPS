@@ -932,13 +932,28 @@ out:
 gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const char *base,
                                     gptps_settings_in_file_fn in_file, void *ud)
 {
-    char err[4096], *tmp, *text = NULL;
+    char err[4096], msg[900], *tmp = NULL, *text = NULL;
     gptps_toml *t = NULL;
+    gptps_log_level lvl = GPTPS_LOG_ERROR;
     size_t tn;
     FILE *f;
     int made = 0;
     gptps_status st = GPTPS_OK;
     if (!r || !path) return GPTPS_E_INVAL;
+    msg[0] = 0;                            /* what to log, once the lock is released */
+    /* One save at a time, from reading the file to renaming its replacement into place.
+     * Every save to a path writes the same "<path>.tmp": a second save let in between
+     * the first's write and its rename truncated that file and wrote into it, so the
+     * first renamed a half-written file into place, and the second's rename found
+     * nothing left to move (GPTPS_E_IO). Reading under the lock too means a save edits
+     * the file the last one left rather than a copy from before it - and, on Windows,
+     * which will not replace a file another handle has open, that one save is never
+     * reading the file while another renames over it.
+     *
+     * From here every way out goes through `out`, which releases the lock, frees what
+     * was read and logs: a return in between would leave r->m held, and the next save
+     * would wait for it forever. */
+    gptps_mutex_lock(r->m);
     f = fopen(path, "rb");
     if (!f && errno == ENOENT && base && strcmp(base, path) != 0) {
         /* A new file starts as a copy of the config file the engine loaded - its
@@ -948,35 +963,33 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
         text = gptps_toml_read_file(base, err, sizeof err);
         if (text && !(t = gptps_toml_parse_text(base, text, err, sizeof err))) { gptps_free(text); text = NULL; }
         if (!t) {
-            char msg[900], *nl = strchr(err, '\n');
+            char *nl = strchr(err, '\n');
             if (nl) *nl = 0;
             snprintf(msg, sizeof msg, "settings saved to %.300s without a copy of the loaded config file: %.500s",
                      path, err);
-            gptps_log(NULL, GPTPS_LOG_WARN, msg);
+            lvl = GPTPS_LOG_WARN;           /* logged only if the save then succeeds */
         }
     } else if (f) {
         fclose(f);
         text = gptps_toml_read_file(path, err, sizeof err);
         if (text) t = gptps_toml_parse_text(path, text, err, sizeof err);
         if (!t) {
-            char msg[900];
             char *nl = strchr(err, '\n');    /* the first problem says enough */
             if (nl) *nl = 0;
             snprintf(msg, sizeof msg, "settings not saved: %.700s%s - the file was left as it is; "
                      "fix it, or save to another path", err, nl ? " (and more)" : "");
-            gptps_log(NULL, GPTPS_LOG_ERROR, msg);
-            gptps_free(text);
-            return text ? GPTPS_E_CONFIG : GPTPS_E_IO;
+            st = text ? GPTPS_E_CONFIG : GPTPS_E_IO;
+            goto out;
         }
     } else if (errno != ENOENT) {
-        return GPTPS_E_IO;                  /* there, but not readable: leave it */
+        st = GPTPS_E_IO;                    /* there, but not readable: leave it */
+        goto out;
     }
     tn = strlen(path) + 5;
     tmp = (char *)gptps_malloc(tn);
-    if (!tmp) { gptps_toml_free(t); gptps_free(text); return GPTPS_E_NOMEM; }
+    if (!tmp) { st = GPTPS_E_NOMEM; goto out; }
     snprintf(tmp, tn, "%s.tmp", path);
 
-    gptps_mutex_lock(r->m);
     f = fopen(tmp, "wb");
     if (!f) st = GPTPS_E_IO;
     else {
@@ -989,12 +1002,15 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
         if (fflush(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
         if (fclose(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
     }
+    if (st == GPTPS_OK) st = gptps_hal_atomic_replace(tmp, path);
+    if (st != GPTPS_OK && made) remove(tmp);
+out:
     gptps_mutex_unlock(r->m);
     gptps_toml_free(t);
     gptps_free(text);
-
-    if (st == GPTPS_OK) st = gptps_hal_atomic_replace(tmp, path);
-    if (st != GPTPS_OK && made) remove(tmp);
     gptps_free(tmp);
+    /* After the unlock: a log sink is host code, and one that hands the message to a
+     * thread of its own, which reads a setting, must not find the lock still held. */
+    if (msg[0] && (lvl == GPTPS_LOG_ERROR || st == GPTPS_OK)) gptps_log(NULL, lvl, msg);
     return st;
 }

@@ -335,6 +335,20 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   handled on both. The Windows change is compiled by CI but not run, since the test
   is Linux-only.
 
+### Fixed — defects the stress test found
+
+- **Two saves at once failed, and could put a cut-off file in place.** Every save to a
+  path writes `<path>.tmp` and renames it over the file. A second save that started
+  between the first's write and its rename truncated that temporary file and wrote into
+  it, so the first renamed a half-written file into place, and the second's rename
+  found nothing to move: `GPTPS_E_IO`. `tests/test_config_strict.c` has two threads
+  save one 33 KB file 300 times each while a third reads it whole. Before the fix, in
+  ten runs of a RelWithDebInfo build, 69 to 233 of the 600 saves failed, and the
+  reader found the file cut off 48 to 1,770 times and empty or missing 891 to 61,649
+  times; in ten runs of a Debug build, 151 to 256 saves failed. The counts follow
+  scheduling and load. Saves of one engine now take turns, from reading the file to
+  renaming its replacement into place.
+
 ### Documentation
 
 - **`examples/item_ledger.c`: what a threaded host must add.** In THREADED mode an

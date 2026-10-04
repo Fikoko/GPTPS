@@ -782,6 +782,163 @@ static void test_define_race(void)
     CHECK(stale == 0);
 }
 
+/* Two threads saving one file at once, and a third reading it all the while. A save
+ * writes "<file>.tmp" and renames it over the file, and every save to that path uses
+ * that one name: a second save let in after the first had written it, and before the
+ * first renamed it, truncated it and wrote into it. The first then renamed the
+ * second's half-written file into place, and the second's own rename found nothing
+ * to move - GPTPS_E_IO. The file is some 33 KB, so stdio writes it in several write()
+ * calls and a cut-off copy can be caught, and the reader holds every read to the
+ * whole file: the lines it started with, a number, and its last line. (gptps_open
+ * would not do: it accepts an empty file and one cut at a line's end.) The reader is
+ * POSIX only: Windows will not replace a file another handle has open, so there a
+ * reader can make a save fail - a rule of the platform, which the engine cannot
+ * change. */
+#define SV_LINES 400
+static gptps *g_sv;
+static int g_sv_stop, g_sv_failed, g_sv_reads, g_sv_cut, g_sv_empty;
+static char g_sv_head[SV_LINES * 96 + 128];          /* the file up to the number */
+static const char g_sv_tail[] = "\n# end\n";          /* and after it */
+static void *sv_saver(void *a)
+{
+    int i;
+    char v[24];
+    for (i = 0; i < 300; ++i) {
+        snprintf(v, sizeof v, "%d", (int)(size_t)a * 1000 + i);    /* a change for every save to write */
+        if (gptps_settings_set(g_sv, "app.n", v) != GPTPS_OK || gptps_settings_save(g_sv, NULL) != GPTPS_OK)
+            __atomic_add_fetch(&g_sv_failed, 1, __ATOMIC_SEQ_CST);
+    }
+    return NULL;
+}
+static void *sv_reader(void *a)
+{
+    (void)a;
+#if !defined(_WIN32)
+    {
+        static char buf[sizeof g_sv_head + 64];
+        size_t hl = strlen(g_sv_head), tl = sizeof g_sv_tail - 1, n, i;
+        do {
+            FILE *f = fopen(CFG2, "rb");
+            int whole = 0;
+            n = 0;
+            if (f) { n = fread(buf, 1, sizeof buf, f); fclose(f); }
+            if (n > hl + tl && memcmp(buf, g_sv_head, hl) == 0 && memcmp(buf + n - tl, g_sv_tail, tl) == 0) {
+                for (whole = 1, i = hl; i < n - tl; ++i) if (buf[i] < '0' || buf[i] > '9') whole = 0;
+            }
+            if (!whole) __atomic_add_fetch(n ? &g_sv_cut : &g_sv_empty, 1, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&g_sv_reads, 1, __ATOMIC_SEQ_CST);
+            /* a HAL call each turn: on a HAL that runs one thread at a time
+             * (tests/hal_sim.c), a loop with none keeps the CPU from the savers */
+            (void)gptps_now_ms(NULL);
+        } while (!__atomic_load_n(&g_sv_stop, __ATOMIC_SEQ_CST));
+    }
+#else
+    __atomic_add_fetch(&g_sv_reads, 1, __ATOMIC_SEQ_CST);
+#endif
+    return NULL;
+}
+static void test_concurrent_saves(void)
+{
+    gptps_thread *a, *b, *rd;
+    size_t hl;
+    uint64_t t0;
+    int i;
+    hl = (size_t)snprintf(g_sv_head, sizeof g_sv_head, "# saved by two threads at once\n");
+    for (i = 0; i < SV_LINES; ++i)
+        hl += (size_t)snprintf(g_sv_head + hl, sizeof g_sv_head - hl,
+                               "# line %03d, one of many: a cut-off copy of this file is caught by its last line\n", i);
+    snprintf(g_sv_head + hl, sizeof g_sv_head - hl, "[app]\nn = ");
+    {
+        char *whole = (char *)malloc(strlen(g_sv_head) + sizeof g_sv_tail + 1);
+        CHECK(whole != NULL);
+        if (!whole) return;
+        sprintf(whole, "%s0%s", g_sv_head, g_sv_tail);
+        put(CFG2, whole);
+        free(whole);
+    }
+    CHECK(gptps_open(CFG2, &g_sv) == GPTPS_OK);
+    if (!g_sv) return;
+    CHECK(gptps_define_global(g_sv, "app.n", GPTPS_SETTING_UINT, "0", NULL, 0) == GPTPS_OK);
+    __atomic_store_n(&g_sv_stop, 0, __ATOMIC_SEQ_CST);
+    rd = gptps_thread_start(sv_reader, NULL);
+    CHECK(rd != NULL);
+    for (t0 = gptps_now_ms(NULL); rd && !__atomic_load_n(&g_sv_reads, __ATOMIC_SEQ_CST) && gptps_now_ms(NULL) - t0 < 5000; ) { }
+    CHECK(__atomic_load_n(&g_sv_cut, __ATOMIC_SEQ_CST) == 0);    /* the file as written: the reader agrees */
+    a = gptps_thread_start(sv_saver, (void *)1);
+    b = gptps_thread_start(sv_saver, (void *)2);
+    CHECK(a && b);
+    if (a) gptps_thread_join(a);
+    if (b) gptps_thread_join(b);
+    __atomic_store_n(&g_sv_stop, 1, __ATOMIC_SEQ_CST);
+    if (rd) gptps_thread_join(rd);
+    if (g_sv_failed || g_sv_cut || g_sv_empty)
+        printf("  %d of 600 saves failed; of %d reads, %d found the file cut off and %d found it empty or gone\n",
+               g_sv_failed, g_sv_reads, g_sv_cut, g_sv_empty);
+    CHECK(g_sv_failed == 0);         /* was GPTPS_E_IO */
+    CHECK(g_sv_cut == 0);            /* was a part of the file */
+    CHECK(g_sv_empty == 0);          /* was none of it */
+    {   /* and it holds the value set last: each save writes the live value */
+        static char last[sizeof g_sv_head + 64];
+        size_t n = 0;
+        FILE *f = fopen(CFG2, "rb");
+        if (f) { n = fread(last, 1, sizeof last - 1, f); fclose(f); }
+        last[n] = 0;
+        CHECK(n == strlen(g_sv_head) + 4 + sizeof g_sv_tail - 1 && strncmp(last, g_sv_head, strlen(g_sv_head)) == 0);
+        CHECK(strstr(last, "\nn = 1299\n# end\n") || strstr(last, "\nn = 2299\n# end\n"));
+    }
+    gptps_shutdown(g_sv);
+    g_sv = NULL;
+    remove(CFG2);
+    remove(CFG2 ".tmp");
+}
+
+/* A save that fails logs why - once it has released the settings lock. A log sink
+ * is host code: one that hands the message to a thread of its own, which reads a
+ * setting, found that lock still held, so the reader waited on the sink - and a sink
+ * that waited for the reader never returned. */
+static gptps *g_ls_e;
+static int g_ls_go, g_ls_read, g_ls_in_time;
+static void *ls_reader(void *a)
+{
+    char v[64];
+    (void)a;
+    while (!__atomic_load_n(&g_ls_go, __ATOMIC_SEQ_CST)) (void)gptps_now_ms(NULL);
+    if (__atomic_load_n(&g_ls_go, __ATOMIC_SEQ_CST) == 1) (void)gptps_settings_get(g_ls_e, "app.n", v, sizeof v);
+    __atomic_store_n(&g_ls_read, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+static void ls_sink(gptps_log_level lvl, const char *msg, void *ud)
+{
+    uint64_t t0;
+    sink(lvl, msg, ud);
+    if (!strstr(msg, "settings not saved")) return;
+    __atomic_store_n(&g_ls_go, 1, __ATOMIC_SEQ_CST);
+    for (t0 = gptps_now_ms(NULL); !__atomic_load_n(&g_ls_read, __ATOMIC_SEQ_CST) && gptps_now_ms(NULL) - t0 < 2000; ) { }
+    __atomic_store_n(&g_ls_in_time, __atomic_load_n(&g_ls_read, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+}
+static void test_save_logs_unlocked(void)
+{
+    gptps_thread *rd;
+    CHECK(gptps_open(NULL, &g_ls_e) == GPTPS_OK);
+    if (!g_ls_e) return;
+    CHECK(gptps_define_global(g_ls_e, "app.n", GPTPS_SETTING_UINT, "0", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_settings_set(g_ls_e, "app.n", "2") == GPTPS_OK);
+    put(CFG2, "[app\nn = 1\n");                                   /* does not parse */
+    rd = gptps_thread_start(ls_reader, NULL);
+    CHECK(rd != NULL);
+    clear_log();
+    gptps_set_log_sink(ls_sink, NULL);
+    CHECK(gptps_settings_save(g_ls_e, CFG2) == GPTPS_E_CONFIG);
+    gptps_set_log_sink(sink, NULL);
+    CHECK(logged("settings not saved: " CFG2 ":1:"));
+    CHECK(__atomic_load_n(&g_ls_in_time, __ATOMIC_SEQ_CST) == 1);   /* the reader was not held up */
+    if (!__atomic_load_n(&g_ls_go, __ATOMIC_SEQ_CST)) __atomic_store_n(&g_ls_go, 2, __ATOMIC_SEQ_CST);
+    if (rd) gptps_thread_join(rd);
+    gptps_shutdown(g_ls_e);
+    g_ls_e = NULL;
+    remove(CFG2);
+}
+
 /* Under a locale whose decimal point is a comma - what a GUI toolkit's init sets
  * from the environment - a file still says 1.5, and a save still writes it. */
 static void test_locale(void)
@@ -1218,6 +1375,8 @@ int main(void)
     test_open_with_addons();
     test_reload_bookkeeping();
     test_define_race();
+    test_concurrent_saves();
+    test_save_logs_unlocked();
     test_locale();
     test_submit_from_write();
     test_callback_mark();
