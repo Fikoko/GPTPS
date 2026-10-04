@@ -25,9 +25,9 @@ the last four about the `durable_queue` add-on:
   without the add-on.
 - **`gptps_settings_save` edits the file instead of rewriting it.** It writes the values
   set live and leaves every other line as it was. Saving to a new path copies the
-  loaded file with those changes. A host that saved to dump every setting gets only
-  the changed ones; `gptps_settings_count` and `gptps_settings_get_info` still
-  enumerate them all.
+  loaded file with those changes, and with the engine's own value in place of any it
+  refused. A host that saved to dump every setting gets only the changed ones;
+  `gptps_settings_count` and `gptps_settings_get_info` still enumerate them all.
 - **Some out-of-process tasks end with a different status.** Each was a bug, fixed
   below, but a host sees the change:
   - A PROGRAM task whose stdin cannot be written, for a reason other than the program
@@ -632,6 +632,17 @@ EINVAL, and checks a directory the process may write but not read (mode 0300).
   copies kept; and a key that began with an earlier key of exactly 511 bytes was
   refused as that key set twice. The key is now compared whole.
   `tests/test_config_strict.c`.
+- **A save to a new path could write values the engine had refused.** A reload
+  applies what it can of its file and installs the file, refused values too. A save to
+  a new path copies that file, and so copied them, to be refused again wherever the
+  new file was read; `gptps_open` fails on one in the engine's own tables. When that
+  file no longer parsed, the save wrote the values it set, refused or not - a quoted
+  `"5"` for a number went in as `5` - and converted its `max_memory_gb` to bytes
+  without the check the open and the reload make: `max_memory_gb = 1e20` is past any
+  64-bit count, a conversion C leaves undefined, which wrote `max_memory_bytes = 0`,
+  "auto", on x86-64. The new file now gets the setting's current value in place of a
+  refused one, and leaves out a refused key no setting has. A save in place still
+  keeps what the file's author wrote. `tests/test_config_strict.c`.
 
 ### Documentation
 

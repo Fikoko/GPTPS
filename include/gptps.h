@@ -1143,7 +1143,8 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * untouched: save() logs why and returns GPTPS_E_CONFIG. A new path gets a copy of
  * the config file the engine loaded - add-ons, [task_defaults], comments and all -
  * with the live changes made in it; without one, the values changed live and those
- * the loaded file set.
+ * the loaded file set. Either way no value the engine refused goes in: the setting's
+ * current value takes its place, and a refused key no setting has is left out.
  * While a reload is applying a file, save() returns GPTPS_E_BUSY: try again. So
  * does reload() while another reload runs, or while an add-on's setup does.
  * reload() re-reads the file and applies it with the same checks as gptps_open, as

@@ -2542,11 +2542,13 @@ typedef struct {
     int  line;
     int  usable;      /* a single value whose text fits `text` */
     gptps_toml_kind kind;   /* as the file wrote it: a number, true/false, a "string", a list */
+    size_t index;     /* its place in the file it was copied from */
 } cfg_item;
 
 static void cfg_item_at(const gptps_toml *t, size_t i, cfg_item *it)
 {
     const char *x = gptps_toml_text_at(t, i);
+    it->index = i;
     gptps_toml_dotted_at(t, i, it->key, sizeof it->key);
     snprintf(it->path, sizeof it->path, "%s", gptps_toml_path(t));
     it->line = gptps_toml_line_at(t, i);
@@ -2841,6 +2843,15 @@ static int cfg_claimed(gptps *e, const gptps_toml *t, size_t i)
     return c;
 }
 
+/* A value refused, marked in the file it came from: a save that copies the file
+ * writes the engine's own value in its place (cfg_refused). */
+static void cfg_refuse(gptps *e, gptps_toml *t, const cfg_item *it)
+{
+    gptps_mutex_lock(e->m);
+    gptps_toml_refuse_at(t, it->index);
+    gptps_mutex_unlock(e->m);
+}
+
 /* Apply a parsed file to a live engine - at open, after cfg_open_keys took the keys
  * that size it, or at a reload. Returns the number of errors, each one logged. No
  * engine lock is held across a set: the registry's write accessors take it. */
@@ -2860,6 +2871,7 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
             cfg_claim(e, t, (size_t)j);
             if (gptps_toml_text_at(t, (size_t)j)) {
                 cfg_item_at(t, (size_t)j, &it);
+                cfg_refuse(e, t, &it);
                 cfg_say(GPTPS_LOG_ERROR, &it, "expects a [\"list\"] of add-on paths"); ++bad;
             }
         }
@@ -2868,11 +2880,13 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
             cfg_claim(e, t, (size_t)j);
             cfg_item_at(t, (size_t)j, &it);
             if (!cfg_value_ok(GPTPS_SETTING_DOUBLE, 1, 0, 1e9, NULL, &it, why, sizeof why)) {
+                cfg_refuse(e, t, &it);
                 cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
             } else if (gptps_toml_find_dotted(t, "limits.max_memory_bytes") < 0) {
                 char v[32];
                 snprintf(v, sizeof v, "%llu", (unsigned long long)(gptps_strtod_c(it.text, NULL) * 1073741824.0));
                 if (gptps_settings_set_text(e->settings, "limits.max_memory_bytes", v, why, sizeof why) != GPTPS_OK) {
+                    cfg_refuse(e, t, &it);
                     cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
                 }
             }
@@ -2887,10 +2901,14 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
         if (!cfg_is_resource(it.key)) continue;
         cfg_claim(e, t, i);
         if (!cfg_value_ok(GPTPS_SETTING_UINT, 0, 0, 0, NULL, &it, why, sizeof why)) {
+            cfg_refuse(e, t, &it);
             cfg_say(GPTPS_LOG_ERROR, &it, "a resource's budget: %s", why); ++bad; continue;
         }
         st = gptps_define_resource(e, it.key + 10, (uint64_t)strtoull(it.text, NULL, 10));
-        if (st != GPTPS_OK) { cfg_say(GPTPS_LOG_ERROR, &it, "the resource could not be defined: %s", gptps_strerror(st)); ++bad; }
+        if (st != GPTPS_OK) {
+            cfg_refuse(e, t, &it);
+            cfg_say(GPTPS_LOG_ERROR, &it, "the resource could not be defined: %s", gptps_strerror(st)); ++bad;
+        }
     }
     /* every key that names a setting, through the registry, as a live set would */
     for (i = 0; i < n; ++i) {
@@ -2899,7 +2917,10 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
         cfg_item_at(t, i, &it);
         if (!cfg_set_from_file(e, &it, &st, why, sizeof why)) continue;
         cfg_claim(e, t, i);
-        if (st != GPTPS_OK) { cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad; }
+        if (st != GPTPS_OK) {
+            cfg_refuse(e, t, &it);
+            cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+        }
     }
     /* per-task keys: checked now, applied when the task registers (or above, through
      * the registry, if it already has). By the dotted key, which is the same however
@@ -2930,14 +2951,18 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
             if (best) {     /* the longest defined leaf wins: np.priority over the built-in priority */
                 /* checked now against its definition; applied when the task registers */
                 if (!cfg_value_ok(ty, hr, mn, mx, ch, &it, why, sizeof why)) {
-                    cfg_claim(e, t, i); cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
+                    cfg_claim(e, t, i);
+                    cfg_refuse(e, t, &it);
+                    cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
                 }
                 continue;
             }
         }
         if (!defaults && strstr(it.key + 6, ".resources.")) {          /* what a run costs of a resource */
             if (!cfg_value_ok(GPTPS_SETTING_UINT, 0, 0, 0, NULL, &it, why, sizeof why)) {
-                cfg_claim(e, t, i); cfg_say(GPTPS_LOG_ERROR, &it, "a resource cost: %s", why); ++bad;
+                cfg_claim(e, t, i);
+                cfg_refuse(e, t, &it);
+                cfg_say(GPTPS_LOG_ERROR, &it, "a resource cost: %s", why); ++bad;
             }
             continue;
         }
@@ -2958,6 +2983,7 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
                     if (d <= 3 && d < best) { best = d; snprintf(hint, sizeof hint, " (did you mean %s?)", TASK_KEYS[m].leaf); }
                 }
                 cfg_claim(e, t, i);
+                cfg_refuse(e, t, &it);
                 cfg_say(GPTPS_LOG_ERROR, &it, "[task_defaults] has no such key%s", hint); ++bad;
             }
             continue;       /* [tasks.<name>]: a host's or plug-in's per-task setting, claimed when it is defined */
@@ -2965,6 +2991,7 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
         if (defaults) cfg_claim(e, t, i);
         if (!cfg_value_ok(k->type, k->has_range, k->min, k->max, k->choices, &it, why, sizeof why)) {
             if (!defaults) cfg_claim(e, t, i);
+            cfg_refuse(e, t, &it);
             cfg_say(GPTPS_LOG_ERROR, &it, "%s", why); ++bad;
         }
     }
@@ -2977,6 +3004,7 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
         cfg_claim(e, t, i);
         hint[0] = 0;
         if (gptps_settings_closest(e->settings, it.key, guess, sizeof guess)) snprintf(hint, sizeof hint, " (did you mean %s?)", guess);
+        cfg_refuse(e, t, &it);
         cfg_say(GPTPS_LOG_ERROR, &it, "[%.*s] has no such key%s", (int)cfg_first_len(it.key), it.key, hint); ++bad;
     }
     /* A value named like one of the engine's tables is a mistake: those hold keys.
@@ -2998,6 +3026,7 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
             for (m = 0; CFG_OWN[m]; ++m)
                 if (!strcmp(first, CFG_OWN[m])) {
                     cfg_claim(e, t, i);
+                    cfg_refuse(e, t, &it);
                     cfg_say(GPTPS_LOG_ERROR, &it, "is one of the engine's tables, not a key - its keys go under [%s]", first);
                     ++bad;
                     break;
@@ -3006,6 +3035,7 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open)
         }
         if ((own = cfg_near_table(first, &d)) == NULL || !cfg_typo_evidence(e, own, it.key + fl + 1, d)) continue;
         cfg_claim(e, t, i);
+        cfg_refuse(e, t, &it);
         cfg_say(GPTPS_LOG_ERROR, &it, "there is no [%s] table (did you mean [%s]?)", first, own);
         ++bad;
     }
@@ -3054,7 +3084,10 @@ static void cfg_apply_pending(gptps *e, const char *prefix)
         gptps_mutex_lock(e->m);
         if (e->toml_gen == gen && i < gptps_toml_count(e->toml)) {
             gptps_toml_claim_at(e->toml, i);
-            if (st != GPTPS_OK) e->cfg_late_errors += 1;   /* the current file's, not the one before */
+            if (st != GPTPS_OK) {
+                e->cfg_late_errors += 1;                    /* the current file's, not the one before */
+                gptps_toml_refuse_at(e->toml, i);
+            }
         }
         gptps_mutex_unlock(e->m);
         if (st != GPTPS_OK) cfg_say(GPTPS_LOG_ERROR, &it, "%s", why);
@@ -4387,23 +4420,37 @@ gptps_status gptps_settings_set_ex(gptps *e, const char *key, const char *value,
 }
 
 /* The value the loaded config file gives a setting: by its key, as max_memory_gb,
- * or for a task through [task_defaults]. 1 and `val`, or 0. A save to a new file
- * writes these. The registry calls it with its lock held, and settings->m -> e->m
- * is the order. */
+ * or for a task through [task_defaults]. 1 and `val`; 2 when the engine refused the
+ * value there, which a save then does not write (see gptps_settings_save_to); or 0. A
+ * save to a new file writes these. The registry calls it with its lock held, and
+ * settings->m -> e->m is the order. */
 static int cfg_in_file(const char *key, void *ud, char *val, size_t cap)
 {
     gptps *e = (gptps *)ud;
     const gptps_toml *t;
     const char *x = NULL;
     long j = -1;
+    int got = 0;
     gptps_mutex_lock(e->m);
     if ((t = e->toml) != NULL) {
         if ((j = gptps_toml_find_dotted(t, key)) >= 0) x = gptps_toml_text_at(t, (size_t)j);
         else if (!strcmp(key, "limits.max_memory_bytes")) {
             if ((j = gptps_toml_find_dotted(t, "limits.max_memory_gb")) >= 0 && (x = gptps_toml_text_at(t, (size_t)j)) != NULL) {
-                snprintf(val, cap, "%llu", (unsigned long long)(gptps_strtod_c(x, NULL) * 1073741824.0));
+                /* In bytes, and only a value the engine took. 1e20 GiB in bytes is past
+                 * any 64-bit count, a conversion C leaves undefined, which on x86-64 wrote
+                 * 0, "auto", into the new file; the check is the one open and reload make. */
+                cfg_item it;
+                char why[160];
+                cfg_item_at(t, (size_t)j, &it);
+                if (gptps_toml_refused_at(t, (size_t)j) ||
+                    !cfg_value_ok(GPTPS_SETTING_DOUBLE, 1, 0, 1e9, NULL, &it, why, sizeof why)) {
+                    got = 2;
+                } else {
+                    snprintf(val, cap, "%llu", (unsigned long long)(gptps_strtod_c(x, NULL) * 1073741824.0));
+                    got = 1;
+                }
                 gptps_mutex_unlock(e->m);
-                return 1;
+                return got;
             }
         } else if (!strncmp(key, "tasks.", 6) && !strstr(key + 6, ".resources.")) {
             const char *leaf = strrchr(key, '.') + 1;
@@ -4413,10 +4460,30 @@ static int cfg_in_file(const char *key, void *ud, char *val, size_t cap)
                 if ((j = gptps_toml_find_dotted(t, d)) >= 0) x = gptps_toml_text_at(t, (size_t)j);
             }
         }
+        if (j >= 0 && gptps_toml_refused_at(t, (size_t)j)) got = 2;
+        else if (x) { snprintf(val, cap, "%s", x); got = 1; }
     }
-    if (x) snprintf(val, cap, "%s", x);
     gptps_mutex_unlock(e->m);
-    return x != NULL;
+    return got;
+}
+
+/* Whether the engine refused the value `text` (NULL: a list) the loaded config file
+ * gives `key`: then a copy of that file writes the setting's own value there, or leaves
+ * the key out. A file changed since it was loaded may give the key another value,
+ * which the engine never judged: that one is copied as it is. Called as cfg_in_file. */
+static int cfg_refused(const char *key, const char *text, void *ud)
+{
+    gptps *e = (gptps *)ud;
+    const char *x;
+    long j;
+    int r = 0;
+    gptps_mutex_lock(e->m);
+    if (e->toml && (j = gptps_toml_find_dotted(e->toml, key)) >= 0 && gptps_toml_refused_at(e->toml, (size_t)j)) {
+        x = gptps_toml_text_at(e->toml, (size_t)j);
+        r = (x == NULL) == (text == NULL) && (!x || !strcmp(x, text));
+    }
+    gptps_mutex_unlock(e->m);
+    return r;
 }
 
 gptps_status gptps_settings_save(gptps *e, const char *path)
@@ -4436,7 +4503,7 @@ gptps_status gptps_settings_save(gptps *e, const char *path)
     base[0] = 0;
     if (e->toml) snprintf(base, sizeof base, "%s", gptps_toml_path(e->toml));
     gptps_mutex_unlock(e->m);
-    return gptps_settings_save_to(e->settings, path, base[0] ? base : NULL, cfg_in_file, e);
+    return gptps_settings_save_to(e->settings, path, base[0] ? base : NULL, cfg_in_file, cfg_refused, e);
 }
 
 gptps_status gptps_settings_reload(gptps *e, const char *path)

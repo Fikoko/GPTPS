@@ -554,7 +554,10 @@ gptps_status gptps_settings_info_at(gptps_settings *r, size_t index, gptps_setti
  * is copied as it was. So a "0 = auto" stays auto, and a file keeps saying what its
  * author wrote. The file is parsed first, with the loader's own parser; one that does
  * not parse is not touched, since it is someone's hand-written work with a mistake in
- * it. A new file gets the changed values and those the loaded config file set. */
+ * it. A new file gets the changed values and those the loaded config file set - a copy
+ * of that file, when it can still be read - but never a value the engine refused: the
+ * setting's current value goes in its place, and a key no setting has is left out, so
+ * the new file opens to what the engine runs with. */
 
 /* leaf = after the last '.'; *seclen = bytes of the section prefix (0 if none) */
 static const char *leaf_of(const char *key, size_t *seclen)
@@ -715,17 +718,19 @@ static void value_span(const char *l, size_t len, size_t *vs, size_t *vl)
 /* Whether a save writes this setting where the file does not have it: one set live,
  * with its current value; or, in a new file, one the loaded config file set, with
  * the value that file gives it - not what it resolved to here, so a "0 = auto"
- * stays auto - unless that value is not one the setting takes. */
+ * stays auto - unless that value is one the engine refused, or not one the setting
+ * takes: then with its current value, which the engine runs with. */
 static int save_wants(gptps_setting_entry *e, const gptps_toml *t, gptps_settings_in_file_fn in_file, void *ud,
                       save_add *A)
 {
+    int k;
     A->file = 0;
     if (e->nosave) return 0;
     if (e->dirty) return 1;
     if (t || !in_file) return 0;
     A->val[0] = 0;
-    if (!in_file(e->key, ud, A->val, sizeof A->val)) return 0;
-    A->file = valid_value(e, A->val);
+    if ((k = in_file(e->key, ud, A->val, sizeof A->val)) == 0) return 0;
+    A->file = k == 1 && valid_value(e, A->val);
     return 1;
 }
 
@@ -739,10 +744,12 @@ static void put_add(FILE *f, const save_add *A)
     fputc('\n', f);
 }
 
-/* `text` (`t` parsed; NULL for a new file) with the changed settings, to `f`.
+/* `text` (`t` parsed; NULL for a new file) with the changed settings, to `f`. With
+ * `refused` - `text` is a copy of the loaded file - a line whose value the engine
+ * refused gets the setting's current value, or is left out if no setting has it.
  * Caller holds r->m. 0, or -1 out of memory. */
 static int write_settings(gptps_settings *r, FILE *f, const char *text, const gptps_toml *t,
-                          gptps_settings_in_file_fn in_file, void *ud)
+                          gptps_settings_in_file_fn in_file, gptps_settings_refused_fn refused, void *ud)
 {
     save_line  *lines = NULL;
     save_block *blocks = NULL;
@@ -866,12 +873,22 @@ static int write_settings(gptps_settings *r, FILE *f, const char *text, const gp
         if (any && at == top_at && top_gap) fputc('\n', f);
         if (i == nlines) break;
         if (lines[i].entry >= 0) {
-            char d[512];
-            int gb;
-            gptps_toml_dotted_at(t, (size_t)lines[i].entry, d, sizeof d);
+            size_t ei = (size_t)lines[i].entry;
+            size_t dn = strlen(gptps_toml_section_at(t, ei)) + strlen(gptps_toml_key_at(t, ei)) + 2;
+            char *d = (char *)gptps_malloc(dn);
+            int gb, bad;
+            if (!d) goto out;
+            gptps_toml_dotted_at(t, ei, d, dn);
             gb = gb_alias && !strcmp(d, SAVE_GB_KEY);
             e = setting_find(r, gb ? SAVE_BYTES_KEY : d);
-            if (e && e->dirty && !e->nosave) {
+            if (e && e->nosave) e = NULL;
+            /* A value the engine refused, copied, would be refused again where the copy
+             * is opened: the setting's value goes there instead - the one the engine runs
+             * with - and a key no setting has is left out. */
+            bad = refused && refused(d, gptps_toml_text_at(t, ei), ud);
+            gptps_free(d);
+            if (bad && !e) continue;
+            if (e && (e->dirty || bad)) {
                 size_t vs, vl;
                 value_span(lines[i].start, lines[i].len, &vs, &vl);
                 if (gb && setting_ull(e) > SAVE_GB_EXACT) {
@@ -930,14 +947,15 @@ out:
 }
 
 gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const char *base,
-                                    gptps_settings_in_file_fn in_file, void *ud)
+                                    gptps_settings_in_file_fn in_file, gptps_settings_refused_fn refused,
+                                    void *ud)
 {
     char err[4096], msg[900], *tmp = NULL, *text = NULL;
     gptps_toml *t = NULL;
     gptps_log_level lvl = GPTPS_LOG_ERROR;
     size_t tn;
     FILE *f;
-    int made = 0;
+    int made = 0, copy = 0;
     gptps_status st = GPTPS_OK;
     if (!r || !path) return GPTPS_E_INVAL;
     msg[0] = 0;                            /* what to log, once the lock is released */
@@ -962,6 +980,7 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
          * settings alone are written, as for an engine opened without a file. */
         text = gptps_toml_read_file(base, err, sizeof err);
         if (text && !(t = gptps_toml_parse_text(base, text, err, sizeof err))) { gptps_free(text); text = NULL; }
+        copy = t != NULL;
         if (!t) {
             char *nl = strchr(err, '\n');
             if (nl) *nl = 0;
@@ -998,7 +1017,7 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
             fputs("# GPTPS settings, written by gptps_settings_save: the values changed live and\n"
                   "# the ones the config file set. Edit freely - a later save updates the values\n"
                   "# you change and keeps the rest, comments included. Every key: docs/CONFIG.md.\n\n", f);
-        if (write_settings(r, f, text ? text : "", t, in_file, ud) != 0) st = GPTPS_E_NOMEM;
+        if (write_settings(r, f, text ? text : "", t, in_file, copy ? refused : NULL, ud) != 0) st = GPTPS_E_NOMEM;
         if (fflush(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
         if (fclose(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
     }

@@ -49,6 +49,7 @@ typedef struct {
     int       arrn;
     int       line;
     int       claimed;   /* a consumer used it (gptps_toml_claim_at) */
+    int       refused;   /* the engine refused its value (gptps_toml_refuse_at) */
     int       big;       /* an integer past LLONG_MAX: only its text holds it */
 } toml_entry;
 
@@ -696,6 +697,8 @@ gptps_toml_kind gptps_toml_kind_at(const gptps_toml *t, size_t i)
 int         gptps_toml_table_line_at(const gptps_toml *t, size_t i) { return t->tb[i].line; }
 const char *gptps_toml_table_at(const gptps_toml *t, size_t i) { return t->tb[i].name; }
 void        gptps_toml_claim_at(gptps_toml *t, size_t i)       { t->e[i].claimed = 1; }
+int         gptps_toml_refused_at(const gptps_toml *t, size_t i) { return t->e[i].refused; }
+void        gptps_toml_refuse_at(gptps_toml *t, size_t i)      { t->e[i].refused = 1; }
 
 void gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap)
 {

@@ -379,7 +379,8 @@ the file, **in place**: each on its own line, keeping that line's comment; a cha
 setting the file lacks goes next to its siblings; every other line stays exactly as
 written, so a `0 = auto` stays auto. A file with an error in it is not overwritten: save
 logs why and returns `GPTPS_E_CONFIG`. Saving to a new path writes a copy of the loaded
-file — add-ons, `[task_defaults]`, comments and all — with the live changes made in it.
+file — add-ons, `[task_defaults]`, comments and all — with the live changes made in it,
+and the engine's own value wherever it refused the file's.
 Whatever save writes reads back as it was: a setting takes only numbers a file can hold
 (no `nan`, `inf` or hex), and a string is written with every control character escaped.
 

@@ -147,6 +147,11 @@ const char *gptps_toml_text_at(const gptps_toml *t, size_t i);
 int         gptps_toml_line_at(const gptps_toml *t, size_t i);
 int         gptps_toml_claimed_at(const gptps_toml *t, size_t i);
 void        gptps_toml_claim_at(gptps_toml *t, size_t i);
+/* Whether the engine refused the entry's value - at the reload that read the file, or
+ * when the setting it names was defined since. A save that copies the file writes the
+ * engine's own value there instead (gptps_settings_save_to). */
+int         gptps_toml_refused_at(const gptps_toml *t, size_t i);
+void        gptps_toml_refuse_at(gptps_toml *t, size_t i);
 void        gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap);
 long        gptps_toml_find_dotted(const gptps_toml *t, const char *dotted);   /* -1 if none */
 /* What a value is, as the file wrote it: the loader holds it to its setting's type. */
@@ -173,12 +178,20 @@ gptps_status    gptps_settings_info_at(gptps_settings *r, size_t index, gptps_se
 /* Save (gptps_settings_save): a file that exists is updated in place with the
  * values set live. A new one starts as a copy of `base` - the config file the
  * engine loaded, or NULL - updated the same way; without a usable `base`, it gets
- * the live values and the ones the loaded file set. `in_file` says which: 1 with
- * the file's value for `key` (as text, unquoted) in `val`, or 0. It may be NULL.
- * Called with the settings lock held. */
+ * the live values and the ones the loaded file set. Only values the engine took go
+ * into a new file from the loaded one:
+ *   - `in_file` says what the loaded file gives a setting: 1 with its value (as text,
+ *     unquoted) in `val`; 2 when it gives one the engine refused, so the setting's own
+ *     value is written instead; or 0;
+ *   - `refused` is asked of each key a copy of `base` holds: 1 when the engine refused
+ *     the value `text` (NULL: a list) the loaded file gives `key`. The copy then
+ *     writes the setting's own value, or leaves the key out if no setting has it.
+ * Either may be NULL. Both are called with the settings lock held. */
 typedef int (*gptps_settings_in_file_fn)(const char *key, void *ud, char *val, size_t cap);
+typedef int (*gptps_settings_refused_fn)(const char *key, const char *text, void *ud);
 gptps_status    gptps_settings_save_to(gptps_settings *r, const char *path, const char *base,
-                                       gptps_settings_in_file_fn in_file, void *ud);
+                                       gptps_settings_in_file_fn in_file,
+                                       gptps_settings_refused_fn refused, void *ud);
 /* A number as a config file writes it (sign, digits; for !whole a fraction and an
  * exponent): what every numeric setting takes, so a saved value reads back. */
 int             gptps_settings_plain_number(const char *v, int whole);

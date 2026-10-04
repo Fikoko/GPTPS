@@ -14,7 +14,7 @@
  *   - gptps_settings_save edits the file in place: the values set live are rewritten
  *     on their own lines, a missing one goes next to its siblings, every other byte
  *     is kept, a file that does not parse is left alone, and the result reopens to
- *     the same values;
+ *     the same values; a save to a new path writes no value the engine refused;
  *   - gptps_settings_set_ex says why it refuses.
  */
 #if !defined(_WIN32)
@@ -1396,6 +1396,117 @@ static void test_save_placement(void)
 }
 
 /* The parser's edges, as the same mutation run found them unpinned. */
+/* A save to a new path writes only values the engine took. A reload applies what it
+ * can of its file, and installs the file - refused values too. A save that copied it
+ * carried those into the new file, which then failed to open; and one that could not
+ * copy it wrote its max_memory_gb in bytes without the check open and reload make:
+ * 1e20 GiB is past any 64-bit count, a conversion C leaves undefined, which wrote
+ * max_memory_bytes = 0, "auto", on x86-64. A refused value now gets the setting's own
+ * in the new file, and a key no setting has is left out. */
+static void define_app(gptps *e)
+{
+    CHECK(gptps_define_global(e, "app.knob", GPTPS_SETTING_UINT, "10", "0..100", 0) == GPTPS_OK);
+    CHECK(gptps_define_global(e, "app.name", GPTPS_SETTING_STRING, "x", NULL, 0) == GPTPS_OK);
+}
+static const char REFUSALS[] =
+    "# hand-written\n"
+    "[limits]\n"
+    "max_memory_gb = 1e20   # too much\n"
+    "bogus = 1\n"
+    "[scheduler]\n"
+    "reserve_after_skips = 5\n"
+    "[task_defaults]\n"
+    "priority = \"high\"\n"
+    "[tasks.t]\n"
+    "priority = 99999999999\n"
+    "timeout_seconds = 7\n"
+    "[app]\n"
+    "knob = 999\n"
+    "name = \"kept\"\n";
+/* REFUSALS, as a copy of it must read: each refused value replaced by the engine's,
+ * the keys no setting has left out, and every other line as it was. */
+static const char REFUSALS_SAVED[] =
+    "# hand-written\n"
+    "[limits]\n"
+    "max_memory_gb = 2   # too much\n"
+    "[scheduler]\n"
+    "reserve_after_skips = 5\n"
+    "[task_defaults]\n"
+    "[tasks.t]\n"
+    "priority = 0\n"
+    "timeout_seconds = 7\n"
+    "[app]\n"
+    "knob = 10\n"
+    "name = \"kept\"\n";
+static void reopens_clean(const char *path)
+{
+    gptps *e = NULL;
+    clear_log();
+    CHECK(gptps_open(path, &e) == GPTPS_OK);
+    if (!e) { printf("%s", g_log); return; }
+    CHECK(reg(e, "t") == GPTPS_OK);
+    define_app(e);
+    CHECK(gptps_config_check(e) == GPTPS_OK);
+    CHECK(has_value(e, "limits.max_memory_bytes", "2147483648"));
+    CHECK(has_value(e, "app.knob", "10"));
+    gptps_shutdown(e);
+}
+static void test_save_refused(void)
+{
+    gptps *e = NULL;
+    const char *out;
+
+    put(CFG, "[limits]\nmax_memory_gb = 2\n");
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (!e) return;
+    CHECK(reg(e, "t") == GPTPS_OK);
+    define_app(e);
+    CHECK(has_value(e, "limits.max_memory_bytes", "2147483648"));
+
+    /* 1. The file the engine loaded no longer parses: the new file gets the settings,
+     * each as the engine runs it where the file's value was refused. */
+    put(CFG2, "[limits]\nmax_memory_gb = 1e20\n[app]\nknob = \"5\"\n");
+    CHECK(gptps_settings_reload(e, CFG2) == GPTPS_E_CONFIG);    /* both refused */
+    CHECK(has_value(e, "limits.max_memory_bytes", "2147483648") && has_value(e, "app.knob", "10"));
+    put(CFG2, "[");
+    remove(FRESH);
+    CHECK(gptps_settings_save(e, FRESH) == GPTPS_OK);
+    out = slurp(FRESH);
+    if (!strstr(out, "max_memory_bytes = 2147483648\n") || !strstr(out, "knob = 10\n")) printf("%s", out);
+    CHECK(strstr(out, "[limits]\nmax_memory_bytes = 2147483648\n") != NULL);  /* was 0 */
+    CHECK(strstr(out, "[app]\nknob = 10\n") != NULL);                         /* was 5 */
+    reopens_clean(FRESH);
+
+    /* 2. A copy of the loaded file. */
+    put(CFG2, REFUSALS);
+    clear_log();
+    CHECK(gptps_settings_reload(e, CFG2) == GPTPS_E_CONFIG);
+    CHECK(logged("config " CFG2 ": 5 errors in the reload"));   /* five refused */
+    CHECK(has_value(e, "scheduler.reserve_after_skips", "5"));
+    CHECK(has_value(e, "tasks.t.timeout_seconds", "7"));
+    remove(FRESH);
+    CHECK(gptps_settings_save(e, FRESH) == GPTPS_OK);
+    out = slurp(FRESH);
+    if (strcmp(out, REFUSALS_SAVED) != 0) printf("saved:\n%s", out);
+    CHECK(strcmp(out, REFUSALS_SAVED) == 0);
+    CHECK(strcmp(slurp(CFG2), REFUSALS) == 0);                  /* the loaded file is untouched */
+    CHECK(gptps_settings_reload(e, FRESH) == GPTPS_OK);          /* the copy, reloaded: all taken */
+    reopens_clean(FRESH);
+
+    /* 3. In place, where the file has gone since: the same copy of the one loaded. */
+    CHECK(gptps_settings_reload(e, CFG2) == GPTPS_E_CONFIG);
+    remove(CFG);
+    CHECK(gptps_settings_save(e, NULL) == GPTPS_OK);
+    CHECK(strcmp(slurp(CFG), REFUSALS_SAVED) == 0);
+
+    /* 4. A file saved in place keeps what its author wrote, refused or not. */
+    CHECK(gptps_settings_save(e, CFG2) == GPTPS_OK);
+    CHECK(strcmp(slurp(CFG2), REFUSALS) == 0);
+    gptps_shutdown(e);
+    remove(CFG2);
+    remove(FRESH);
+}
+
 static void test_parser_edges(void)
 {
     static const struct { const char *esc, *bytes; } UTF8[] = {
@@ -1550,6 +1661,7 @@ int main(void)
     test_failed_setup_undoes_only_its_own();
     test_watch_while_setting();
     test_save_placement();
+    test_save_refused();
     test_parser_edges();
     gptps_set_log_sink(NULL, NULL);
     remove(CFG);
