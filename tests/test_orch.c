@@ -37,6 +37,11 @@ static void obs_fail(const gptps_event *ev, void *ud)
 }
 static gptps_status task_block(gptps_ctx *c, void *u) { (void)u; while (!get(&g_release) && !gptps_is_cancelled(c)) { } return GPTPS_OK; }
 static gptps_status task_mark(gptps_ctx *c, void *u) { (void)c; (void)u; inc(&c_mark); return GPTPS_OK; }
+/* task_mark, held back while g_hold is set: a dependency that must still be
+ * outstanding when its gate is made. */
+static int g_hold;
+static gptps_status task_held_mark(gptps_ctx *c, void *u)
+{ (void)u; while (get(&g_hold) && !gptps_is_cancelled(c)) { } inc(&c_mark); return GPTPS_OK; }
 static gptps_status task_fail(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_E_IO; }
 
 static void reg(gptps *e, const char *n, gptps_run_fn f)
@@ -91,11 +96,21 @@ static int check_unsatisfiable_gate(void)
     if (!e) return 1;
     o = gptps_orch_install(e);
     if (!o) { gptps_shutdown(e); return 1; }
-    reg(e, "dep", task_mark);
+    reg(e, "dep", task_held_mark);
 
+    /* The dependency is held until the gate exists. A worker that ran it first made
+     * it terminal, and gptps_orch_after then took its documented fast path: it
+     * submitted "no_such_task" at once and returned the engine's GPTPS_E_NOTFOUND,
+     * with no gate to converge. A main thread preempted between the two calls lost
+     * that race; the simulation HAL (tests/hal_sim.c) lost it on 4 of seeds 1-100. */
+    __atomic_store_n(&g_hold, 1, __ATOMIC_SEQ_CST);
     if (gptps_submit(e, "dep", NULL, 0, &dep) != GPTPS_OK) ++bad;
     /* payload is non-empty on purpose: a retry copies it, which is the cost being bounded */
-    if (gptps_orch_after(o, "no_such_task", "xxxx", 4, &dep, 1, NULL) != GPTPS_OK) ++bad;
+    if (gptps_orch_after(o, "no_such_task", "xxxx", 4, &dep, 1, NULL) != GPTPS_OK) {
+        printf("FAIL the gate was not held: its dependency was already terminal\n");
+        ++bad;
+    }
+    __atomic_store_n(&g_hold, 0, __ATOMIC_SEQ_CST);
 
     /* drive terminal events until the orchestrator gives up (bounded by the retry
      * cap); each unrelated completion is one retry opportunity */
