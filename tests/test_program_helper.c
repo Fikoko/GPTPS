@@ -60,6 +60,28 @@ static void on_ev_big(const gptps_event *ev, void *ud)
 static void fill_big(void) { size_t i; for (i = 0; i < BIG_LEN; ++i) g_big[i] = (unsigned char)((i * 1103515245u + 12345u) >> 16); }
 static int wait_started(unsigned ms) { uint64_t s = gptps_now_ms(NULL); while (get(&g_started) < 1 && gptps_now_ms(NULL) - s < ms) { } return get(&g_started) >= 1; }
 
+/* ---- the 16 MiB result cap (case H) ----------------------------------------- *
+ * Read only after gptps_shutdown, which joins the worker that wrote them. */
+#define CAP_BYTES ((size_t)16 * 1024 * 1024)  /* the executors' result cap: allowed */
+static int          g_cap_finished, g_cap_failed, g_cap_zero;
+static size_t       g_cap_len;
+static gptps_status g_cap_status;
+static void on_ev_cap(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_FINISHED) {
+        const unsigned char *b = (const unsigned char *)ev->result;
+        size_t i;
+        g_cap_len = ev->result_len;
+        g_cap_zero = 1;                         /* every byte the helper's zero */
+        for (i = 0; i < ev->result_len; ++i) if (b[i]) { g_cap_zero = 0; break; }
+        inc(&g_cap_finished);
+    } else if (ev->kind == GPTPS_EV_FAILED) {
+        g_cap_status = ev->status;
+        inc(&g_cap_failed);
+    }
+}
+
 static gptps *open_prog(const char *name, const char *const *argv, unsigned timeout_s)
 {
     gptps *e = NULL;
@@ -146,6 +168,36 @@ int main(void)
     CHECK(wait_started(3000));
     CHECK(gptps_cancel(e, h) == GPTPS_OK);
     gptps_shutdown(e);
+
+    /* H) the result cap: 16 MiB of output is allowed - the OOP executor takes a result
+     * of exactly the cap too - and one byte more is refused with GPTPS_E_IO, never
+     * truncated. Both PROGRAM pumps refused as soon as their buffer filled, so a
+     * result of exactly 16 MiB failed as well. Run on POSIX and Windows alike. */
+    {
+        static const char *const sizes[3] = { "16777215", "16777216", "16777217" };
+        static const char *zeros[4];
+        int k;
+        for (k = 0; k < 3; ++k) {
+            zeros[0] = HELPER_PATH; zeros[1] = "zeros"; zeros[2] = sizes[k]; zeros[3] = (const char *)0;
+            g_cap_finished = g_cap_failed = g_cap_zero = 0; g_cap_len = 0; g_cap_status = GPTPS_OK;
+            e = open_prog("zeros", zeros, 30); CHECK(e);   /* argv is copied at registration */
+            if (!e) continue;
+            gptps_set_event_cb(e, on_ev_cap, NULL);
+            CHECK(gptps_submit(e, "zeros", NULL, 0, &h) == GPTPS_OK);
+            gptps_shutdown(e);
+            if (k < 2) {                                    /* up to the cap: all of it */
+                CHECK(get(&g_cap_finished) == 1);           /* k == 1 was GPTPS_E_IO */
+                CHECK(g_cap_len == CAP_BYTES - 1 + (size_t)k);
+                CHECK(g_cap_zero);
+            } else {                                        /* past the cap: refused */
+                CHECK(get(&g_cap_finished) == 0);
+                CHECK(get(&g_cap_failed) >= 1);
+                CHECK(g_cap_status == GPTPS_E_IO);
+            }
+            if (k < 2 && get(&g_cap_finished) != 1)
+                printf("  case H, %s bytes: the task failed with %s\n", sizes[k], gptps_strerror(g_cap_status));
+        }
+    }
 
     if (fails) { printf("%d program-helper check(s) FAILED\n", fails); return 1; }
     printf("all program-helper checks passed\n");

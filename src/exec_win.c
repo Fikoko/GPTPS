@@ -105,17 +105,29 @@ static DWORD WINAPI reader_proc(LPVOID p)
     reader_ctx *r = (reader_ctx *)p;
     for (;;) {
         DWORD got;
+        BOOL ok;
+        char probe;                       /* where a byte past the cap lands */
+        int full = 0;                     /* the buffer is at the cap */
         if (r->len == r->cap) {
             size_t nc = r->cap ? r->cap * 2 : 65536;
             char *nb;
             if (nc > GPTPS_WIN_RESULT_CAP) nc = GPTPS_WIN_RESULT_CAP;
-            if (nc == r->cap) { r->oversize = 1; reader_stop_child(r); break; }
-            nb = (char *)gptps_realloc(r->buf, nc);
-            if (!nb) { r->nomem = 1; reader_stop_child(r); break; }
-            r->buf = nb; r->cap = nc;
+            full = (nc == r->cap);
+            if (!full) {
+                nb = (char *)gptps_realloc(r->buf, nc);
+                if (!nb) { r->nomem = 1; reader_stop_child(r); break; }
+                r->buf = nb; r->cap = nc;
+            }
         }
-        if (!ReadFile(r->h, r->buf + r->len, (DWORD)(r->cap - r->len), &got, NULL)) break; /* pipe closed */
+        /* At the cap, read one byte into `probe`: the pipe closing there is a result of
+         * exactly the cap, which is allowed, and only a byte past it is oversize - as
+         * in exec_oop_posix.c. Refusing as soon as the buffer filled turned a result of
+         * exactly 16 MiB into GPTPS_E_IO. */
+        ok = full ? ReadFile(r->h, &probe, 1, &got, NULL)
+                  : ReadFile(r->h, r->buf + r->len, (DWORD)(r->cap - r->len), &got, NULL);
+        if (!ok) break;                   /* pipe closed */
         if (got == 0) break;
+        if (full) { r->oversize = 1; reader_stop_child(r); break; }   /* >16 MiB */
         r->len += got;
     }
     return 0;

@@ -29,6 +29,8 @@ Four changes can need a change in a host. The first three are about the config f
   enumerate them all.
 - **Some out-of-process tasks end with a different status.** Each was a bug, fixed
   below, but a host sees the change:
+  - A PROGRAM result of exactly 16 MiB is returned, where 1.5 failed the task with
+    `GPTPS_E_IO`. A byte more still fails.
   - In a host that closed its standard descriptors, as a daemon does, an OOP task that
     prints now returns its result, where 1.5 failed it with `GPTPS_E_IO`. Such a host
     needs two free descriptors above fd 2 for each OOP task it starts: without them
@@ -284,6 +286,14 @@ Both found while writing the conformance test.
   way. Both ends of the pipe now move above fd 2, as the PROGRAM executor's child
   already moved its own; if no descriptor is free there, the attempt fails with
   `GPTPS_E_IO`. `tests/test_oop.c` runs both shapes.
+- **A PROGRAM result of exactly 16 MiB failed with `GPTPS_E_IO`,** on POSIX and on
+  Windows. 16 MiB is the cap, and the OOP executor accepts a result of that size, but
+  the PROGRAM executors refused as soon as their buffer was full, before they knew
+  whether more was coming. They now read one byte more: the end of the output there
+  is a result of exactly the cap, and a byte is one too many.
+  `tests/test_program_helper.c` runs results of 16 MiB less a byte, exactly 16 MiB and
+  a byte over, which CI does on Linux, macOS and Windows.
+
 ### Documentation
 
 - **`examples/item_ledger.c`: what a threaded host must add.** In THREADED mode an

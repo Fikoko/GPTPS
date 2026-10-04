@@ -11,6 +11,8 @@
  *                       tells the parent "the child is done" while the process is
  *                       very much alive - the shape that used to leave the executor
  *                       blocked in waitpid() with no deadline to rescue it.
+ *             "zeros" : write exactly argv[2] zero bytes, then exit 0 - a result of
+ *                       a chosen size, for the 16 MiB result cap.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +41,16 @@ int main(int argc, char **argv)
         close(STDOUT_FILENO);
 #endif
         for (;;) { /* alive but silent: the parent must not wait for us forever */ }
+    }
+    if (strcmp(mode, "zeros") == 0) {
+        static char chunk[65536];                    /* zero-initialised */
+        unsigned long left = (argc > 2) ? strtoul(argv[2], NULL, 10) : 0;
+        while (left) {
+            size_t n = (left < sizeof chunk) ? (size_t)left : sizeof chunk;
+            if (fwrite(chunk, 1, n, stdout) != n) return 1;
+            left -= (unsigned long)n;
+        }
+        return fflush(stdout) == 0 ? 0 : 1;
     }
     {
         int up = (strcmp(mode, "upper") == 0), c;

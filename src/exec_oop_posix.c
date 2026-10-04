@@ -628,17 +628,26 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             /* drain stdout */
             if (pfd[oidx].revents & (POLLIN | POLLHUP | POLLERR)) {
                 ssize_t r;
+                char probe;                        /* where a byte past the cap lands */
+                int full = 0;                      /* the buffer is at the cap */
                 if (len == cap) {
                     size_t ncap = cap ? cap * 2 : 65536;
                     char *nb;
                     if (ncap > GPTPS_PROG_RESULT_CAP) ncap = GPTPS_PROG_RESULT_CAP;
-                    if (ncap == cap) { oversize = 1; kill(-pid, SIGKILL); break; } /* >16 MiB */
-                    nb = (char *)gptps_realloc(buf, ncap);
-                    if (!nb) { nomem = 1; kill(-pid, SIGKILL); break; }
-                    buf = nb; cap = ncap;
+                    full = (ncap == cap);
+                    if (!full) {
+                        nb = (char *)gptps_realloc(buf, ncap);
+                        if (!nb) { nomem = 1; kill(-pid, SIGKILL); break; }
+                        buf = nb; cap = ncap;
+                    }
                 }
-                r = read(outp[0], buf + len, cap - len);
-                if (r > 0) len += (size_t)r;
+                /* At the cap, read one byte into `probe`: EOF there is a result of
+                 * exactly the cap, which is allowed (the OOP executor takes one too),
+                 * and only a byte past it is oversize. Refusing as soon as the buffer
+                 * filled turned a result of exactly 16 MiB into GPTPS_E_IO. */
+                r = full ? read(outp[0], &probe, 1) : read(outp[0], buf + len, cap - len);
+                if (r > 0 && full) { oversize = 1; kill(-pid, SIGKILL); break; } /* >16 MiB */
+                else if (r > 0) len += (size_t)r;
                 else if (r == 0) break;            /* stdout EOF: child is done */
                 else if (errno != EINTR && errno != EAGAIN) { killed = 1; kill_st = GPTPS_E_IO; kill(-pid, SIGKILL); break; } /* I/O error: kill so waitpid can't hang */
             }
