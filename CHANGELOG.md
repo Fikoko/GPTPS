@@ -11,6 +11,9 @@ the release version and is documented in `include/gptps.h`.
 
 Four changes can need a change in a host. The first three are about the config file:
 
+Six changes can need a change in a host. The first three are about the config file,
+the last three about the `durable_queue` add-on:
+
 - **A config file with a mistake in it fails `gptps_open`.** 1.5 used what it
   understood and dropped the rest without a word: a misspelt key, a line it could not
   read, a value of the wrong type. Each is now an error. The open returns
@@ -56,6 +59,27 @@ Four changes can need a change in a host. The first three are about the config f
   the registration has returned. On the registering thread - in an add-on's watcher
   that hears the type's file values - the type is there, but removing it returns
   `GPTPS_E_BUSY`.
+
+- **`gptps_dq_open` returns NULL where 1.5 lost records.** It does so for a journal it
+  cannot read - one that exists but will not open for reading, or a read that fails -
+  and for a journal cut short by damage when no copy of it can be made. 1.5 opened,
+  and the compaction an open runs rewrote the journal without every record it had not
+  read. The journal is now left as it was: retry once the cause is gone. A failed
+  open now unregisters the observer it registered, so, like
+  `gptps_register_observer`, call it before the engine runs work.
+- **A failed durable call can break the queue.** A submit, batch or retraction that
+  returns `GPTPS_E_IO` now returns only once its write is durably cut back out of the
+  journal, so that it cannot come back. If even that fails, the queue writes nothing
+  more: every durable call returns `GPTPS_E_IO`, and an error goes to the log sink,
+  until `gptps_dq_compact` returns `GPTPS_OK`. A host whose retries on `GPTPS_E_IO`
+  keep failing should try a compaction. 1.5 went on writing.
+- **`gptps_dq_compact` returns `GPTPS_E_IO` when it cannot sync the journal's
+  directory** after putting the new journal in place, and so does the drain's
+  `*out_compact`. Until a sync of the directory succeeds, durable calls wait for one,
+  and fail with `GPTPS_E_IO` if it fails. 1.5 ignored the failure. A directory that
+  cannot be synced at all - one the process may write but not read, or on a file
+  system with no fsync for a directory - is not a failure: there the queue carries on
+  as 1.5 did.
 
 ### Added — bounded mode: no allocation once work starts (ABI 2.4)
 
@@ -455,6 +479,76 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   kept in the type's definition. `gptps_clone_task` copied it, and registration refuses
   a service with a timeout: `GPTPS_E_INVAL`. The copy now takes the policy a service
   runs with. `tests/test_service.c`.
+
+### Fixed — `durable_queue`: I/O errors that lost acknowledged work, or brought back failed work
+
+`tests/test_durable_crash.c` kills a process at each I/O call the queue makes during a
+workload, one call per run: before the call, after it, in the middle of a write, or
+with a power cut that takes everything not yet fsync'd. Or it makes that call fail -
+or that call and the next fsync - and lets the workload go on. Then it recovers the
+journal and checks it against `gptps_durable_queue.h`. A sweep is about 11,800 runs:
+in 200 sweeps here, on a shared 4-CPU machine, each took 28 to 60 s (19 to 29 s of
+CPU). Linux only. No crash broke a promise. Failed calls broke five, all present in
+1.5.0:
+
+- **A submit that returned `GPTPS_E_IO` could come back after a power cut.** When an
+  fsync failed, the group commit cut the journal back to the last good fsync and failed
+  every write still waiting, but never made the cut durable. The bytes it cut could
+  already be on disk: an fsync settles only the writes made before it began, yet may
+  catch one made while it runs, and the kernel's own writeback can catch one at any
+  time. A write whose own flush failed was cut back the same way. The test meets this
+  only when one submitter writes while another's fsync runs, which none of 10 runs here
+  did. With its fsync model slowed by 3 ms, so that more is written while an fsync
+  runs, 1.5.0's queue brought such a submit back in 7 of 1,100 targeted runs. Now a
+  failure is reported only once the cut is durable, and a queue that cannot make it
+  durable stops writing (see "Upgrading from 1.5"). The same slowed runs bring none
+  back.
+- **A read error while opening the journal deleted records.** `gptps_dq_open` took a
+  journal it could not open for reading (EIO, EACCES, ENFILE) for one that did not
+  exist yet. It took a failed read for the end of the file, or for damage. The
+  compaction that follows then rewrote the journal without every record it had not
+  read. One failed `fopen` lost all eight open records of the test's journal; a
+  failed `fread` lost the records from that point on. The open now returns NULL and
+  leaves the journal as it was, as the header says it does on an I/O error.
+- **A journal cut short by damage was compacted though no copy of it could be made.**
+  The header says the records after a cut are "reported and kept in the copy, but not
+  loaded". When the copy failed (a full disk, a failed fsync), the compaction went
+  ahead, and those records were gone. The open now returns NULL and leaves the journal
+  as it was. Other damage is compacted as before when no copy can be made: the copy
+  would hold only bytes already lost.
+- **A compaction ignored a short write of the journal's header.** It renamed a journal
+  with a broken header into place, and from then on every `gptps_dq_open` returned
+  NULL, with every record out of reach until someone repaired the file by hand. The
+  compaction now fails with `GPTPS_E_IO` and keeps the old journal.
+- **A compaction ignored a failed fsync of the journal's directory.** Until that
+  fsync succeeds, a power cut can undo the rename. That takes everything written to the
+  new journal since: submits acknowledged as durable were lost, and records retracted
+  since came back. The compaction now returns `GPTPS_E_IO`. Until a later sync of the
+  directory succeeds, the group commit syncs it again before it acknowledges anything.
+  `gptps_dq_open` does not fail on it: once its compaction has replaced the journal,
+  it returns the queue, with a warning.
+
+Three more, found in review of the same code, each in 1.5.0 as well:
+
+- **An earlier copy that the process could not read was overwritten.** A copy goes to
+  the first of `.corrupt` to `.corrupt.9` that does not exist, but any name that would
+  not open for reading counted as free: a mode-0200 copy, or another user's, was
+  truncated and replaced. On 1.5.0's queue, a 31-byte earlier copy became the new
+  63-byte one. A name is now free only when the file system says nothing is there.
+- **With all ten names taken, no copy was made.** Together with the fix for cut
+  journals above, that would have kept such a queue from opening for good. The oldest
+  copy, by modification time, is now replaced; and a copy identical to the journal is
+  not made again, so retrying an open that failed does not use up the names.
+- **An open that failed could leave an empty journal behind.** When the compaction of
+  a new queue could not rename its file into place, it reopened the journal to put back
+  an append handle the open never had, which created it.
+
+Each fix was taken out in turn. Without any one but the first, the test failed on its
+first run here. Without the first, it passed 10 plain runs, and failed 3 of 3 with
+`GPTPS_CRASH_SYNC_DELAY_US=3000`, which slows its fsync model by 3 ms; with it, it
+passed 4 of 4 that way.
+The test also runs the workload with every fsync of the directory failing with
+EINVAL, and checks a directory the process may write but not read (mode 0300).
 
 ### Documentation
 

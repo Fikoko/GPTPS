@@ -706,6 +706,18 @@ target_include_directories(test_durable_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_durable_oom PRIVATE gptps)
 add_test(NAME durable_oom COMMAND test_durable_oom)
 set_tests_properties(durable_oom PROPERTIES TIMEOUT 30)
+# Crashed at every I/O call it makes, and recovered after each: compiles the add-on in
+# with its file calls wrapped (GNU ld's --wrap, so Linux only) and forks a child per run.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+add_executable(test_durable_crash tests/test_durable_crash.c)
+target_include_directories(test_durable_crash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable_crash PRIVATE gptps)
+target_link_options(test_durable_crash PRIVATE
+    "LINKER:--wrap=fopen,--wrap=fread,--wrap=fwrite,--wrap=fflush,--wrap=fclose"
+    "LINKER:--wrap=fsync,--wrap=ftruncate,--wrap=rename,--wrap=remove")
+add_test(NAME durable_crash COMMAND test_durable_crash)
+set_tests_properties(durable_crash PROPERTIES TIMEOUT 120)
+endif()
 # Complexity gate, like admission_perf: draining a recovered backlog stays LINEAR in
 # its size (the observer's lookup used to walk every record, per event).
 add_executable(test_durable_perf tests/test_durable_perf.c)

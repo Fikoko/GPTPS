@@ -641,8 +641,8 @@ static void test_recover_again(void)
     remove(JOURNAL_A);
 }
 
-/* Warnings the add-on sends to the core's log sink. It sends them only from
- * gptps_dq_open, on the calling thread - here always the main one. */
+/* Warnings the add-on sends to the core's log sink. It sends them from the call that
+ * met the trouble, on the calling thread - here always the main one. */
 static int  g_warns;
 static char g_warn[1024];
 static void warn_sink(gptps_log_level lvl, const char *msg, void *ud)
@@ -1080,8 +1080,11 @@ static void test_resubmit_cb(void)
  * descriptor is swapped for a pipe,
  * on which fwrite and fflush succeed but fsync fails, so the marker cannot be made
  * durable: the record must stay open and the execution must be left alone. The
- * same window holds gptps_dq_submit to its own promise not to enqueue. POSIX only
- * (dup2), and skipped where fsync on a pipe does not fail. */
+ * same window holds gptps_dq_submit to its own promise not to enqueue. A pipe cannot
+ * be truncated either, so the queue cannot take the marker back out, and breaks: it
+ * warns once, writes nothing more, and fails every durable call - with the journal's
+ * descriptor back, too - until a compaction rewrites the journal. POSIX only (dup2),
+ * and skipped where fsync on a pipe does not fail. */
 static int          g_io_ev;
 static gptps_handle g_io_h;
 static void io_obs(const gptps_event *ev, void *ud)
@@ -1125,7 +1128,10 @@ static void test_cancel_io(void)
         if (fsync(pfd[1]) != 0) {
             saved = dup(jfd);
             CHECK(saved >= 0 && dup2(pfd[1], jfd) == jfd);
+            gptps_set_log_sink(warn_sink, NULL);
+            g_warns = 0;
             CHECK(gptps_dq_cancel(dq, hb) == GPTPS_E_IO);
+            CHECK(g_warns == 1 && strstr(g_warn, "fails until gptps_dq_compact") != NULL);
             CHECK(gptps_dq_pending(dq) == 2);           /* nothing retracted... */
             CHECK(get(&g_io_ev) == 0);                  /* ...and nothing cancelled */
             {
@@ -1141,6 +1147,11 @@ static void test_cancel_io(void)
             }
             CHECK(dup2(saved, jfd) == jfd);
             close(saved);
+            CHECK(gptps_dq_cancel(dq, hb) == GPTPS_E_IO); /* broken: writes nothing */
+            CHECK(get(&g_io_ev) == 0 && gptps_dq_pending(dq) == 2);
+            CHECK(g_warns == 1);                        /* one warning per break */
+            CHECK(gptps_dq_compact(dq) == GPTPS_OK);    /* repaired */
+            gptps_set_log_sink(NULL, NULL);
             CHECK(gptps_dq_cancel(dq, hb) == GPTPS_OK); /* durable again: it retracts */
             CHECK(get(&g_io_ev) == 1);
             CHECK(gptps_dq_pending(dq) == 1);

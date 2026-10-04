@@ -3,8 +3,8 @@
 /*
  * addon_compat.h - tiny portable primitives shared by the bundled add-ons, so
  * they build and run on POSIX and Windows from the same source. A mutex, a
- * condition variable with a timed wait, and a file-sync; everything else in the
- * add-ons is already the public C99 API.
+ * condition variable with a timed wait, a file-sync, and whether a file exists;
+ * everything else in the add-ons is already the public C99 API.
  *
  * NOT the HAL. gptps_hal.h is INTERNAL to the core and deliberately not installed,
  * and an add-on distributed as a binary plugin cannot link core symbols at all - so
@@ -29,6 +29,9 @@
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <io.h>
+#  include <errno.h>
+#  include <sys/types.h>
+#  include <sys/stat.h>
 typedef CRITICAL_SECTION apx_mutex;
 static APX_UNUSED void apx_mutex_init(apx_mutex *m)    { InitializeCriticalSection(m); }
 static APX_UNUSED void apx_mutex_lock(apx_mutex *m)    { EnterCriticalSection(m); }
@@ -57,12 +60,23 @@ static APX_UNUSED int  apx_fsync_fd(int fd)
 /* NTFS has no durable directory-entry fsync API exposed here; rename is
  * effectively durable once the file data is committed, so this is a no-op. */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)  { (void)dir; return 0; }
+/* Whether `path` exists: 1 if it does (with its size and modification time, in
+ * seconds), 0 if it does not, -1 if that cannot be told. A file this process may not
+ * read still exists. */
+static APX_UNUSED int apx_file_info(const char *path, long long *size, long long *mtime)
+{
+    struct _stat64 st;
+    if (_stat64(path, &st) == 0) { *size = (long long)st.st_size; *mtime = (long long)st.st_mtime; return 1; }
+    return errno == ENOENT ? 0 : -1;
+}
 #else
 #  include <pthread.h>
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <time.h>
 #  include <errno.h>
+#  include <sys/types.h>
+#  include <sys/stat.h>
 typedef pthread_mutex_t apx_mutex;
 static APX_UNUSED void apx_mutex_init(apx_mutex *m)    { pthread_mutex_init(m, NULL); }
 static APX_UNUSED void apx_mutex_lock(apx_mutex *m)    { pthread_mutex_lock(m); }
@@ -113,20 +127,55 @@ static APX_UNUSED int  apx_fsync_fd(int fd)
 }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return apx_fsync_fd(fileno(f)); }
 static APX_UNUSED int  apx_truncate(FILE *f, long len) { return ftruncate(fileno(f), (off_t)len); }
+/* An errno that says this directory cannot be synced here, rather than that a sync
+ * failed: the process may write and search it but not read it, so cannot open it
+ * (EACCES, EPERM), or its file system has no fsync for a directory (EINVAL, ENOTSUP,
+ * EOPNOTSUPP, EROFS - fsync(2) lists EROFS beside EINVAL for that - or EBADF, EISDIR
+ * where a platform reports it so). PostgreSQL and SQLite treat these the same way. */
+static APX_UNUSED int apx_cannot_sync(int err)
+{
+    switch (err) {
+    case EACCES: case EPERM: case EINVAL: case EBADF: case EISDIR: case EROFS:
+#if defined(ENOTSUP)
+    case ENOTSUP:
+#endif
+#if defined(EOPNOTSUPP) && (!defined(ENOTSUP) || EOPNOTSUPP != ENOTSUP)
+    case EOPNOTSUPP:
+#endif
+        return 1;
+    default:
+        return 0;
+    }
+}
 /* fsync the directory so a rename of a journal file is durable across a crash
- * (the rename's directory-entry update must itself be flushed). */
+ * (the rename's directory-entry update must itself be flushed). Returns 0 once it
+ * is - and when this directory cannot be synced at all (apx_cannot_sync): there it
+ * never could be, and the caller carries on as it always has. -1, with errno set,
+ * only for a sync that failed: an I/O error. */
 static APX_UNUSED int  apx_dir_fsync(const char *dir)
 {
-    int fd, rc;
+    int fd, rc, err;
 #ifdef O_DIRECTORY
     fd = open(dir, O_RDONLY | O_DIRECTORY);
 #else
     fd = open(dir, O_RDONLY);
 #endif
-    if (fd < 0) return -1;
+    if (fd < 0) return apx_cannot_sync(errno) ? 0 : -1;
     rc = fsync(fd);
+    err = errno;
     close(fd);
-    return rc;
+    if (rc == 0 || apx_cannot_sync(err)) return 0;
+    errno = err;
+    return -1;
+}
+/* Whether `path` exists: 1 if it does (with its size and modification time, in
+ * seconds), 0 if it does not, -1 if that cannot be told. A file this process may not
+ * read still exists. */
+static APX_UNUSED int apx_file_info(const char *path, long long *size, long long *mtime)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) { *size = (long long)st.st_size; *mtime = (long long)st.st_mtime; return 1; }
+    return errno == ENOENT ? 0 : -1;
 }
 #endif
 

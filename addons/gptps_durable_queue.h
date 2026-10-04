@@ -60,6 +60,23 @@
  * attempt ends, so is work that a process dying for other reasons never lets finish -
  * the honest outcome, since that work cannot complete there.
  *
+ * I/O errors. A durable call that returns GPTPS_E_IO - gptps_dq_submit, _submit_batch,
+ * gptps_dq_cancel - changed nothing that a restart or a power cut can bring back: the
+ * queue cuts what it wrote back out of the journal, and makes the cut durable, before
+ * it answers. If even that fails, the queue BREAKS. The calls failing at that moment
+ * return GPTPS_E_IO although what they wrote may still be read back by the next
+ * gptps_dq_open - a submit's record recovered, a retraction's record closed - every
+ * later durable call returns GPTPS_E_IO without writing, and an error goes to the
+ * core's log sink. A gptps_dq_compact that returns GPTPS_OK repairs it: it rewrites
+ * the journal from what the queue holds, and once it has, nothing that failed can come
+ * back. A compaction that replaces the journal but cannot reopen it breaks the queue
+ * too. A compacted journal is put in place by a rename, which a sync of its directory
+ * makes durable. Until one succeeds, nothing written to the new journal is
+ * acknowledged. A directory that cannot be synced at all - the process may write it
+ * but not read it, or its file system has no fsync for a directory - is not an error:
+ * the queue goes on without the sync, and there a power cut can still undo a
+ * compaction, and lose what was acknowledged since.
+ *
  * Lifecycle (ordering matters):
  *     dq = gptps_dq_open(e, "queue.journal");   // replays + compacts
  *     gptps_dq_recover(dq);                      // re-submit prior-run survivors
@@ -99,24 +116,42 @@ typedef struct gptps_dq gptps_dq;
 
 /* Open (or create) a durable queue backed by `journal_path`, attached to engine
  * `e`. Replays the journal (loading records persisted but not completed) and
- * compacts the file to just those. Registers an observer on `e`. Returns NULL on
- * I/O error, a corrupt journal header, or too little memory to load the journal,
- * which is then left as it was. Does NOT re-submit (see _recover).
+ * compacts the file to just those. Registers an observer on `e`, so like
+ * gptps_register_observer it is a setup-time call. Does NOT re-submit (see _recover).
+ *
+ * Returns NULL, and leaves the journal as it was, when:
+ *   - e or journal_path is NULL, or there is too little memory to open it;
+ *   - the journal cannot be read: it exists but cannot be opened for reading (only a
+ *     journal that does not exist is a new, empty one), or a read fails;
+ *   - its file header is corrupt;
+ *   - it is cut short by damage (below) and no copy of it can be made;
+ *   - the observer cannot be registered on `e`;
+ *   - the compaction fails before it replaces the journal: its new file cannot be
+ *     created, written, fsync'd or renamed into place.
+ * Once the compaction has replaced the journal the open does not fail. If the journal's
+ * directory then cannot be synced, nothing is acknowledged until a sync of it succeeds,
+ * and a warning goes to the core's log sink; if the journal cannot be reopened for
+ * appending, the queue it returns is broken (see "I/O errors").
  *
  * A damaged journal. The record a crash was writing when it struck - torn, at the end
  * of the file - is dropped silently; that is what a crash leaves. Damage anywhere
  * else is skipped and every valid record after it kept, whatever the damaged bytes
- * held being lost. The original file is first copied to "<journal_path>.corrupt"
- * (".corrupt.1" to ".corrupt.9" if that exists) and a warning goes to the core's log
- * sink. One case is not guessed at: a record whose header claims more bytes than the
- * file holds looks exactly like a torn write, so valid records after it are reported
- * and kept in the copy, but not loaded. */
+ * held being lost. The original file is first copied to "<journal_path>.corrupt", or
+ * the first of ".corrupt.1" to ".corrupt.9" that does not exist - once all ten exist,
+ * the oldest of them, by modification time, is replaced - and a warning goes to the
+ * core's log sink. A copy identical to the journal already there is not made again.
+ * One case is not guessed at: a record whose header claims more bytes than the file
+ * holds looks exactly like a torn write, so valid records after it are reported and
+ * kept in the copy, but not loaded. Then the copy is the only place they are kept, and
+ * if it cannot be made the open fails. Other damage is compacted away even when no
+ * copy can be made, with a warning that says so. */
 gptps_dq *gptps_dq_open(gptps *e, const char *journal_path);
 
 /* Durable submit: persist (task_name, payload) to the journal and fsync it
  * BEFORE enqueuing via gptps_submit. Returns gptps_submit's status (and its
  * handle via out_handle); on a journal write error, or an fsync that fails,
- * returns GPTPS_E_IO and does not enqueue. Calls from several threads share
+ * returns GPTPS_E_IO, does not enqueue, and the record does not come back (see
+ * "I/O errors" for the one exception). Calls from several threads share
  * fsyncs, and none of them stalls the engine while it waits. Returns GPTPS_E_INVAL for a NULL dq/task_name, a task_name longer
  * than 4096 bytes, or len above 256 MiB - the journal format's limits, which are
  * rejected here rather than written as a record the replayer would discard. */
@@ -188,7 +223,8 @@ gptps_status gptps_dq_set_resubmit_cb(gptps_dq *dq, gptps_dq_resubmit_cb cb, voi
  * gptps_dq_recover re-submitted (gptps_dq_recover returns only a count, so that
  * handle is known only from the engine's events). The retraction is fsync'd
  * before the engine is told, so it survives a crash; if it cannot be made durable
- * the call returns GPTPS_E_IO, leaving the record open and the execution alone.
+ * the call returns GPTPS_E_IO, leaving the record open and the execution alone (see
+ * "I/O errors").
  *
  * Returns GPTPS_OK once the record is retracted - including for work an earlier
  * gptps_cancel already stopped. A still-live item then ends as gptps_cancel
@@ -225,19 +261,29 @@ size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *
  *
  * The return value counts records the callback saw, and that is true either way -
  * so a compaction failure cannot be signalled through it. But the consequence
- * matters: if compaction fails the drained records are still in the journal, so a
- * RESTART re-quarantines them and your callback sees them a second time. That is
- * this add-on's at-least-once contract applied to the drain, and it is fine for an
- * idempotent callback and not fine for one that bills, emails, or files a ticket.
+ * matters: until the compaction is durable, the drained records can still be read
+ * back - the old journal is still in place, or a power cut can bring it back while its
+ * directory is not synced - so a RESTART re-quarantines them and your callback sees
+ * them a second time. That is this add-on's at-least-once contract applied to the
+ * drain, and it is fine for an idempotent callback and not fine for one that bills,
+ * emails, or files a ticket.
  *
- * *out_compact (may be NULL) receives GPTPS_OK if the journal was compacted, the
- * failure status if it was not, and GPTPS_OK when there was nothing to drain.
- * Everything else - including the at-least-once guarantee itself - is unchanged. */
+ * *out_compact (may be NULL) receives the compaction's status, as gptps_dq_compact
+ * returns it, and GPTPS_OK when there was nothing to drain. GPTPS_OK: the drained
+ * records are durably out of the journal. Anything else: the queue cannot vouch for
+ * that, and a restart may hand them to your callback again. Everything else -
+ * including the at-least-once guarantee itself - is unchanged. */
 size_t gptps_dq_drain_quarantine_ex(gptps_dq *dq, gptps_dq_quarantine_cb cb,
                                     void *user_data, gptps_status *out_compact);
 
 /* Rewrite the journal to contain only still-pending records, bounding its growth
- * within a long-running process. Returns GPTPS_OK or GPTPS_E_IO.
+ * within a long-running process. Returns GPTPS_OK once the rewritten journal is in
+ * place and durable; that also repairs a broken queue (see "I/O errors"). GPTPS_E_INVAL
+ * for a NULL dq. GPTPS_E_NOMEM or GPTPS_E_IO if the old journal is still in place, as
+ * it was. GPTPS_E_IO too if the new one is in place, but its directory could not be
+ * synced - a power cut could still bring back the old one, so submits and retractions
+ * made after it are acknowledged only once a sync of the directory succeeds - or it
+ * could not be reopened for appending, which breaks the queue.
  *
  * Compact when the engine is quiet. A compaction holds the queue from start to end - it
  * rewrites every pending record and fsyncs the result - and the engine's threads wait

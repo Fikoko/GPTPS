@@ -185,11 +185,19 @@ anything a prior run left pending.
 - **Compact when the engine is quiet:** a compaction holds the queue while it rewrites
   and fsyncs the journal.
 - **Quarantine drains are at-least-once too.** `gptps_dq_drain_quarantine()` compacts
-  the drained records out of the journal afterwards; if that compaction fails they are
-  still on disk, so a restart hands them to your callback **again**. Fine for an
-  idempotent callback, not fine for one that bills or emails — use
+  the drained records out of the journal afterwards; until that compaction is durable
+  they can still be read back, so a restart hands them to your callback **again**. Fine
+  for an idempotent callback, not fine for one that bills or emails — use
   `gptps_dq_drain_quarantine_ex()`, which reports the compaction status separately from
   the drained count.
+- **`GPTPS_E_IO` means it did not happen.** A submit, batch or retraction that returns
+  `GPTPS_E_IO` leaves nothing a restart or a power cut can bring back: the queue cuts
+  its write back out of the journal, and makes the cut durable, before it answers. If
+  even that fails, the queue *breaks*: what those calls wrote may still come back, every
+  later durable call fails, and an error goes to the log sink, until
+  `gptps_dq_compact()` succeeds. A directory the queue cannot sync at all — one it may
+  write but not read, or on a file system with no fsync for a directory — is not an
+  error, but there a power cut can still undo a compaction.
 - **Cancelling:** `gptps_cancel()` stops the current execution only. The record stays
   pending, and the next run's `gptps_dq_recover()` re-submits it. To withdraw the work
   itself, call `gptps_dq_cancel(dq, handle)`: it makes the retraction durable, then
@@ -218,8 +226,12 @@ anything a prior run left pending.
   log sink. Any attempt that ends clears the count.
 - **A damaged journal is not destroyed.** A record torn at the end of the file — what a
   crash leaves — is dropped silently, as before. Damage anywhere else is skipped and
-  every valid record after it kept; the original is copied to `<journal>.corrupt` first,
-  and a warning goes to the log sink.
+  every valid record after it kept; the original is copied to `<journal>.corrupt` first
+  (`.corrupt.1` to `.corrupt.9` when that is taken, and once all ten are, over the
+  oldest), and a warning goes to the log sink. A record that claims more bytes than the
+  file holds looks like a torn write, so the valid records after it are kept in the
+  copy only: if no copy can be made, `gptps_dq_open()` returns NULL and leaves the
+  journal as it was.
 - **Not for services that exit cleanly.** A `GPTPS_TASK_SERVICE` without
   `GPTPS_TASK_RETIRE_ON_OK` reports `FINISHED` each time its `run()` returns `GPTPS_OK`,
   so its first clean exit closes the record. One that runs until stopped keeps it.

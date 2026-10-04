@@ -40,6 +40,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <errno.h>
 
 #define DQ_FILE_MAGIC 0x47445131u /* "GDQ1" */
 #define DQ_REC_MAGIC  0x44515231u /* "DQR1" */
@@ -104,20 +105,23 @@ typedef struct {
 } dq_slot;
 
 /* A write its caller must see made durable before going on: the 'P' of a submit, or the
- * 'D' of a retraction. It lives on the caller's stack, and is linked into the queue's
- * list from the moment its bytes are written until the caller has acted on how it
- * ended - which is also what a compaction reads (see "journal writes and group commit"). */
+ * 'D' of a retraction - or, once such a write has failed, the cut that took it back
+ * out of the file (see cut_back). It lives on the caller's stack, and is linked into
+ * the queue's list from the moment its bytes are written until the caller has acted on
+ * how it ended - which is also what a compaction reads (see "journal writes and group
+ * commit"). */
 typedef struct dq_waiter {
     uint64_t          ticket;   /* write order */
     uint64_t          seq;      /* the records it is about: seq .. seq_end (a batch) */
     uint64_t          seq_end;
-    char              type;     /* 'P' or 'D' */
+    char              type;     /* 'P' or 'D'; DQ_W_CUT for a cut */
     int               state;    /* DQ_W_* */
     struct dq_waiter *next;
 } dq_waiter;
 #define DQ_W_WAITING 0
 #define DQ_W_DURABLE 1
 #define DQ_W_FAILED  2
+#define DQ_W_CUT     0          /* the type of a cut's waiter: no record type */
 
 struct gptps_dq {
     gptps          *e;
@@ -134,6 +138,8 @@ struct gptps_dq {
     void           *resub_ud;
     apx_mutex       jmu;       /* the journal - see "journal writes and group commit" */
     FILE           *fp;        /* JMU: append handle */
+    int             broken;    /* JMU: nothing more is written - see "a broken queue" */
+    int             broke_note;   /* JMU: it broke, and nobody has warned of it yet */
     apx_mutex       smu;       /* the group commit below */
     apx_cond        scv;       /* SMU: broadcast when an fsync ends */
     int             fd;        /* SMU, changed under JMU too: fp's descriptor, -1 with none */
@@ -142,6 +148,7 @@ struct gptps_dq {
     long            last_end;  /* SMU: the file offset just past the newest durable write */
     long            synced;    /* SMU: every byte below it is on disk */
     int             syncing;   /* SMU: an fsync is running; its caller holds no lock */
+    int             dir_dirty; /* SMU: a compaction's rename is not known durable yet */
 };
 
 /* ---- little-endian + checksum helpers ---- */
@@ -175,11 +182,11 @@ static int fsync_parent_dir(const char *path)
 }
 
 /* ---- record I/O ---- */
-static void write_file_header(FILE *f)
+static int write_file_header(FILE *f)   /* 0 on success */
 {
     unsigned char h[DQ_FHDR_LEN];
     put32(h, DQ_FILE_MAGIC); put32(h + 4, DQ_VERSION);
-    fwrite(h, 1, sizeof h, f);
+    return fwrite(h, 1, sizeof h, f) == sizeof h ? 0 : -1;
 }
 
 /* Append one record. Returns 0 on success. Does not flush/fsync.
@@ -220,7 +227,9 @@ static int write_record(FILE *f, char type, uint64_t seq,
     return (w == total) ? 0 : -1;
 }
 
-/* Roll `f` back to `start` bytes and clear stdio's sticky error flag.
+/* Roll `f` back to `start` bytes and clear stdio's sticky error flag. Returns 0 once
+ * the file ends at `start`, -1 if it could not be cut back there. The cut is not
+ * durable until the next fsync (see cut_back).
  * Called after a failed append, and after an fsync that failed. Two things are being
  * repaired:
  *  1. The PARTIAL record a short write left behind. A torn record sitting in the
@@ -235,16 +244,19 @@ static int write_record(FILE *f, char type, uint64_t seq,
  * not been repositioned reports 0 on the Windows CRT, and ftell returns -1 past
  * LONG_MAX on 32-bit builds. Truncating on such an offset would erase the whole
  * journal; refusing leaves at worst a torn record, which replay() already
- * handles. */
-static void rollback_to(FILE *f, long start)
+ * handles - for a marker. A write whose failure is about to be reported must not stay
+ * in the file, so for that one a refusal breaks the queue (see cut_back). */
+static int rollback_to(FILE *f, long start)
 {
-    if (!f) return;
+    int rc;
+    if (!f) return -1;
     clearerr(f);
-    if (start < DQ_FHDR_LEN) return;
+    if (start < DQ_FHDR_LEN) return -1;
     fflush(f);
     clearerr(f);
-    if (apx_truncate(f, start) == 0) fseek(f, start, SEEK_SET);
+    rc = (apx_truncate(f, start) == 0 && fseek(f, start, SEEK_SET) == 0) ? 0 : -1;
     clearerr(f);
+    return rc;
 }
 
 /* ---- journal writes and group commit ----
@@ -260,7 +272,8 @@ static void rollback_to(FILE *f, long start)
  * So there are three locks now, always taken in this order and never the reverse:
  *   mu  - the record table, the handle index, pending, trial, next_seq; the observer's;
  *   jmu - the journal FILE*: every write and its position, a truncation, a compaction;
- *         held for the microseconds of a write, never across an fsync;
+ *         held for the microseconds of a write, never across an fsync - but for the one
+ *         that makes a failed fsync's cut durable, below;
  *   smu - the group commit: the waiter list and the offsets below.
  * An fsync runs with NO lock held, by whichever caller finds none running: it makes
  * durable everything written before it began, and settles every waiter that covers. So
@@ -268,40 +281,119 @@ static void rollback_to(FILE *f, long start)
  *
  * An fsync that fails makes nothing after the last good one trustworthy - on Linux a
  * failed fsync may discard the very pages it could not write, and the next one then
- * succeeds - so the file is truncated back to `synced` and every write still waiting
- * fails with GPTPS_E_IO, as a single write's failure always did: a submit that was not
- * made durable is not enqueued, and a retraction that was not stays undone. Markers
- * written past that point go too, which a lost marker is allowed to.
+ * succeeds - so the file is cut back to `synced` and every write still waiting fails
+ * with GPTPS_E_IO, as a single write's failure always did: a submit that was not made
+ * durable is not enqueued, and a retraction that was not stays undone. Markers written
+ * past that point go too, which a lost marker is allowed to. While a compaction's
+ * rename is not known durable, the fsync includes the directory's, and fails the same
+ * way (see do_rewrite).
+ *
+ * But a cut is not durable either until an fsync says so, and the bytes it took out may
+ * be: an fsync that began before them may have caught them anyway - it settles only
+ * the writes made before it began - and so may the kernel's own writeback, at any time.
+ * A power cut then brought back a write whose caller had been told it failed: a submit
+ * that returned GPTPS_E_IO was recovered and ran. So a failure is reported only once the
+ * cut that took the write out is durable. The failed fsync's cut is fsync'd before
+ * anyone is failed, and a write that fails on its way into the file waits, as a cut
+ * (cut_back), for the next fsync to begin after it. If even that cannot be done, the
+ * queue breaks (see "a broken queue").
  *
  * A submit and a retraction take jmu before letting go of mu, so a compaction - which
  * holds both - never meets a record reserved but not yet written. It first settles
  * every write in flight (quiesce), then writes a committing record only if its 'P'
  * became durable, and drops a retracting one if its 'D' did: what the waiters were told
- * and what the rewritten file says always agree. */
+ * and what the rewritten file says always agree.
+ *
+ * ---- a broken queue ----
+ *
+ * What the queue cannot answer for: a write it could not take back out of the journal
+ * durably - the cut failed, or the fsync after it did. Its bytes may then be read back
+ * by the next open, though its caller is told it failed. From then on nothing more is
+ * written, so nothing buries those bytes under valid records, and every durable call
+ * fails with GPTPS_E_IO without writing, until a compaction succeeds: it rewrites the
+ * journal from the table, which holds exactly what every caller was told, and once that
+ * is durable nothing that failed can come back. A compaction that cannot reopen the
+ * journal it put in place breaks the queue too: there is no file to write. Each break
+ * is reported once, to the core's log sink, by the public call it happened in
+ * (warn_if_broke), with no lock held. */
+
+static void break_queue(gptps_dq *dq)   /* caller holds jmu */
+{
+    if (!dq->broken) dq->broke_note = 1;
+    dq->broken = 1;
+}
+
+/* The warning, once per break. Caller holds no lock. */
+static void warn_if_broke(gptps_dq *dq)
+{
+    char msg[512];
+    int note;
+    apx_mutex_lock(&dq->jmu);
+    note = dq->broke_note;
+    dq->broke_note = 0;
+    apx_mutex_unlock(&dq->jmu);
+    if (!note) return;
+    snprintf(msg, sizeof msg,
+             "gptps_durable_queue: %s: a write to the journal failed, and so did undoing it, "
+             "or the journal could not be reopened. A call that failed then with GPTPS_E_IO "
+             "may still be read back by the next gptps_dq_open. Every durable call fails "
+             "until gptps_dq_compact succeeds.", dq->path);
+    gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+}
 
 /* Append a marker and flush it. A lost marker is harmless (replay just re-runs or
  * re-quarantines that record, or misses one crash), but a TORN one is damage, so this
- * rolls back too. Caller holds mu, not jmu. */
+ * rolls back too. Its cut need not be durable: whether the marker comes back or not,
+ * nobody was told otherwise. Caller holds mu, not jmu. */
 static void append_marker(gptps_dq *dq, char type, uint64_t seq)
 {
     long start;
     apx_mutex_lock(&dq->jmu);
-    if (dq->fp) {   /* else lost: a compaction that could not reopen the journal */
+    if (dq->fp && !dq->broken) {   /* else lost: see "a broken queue" */
         fseek(dq->fp, 0, SEEK_END);   /* see write_durable */
         start = ftell(dq->fp);
         if (write_record(dq->fp, type, seq, "", NULL, 0) != 0 || fflush(dq->fp) != 0)
-            rollback_to(dq->fp, start);
+            (void)rollback_to(dq->fp, start);
     }
     apx_mutex_unlock(&dq->jmu);
 }
 
+/* Link `w` into the waiter list, for a write of `type` about seq .. seq_end that ends
+ * the file at `end` (-1: a cut, which ends nothing). Caller holds jmu. */
+static void register_waiter(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
+                            uint64_t seq_end, long end)
+{
+    apx_mutex_lock(&dq->smu);
+    w->ticket = ++dq->tickets; w->seq = seq; w->seq_end = seq_end; w->type = type;
+    w->state = DQ_W_WAITING;
+    w->next = dq->waiters; dq->waiters = w;
+    if (end >= 0) dq->last_end = end;
+    apx_mutex_unlock(&dq->smu);
+}
+
+/* A durable write failed after `start`, where it began: cut the file back there, and
+ * register `w` as the cut, so its caller waits for an fsync that began after it - one
+ * that makes it durable - before reporting the failure (see "group commit"). -1 then;
+ * -2 if the file could not be cut back, which breaks the queue, `w` not registered.
+ * Caller holds jmu. */
+static int cut_back(gptps_dq *dq, dq_waiter *w, long start, uint64_t seq, uint64_t seq_end)
+{
+    if (rollback_to(dq->fp, start) != 0) { break_queue(dq); return -2; }
+    register_waiter(dq, w, DQ_W_CUT, seq, seq_end, -1);
+    return -1;
+}
+
 /* Write a record that must become durable, and register `w` for it. Caller holds jmu.
- * -1 if the write failed: it is rolled back, and `w` is not registered. */
+ * 0: written, `w` registered for it. -1: the write failed, and `w` is registered for
+ * the cut that undid it (cut_back). -2: nothing to wait for - a broken queue, which
+ * writes nothing, or a cut that failed. Either way the caller waits for a registered
+ * `w` (sync_until) and then unregisters it, and the call succeeded only if it returned
+ * 0 and `w` became durable. */
 static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
                          const char *name, const void *payload, size_t plen)
 {
-    long start, end;
-    if (!dq->fp) return -1;   /* a compaction that could not reopen the journal */
+    long start;
+    if (!dq->fp || dq->broken) return -2;   /* see "a broken queue" */
     /* Seek to EOF before sampling the rollback point. C99 leaves an append
      * stream's initial position implementation-defined and the Windows CRT
      * documents it as the START of the file until the first I/O, so the first
@@ -309,43 +401,28 @@ static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
      * truncate every recovered record away on a transient ENOSPC. */
     fseek(dq->fp, 0, SEEK_END);
     start = ftell(dq->fp);
-    if (write_record(dq->fp, type, seq, name, payload, plen) != 0 || fflush(dq->fp) != 0) {
-        rollback_to(dq->fp, start);
-        return -1;
-    }
-    end = ftell(dq->fp);
-    apx_mutex_lock(&dq->smu);
-    w->ticket = ++dq->tickets; w->seq = w->seq_end = seq; w->type = type; w->state = DQ_W_WAITING;
-    w->next = dq->waiters; dq->waiters = w;
-    dq->last_end = end;
-    apx_mutex_unlock(&dq->smu);
+    if (write_record(dq->fp, type, seq, name, payload, plen) != 0 || fflush(dq->fp) != 0)
+        return cut_back(dq, w, start, seq, seq);
+    register_waiter(dq, w, type, seq, seq, ftell(dq->fp));
     return 0;
 }
 
 /* write_durable for a batch: n 'P' records with seqs first .. first+n-1, one waiter for
- * all of them, so one fsync settles the batch. All of it, or - rolled back - none.
+ * all of them, so one fsync settles the batch. All of it, or - cut back - none.
  * Caller holds jmu. */
 static int write_durable_batch(gptps_dq *dq, dq_waiter *w, const gptps_dq_item *items,
                                size_t n, uint64_t first)
 {
-    long start, end;
+    long start;
     size_t i;
-    if (!dq->fp) return -1;
+    if (!dq->fp || dq->broken) return -2;
     fseek(dq->fp, 0, SEEK_END);       /* see write_durable */
     start = ftell(dq->fp);
     for (i = 0; i < n; ++i)
-        if (write_record(dq->fp, 'P', first + i, items[i].task_name, items[i].payload, items[i].len) != 0) {
-            rollback_to(dq->fp, start);
-            return -1;
-        }
-    if (fflush(dq->fp) != 0) { rollback_to(dq->fp, start); return -1; }
-    end = ftell(dq->fp);
-    apx_mutex_lock(&dq->smu);
-    w->ticket = ++dq->tickets; w->seq = first; w->seq_end = first + n - 1;
-    w->type = 'P'; w->state = DQ_W_WAITING;
-    w->next = dq->waiters; dq->waiters = w;
-    dq->last_end = end;
-    apx_mutex_unlock(&dq->smu);
+        if (write_record(dq->fp, 'P', first + i, items[i].task_name, items[i].payload, items[i].len) != 0)
+            return cut_back(dq, w, start, first, first + n - 1);
+    if (fflush(dq->fp) != 0) return cut_back(dq, w, start, first, first + n - 1);
+    register_waiter(dq, w, 'P', first, first + n - 1, ftell(dq->fp));
     return 0;
 }
 
@@ -376,17 +453,24 @@ static void sync_until(gptps_dq *dq, const dq_waiter *w)
             long     end  = dq->last_end;
             long     good = dq->synced;   /* only this caller moves it until syncing clears */
             int      fd   = dq->fd;
+            int      dir  = dq->dir_dirty;
             int      rc;
             dq->syncing = 1;
             apx_mutex_unlock(&dq->smu);
             rc = (fd >= 0) ? apx_fsync_fd(fd) : -1;
+            if (rc == 0 && dir) rc = fsync_parent_dir(dq->path);   /* see do_rewrite */
             if (rc == 0) {
                 apx_mutex_lock(&dq->smu);
                 settle(dq, upto, DQ_W_DURABLE);
                 if (end > dq->synced) dq->synced = end;
+                if (dir) dq->dir_dirty = 0;   /* no compaction runs while syncing is set */
             } else {
+                /* Cut back to the last good fsync, and make the cut durable BEFORE
+                 * failing anyone: the bytes past `good` may be on disk already (see
+                 * above). jmu is held across that fsync, so no write lands between the
+                 * cut and it; it is the failure path, and no other fsync is running. */
                 apx_mutex_lock(&dq->jmu);     /* jmu before smu, always */
-                rollback_to(dq->fp, good);
+                if (rollback_to(dq->fp, good) != 0 || apx_fsync(dq->fp) != 0) break_queue(dq);
                 apx_mutex_lock(&dq->smu);
                 settle(dq, UINT64_MAX, DQ_W_FAILED);
                 dq->last_end = good;
@@ -575,13 +659,22 @@ static dq_rec *find_open(gptps_dq *dq, gptps_handle h)
  *     which rejects the stale journal blocks a file system without data ordering can
  *     expose after a crash.
  * Whatever the damaged bytes held is lost either way. Before the compaction rewrites
- * the file, the original is copied aside and a warning goes to the core's log sink
- * (gptps_set_log_sink): damage is never destroyed by the code that found it.
+ * the file, the original is copied aside (preserve_copy) and a warning goes to the
+ * core's log sink (gptps_set_log_sink). Past a cut the copy is the only place the valid
+ * records after it are kept, so if no copy can be made the open fails, and leaves the
+ * journal as it was: the compaction used to go ahead and delete them. Confined damage
+ * loses nothing more by being compacted, so there the open goes on, warning that the
+ * copy failed - as it did before.
  *
  * Offsets are longs. Past LONG_MAX (2 GiB with a 32-bit long) ftell cannot report the
  * size, and replay then reads as it always did: up to the first record that does not
  * verify. Running out of memory fails the open instead of compacting away what could
- * not be loaded. */
+ * not be loaded, and so does a read that fails: a bad sector, EIO, a journal this
+ * process may not read. Replay used to take a failed fopen for "no journal yet" and a
+ * failed fread for the end of the file or for damage, and the compaction then rewrote
+ * the journal without every record it had not read - one transient error at open
+ * deleted acknowledged work. A short read is damage only when the stream reports no
+ * error; and only a journal that does not exist (ENOENT) is an empty one. */
 
 typedef struct {               /* one record as read, before it is applied */
     char           type;
@@ -596,6 +689,7 @@ typedef struct {               /* one record as read, before it is applied */
 #define DQ_READ_BAD   -1       /* does not verify */
 #define DQ_READ_TORN  -2       /* a readable header claiming more bytes than the file holds */
 #define DQ_READ_NOMEM -3
+#define DQ_READ_ERR   -4       /* the read failed: nothing is known about the bytes */
 
 /* Read the record at the stream's position, `left` bytes before the end of the file
  * (-1: unknown). On DQ_READ_OK, r->body is the caller's to free. */
@@ -607,6 +701,7 @@ static int read_rec(FILE *f, long left, dq_raw *r)
     r->body = NULL;
     if (left == 0) return DQ_READ_END;
     got = fread(hdr, 1, DQ_RHDR_LEN, f);
+    if (ferror(f)) return DQ_READ_ERR;
     if (got == 0 && left < 0) return DQ_READ_END;
     if (got != DQ_RHDR_LEN || get32(hdr) != DQ_REC_MAGIC) return DQ_READ_BAD;
     r->type = (char)hdr[4]; r->nlen = get16(hdr + 6); r->plen = get32(hdr + 8); r->seq = get64(hdr + 12);
@@ -619,14 +714,14 @@ static int read_rec(FILE *f, long left, dq_raw *r)
     if (fread(r->body, 1, blen, f) != blen ||
         fnv(r->body, (size_t)r->nlen + r->plen, crc) != get32(r->body + r->nlen + r->plen)) {
         free(r->body); r->body = NULL;
-        return DQ_READ_BAD;
+        return ferror(f) ? DQ_READ_ERR : DQ_READ_BAD;
     }
     return DQ_READ_OK;
 }
 
 /* After a record at `bad` that does not verify: the offset of the next record that
  * does, and that may stand there (see above), with the stream left at it; -1 if there
- * is none before `end`; -2 out of memory. */
+ * is none before `end`; -2 out of memory or a failed read. */
 static long resync(FILE *f, long bad, long end, uint64_t last_p)
 {
     unsigned char buf[4096];
@@ -636,6 +731,7 @@ static long resync(FILE *f, long bad, long end, uint64_t last_p)
         if ((long)want > end - base) want = (size_t)(end - base);
         if (fseek(f, base, SEEK_SET) != 0) return -1;
         got = fread(buf, 1, want, f);
+        if (ferror(f)) return -2;
         if (got < 4) return -1;
         for (i = 0; i + 4 <= got; ++i) {
             long at = base + (long)i;
@@ -644,7 +740,7 @@ static long resync(FILE *f, long bad, long end, uint64_t last_p)
             if (get32(buf + i) != DQ_REC_MAGIC) continue;
             if (fseek(f, at, SEEK_SET) != 0) return -1;
             k = read_rec(f, end - at, &r);
-            if (k == DQ_READ_NOMEM) return -2;
+            if (k == DQ_READ_NOMEM || k == DQ_READ_ERR) return -2;
             if (k != DQ_READ_OK) continue;
             free(r.body);
             if (r.type == 'P' && r.seq <= last_p) continue;   /* stale, or not a record at all */
@@ -707,7 +803,7 @@ typedef struct {
 } dq_damage;
 
 /* Replay the journal at dq->path into dq->recs. Returns 0 (ok / missing file) or
- * -1 (present but corrupt header, or out of memory). */
+ * -1 (present but corrupt header, unreadable, or out of memory). */
 static int replay(gptps_dq *dq, dq_damage *dmg)
 {
     FILE *f = fopen(dq->path, "rb");
@@ -716,8 +812,9 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
     uint64_t last_p = 0;
     size_t r;
     memset(dmg, 0, sizeof *dmg);
-    if (!f) return 0;                                 /* no journal yet */
+    if (!f) return errno == ENOENT ? 0 : -1;          /* no journal yet; or one we cannot read */
     r = fread(fh, 1, DQ_FHDR_LEN, f);
+    if (ferror(f)) { fclose(f); return -1; }
     if (r == 0) { fclose(f); return 0; }              /* empty file */
     if (r < DQ_FHDR_LEN || get32(fh) != DQ_FILE_MAGIC || get32(fh + 4) != DQ_VERSION) {
         fclose(f); return -1;                         /* corrupt header */
@@ -729,7 +826,7 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
         long next;
         int k = read_rec(f, end < 0 ? -1 : end - pos, &rr);
         if (k == DQ_READ_END) break;
-        if (k == DQ_READ_NOMEM) { fclose(f); return -1; }
+        if (k == DQ_READ_NOMEM || k == DQ_READ_ERR) { fclose(f); return -1; }
         if (k != DQ_READ_OK) {
             next = (end < 0) ? -1 : resync(f, pos, end, last_p);
             if (next == -2) { fclose(f); return -1; }
@@ -750,66 +847,6 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
     return 0;
 }
 
-/* Copy the journal aside before the open-time compaction rewrites it (see "reading a
- * damaged journal"), to the first of "<path>.corrupt", "<path>.corrupt.1" .. ".9"
- * that does not exist yet, so the evidence of an earlier incident is never
- * overwritten. Returns that name (malloc'd), or NULL if no copy could be made. */
-static char *preserve_copy(const char *path)
-{
-    size_t cap = strlen(path) + 16;
-    char *name = (char *)malloc(cap);
-    unsigned char buf[8192];
-    FILE *in, *out, *probe;
-    int k, ok;
-    if (!name) return NULL;
-    for (k = 0; k < 10; ++k) {
-        if (k) snprintf(name, cap, "%s.corrupt.%d", path, k);
-        else   snprintf(name, cap, "%s.corrupt", path);
-        probe = fopen(name, "rb");
-        if (!probe) break;
-        fclose(probe);
-    }
-    if (k == 10) { free(name); return NULL; }
-    in  = fopen(path, "rb");
-    out = in ? fopen(name, "wb") : NULL;
-    ok  = (in && out);
-    while (ok) {
-        size_t got = fread(buf, 1, sizeof buf, in);
-        if (got && fwrite(buf, 1, got, out) != got) ok = 0;
-        if (got < sizeof buf) { if (ferror(in)) ok = 0; break; }
-    }
-    if (out && (fflush(out) != 0 || apx_fsync(out) != 0)) ok = 0;
-    if (in)  fclose(in);
-    if (out) fclose(out);
-    if (!ok) { if (out) remove(name); free(name); return NULL; }
-    fsync_parent_dir(name);
-    return name;
-}
-
-static void report_damage(const gptps_dq *dq, const dq_damage *d)
-{
-    char msg[1024];
-    char *copy = preserve_copy(dq->path);
-    if (d->cut)
-        snprintf(msg, sizeof msg,
-                 "gptps_durable_queue: %s is damaged at byte %ld, where a record claims more "
-                 "bytes than the file holds, and valid records follow; the %lu bytes from there "
-                 "were not read. %s%s",
-                 dq->path, d->first, d->bytes,
-                 copy ? "The original is preserved as " : "The original could not be preserved.",
-                 copy ? copy : "");
-    else
-        snprintf(msg, sizeof msg,
-                 "gptps_durable_queue: %s is damaged: %lu unreadable byte(s) in %d place(s), the "
-                 "first at byte %ld, were skipped and every valid record after them kept; whatever "
-                 "they held is lost. %s%s",
-                 dq->path, d->bytes, d->regions, d->first,
-                 copy ? "The original is preserved as " : "The original could not be preserved.",
-                 copy ? copy : "");
-    gptps_log(NULL, GPTPS_LOG_WARN, msg);
-    free(copy);
-}
-
 /* rename() over an EXISTING file is undefined in C99 and fails outright on
  * Windows, where the CRT reports EEXIST - which would make every compaction fail
  * there, and with it gptps_dq_open on any pre-existing journal (crash recovery,
@@ -824,6 +861,119 @@ static int dq_rename_replace(const char *from, const char *to)
 #endif
 }
 
+#define DQ_COPIES 10            /* "<path>.corrupt", then ".corrupt.1" to ".corrupt.9" */
+
+static void copy_name(char *out, size_t cap, const char *path, int k)
+{
+    if (k) snprintf(out, cap, "%s.corrupt.%d", path, k);
+    else   snprintf(out, cap, "%s.corrupt", path);
+}
+
+/* 1 if files a and b read back the same, byte for byte; 0 if not, or if either cannot
+ * be read. */
+static int same_bytes(const char *a, const char *b)
+{
+    unsigned char x[4096], y[4096];
+    FILE *fa = fopen(a, "rb"), *fb = fa ? fopen(b, "rb") : NULL;
+    int same = (fa && fb);
+    while (same) {
+        size_t n = fread(x, 1, sizeof x, fa), m = fread(y, 1, sizeof y, fb);
+        if (n != m || ferror(fa) || ferror(fb) || memcmp(x, y, n) != 0) same = 0;
+        else if (n < sizeof x) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
+/* Copy file `from` to `to`, made durable; 0 on success. */
+static int copy_file(const char *from, const char *to)
+{
+    unsigned char buf[8192];
+    FILE *in = fopen(from, "rb"), *out = in ? fopen(to, "wb") : NULL;
+    int ok = (in && out);
+    while (ok) {
+        size_t got = fread(buf, 1, sizeof buf, in);
+        if (got && fwrite(buf, 1, got, out) != got) ok = 0;
+        if (got < sizeof buf) { if (ferror(in)) ok = 0; break; }
+    }
+    if (out && (fflush(out) != 0 || apx_fsync(out) != 0)) ok = 0;
+    if (in)  fclose(in);
+    if (out) fclose(out);   /* after the fsync: nothing is left for it to lose */
+    return ok ? 0 : -1;
+}
+
+/* Copy the journal aside before the open-time compaction rewrites it (see "reading a
+ * damaged journal"). The copy goes to the first of "<path>.corrupt", "<path>.corrupt.1"
+ * .. ".9" that does not exist, so an earlier incident's copy is kept - whether or not
+ * this process may read it: a name counts as free only when the file system says
+ * nothing is there. It used to count as free whenever it could not be opened for
+ * reading, and a copy this process could not read was overwritten. Once all ten
+ * exist, the oldest of them, by modification time, is replaced: the queue still opens
+ * after ten incidents nobody cleaned up after. A copy identical to the journal already
+ * in one of them IS the copy, so an open retried after a failure does not use up the
+ * slots, and with them the copies of earlier incidents. The copy is written to
+ * "<path>.tmp", fsync'd, and renamed into place, so a slot only ever holds a whole copy,
+ * and an old copy is replaced only by a whole new one. Returns the copy's name
+ * (malloc'd) once it and its name are durable, or NULL if no copy could be made. */
+static char *preserve_copy(const char *path)
+{
+    size_t cap = strlen(path) + 16;
+    char *name = (char *)malloc(cap), *tmp = (char *)malloc(cap);
+    long long jsize = 0, size = 0, mtime = 0, oldest = 0;
+    int k, use = -1, old = -1;
+    if (!name || !tmp || apx_file_info(path, &jsize, &mtime) != 1) goto none;
+    for (k = 0; k < DQ_COPIES; ++k) {
+        int st;
+        copy_name(name, cap, path, k);
+        st = apx_file_info(name, &size, &mtime);
+        if (st == 0 && use < 0) use = k;
+        if (st != 1) continue;                    /* free, or cannot tell: left alone */
+        if (size == jsize && same_bytes(name, path)) {
+            free(tmp);                            /* kept already; its name made durable */
+            if (fsync_parent_dir(name) != 0) { free(name); return NULL; }
+            return name;
+        }
+        if (old < 0 || mtime < oldest) { old = k; oldest = mtime; }
+    }
+    if (use < 0) use = old;
+    if (use < 0) goto none;
+    copy_name(name, cap, path, use);
+    snprintf(tmp, cap, "%s.tmp", path);
+    if (copy_file(path, tmp) != 0 || dq_rename_replace(tmp, name) != 0) { remove(tmp); goto none; }
+    free(tmp);
+    if (fsync_parent_dir(name) != 0) { free(name); return NULL; }
+    return name;
+none:
+    free(name); free(tmp);
+    return NULL;
+}
+
+/* Warn about the damage replay found, and where the original went. Past a cut, the
+ * copy is the only place the valid records after it are kept, so without one the open
+ * does not go on (see gptps_dq_open). */
+static void report_damage(const gptps_dq *dq, const dq_damage *d, const char *copy)
+{
+    char msg[1024];
+    const char *kept = copy ? "The original is preserved as "
+                     : d->cut ? "The original could not be copied aside, so the journal is left "
+                                "as it is and the queue is not opened."
+                              : "The original could not be preserved.";
+    if (d->cut)
+        snprintf(msg, sizeof msg,
+                 "gptps_durable_queue: %s is damaged at byte %ld, where a record claims more "
+                 "bytes than the file holds, and valid records follow; the %lu bytes from there "
+                 "were not read. %s%s",
+                 dq->path, d->first, d->bytes, kept, copy ? copy : "");
+    else
+        snprintf(msg, sizeof msg,
+                 "gptps_durable_queue: %s is damaged: %lu unreadable byte(s) in %d place(s), the "
+                 "first at byte %ld, were skipped and every valid record after them kept; whatever "
+                 "they held is lost. %s%s",
+                 dq->path, d->bytes, d->regions, d->first, kept, copy ? copy : "");
+    gptps_log(NULL, GPTPS_LOG_WARN, msg);
+}
+
 /* (Re)open the append handle and publish its descriptor. Caller holds jmu. */
 static void reopen_append(gptps_dq *dq)
 {
@@ -836,20 +986,28 @@ static void reopen_append(gptps_dq *dq)
 
 /* Rewrite the journal to contain only still-pending records, then reopen the append
  * handle and drop completed records from memory. Caller holds mu (not jmu): every
- * write in flight is settled first (see "journal writes and group commit"). */
-static gptps_status do_rewrite(gptps_dq *dq)
+ * write in flight is settled first (see "journal writes and group commit").
+ * GPTPS_OK once the new journal is in place, durable, and open for appending. Else
+ * GPTPS_E_NOMEM or GPTPS_E_IO, and *replaced says whether the rename happened. If not,
+ * the old journal stands as it was. If so, either the directory could not be synced
+ * (dir_dirty: see below) or the journal could not be reopened, which breaks the queue. */
+static gptps_status do_rewrite(gptps_dq *dq, int *replaced)
 {
     size_t tn = strlen(dq->path) + 5, i, keep = 0;
     char *tmp = (char *)malloc(tn);
     FILE *t;
     long end;
-    int reopened;
+    int reopened, dirty, had;
+    *replaced = 0;
     if (!tmp) return GPTPS_E_NOMEM;
     snprintf(tmp, tn, "%s.tmp", dq->path);
     quiesce(dq);                      /* from here on jmu is held */
     t = fopen(tmp, "wb");
     if (!t) { apx_mutex_unlock(&dq->jmu); free(tmp); return GPTPS_E_IO; }
-    write_file_header(t);
+    if (write_file_header(t) != 0) {  /* unchecked, a short write here installed a journal no open could read */
+        fclose(t); remove(tmp); apx_mutex_unlock(&dq->jmu); free(tmp);
+        return GPTPS_E_IO;
+    }
     apx_mutex_lock(&dq->smu);         /* waiter_state below; nothing can change it now */
     for (i = 0; i < dq->n; ++i) {
         const dq_rec *rc = &dq->recs[i];
@@ -882,6 +1040,7 @@ static gptps_status do_rewrite(gptps_dq *dq)
     }
     fclose(t);
 
+    had = (dq->fp != NULL);
     if (dq->fp) { fclose(dq->fp); dq->fp = NULL; }
     if (dq_rename_replace(tmp, dq->path) != 0) {
         /* The original journal is untouched on disk (the rename never happened),
@@ -889,20 +1048,38 @@ static gptps_status do_rewrite(gptps_dq *dq)
          * is documented as an ordinary recoverable GPTPS_E_IO, and leaving
          * dq->fp NULL would turn the caller's next submit - or the next terminal
          * event, on an engine worker thread - into a NULL-FILE* crash. Everything
-         * written to it so far is on disk: quiesce saw to that. */
+         * written to it so far is on disk: quiesce saw to that. Only a handle there
+         * was: gptps_dq_open has none yet, and opening one would create the
+         * journal of a new queue whose open is about to fail. */
         remove(tmp); free(tmp);
-        reopen_append(dq);
+        if (had) {
+            reopen_append(dq);
+            if (!dq->fp) break_queue(dq);
+        }
         apx_mutex_unlock(&dq->jmu);
         return GPTPS_E_IO;
     }
-    fsync_parent_dir(dq->path);   /* make the rename's directory entry durable */
+    *replaced = 1;
+    /* Make the rename's directory entry durable. Until it is, a power cut can put the
+     * journal's name back on the old file, and lose everything written to the new one:
+     * submits acknowledged as durable, retractions. This fsync's result used to be
+     * ignored. Now a failure is reported, and until one succeeds the group commit makes
+     * it again before it settles any write (sync_until), so nothing written to the new
+     * file is acknowledged while its name could still be lost. A directory that cannot
+     * be synced at all - one this process may not read, a file system with no fsync
+     * for a directory - is not a failure (apx_dir_fsync): there the queue goes on as
+     * it always has, and a power cut can still undo a rename. */
+    dirty = fsync_parent_dir(dq->path) != 0;
     free(tmp);
-    reopen_append(dq);            /* a NULL fp is the last resort: writes degrade to errors */
+    reopen_append(dq);
     reopened = (dq->fp != NULL);
     end = reopened ? ftell(dq->fp) : -1;
     apx_mutex_lock(&dq->smu);
     dq->synced = dq->last_end = end;   /* the whole new file was fsync'd before the rename */
+    dq->dir_dirty = dirty;
     apx_mutex_unlock(&dq->smu);
+    if (!reopened) break_queue(dq);  /* no file to write: see "a broken queue" */
+    else if (!dirty) dq->broken = dq->broke_note = 0;   /* repaired: the table is the journal */
     apx_mutex_unlock(&dq->jmu);
     if (!reopened) return GPTPS_E_IO;
 
@@ -912,7 +1089,7 @@ static gptps_status do_rewrite(gptps_dq *dq)
         else dq->recs[keep++] = dq->recs[i];
     }
     dq->n = keep;
-    return GPTPS_OK;
+    return dirty ? GPTPS_E_IO : GPTPS_OK;
 }
 
 /* ---- resubmission ---- */
@@ -1057,7 +1234,7 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path)
     gptps_dq *dq;
     dq_damage dmg;
     size_t i;
-    gptps_status st;
+    int registered = 0, replaced = 0, dirty;
     if (!e || !journal_path) return NULL;
     dq = (gptps_dq *)calloc(1, sizeof *dq);
     if (!dq) return NULL;
@@ -1069,8 +1246,14 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path)
     dq->path = dup_str(journal_path);
     if (!dq->path) goto fail;
 
-    if (replay(dq, &dmg) != 0) goto fail;    /* corrupt header, or out of memory */
-    if (dmg.regions) report_damage(dq, &dmg);   /* BEFORE do_rewrite replaces the file */
+    if (replay(dq, &dmg) != 0) goto fail;    /* corrupt header, unreadable, or out of memory */
+    if (dmg.regions) {                       /* BEFORE do_rewrite replaces the file */
+        char *copy = preserve_copy(dq->path);
+        int kept = (copy != NULL);
+        report_damage(dq, &dmg, copy);
+        free(copy);
+        if (!kept && dmg.cut) goto fail;     /* see "reading a damaged journal" */
+    }
     for (i = 0; i < dq->n; ++i) {
         dq_rec *rc = &dq->recs[i];
         if (rc->done || rc->quarantined) continue;
@@ -1092,14 +1275,33 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path)
         rc->suspect = (rc->crashes >= DQ_SUSPECT_AT);
         dq->pending += 1;                    /* quarantined records are retained, not pending */
     }
-    apx_mutex_lock(&dq->mu);
-    st = do_rewrite(dq);
-    apx_mutex_unlock(&dq->mu);
-    if (st != GPTPS_OK) goto fail;
+    /* Every way the open can fail comes before the compaction, which leaves the journal
+     * as it was until its rename. Once that has happened the open does not fail: the
+     * observer is registered first, and a directory that could not be synced (the
+     * group commit syncs it before it acknowledges anything) or a journal that could
+     * not be reopened (a broken queue) is reported instead. */
     if (gptps_register_observer(e, dq_on_event, dq) != GPTPS_OK) goto fail;
+    registered = 1;
+    apx_mutex_lock(&dq->mu);
+    (void)do_rewrite(dq, &replaced);
+    apx_mutex_unlock(&dq->mu);
+    if (!replaced) goto fail;
+    apx_mutex_lock(&dq->smu);
+    dirty = dq->dir_dirty;
+    apx_mutex_unlock(&dq->smu);
+    if (dirty) {
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "gptps_durable_queue: %s was compacted, but its directory could not be "
+                 "synced, so a power cut could still bring back the journal as it was. Nothing "
+                 "is acknowledged until a sync of the directory succeeds.", dq->path);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    warn_if_broke(dq);
     return dq;
 
 fail:
+    if (registered) gptps_unregister_observer(e, dq_on_event, dq);
     if (dq->fp) fclose(dq->fp);
     for (i = 0; i < dq->n; ++i) { free(dq->recs[i].name); free(dq->recs[i].payload); }
     free(dq->recs); free(dq->slots); free(dq->path);
@@ -1164,18 +1366,20 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     /* Durable before we enqueue: a swallowed fsync error would be a false durability
      * claim. The wait holds no lock the engine's threads need, and it shares its fsync
      * with any other submit in flight. If the write or the fsync fails, the journal is
-     * rolled back, so a transient full disk costs this submit rather than every submit
-     * for the rest of the process's life. */
-    if (wrote == 0) sync_until(dq, &w);
+     * cut back, so a transient full disk costs this submit rather than every submit
+     * for the rest of the process's life - and the wait goes on until that cut is
+     * durable, so the record cannot come back (see "group commit"). */
+    if (wrote != -2) sync_until(dq, &w);
 
     apx_mutex_lock(&dq->mu);
     rc = find_by_seq(dq, seq);        /* the table may have moved or been compacted since */
     rc->committing = 0;
-    if (wrote == 0) unregister_waiter(dq, &w);
+    if (wrote != -2) unregister_waiter(dq, &w);
     if (wrote != 0 || w.state != DQ_W_DURABLE) {
-        rc->done = 1;                 /* never journaled, or truncated away: not a record */
+        rc->done = 1;                 /* never journaled, or cut away: not a record */
         map_unreserve(dq);
         apx_mutex_unlock(&dq->mu);
+        warn_if_broke(dq);
         return GPTPS_E_IO;
     }
     dq->pending += 1;
@@ -1245,11 +1449,11 @@ gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
     apx_mutex_unlock(&dq->mu);
     wrote = write_durable_batch(dq, &w, items, n, first);
     apx_mutex_unlock(&dq->jmu);
-    if (wrote == 0) sync_until(dq, &w);               /* one fsync for the lot */
+    if (wrote != -2) sync_until(dq, &w);              /* one fsync for the lot */
     durable = (wrote == 0 && w.state == DQ_W_DURABLE);
 
     apx_mutex_lock(&dq->mu);
-    if (wrote == 0) unregister_waiter(dq, &w);
+    if (wrote != -2) unregister_waiter(dq, &w);
     for (i = 0; i < n; ++i) {
         dq_rec *rc = find_by_seq(dq, first + i);
         gptps_handle h = 0;
@@ -1275,6 +1479,7 @@ gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
     }
     apx_mutex_unlock(&dq->mu);
     free(nm); free(pl);
+    if (!durable) warn_if_broke(dq);
     return durable ? GPTPS_OK : GPTPS_E_IO;
 
 refuse:
@@ -1340,11 +1545,11 @@ gptps_status gptps_dq_cancel(gptps_dq *dq, gptps_handle h)
     apx_mutex_unlock(&dq->mu);
     wrote = write_durable(dq, &w, 'D', seq, "", NULL, 0);
     apx_mutex_unlock(&dq->jmu);
-    if (wrote == 0) sync_until(dq, &w);
+    if (wrote != -2) sync_until(dq, &w);
     durable = (wrote == 0 && w.state == DQ_W_DURABLE);
 
     apx_mutex_lock(&dq->mu);
-    if (wrote == 0) unregister_waiter(dq, &w);
+    if (wrote != -2) unregister_waiter(dq, &w);
     rc = find_by_seq(dq, seq);        /* NULL: retracted by a concurrent call and compacted away */
     if (rc) {
         rc->retracting -= 1;
@@ -1370,7 +1575,7 @@ gptps_status gptps_dq_cancel(gptps_dq *dq, gptps_handle h)
         durable = 1;
     }
     apx_mutex_unlock(&dq->mu);
-    if (!durable) return GPTPS_E_IO;
+    if (!durable) { warn_if_broke(dq); return GPTPS_E_IO; }
     /* Outside dq->mu: gptps_cancel delivers the terminal event on this thread for
      * an item still queued or between attempts, and a callback reacting to it may
      * call back into this queue. The retraction stands whatever it returns.
@@ -1420,17 +1625,20 @@ size_t gptps_dq_drain_quarantine_ex(gptps_dq *dq, gptps_dq_quarantine_cb cb,
      *
      * A failure here is genuinely NOT a failed drain: cb has already seen every
      * payload, and the return value counts what cb saw. What it does mean is that
-     * the journal still holds those records, so a restart re-quarantines them and
-     * cb sees them AGAIN - this add-on's at-least-once contract, applied to the
-     * drain callback. A host whose cb is not idempotent (it bills, it emails, it
+     * the records are not known to be out of the journal - the old one still stands,
+     * or a power cut can bring it back while its directory is not synced - so a
+     * restart can re-quarantine them and cb see them AGAIN: this add-on's
+     * at-least-once contract, applied to the drain callback. A host whose cb is not idempotent (it bills, it emails, it
      * files a ticket) has to know that happened, and used to have no way to find
      * out. Reported through out_compact rather than the return value, so the count
      * keeps meaning "records drained". */
     if (n) {
-        gptps_status cst = do_rewrite(dq);
+        int replaced;
+        gptps_status cst = do_rewrite(dq, &replaced);
         if (out_compact) *out_compact = cst;
     }
     apx_mutex_unlock(&dq->mu);
+    if (n) warn_if_broke(dq);
     return n;
 }
 
@@ -1442,10 +1650,12 @@ size_t gptps_dq_drain_quarantine(gptps_dq *dq, gptps_dq_quarantine_cb cb, void *
 gptps_status gptps_dq_compact(gptps_dq *dq)
 {
     gptps_status st;
+    int replaced;
     if (!dq) return GPTPS_E_INVAL;
     apx_mutex_lock(&dq->mu);
-    st = do_rewrite(dq);
+    st = do_rewrite(dq, &replaced);
     apx_mutex_unlock(&dq->mu);
+    warn_if_broke(dq);
     return st;
 }
 
