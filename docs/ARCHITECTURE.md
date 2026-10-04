@@ -563,7 +563,8 @@ management + generic settings (new symbols, an appended `GPTPS_E_BUSY` status, a
 Every increment ships with tests and is held to: CTest green on Linux + macOS,
 **AddressSanitizer + UBSan**-clean across the whole suite and **ThreadSanitizer**-
 clean on the concurrent paths (ASLR disabled in CI), stress loops on timing-
-sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), and a
+sensitive tests, fuzzing of the two hand-rolled parsers (TOML + journal), system-call
+fault injection into the out-of-process executors (`tests/test_exec_faults.c`), and a
 check that all three build paths work (CMake, the single-file amalgamation, and a
 plain `cc -std=c99`). Platform-specific tests (OOP memory caps, cgroup enforcement)
 **self-skip** where the facility is absent rather than failing (cgroup delegation, a

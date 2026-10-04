@@ -811,6 +811,42 @@ target_compile_definitions(test_hang PRIVATE HELPER_PATH="$<TARGET_FILE:prog_hel
 add_dependencies(test_hang prog_helper)
 add_test(NAME hang COMMAND test_hang)
 set_tests_properties(hang PROPERTIES TIMEOUT 60)
+
+# --- the out-of-process executors when system calls fail -------------------
+# The linker's --wrap (GNU ld and lld both have it) puts a wrapper in front of the
+# system calls the POSIX executors make, so the test can fail each one in turn; the
+# HAL clock is wrapped too, so a timeout need not take a second of wall clock. It
+# wraps the static library's calls, so the core must not come from the amalgamation.
+# Linux only: the test reads /proc/self/fd for leaked descriptors and makes itself a
+# subreaper (PR_SET_CHILD_SUBREAPER) to find the processes left behind.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(CheckFunctionExists)
+    add_executable(test_exec_faults tests/test_exec_faults.c)
+    target_include_directories(test_exec_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_exec_faults PRIVATE gptps)
+    set(_wrapped fork pipe pipe2 dup2 poll read write close waitpid kill setrlimit execvp
+                 fcntl gptps_hal_monotonic_ms)
+    # The names glibc gives two of those calls in some builds: setrlimit64 and fcntl64
+    # with -D_FILE_OFFSET_BITS=64, __fcntl_time64 with a 32-bit -D_TIME_BITS=64. The
+    # core calls whichever its flags pick, so each one the C library has is wrapped.
+    foreach(_alt setrlimit64 fcntl64 __fcntl_time64)
+        string(TOUPPER "${_alt}" _ALT)
+        string(REGEX REPLACE "^_+" "" _ALT "${_ALT}")
+        check_function_exists(${_alt} GPTPS_HAVE_${_ALT})
+        if(GPTPS_HAVE_${_ALT})
+            list(APPEND _wrapped ${_alt})
+            target_compile_definitions(test_exec_faults PRIVATE GPTPS_WRAP_${_ALT})
+        endif()
+    endforeach()
+    foreach(_w ${_wrapped})
+        target_link_options(test_exec_faults PRIVATE "LINKER:--wrap=${_w}")
+    endforeach()
+    target_compile_definitions(test_exec_faults PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+    add_dependencies(test_exec_faults prog_helper)
+    add_test(NAME exec_faults COMMAND test_exec_faults)
+    set_tests_properties(exec_faults PROPERTIES TIMEOUT 120)
+endif()
+
 if(UNIX)
     # The core again, with the callback-record cap cut to 4 so a test can pass it.
     add_executable(test_cb_cap tests/test_cb_cap.c ${GPTPS_SRC})

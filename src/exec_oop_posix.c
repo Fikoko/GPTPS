@@ -391,9 +391,16 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
          * rejects an oversize record, so sending it would just desynchronise. */
         len64 = (rlen > GPTPS_EXEC_RESULT_CAP) ? 0 : (uint64_t)rlen;
         if (rlen > GPTPS_EXEC_RESULT_CAP) st32 = (int32_t)GPTPS_E_IO;
-        write_all(p[1], &st32, sizeof st32);
-        write_all(p[1], &len64, sizeof len64);
-        if (len64) write_all(p[1], res, (size_t)len64);
+        /* Stop at the first write that fails. Nothing makes the write after a failed
+         * one fail too - a pipe write fails with ENOMEM when no page can be had for
+         * the buffer, and the next may find one - and the record has nothing to
+         * resync on: had the length gone missing and the payload still followed, the
+         * parent would read the payload's first 8 bytes AS the length, and a payload
+         * that starts with a small number parses as a whole record - a FINISHED with
+         * the wrong bytes. Cut short, it is a torn record the parent rejects. */
+        if (write_all(p[1], &st32, sizeof st32) == 0 &&
+            write_all(p[1], &len64, sizeof len64) == 0 && len64)
+            (void)write_all(p[1], res, (size_t)len64);
         /* Deliberately no free() and no allocator call on this path: we are in a
          * forked child of a threaded process, so a host allocator installed via
          * gptps_set_allocator may hold a mutex locked by a thread that did not
@@ -658,7 +665,12 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
                 } else {
                     ssize_t w = write(inp[1], wp, wleft);
                     if (w > 0) { wp += w; wleft -= (size_t)w; if (!wleft) { exec_close(inp[1]); in_open = 0; } }
-                    else if (w < 0 && errno != EINTR && errno != EAGAIN) { exec_close(inp[1]); in_open = 0; }
+                    else if (w < 0 && errno == EPIPE) { exec_close(inp[1]); in_open = 0; } /* child closed its stdin */
+                    /* Any other error (ENOMEM: no page for the pipe buffer) means the payload
+                     * cannot be delivered. Closing stdin as for EPIPE would hand the program
+                     * a truncated payload as if it were all of it, and a program that exits 0
+                     * on that is a FINISHED with the wrong result. Fail it, as a read error does. */
+                    else if (w < 0 && errno != EINTR && errno != EAGAIN) { killed = 1; kill_st = GPTPS_E_IO; kill(-pid, SIGKILL); break; }
                 }
             }
         }

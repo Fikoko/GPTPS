@@ -69,20 +69,39 @@ static char *build_cmdline(const char *const *argv)
     return out;
 }
 
-typedef struct { HANDLE h; const char *data; size_t len; } writer_ctx;
+typedef struct { HANDLE h; const char *data; size_t len; int ioerr;
+                 HANDLE proc, job; int assigned; } writer_ctx;
 static DWORD WINAPI writer_proc(LPVOID p)
 {
     writer_ctx *w = (writer_ctx *)p;
     size_t off = 0; DWORD wr;
     while (off < w->len) {
-        if (!WriteFile(w->h, w->data + off, (DWORD)(w->len - off), &wr, NULL) || wr == 0) break;
+        if (!WriteFile(w->h, w->data + off, (DWORD)(w->len - off), &wr, NULL)) {
+            DWORD e = GetLastError();
+            /* ERROR_NO_DATA / ERROR_BROKEN_PIPE: the child closed its stdin, so it wants
+             * no more of it (EPIPE in exec_oop_posix.c). ERROR_OPERATION_ABORTED is the
+             * parent's own CancelSynchronousIo, after the child has exited. Any other
+             * error means the payload cannot be delivered: closing stdin as if it were
+             * all of it would hand the program a truncated payload, and one that exits
+             * 0 on that is a success with the wrong result. Stop the child before it
+             * sees EOF (termination is asynchronous, hence the wait), and the attempt
+             * fails with GPTPS_E_IO, as on POSIX. */
+            if (e != ERROR_NO_DATA && e != ERROR_BROKEN_PIPE && e != ERROR_OPERATION_ABORTED) {
+                w->ioerr = 1;
+                if (w->assigned) TerminateJobObject(w->job, 1);
+                else             TerminateProcess(w->proc, 1);
+                WaitForSingleObject(w->proc, GPTPS_WIN_JOIN_GRACE_MS);
+            }
+            break;
+        }
+        if (wr == 0) break;
         off += wr;
     }
     CloseHandle(w->h); /* EOF on the child's stdin */
     return 0;
 }
 
-typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize;
+typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize, ioerr;
                  HANDLE proc, job; int assigned; } reader_ctx;
 
 /* When the reader stops early it must also stop the child, because nothing else
@@ -125,8 +144,23 @@ static DWORD WINAPI reader_proc(LPVOID p)
          * exactly 16 MiB into GPTPS_E_IO. */
         ok = full ? ReadFile(r->h, &probe, 1, &got, NULL)
                   : ReadFile(r->h, r->buf + r->len, (DWORD)(r->cap - r->len), &got, NULL);
-        if (!ok) break;                   /* pipe closed */
-        if (got == 0) break;
+        if (!ok) {
+            DWORD e = GetLastError();
+            /* ERROR_BROKEN_PIPE / ERROR_HANDLE_EOF: every write end is closed, the end
+             * of the output. ERROR_OPERATION_ABORTED and ERROR_INVALID_HANDLE are the
+             * parent's own teardown, after the child has exited: CancelSynchronousIo,
+             * then closing outR. Any other error means the output cannot be read
+             * whole: taking it for the end would make a success of part of it. Stop
+             * the child, and the attempt fails with GPTPS_E_IO, as a stdout read error
+             * does in exec_oop_posix.c. */
+            if (e != ERROR_BROKEN_PIPE && e != ERROR_HANDLE_EOF &&
+                e != ERROR_OPERATION_ABORTED && e != ERROR_INVALID_HANDLE) {
+                r->ioerr = 1;
+                reader_stop_child(r);
+            }
+            break;
+        }
+        if (got == 0) break;              /* end of the output */
         if (full) { r->oversize = 1; reader_stop_child(r); break; }   /* >16 MiB */
         r->len += got;
     }
@@ -199,8 +233,9 @@ return GPTPS_E_NOMEM; }
     if (job && AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
     ResumeThread(pi.hThread);
 
-    wc.h = inW; wc.data = (const char *)payload; wc.len = plen;
-    rc.h = outR; rc.buf = NULL; rc.len = rc.cap = 0; rc.nomem = rc.oversize = 0;
+    wc.h = inW; wc.data = (const char *)payload; wc.len = plen; wc.ioerr = 0;
+    wc.proc = pi.hProcess; wc.job = job; wc.assigned = assigned;
+    rc.h = outR; rc.buf = NULL; rc.len = rc.cap = 0; rc.nomem = rc.oversize = rc.ioerr = 0;
     rc.proc = pi.hProcess; rc.job = job; rc.assigned = assigned;
     wt = CreateThread(NULL, 0, writer_proc, &wc, 0, NULL);
     if (!wt) CloseHandle(inW);                 /* no writer => close stdin so the child sees EOF */
@@ -279,6 +314,8 @@ return GPTPS_E_NOMEM; }
 
     if      (killed)        eff = kill_st;
     else if (rc.oversize)   eff = GPTPS_E_IO;
+    else if (wc.ioerr)      eff = GPTPS_E_IO;   /* the payload could not be delivered */
+    else if (rc.ioerr)      eff = GPTPS_E_IO;   /* the output could not be read */
     else if (rc.nomem)      eff = GPTPS_E_NOMEM;
     else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
 

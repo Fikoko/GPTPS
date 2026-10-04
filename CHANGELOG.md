@@ -29,6 +29,14 @@ Four changes can need a change in a host. The first three are about the config f
   enumerate them all.
 - **Some out-of-process tasks end with a different status.** Each was a bug, fixed
   below, but a host sees the change:
+  - A PROGRAM task whose stdin cannot be written, for a reason other than the program
+    closing it, fails with `GPTPS_E_IO`, on POSIX and Windows. 1.5 closed stdin and
+    reported what the program made of the part it had, often `GPTPS_OK`.
+  - On Windows, a PROGRAM task whose stdout cannot be read to its end fails with
+    `GPTPS_E_IO`. 1.5 reported the part it had read, often as `GPTPS_OK`.
+  - An OOP task whose child cannot write its whole result fails, with
+    `GPTPS_E_TASK` or `GPTPS_E_IO`, where 1.5 could report a `FINISHED` carrying the
+    wrong bytes.
   - A PROGRAM result of exactly 16 MiB is returned, where 1.5 failed the task with
     `GPTPS_E_IO`. A byte more still fails.
   - In a host that closed its standard descriptors, as a daemon does, an OOP task that
@@ -285,7 +293,8 @@ Both found while writing the conformance test.
   `GPTPS_E_IO`. With fds 1 and 2 free, a task that wrote to stderr failed the same
   way. Both ends of the pipe now move above fd 2, as the PROGRAM executor's child
   already moved its own; if no descriptor is free there, the attempt fails with
-  `GPTPS_E_IO`. `tests/test_oop.c` runs both shapes.
+  `GPTPS_E_IO`. `tests/test_oop.c` runs both shapes, and `tests/test_exec_faults.c`
+  fails the move.
 - **A PROGRAM result of exactly 16 MiB failed with `GPTPS_E_IO`,** on POSIX and on
   Windows. 16 MiB is the cap, and the OOP executor accepts a result of that size, but
   the PROGRAM executors refused as soon as their buffer was full, before they knew
@@ -293,6 +302,38 @@ Both found while writing the conformance test.
   is a result of exactly the cap, and a byte is one too many.
   `tests/test_program_helper.c` runs results of 16 MiB less a byte, exactly 16 MiB and
   a byte over, which CI does on Linux, macOS and Windows.
+- **On Windows, a PROGRAM task could finish on part of its output.** The executor took
+  any error reading the program's stdout for the end of it, so a program that exited 0
+  was reported as a success with what had been read. Only the end of the output
+  (`ERROR_BROKEN_PIPE`) means that now. Any other error stops the program and fails
+  the attempt with `GPTPS_E_IO`, as it does on POSIX. CI compiles the change, but no
+  test makes a Windows pipe read fail.
+
+`tests/test_exec_faults.c` runs OOP and PROGRAM tasks through the POSIX executors and
+fails, one at a time, each call they make to fork, pipe, pipe2, dup2, poll, read,
+write, close, waitpid, kill, setrlimit and execvp, and to fcntl to move a descriptor
+above fd 2, then checks what each task reports. It leaves the cgroup path off. It
+found two ways a failed write ended as a `FINISHED` with the wrong result:
+
+- **An OOP task could finish with the wrong bytes.** The child sends its result as a
+  status, a length and a payload, in three writes, and it went on after one failed.
+  Linux's pipe write fails with `ENOMEM` when it cannot get a page for the buffer, and
+  nothing makes the next write fail too. The test injects that sequence; it has not
+  been seen on a real system. With the length lost, the parent read the payload's
+  first 8 bytes as the length, and a payload that starts with a small number parsed as
+  a whole record: a `FINISHED` carrying 3 of its 11 bytes, in the test. The child now
+  stops at the first write that fails, so the parent sees a torn record and fails the
+  attempt.
+- **A PROGRAM task could finish on part of its payload.** The executor took any error
+  writing the program's stdin to mean the program had closed it: it closed stdin and
+  let the program run on what it had, so a program that exits 0 on short input -
+  `cat`, in the test - was reported as a success with its output for part of the
+  payload, from none of it to 94208 of its 98304 bytes. Only the program closing its
+  stdin means that now: `EPIPE` on POSIX, `ERROR_NO_DATA` or `ERROR_BROKEN_PIPE` on
+  Windows. Any other error fails the attempt with `GPTPS_E_IO`, and the program is
+  killed before it sees the end of its input, as an error reading its stdout is
+  handled on both. The Windows change is compiled by CI but not run, since the test
+  is Linux-only.
 
 ### Documentation
 
