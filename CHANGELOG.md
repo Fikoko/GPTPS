@@ -348,6 +348,18 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   times; in ten runs of a Debug build, 151 to 256 saves failed. The counts follow
   scheduling and load. Saves of one engine now take turns, from reading the file to
   renaming its replacement into place.
+- **A failed add-on load could remove what the host registered while it ran, or
+  everything.** The unwind of a failed setup took everything ahead of each list's head,
+  as the head was when the setup began, for the setup's own: task types, observers and
+  constraints. A type, an observer or an admission constraint a host thread registered
+  while the setup ran was removed with it, without a word. If that old head was
+  removed meanwhile, the unwind never met it again and removed every type, observer or
+  constraint in the engine; or, its memory reused by a newer one, it stopped at once
+  and left the failed add-on's in place. It also put back the scheduler it had found,
+  over one the host set meanwhile. Each now records the load that registered it, and
+  the unwind removes exactly those; it puts the scheduler back only if the failed
+  setup was the last to set it. `tests/test_config_strict.c`, with `addon_waiter`
+  given a cue to fail, and an observer, a constraint and a scheduler of its own.
 
 ### Documentation
 

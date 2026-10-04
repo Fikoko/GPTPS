@@ -122,6 +122,7 @@ typedef struct gptps_reg {
     bool               cancelling; /* true => removal is CANCEL: drop in-flight items rather than dead-letter */
     bool               service;    /* true => GPTPS_TASK_SERVICE: supervised long-running instances (restart-on-exit) */
     bool               retire_on_ok;/* service only: a clean GPTPS_OK return retires the instance instead of restarting it */
+    const void        *load_tag;   /* the add-on load whose setup registered it (e->setup_tag), else NULL */
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
     uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
@@ -161,12 +162,14 @@ typedef struct gptps_loaded {
 typedef struct gptps_observer {
     gptps_event_cb         fn;
     void                  *ud;
+    const void            *load_tag;   /* the add-on load whose setup registered it, else NULL */
     struct gptps_observer *next;
 } gptps_observer;
 
 typedef struct gptps_constraint {
     gptps_constraint_fn      fn;
     void                    *ud;
+    const void              *load_tag; /* the add-on load whose setup registered it, else NULL */
     struct gptps_constraint *next;
 } gptps_constraint;
 
@@ -365,6 +368,13 @@ struct gptps {
      * a dangling pointer. 32 bytes is enough by construction: the namespace grammar
      * caps a token at 31 characters. NULL owner / released seam => empty string. */
     char           sched_owner[32];
+    /* The seam as it was before the add-on load that changed it last, if one did
+     * (sched_tag is that load's tag; NULL once anyone else changes it): what a failed
+     * setup puts back - and only then, so a seam the host set meanwhile stays. */
+    const void    *sched_tag;
+    gptps_sched_fn sched_undo_fn;
+    void          *sched_undo_ud;
+    char           sched_undo_owner[32];
 
     /* Namespace enforcement window (ABI 2.1). Set under e->m immediately before an
      * add-on's setup() runs and cleared immediately after. The tid pin means only
@@ -777,6 +787,15 @@ static void intake_resort(gptps *e)
  * `ret` is what the entry point returns to say "engine unusable" for its own type. */
 #define GPTPS_REFUSE_AFTER_FORK(e, ret) \
     do { if ((e)->fork_gen != gptps_hal_fork_generation()) return ret; } while (0)
+
+/* The tag of the add-on load whose setup is running on this thread, or NULL. What
+ * such a setup registers - a task type, an observer, a constraint, a scheduler -
+ * carries it, so that if the setup fails the unwind removes exactly that, and
+ * nothing a host thread registered meanwhile. Caller holds e->m. */
+static const void *setup_tag_here(const gptps *e)
+{
+    return (e->setup_on && e->setup_tid == gptps_hal_thread_id()) ? e->setup_tag : NULL;
+}
 
 /* Find a live (non-tombstoned) task by name. A draining task is logically gone:
  * its name is free to submit-reject / re-register. */
@@ -3345,6 +3364,9 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
     r->priority = 0;
     r->enabled = true;
+    /* Registered by an add-on's setup, on its thread: if that setup fails, this is how
+     * the unwind tells its types from those other threads registered meanwhile. */
+    r->load_tag = setup_tag_here(e);
     r->engine = e;
     apply_task_config(e, name, &r->def, &r->priority); /* config file overrides compiled-in defaults */
     r->service = (svc_flags & GPTPS_TASK_SERVICE) != 0;
@@ -3844,7 +3866,10 @@ gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_na
     return GPTPS_OK;
 }
 
-gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned flags)
+/* gptps_unregister_task, and the unwind of a failed add-on load, which passes its
+ * load's tag: then only a type that load registered is removed - not one a host
+ * thread registered under the same name after removing the add-on's. */
+static gptps_status unregister_task(gptps *e, const char *task_name, unsigned flags, const void *only_tag)
 {
     gptps_reg *r;
     unsigned mode = flags & GPTPS_REMOVE_MODE_MASK;
@@ -3862,6 +3887,7 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
     gptps_mutex_lock(e->m);
     if (e->stopping) { gptps_mutex_unlock(e->m); return GPTPS_E_SHUTDOWN; }
     r = registry_find(e, task_name);
+    if (r && only_tag && r->load_tag != only_tag) r = NULL;
     if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
 
     /* A service's instances run until stopped, so a DRAIN (wait for work to finish)
@@ -4032,6 +4058,11 @@ gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned fla
 
     reg_destroy(r);                           /* settings already removed above */
     return GPTPS_OK;
+}
+
+gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned flags)
+{
+    return unregister_task(e, task_name, flags, NULL);
 }
 
 /* --- generic settings: public entry points --- */
@@ -4474,62 +4505,82 @@ static const gptps_api_routines G_API = {
 };
 
 /* Undo whatever a FAILED addon setup() managed to register before it gave up.
- * Every list the host table can extend is prepend-only, so anything in front of
- * the snapshot head belongs to this setup. Without this, a setup that registered
- * an observer and then returned E_DUP on its second task left a live function
- * pointer on a list the engine walks on the very next event. Matches
- * gptps_unregister_observer's discipline: unlink under e->m, free after. */
-static void addon_unwind(gptps *e, gptps_observer *obs0, gptps_constraint *con0,
-                         gptps_reg *reg0, gptps_sched_fn sched0, void *schedud0,
-                         const char *owner0)
+ * Without this, a setup that registered an observer and then returned E_DUP on its
+ * second task left a live function pointer on a list the engine walks on the very
+ * next event. Matches gptps_unregister_observer's discipline: unlink under e->m,
+ * free after.
+ *
+ * What the setup registered is told by the load's tag, which the setup's thread
+ * stamps on every task type, observer and constraint it registers, and on a
+ * scheduler it sets (setup_tag_here). Host threads may register and unregister while
+ * a setup runs. The unwind used to take everything ahead of each list's head, as the
+ * head was when the setup began, to be the setup's own: an observer, constraint or
+ * task type a host thread registered meanwhile was removed with the add-on's - a
+ * host's admission constraint, a quota, gone without a word - and once that old head
+ * was unregistered, the scan never met it again and removed everything in the list.
+ * It put the scheduler it found back unconditionally too, reverting one the host set
+ * meanwhile. */
+static void addon_unwind(gptps *e, const void *tag)
 {
-    gptps_observer   *odead = NULL;
-    gptps_constraint *cdead = NULL;
+    gptps_observer   *odead = NULL, **op;
+    gptps_constraint *cdead = NULL, **cp;
     gptps_reg *r;
+    gptps_status st;
 
     gptps_mutex_lock(e->m);
-    while (e->observers && e->observers != obs0) {
-        gptps_observer *o = e->observers; e->observers = o->next; o->next = odead; odead = o;
+    for (op = &e->observers; *op; ) {
+        gptps_observer *o = *op;
+        if (o->load_tag != tag) { op = &o->next; continue; }
+        *op = o->next; o->next = odead; odead = o;
     }
-    while (e->constraints && e->constraints != con0) {
-        gptps_constraint *c = e->constraints; e->constraints = c->next; c->next = cdead; cdead = c;
+    for (cp = &e->constraints; *cp; ) {
+        gptps_constraint *c = *cp;
+        if (c->load_tag != tag) { cp = &c->next; continue; }
+        *cp = c->next; c->next = cdead; cdead = c;
     }
-    /* Restore the seam AND its owner label, UNCONDITIONALLY. Restoring only the
-     * function left a live mismatch whenever a scheduler already existed: the
-     * incumbent's fn came back under the FAILED add-on's label, so
-     * gptps_scheduler_owner named an add-on that is not installed, and the real
-     * owner could no longer release its own seam (gptps_set_scheduler_ex's `self`
-     * test compares owner strings, so it saw a stranger and returned E_BUSY). That
-     * is precisely the "two parties, both believe they hold it" failure this seam's
-     * ownership rules exist to eliminate - reintroduced through the failure path. */
-    e->sched_fn = sched0; e->sched_ud = schedud0;
-    if (owner0) { memcpy(e->sched_owner, owner0, sizeof e->sched_owner); }
-    else        { e->sched_owner[0] = '\0'; }
+    /* The seam, if this setup was the last to change it: put back what it found,
+     * function AND owner label. Restoring only the function left a live mismatch
+     * whenever a scheduler already existed: the incumbent's fn came back under the
+     * FAILED add-on's label, so gptps_scheduler_owner named an add-on that is not
+     * installed, and the real owner could no longer release its own seam
+     * (gptps_set_scheduler_ex's `self` test compares owner strings, so it saw a
+     * stranger and returned E_BUSY) - the "two parties, both believe they hold it"
+     * failure this seam's ownership rules exist to eliminate. A seam someone else set
+     * since is theirs, and stays. */
+    if (e->sched_tag == tag) {
+        e->sched_fn = e->sched_undo_fn; e->sched_ud = e->sched_undo_ud;
+        memcpy(e->sched_owner, e->sched_undo_owner, sizeof e->sched_owner);
+        e->sched_tag = NULL;
+        gptps_cond_signal(e->cv_disp);   /* re-evaluate ordering on the next pass */
+    }
     gptps_mutex_unlock(e->m);
 
     while (odead) { gptps_observer   *n = odead->next; gptps_free(odead); odead = n; }
     while (cdead) { gptps_constraint *n = cdead->next; gptps_free(cdead); cdead = n; }
 
     /* Unregister the task types this setup added, one at a time: snapshot the name
-     * of the frontmost new reg under e->m, then unregister it with the lock released
-     * (gptps_unregister_task takes e->m itself), and rescan.
+     * of the oldest one left under e->m, then unregister it with the lock released
+     * (unregister_task takes e->m itself), and rescan.
      *
      * This used to buffer up to 16 names into a fixed array, so an add-on that
      * registered more than that before failing left the surplus types live and
      * submittable while the host had been told the load failed. Rescanning has no
      * cap and needs no allocation, which matters on a path that is often reached
-     * BECAUSE memory ran out. The list is prepend-only, so everything ahead of reg0
-     * belongs to this setup; reg0 itself is never removed, so it stays a valid
-     * stopping point. Bail out if a removal refuses, rather than spinning on it. */
+     * BECAUSE memory ran out. Bail out if a removal refuses, rather than spinning on
+     * it. The removal checks the tag again under the lock, so a type a host thread
+     * registers under the same name, once it has removed the add-on's, stays. */
     for (;;) {
         char name[GPTPS_TASK_NAME_MAX + 1];
+        gptps_reg *mine = NULL;
         gptps_mutex_lock(e->m);
-        r = e->registry;
-        if (!r || r == reg0) { gptps_mutex_unlock(e->m); break; }
-        while (r->next && r->next != reg0) r = r->next;   /* oldest of the new types */
-        snprintf(name, sizeof name, "%s", r->name);
+        for (r = e->registry; r; r = r->next)            /* newest first: the last one found is the oldest */
+            if (r->load_tag == tag && !r->removed) mine = r;
+        if (!mine) { gptps_mutex_unlock(e->m); break; }
+        snprintf(name, sizeof name, "%s", mine->name);
         gptps_mutex_unlock(e->m);
-        if (gptps_unregister_task(e, name, GPTPS_REMOVE_CANCEL) != GPTPS_OK) break;
+        st = unregister_task(e, name, GPTPS_REMOVE_CANCEL, tag);
+        /* NOTFOUND: another thread removed it first - the next scan passes it over */
+        if (st != GPTPS_OK && st != GPTPS_E_NOTFOUND) break;
     }
 }
 
@@ -4616,22 +4667,14 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
     }
 
     if (addon->setup) {
-        /* Snapshot every list setup() can prepend to, so a PARTIAL setup is undone
-         * rather than left live. A failed load is a status a host reasonably logs
-         * and continues past ("running without add-on X"), so it must leave the
-         * engine in a consistent state - not one event away from a wild jump. */
-        gptps_observer   *obs0;
-        gptps_constraint *con0;
-        gptps_reg        *reg0;
-        gptps_sched_fn    sched0;
-        void             *schedud0;
+        /* What setup() registers carries this load's tag, so a PARTIAL setup is
+         * undone rather than left live (addon_unwind). A failed load is a status a
+         * host reasonably logs and continues past ("running without add-on X"), so it
+         * must leave the engine in a consistent state - not one event away from a
+         * wild jump. */
         const void       *tag;          /* this load's: what its setup registers carries it */
-        char              owner0[32];   /* copy: e->sched_owner is a buffer, not a pointer */
 
         gptps_mutex_lock(e->m);
-        obs0 = e->observers; con0 = e->constraints; reg0 = e->registry;
-        sched0 = e->sched_fn; schedud0 = e->sched_ud;
-        memcpy(owner0, e->sched_owner, sizeof owner0);
         /* Open the namespace window, pinned to this thread. */
         e->cur_ns = ns; e->cur_ns_len = ns ? strlen(ns) : 0;
         e->cur_ns_tid = gptps_hal_thread_id();
@@ -4661,7 +4704,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
         cfg_apply_pending(e, "");
 
         if (s != GPTPS_OK) {
-            addon_unwind(e, obs0, con0, reg0, sched0, schedud0, owner0);
+            addon_unwind(e, tag);
             /* An add-on may report WHY it failed through err_out. Surface it - it is
              * the only diagnostic channel a plug-in has, and the header promises it -
              * then free it, since the contract is that the add-on hands ownership over. */
@@ -5161,6 +5204,16 @@ gptps_status gptps_set_scheduler_ex(gptps *e, gptps_sched_fn fn, void *user_data
         int self = (fn == NULL && owner && e->sched_owner[0] && strcmp(owner, e->sched_owner) == 0);
         if (!self) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
     }
+    {   /* An add-on's setup changing it keeps what to put back if that setup fails -
+         * the seam as it was before, unless this load already holds that record. Any
+         * other change makes the seam no load's to put back. */
+        const void *tag = setup_tag_here(e);
+        if (tag && e->sched_tag != tag) {
+            e->sched_undo_fn = e->sched_fn; e->sched_undo_ud = e->sched_ud;
+            memcpy(e->sched_undo_owner, e->sched_owner, sizeof e->sched_undo_owner);
+        }
+        e->sched_tag = tag;
+    }
     e->sched_fn = fn; e->sched_ud = user_data;
     /* Copy, do not borrow - see the field's declaration. */
     if (fn && owner) {
@@ -5204,6 +5257,7 @@ gptps_status gptps_register_observer(gptps *e, gptps_event_cb fn, void *user_dat
     o->fn = fn; o->ud = user_data;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
+    o->load_tag = setup_tag_here(e);    /* an add-on's: undone if its setup fails */
     o->next = e->observers; e->observers = o;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
@@ -5260,6 +5314,7 @@ gptps_status gptps_register_constraint(gptps *e, gptps_constraint_fn fn, void *u
     c->fn = fn; c->ud = user_data;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
+    c->load_tag = setup_tag_here(e);    /* an add-on's: undone if its setup fails */
     c->next = e->constraints; e->constraints = c;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;

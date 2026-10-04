@@ -1166,6 +1166,132 @@ static void test_addon_lifecycle(void)
 #endif
 }
 
+/* A failed setup is undone - the task types, observers and constraints it registered
+ * removed, the scheduler it set put back - and nothing else. The unwind took
+ * everything ahead of each list's head, as the head was when the setup began, to be
+ * the setup's own: a type, observer or constraint a host thread registered while the
+ * setup ran went with it. Once that head was removed meanwhile, the unwind never met
+ * its stopping point and removed every type, observer and constraint in the engine.
+ * And it put back the scheduler it had found, over one the host set meanwhile. */
+static int g_fs_finished, g_fs_other;
+static void fs_obs_a(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_FINISHED) __atomic_add_fetch(&g_fs_finished, 1, __ATOMIC_SEQ_CST);
+    else if (ev->kind == GPTPS_EV_FAILED || ev->kind == GPTPS_EV_DEAD_LETTERED || ev->kind == GPTPS_EV_DROPPED)
+        __atomic_add_fetch(&g_fs_other, 1, __ATOMIC_SEQ_CST);
+}
+static void fs_obs_b(const gptps_event *ev, void *ud) { (void)ev; (void)ud; }
+static void fs_obs_c(const gptps_event *ev, void *ud) { (void)ev; (void)ud; }
+static gptps_admit_decision fs_admit(const gptps_constraint_input *in, uint32_t *r)
+{ (void)in; (void)r; return GPTPS_ADMIT; }
+static gptps_admit_decision fs_con_a(const gptps_constraint_input *in, uint32_t *r, void *ud) { (void)ud; return fs_admit(in, r); }
+static gptps_admit_decision fs_con_b(const gptps_constraint_input *in, uint32_t *r, void *ud) { (void)ud; return fs_admit(in, r); }
+static gptps_admit_decision fs_con_c(const gptps_constraint_input *in, uint32_t *r, void *ud) { (void)ud; return fs_admit(in, r); }
+static int64_t fs_score(const gptps_sched_input *in, void *ud) { (void)ud; return (int64_t)in->priority; }
+static int fs_owner_is(gptps *e, const char *want)
+{
+    const char *o = gptps_scheduler_owner(e);
+    return want ? (o && strcmp(o, want) == 0) : o == NULL;
+}
+/* MANUAL, so that every event fires on this thread, in gptps_step: unregistering an
+ * observer is setup-time, and must not race an engine thread walking the list. */
+static gptps_status fs_open(gptps **e)
+{
+    gptps_config c;
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.limits.struct_size = sizeof c.limits; c.mode = GPTPS_RUN_MANUAL;
+    return gptps_open_ex(&c, e);
+}
+/* Neither the add-on's constraint, which denies probe.denied, nor its observer, which
+ * logs, is there: an item of probe.denied runs, and nobody else hears it. */
+static int fs_addon_gone(gptps *e)
+{
+    uint64_t t0;
+    size_t ran;
+    __atomic_store_n(&g_fs_finished, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_fs_other, 0, __ATOMIC_SEQ_CST);
+    clear_log();
+    if (gptps_submit(e, "probe.denied", NULL, 0, NULL) != GPTPS_OK) return 0;
+    for (t0 = gptps_now_ms(NULL); !__atomic_load_n(&g_fs_finished, __ATOMIC_SEQ_CST) &&
+         !__atomic_load_n(&g_fs_other, __ATOMIC_SEQ_CST) && gptps_now_ms(NULL) - t0 < 5000; )
+        if (gptps_step(e, &ran) != GPTPS_OK) return 0;
+    return __atomic_load_n(&g_fs_finished, __ATOMIC_SEQ_CST) == 1 && __atomic_load_n(&g_fs_other, __ATOMIC_SEQ_CST) == 0 &&
+           !logged("waiter's observer heard");
+}
+static int fs_setup_running(gptps *e)
+{
+    uint64_t t0;
+    for (t0 = gptps_now_ms(NULL); !gptps_task_exists(e, "waiter.started") && gptps_now_ms(NULL) - t0 < 5000; ) { }
+    return gptps_task_exists(e, "waiter.started");
+}
+static void test_failed_setup_undoes_only_its_own(void)
+{
+#if defined(ADDON_WAITER_PATH)
+    gptps *e = NULL;
+    gptps_status loaded = GPTPS_OK;
+    gptps_thread *loader;
+
+    /* The host registers, unregisters and takes the seam while the setup runs. */
+    CHECK(fs_open(&e) == GPTPS_OK);
+    if (!e) return;
+    g_cb_engine = e;
+    CHECK(reg(e, "probe.denied") == GPTPS_OK);
+    CHECK(reg(e, "keep") == GPTPS_OK);
+    CHECK(reg(e, "head") == GPTPS_OK);                       /* the head as the setup begins */
+    CHECK(gptps_register_observer(e, fs_obs_a, NULL) == GPTPS_OK);
+    CHECK(gptps_register_observer(e, fs_obs_b, NULL) == GPTPS_OK);                /* the head */
+    CHECK(gptps_register_constraint(e, fs_con_a, NULL) == GPTPS_OK);
+    CHECK(gptps_register_constraint(e, fs_con_b, NULL) == GPTPS_OK);              /* the head */
+    CHECK(gptps_set_scheduler_ex(e, fs_score, NULL, "host", 0) == GPTPS_OK);     /* the setup finds it taken */
+    loader = gptps_thread_start(load_waiter, &loaded);
+    CHECK(loader != NULL);
+    CHECK(fs_setup_running(e));
+    CHECK(fs_owner_is(e, "host"));                           /* it asked for the seam, and was refused */
+    CHECK(reg(e, "mine") == GPTPS_OK);                       /* the host's, meanwhile */
+    CHECK(gptps_unregister_task(e, "head", GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);
+    CHECK(gptps_register_observer(e, fs_obs_c, NULL) == GPTPS_OK);
+    CHECK(gptps_unregister_observer(e, fs_obs_b, NULL) == GPTPS_OK);
+    CHECK(gptps_register_constraint(e, fs_con_c, NULL) == GPTPS_OK);
+    CHECK(gptps_unregister_constraint(e, fs_con_b, NULL) == GPTPS_OK);
+    CHECK(gptps_set_scheduler_ex(e, fs_score, NULL, "host2", GPTPS_SCHED_REPLACE) == GPTPS_OK);
+    CHECK(reg(e, "host.fail") == GPTPS_OK);                  /* its cue to give up */
+    if (loader) gptps_thread_join(loader);
+    CHECK(loaded == GPTPS_E_TASK);
+    CHECK(!gptps_task_exists(e, "waiter.started"));          /* its own type is undone */
+    CHECK(gptps_task_exists(e, "mine"));                     /* was removed with it */
+    CHECK(gptps_task_exists(e, "host.fail"));                /* so was this */
+    CHECK(gptps_task_exists(e, "keep"));                     /* and this, older than the load */
+    CHECK(fs_owner_is(e, "host2"));                          /* was "host" again */
+    CHECK(fs_addon_gone(e));
+    CHECK(gptps_unregister_observer(e, fs_obs_c, NULL) == GPTPS_OK);      /* was removed with its own */
+    CHECK(gptps_unregister_observer(e, fs_obs_a, NULL) == GPTPS_OK);      /* so was this, older than the load */
+    CHECK(gptps_unregister_constraint(e, fs_con_c, NULL) == GPTPS_OK);    /* and these */
+    CHECK(gptps_unregister_constraint(e, fs_con_a, NULL) == GPTPS_OK);
+    gptps_shutdown(e);
+
+    /* The host does nothing meanwhile: the seam the setup took is put back as it was. */
+    e = NULL;
+    loaded = GPTPS_OK;
+    CHECK(fs_open(&e) == GPTPS_OK);
+    if (!e) return;
+    g_cb_engine = e;
+    CHECK(reg(e, "probe.denied") == GPTPS_OK);
+    CHECK(gptps_register_observer(e, fs_obs_a, NULL) == GPTPS_OK);
+    loader = gptps_thread_start(load_waiter, &loaded);
+    CHECK(loader != NULL);
+    CHECK(fs_setup_running(e));
+    CHECK(fs_owner_is(e, "waiter"));                         /* it took the seam */
+    CHECK(reg(e, "host.fail") == GPTPS_OK);
+    if (loader) gptps_thread_join(loader);
+    CHECK(loaded == GPTPS_E_TASK);
+    CHECK(fs_owner_is(e, NULL));
+    CHECK(fs_addon_gone(e));
+    CHECK(gptps_unregister_observer(e, fs_obs_a, NULL) == GPTPS_OK);
+    gptps_shutdown(e);
+#endif
+}
+
 static gptps *g_wl_engine;
 static int g_wl_stop;
 static void noop_watch(const char *k, const char *v, void *u) { (void)k; (void)v; (void)u; }
@@ -1381,6 +1507,7 @@ int main(void)
     test_submit_from_write();
     test_callback_mark();
     test_addon_lifecycle();
+    test_failed_setup_undoes_only_its_own();
     test_watch_while_setting();
     test_save_placement();
     test_parser_edges();
