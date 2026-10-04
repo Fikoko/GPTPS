@@ -253,20 +253,43 @@ static void entry_free(toml_entry *e)
     if (e->arr) { for (j = 0; j < e->arrn; ++j) gptps_free(e->arr[j]); gptps_free(e->arr); }
 }
 
+void gptps_toml_key_shown(const char *section, const char *key, char *buf, size_t cap)
+{
+    size_t sl = strlen(section), off = sl ? sl + 1 : 0, n = off + strlen(key), i, k = 0, head, tail;
+#define KEY_AT(p) ((p) < sl ? section[p] : (p) < off ? '.' : key[(p) - off])
+    if (!cap) return;
+    if (n < cap || cap < 8) {                       /* whole, or as much as a tiny buffer holds */
+        for (i = 0; i < n && i + 1 < cap; ++i) buf[i] = KEY_AT(i);
+        buf[i] = 0;
+        return;
+    }
+    head = (cap - 4) / 2; tail = cap - 4 - head;    /* "..." and the NUL */
+    for (i = 0; i < head; ++i) buf[k++] = KEY_AT(i);
+    buf[k++] = '.'; buf[k++] = '.'; buf[k++] = '.';
+    for (i = n - tail; i < n; ++i) buf[k++] = KEY_AT(i);
+    buf[k] = 0;
+#undef KEY_AT
+}
+
 /* Parse the value text `val` into a fresh entry, `dotted` being its key as the loader
- * looks it up. 0 on success; -1 with errbuf set. */
+ * looks it up. 0 on success; -1 with errbuf set. A message names the key, its middle
+ * left out when it is long: printed whole, a key of some 560 bytes or more filled the
+ * line's buffer, and what was wrong with it - "is set twice (first on line 3)" - was
+ * cut off. */
 static int parse_dotted_value(struct gptps_toml *t, const char *section, const char *key,
-                              const char *dotted, char *val, int line, char *errbuf, size_t errlen)
+                              const char *full, char *val, int line, char *errbuf, size_t errlen)
 {
     toml_entry tmp, *e;
     const toml_entry *dup;
     const char *why;
+    char dotted[GPTPS_TOML_SHOWN];
+    gptps_toml_key_shown("", full, dotted, sizeof dotted);
     memset(&tmp, 0, sizeof tmp);
     tmp.line = line;
     val = trim(val);
     if (!*val) return fail(errbuf, errlen, t->path, line, "%s: missing value after =", dotted);
     /* Set twice, however it is spelled: [a.b] c = 1 and [a] "b.c" = 2 are one key. */
-    if ((dup = find_dotted(t, dotted)) != NULL)
+    if ((dup = find_dotted(t, full)) != NULL)
         return fail(errbuf, errlen, t->path, line, "%s is set twice (first on line %d)", dotted, dup->line);
 
     if (val[0] == '"') {                                  /* "string" */

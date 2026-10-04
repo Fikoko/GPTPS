@@ -1537,6 +1537,10 @@ static void test_save_refused(void)
     remove(FRESH);
 }
 
+static char g_edge[64];
+static size_t edge_rd(void *t, char *b, size_t c) { (void)t; return (size_t)snprintf(b, c, "%s", g_edge); }
+static gptps_status edge_wr(void *t, const char *v) { (void)t; snprintf(g_edge, sizeof g_edge, "%s", v); return GPTPS_OK; }
+
 static void test_parser_edges(void)
 {
     static const struct { const char *esc, *bytes; } UTF8[] = {
@@ -1595,26 +1599,57 @@ static void test_parser_edges(void)
     refused(text, CFG ":1: the table name is too long");
     /* a key set twice at the top level, not only in a table */
     refused("x = 1\nx = 2\n", CFG ":2: x is set twice (first on line 1)");
-    /* Keys past 511 bytes are compared whole. The check used to cut the new key to 511
-     * bytes: the same 600-byte key twice was taken, and a 600-byte key after the
-     * 511-byte key it starts with was refused as that key set twice. */
+    /* Keys past 511 bytes are compared whole (test_toml.c holds the parser to that).
+     * A key set twice is named with its middle left out, so the message still says
+     * what is wrong: printed whole, a 600-byte key filled the line's buffer and cut off
+     * "is set twice". And a key the engine cannot hold whole is refused: none of the
+     * settings it makes has one longer than 383 bytes, and cut to that, it matched a
+     * setting it only starts with. */
     {
-        static char big[1300], k600[601], k599x[601], k511[512];
+        static char big[1300], k600[601], k511[512], want[300];
         memset(k600, 'k', 600); k600[600] = 0;
-        memcpy(k599x, k600, sizeof k599x); k599x[599] = 'x';
         memcpy(k511, k600, 511); k511[511] = 0;
         snprintf(big, sizeof big, "%s = 1\n%s = 2\n", k600, k600);
-        refused(big, CFG ":2: kkkkkkkk");       /* the message, cut short, names the line */
+        snprintf(want, sizeof want, CFG ":2: %.78s...%.78s is set twice (first on line 1)", k600, k600);
+        refused(big, want);
         snprintf(big, sizeof big, "%s = 1\n%s = 2\n", k511, k600);
-        put(CFG, big);
-        clear_log();
-        CHECK(gptps_open(CFG, &e) == GPTPS_OK);                /* two keys, both waiting */
-        if (!e) printf("%s", g_log);
-        if (e) { gptps_shutdown(e); e = NULL; }
-        snprintf(big, sizeof big, "%s = 1\n%s = 2\n", k600, k599x);
-        put(CFG, big);
-        CHECK(gptps_open(CFG, &e) == GPTPS_OK);                /* the last byte tells them apart */
-        if (e) { gptps_shutdown(e); e = NULL; }
+        snprintf(want, sizeof want, CFG ":1: %.78s...%.78s: the key is 511 bytes long - a file may set one "
+                 "of at most 383", k600, k600);
+        refused(big, want);
+        snprintf(want, sizeof want, CFG ":2: %.78s...%.78s: the key is 600 bytes long", k600, k600);
+        CHECK(logged(want));
+        CHECK(!logged("is set twice"));
+    }
+    {   /* at the edge: a host's 383-byte key takes the file's value, and a key that only
+         * starts with it - 387 bytes - is refused, at a reload too, and changes nothing */
+        static char hkey[400], file[1000], lkey[400];
+        gptps_setting_def d;
+        memset(hkey, 'a', sizeof hkey);
+        memcpy(hkey, "app.", 4); hkey[383] = 0;
+        memcpy(lkey, hkey, 383); memcpy(lkey + 383, "zzzz", 5);
+        put(CFG, "[scheduler]\nreserve_after_skips = 4\n");
+        CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+        if (e) {
+            memset(&d, 0, sizeof d);
+            d.struct_size = sizeof d; d.key = hkey; d.type = GPTPS_SETTING_STRING; d.hot = 1;
+            d.read = edge_rd; d.write = edge_wr;
+            snprintf(g_edge, sizeof g_edge, "unset");
+            CHECK(gptps_register_setting(e, &d) == GPTPS_OK);
+            snprintf(file, sizeof file, "[scheduler]\nreserve_after_skips = 4\n[app]\n%s = \"far\"\n", lkey + 4);
+            put(CFG, file);
+            clear_log();
+            CHECK(gptps_settings_reload(e, NULL) == GPTPS_E_CONFIG);
+            CHECK(logged("the key is 387 bytes long"));
+            CHECK(strcmp(g_edge, "unset") == 0);                  /* not the value of another key */
+            snprintf(file, sizeof file, "[scheduler]\nreserve_after_skips = 4\n[app]\n%s = \"near\"\n", hkey + 4);
+            put(CFG, file);
+            CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);   /* 383 bytes: whole, and taken */
+            CHECK(strcmp(g_edge, "near") == 0);
+            gptps_shutdown(e); e = NULL;
+        }
+        snprintf(file, sizeof file, "[app]\n%s = \"far\"\n", lkey + 4);
+        refused(file, CFG ":2: app.aaaa");                         /* and at open */
+        CHECK(logged("the key is 387 bytes long"));
     }
     /* a line with no key, said two ways */
     refused("= 1\n", CFG ":1: missing key before =");

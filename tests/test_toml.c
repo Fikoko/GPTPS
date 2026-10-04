@@ -251,6 +251,47 @@ static void test_why_it_failed(void)
     remove(WHY_PATH);
 }
 
+/* Long keys: compared whole when the parser looks for one set twice, and named in a
+ * message with their middle left out (gptps_toml_key_shown), so the message keeps what
+ * follows the key. */
+static void test_long_keys(void)
+{
+    static char text[1400], k600[601], k599x[601], k511[512], want[300];
+    char err[1024], buf[GPTPS_TOML_SHOWN], tiny[6];
+    gptps_toml *t;
+    memset(k600, 'k', 600); k600[600] = 0;
+    memcpy(k599x, k600, sizeof k599x); k599x[599] = 'x';
+    memcpy(k511, k600, 511); k511[511] = 0;
+
+    snprintf(text, sizeof text, "%s = 1\n%s = 2\n", k511, k600);       /* a key, and a longer one */
+    t = gptps_toml_parse_text("long.toml", text, err, sizeof err, NULL);
+    CHECK(t != NULL && gptps_toml_count(t) == 2);
+    gptps_toml_free(t);
+    snprintf(text, sizeof text, "%s = 1\n%s = 2\n", k600, k599x);      /* the last byte tells them apart */
+    t = gptps_toml_parse_text("long.toml", text, err, sizeof err, NULL);
+    CHECK(t != NULL && gptps_toml_count(t) == 2);
+    gptps_toml_free(t);
+    snprintf(text, sizeof text, "%s = 1\n%s = 2\n", k600, k600);       /* the same one twice */
+    t = gptps_toml_parse_text("long.toml", text, err, sizeof err, NULL);
+    CHECK(t == NULL);
+    gptps_toml_free(t);
+    snprintf(want, sizeof want, "long.toml:2: %.78s...%.78s is set twice (first on line 1)", k600, k600);
+    CHECK(strstr(err, want) != NULL);
+
+    gptps_toml_key_shown("tasks.a", "b", buf, sizeof buf);               /* whole when it fits */
+    CHECK(strcmp(buf, "tasks.a.b") == 0);
+    gptps_toml_key_shown("", "x", buf, sizeof buf);
+    CHECK(strcmp(buf, "x") == 0);
+    k600[0] = 'A'; k600[599] = 'Z';
+    gptps_toml_key_shown("sec", k600, buf, sizeof buf);                  /* its ends, around "..." */
+    CHECK(strlen(buf) == sizeof buf - 1);
+    CHECK(strncmp(buf, "sec.Akkk", 8) == 0 && strstr(buf, "...") != NULL);
+    CHECK(buf[sizeof buf - 2] == 'Z' && buf[sizeof buf - 3] == 'k');
+    gptps_toml_key_shown("sec", k600, tiny, sizeof tiny);               /* a buffer too small to elide */
+    CHECK(strcmp(tiny, "sec.A") == 0);
+    k600[0] = 'k'; k600[599] = 'k';
+}
+
 /* strip_comment() used to flip its in-string flag on the ESCAPED quote of
  * `"a\"b#c"`, conclude the following '#' started a comment and cut the line there.
  * The value came back as `a`: silent truncation of any string carrying an escaped
@@ -428,6 +469,7 @@ int main(void)
     /* 1.1.0 config hardening (each pins a fix that shipped with its own repro) */
     test_dir_as_config_path();
     test_why_it_failed();
+    test_long_keys();
     test_comment_escapes();
     test_limits_range();
     test_open_ex_reads_its_file();

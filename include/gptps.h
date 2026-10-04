@@ -1149,7 +1149,8 @@ GPTPS_API gptps_status gptps_settings_set_ex(gptps *e, const char *key, const ch
 
 /* Config file check. A config file is validated as it is read:
  * gptps_open / gptps_open_ex fail with GPTPS_E_CONFIG on a line that does not parse,
- * a value out of range or of the wrong type, or a key no engine-owned table has -
+ * a value out of range or of the wrong type, a key no engine-owned table has, or a
+ * key longer than 383 bytes, which a file cannot set -
  * and log each problem, naming the file, the line and the key, through the log sink.
  * Memory that runs out reading or applying the file is not a mistake in it: the open
  * fails with GPTPS_E_NOMEM, and the open made again says what else there was.

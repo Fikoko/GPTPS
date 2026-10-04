@@ -162,6 +162,11 @@ void        gptps_toml_claim_at(gptps_toml *t, size_t i);
 int         gptps_toml_refused_at(const gptps_toml *t, size_t i);
 void        gptps_toml_refuse_at(gptps_toml *t, size_t i);
 void        gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap);
+/* section + "." + key (just key when section is ""), for a message: whole if it fits
+ * `cap`, else its start and its end with "..." between, so what follows the key in
+ * the message is not cut off. GPTPS_TOML_SHOWN is the size the messages use. */
+#define GPTPS_TOML_SHOWN 160
+void        gptps_toml_key_shown(const char *section, const char *key, char *buf, size_t cap);
 long        gptps_toml_find_dotted(const gptps_toml *t, const char *dotted);   /* -1 if none */
 /* What a value is, as the file wrote it: the loader holds it to its setting's type. */
 typedef enum { GPTPS_TOML_INT, GPTPS_TOML_FLOAT, GPTPS_TOML_BOOL, GPTPS_TOML_STRING, GPTPS_TOML_ARRAY } gptps_toml_kind;

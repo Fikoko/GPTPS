@@ -685,6 +685,19 @@ EINVAL, and checks a directory the process may write but not read (mode 0300).
   copies kept; and a key that began with an earlier key of exactly 511 bytes was
   refused as that key set twice. The key is now compared whole.
   `tests/test_config_strict.c`.
+- **A key past 383 bytes was applied to the setting its first 383 bytes name.** The
+  engine copied each key of the file into a 384-byte buffer to apply it, cutting a
+  longer one; `app.<379 bytes>zzzz = "far"` set the host's setting
+  `app.<379 bytes>`. No setting the engine makes has a longer key. Such a key is now
+  refused, before anything reads the file's keys: `gptps_open` fails on it, a reload
+  reports it and leaves the setting alone, and a save to a new path leaves it out. A
+  host setting with a longer key can be set live, not from a file.
+  `tests/test_config_strict.c` tries both sides of the edge, at open and at a reload.
+- **The parser's message about a long key lost its end.** A key of some 560 bytes or
+  more filled the 600-byte line the message is built in, so "is set twice (first on
+  line 3)", or whatever else was wrong, was cut off. The parser and the long-key check
+  now name such a key by its first and last 78 bytes with `...` between.
+  `tests/test_toml.c`, `tests/test_config_strict.c`.
 - **A save to a new path could write values the engine had refused.** A reload
   applies what it can of its file and installs the file, refused values too. A save to
   a new path copies that file, and so copied them, to be refused again wherever the

@@ -2671,9 +2671,11 @@ fail:
  * refused. */
 
 /* One entry, copied out of the file: a reload may swap and free the file while a
- * value from it is being applied. */
+ * value from it is being applied. Its key always fits: a longer one is refused before
+ * any entry is copied out (cfg_refuse_long_keys). */
+#define CFG_KEY_MAX 384           /* a key's bytes, with its NUL; no setting's key is longer */
 typedef struct {
-    char key[384];
+    char key[CFG_KEY_MAX];
     char text[GPTPS_SETTINGS_VALUE_MAX];
     char path[256];
     int  line;
@@ -2987,6 +2989,35 @@ static void cfg_refuse(gptps *e, gptps_toml *t, const cfg_item *it)
     gptps_mutex_lock(e->m);
     gptps_toml_refuse_at(t, it->index);
     gptps_mutex_unlock(e->m);
+}
+
+/* A key the engine cannot hold whole, refused before anything looks at the file's keys
+ * by their names: cut to fit a cfg_item, it matched any setting whose key it starts
+ * with, and a value meant for one key was applied to another. The settings the engine
+ * makes for a task or a resource are built in buffers of this size, so none has a
+ * longer key; a host's could, and a file cannot set it. Claimed, so no later pass
+ * reads it, and refused, so a save that copies the file leaves it out. Returns the
+ * number refused, each one logged. */
+static unsigned cfg_refuse_long_keys(gptps *e, gptps_toml *t)
+{
+    unsigned bad = 0;
+    size_t i, n = gptps_toml_count(t);
+    for (i = 0; i < n; ++i) {
+        const char *sec = gptps_toml_section_at(t, i), *key = gptps_toml_key_at(t, i);
+        size_t len = (*sec ? strlen(sec) + 1 : 0) + strlen(key);
+        char shown[GPTPS_TOML_SHOWN], msg[GPTPS_TOML_SHOWN + 400];
+        cfg_item it;
+        if (len < CFG_KEY_MAX || cfg_claimed(e, t, i)) continue;
+        cfg_claim(e, t, i);
+        cfg_item_at(t, i, &it);
+        cfg_refuse(e, t, &it);
+        gptps_toml_key_shown(sec, key, shown, sizeof shown);
+        snprintf(msg, sizeof msg, "config %s:%d: %s: the key is %lu bytes long - a file may set one of "
+                 "at most %d", it.path, it.line, shown, (unsigned long)len, CFG_KEY_MAX - 1);
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+        ++bad;
+    }
+    return bad;
 }
 
 /* Apply a parsed file to a live engine - at open, after cfg_open_keys took the keys
@@ -3381,6 +3412,7 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
     e = *out_engine;
     e->toml = t;                         /* retained for register-time task overrides */
     e->cfg_opening = 1;                  /* no other thread has the engine yet */
+    bad += cfg_refuse_long_keys(e, t);   /* before an add-on's setup applies the file's values */
 
     /* top-level addons = ["lib1.so", ...]. One that does not load fails the open,
      * like any other mistake in the file: an add-on is a policy carrier (a
@@ -4785,7 +4817,8 @@ gptps_status gptps_settings_reload(gptps *e, const char *path)
     e->cfg_late_errors = 0;              /* the old file's: this one replaces it */
     gptps_mutex_unlock(e->m);
     in = cb_enter(e);                    /* runs host write accessors */
-    bad = cfg_apply(e, t, 0, &oom);      /* the same checks as at open, and as a live set */
+    bad = cfg_refuse_long_keys(e, t);
+    bad += cfg_apply(e, t, 0, &oom);     /* the same checks as at open, and as a live set */
     cb_leave(in);
     gptps_mutex_lock(e->m);              /* swap so future task registrations see it */
     old = e->toml; e->toml = t; e->toml_gen += 1; e->toml_reloading = 0;
