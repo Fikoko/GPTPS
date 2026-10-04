@@ -9,10 +9,8 @@ the release version and is documented in `include/gptps.h`.
 
 ### Upgrading from 1.5
 
-Four changes can need a change in a host. The first three are about the config file:
-
-Six changes can need a change in a host. The first three are about the config file,
-the last three about the `durable_queue` add-on:
+Nine changes can need a change in a host. The first three are about the config file,
+the last four about the `durable_queue` add-on:
 
 - **A config file with a mistake in it fails `gptps_open`.** 1.5 used what it
   understood and dropped the rest without a word: a misspelt key, a line it could not
@@ -80,6 +78,19 @@ the last three about the `durable_queue` add-on:
   cannot be synced at all - one the process may write but not read, or on a file
   system with no fsync for a directory - is not a failure: there the queue carries on
   as 1.5 did.
+- **`gptps_dq_open` treats two more kinds of record as damage, and `GPTPS_E_FULL` from
+  a durable submit has a second meaning.** A record that verifies but that no writer
+  makes - a submitted record numbered at or below one before it, or any record
+  numbered past 2^63-1 - is skipped, the journal copied aside and a warning logged, as
+  for other damage; 1.5 applied it, and lost other records' verdicts (see "Fixed").
+  A journal holding a record or marker numbered exactly 2^63-1 leaves the queue no
+  number to give: `gptps_dq_submit` and `gptps_dq_submit_batch` return `GPTPS_E_FULL`
+  and write nothing, for as long as that queue is open, and the open logs a warning.
+  1.5 numbered on past it. From these calls `GPTPS_E_FULL` otherwise means what it
+  means from `gptps_submit` - a bounded engine with every item in use, or the intake
+  full - which a retry can get past. The new one lasts, so a host that retries on
+  `GPTPS_E_FULL` should bound its retries. Only a damaged journal gets there; an open
+  after that record has closed and been compacted away clears it.
 
 ### Added — bounded mode: no allocation once work starts (ABI 2.4)
 
@@ -588,6 +599,33 @@ first run here. Without the first, it passed 10 plain runs, and failed 3 of 3 wi
 passed 4 of 4 that way.
 The test also runs the workload with every fsync of the directory failing with
 EINVAL, and checks a directory the process may write but not read (mode 0300).
+
+### Fixed — found by fuzzing the code that reads files
+
+- **`durable_queue`: a record numbered 2^64-1 crashed a submit, or kept its record
+  from closing.** Replay set the next record number one past the highest it read,
+  which wrapped to 0. The next `gptps_dq_submit` took 0 and appended it after the
+  higher numbers, though the binary search that finds a record by its number needs
+  them rising. With two or more records in the table - a 60-byte journal of records 1
+  and 2^64-1 is enough - the submit could not find the record it had just added, and
+  wrote through NULL: the first start that submitted anything crashed, and the record
+  it had written stood out of order (see the next entry). A stray marker at that
+  number, which no record had, did the same. With one record, at 2^64-1, a submit
+  before its verdict made the search miss that record instead: its verdict closed
+  nothing, and it ran again at the next start. A record numbered past 2^63-1, which
+  no writer reaches, is now damage: skipped, preserved and reported like any other.
+  A record or marker at exactly 2^63-1 leaves no number to give, so a submit returns
+  `GPTPS_E_FULL` (see "Upgrading from 1.5"). `tests/test_durable.c`, case I.
+- **`durable_queue`: a record numbered at or below the one before it lost other
+  records' verdicts.** Replay applied every record that verified, whatever its number;
+  only a resync after damage held a 'P' to the rising order every writer appends in,
+  and the binary search relies on. One out of order - a stale block a file system
+  exposes after a crash, or the record the crash above left - hid records from the
+  search, before it as well as after it. Their verdicts closed nothing: finished work
+  ran again at the next start, and a dead-lettered record was not quarantined, and
+  ran and failed again there. In `P1 P7 P2` the search lost record 2, or, once a
+  submit had added record 8, record 7. Such a record is now damage too.
+  `tests/test_durable.c`, case I.
 
 ### Documentation
 

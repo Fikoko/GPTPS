@@ -22,6 +22,8 @@
  *      reported, and the original is preserved; a torn tail is dropped silently.
  *   H) journaling does not stall the engine, and every acknowledged submit survives
  *      a SIGKILL in the middle of concurrent submits and compactions.
+ *   I) a record no writer makes - numbered past 2^63, or a 'P' at or below one
+ *      before it - is damage, and the queue's numbers stop at 2^63-1 (GPTPS_E_FULL).
  *
  * Every phase fully shuts down (joining all engine threads) before a fork, so the
  * fork happens from a single-threaded process.
@@ -1074,6 +1076,243 @@ static void test_resubmit_cb(void)
     remove(JOURNAL_C);
 }
 
+/* I) Records no writer makes. A writer numbers each record one above the last, from
+ * 1, so no record it writes is numbered near 2^63, and no 'P' at or below one before
+ * it. Replay applied such records anyway, and find_by_seq's binary search, which needs
+ * the table in rising order, then lost records:
+ *   - a record at 2^64-1 set the next number to 2^64-1 + 1, which wrapped to 0. With
+ *     two or more records in the table, the next submit could not find the record it
+ *     had just added at 0 and wrote through NULL; with one, the record at 2^64-1 was
+ *     the one the search lost, and its verdict closed nothing;
+ *   - in P1 P7 P2, the search lost record 2 - and once a submit added 8, record 7.
+ * Each such record is now damage: skipped, preserved, reported. The journals are
+ * written by hand. Every record is task "work" with a one-byte payload, its tag. */
+#define JOURNAL_D "dq_test_d.journal"
+#define SEQ_TOP   0xFFFFFFFFFFFFFFFFull     /* 2^64-1 */
+#define SEQ_MAX   0x7FFFFFFFFFFFFFFFull     /* 2^63-1: the highest a record may carry */
+#define REC_D     (8 + 29)                  /* the file header, and one such record */
+
+typedef struct { char type; uint64_t seq; unsigned char tag; } jspec;
+
+static void write_d(const jspec *r, int n)
+{
+    FILE *f;
+    int i;
+    remove(JOURNAL_D);
+    f = jopen(JOURNAL_D); CHECK(f != NULL); if (!f) return;
+    for (i = 0; i < n; ++i) {
+        if (r[i].type == 'P') jrec(f, 'P', r[i].seq, "work", &r[i].tag, 1);
+        else                  jrec(f, r[i].type, r[i].seq, "", NULL, 0);   /* a marker */
+    }
+    fclose(f);
+}
+static gptps *open_d(gptps_dq **out)
+{
+    gptps *e = open_manual_depth(0);
+    *out = NULL;
+    CHECK(e != NULL); if (!e) return NULL;
+    *out = gptps_dq_open(e, JOURNAL_D); CHECK(*out != NULL);
+    if (!*out) { gptps_shutdown(e); return NULL; }
+    return e;
+}
+static void step_all(gptps *e) { size_t ran = 0; while (gptps_step(e, &ran) == GPTPS_OK && ran) { } }
+/* Every copy a damaged JOURNAL_D can leave. One an earlier run left would be taken for
+ * this run's: a copy identical to the journal is not made again. */
+static void remove_copies_d(void)
+{
+    char p[64];
+    int k;
+    snprintf(p, sizeof p, "%s.corrupt", JOURNAL_D); remove(p);
+    for (k = 1; k <= 9; ++k) { snprintf(p, sizeof p, "%s.corrupt.%d", JOURNAL_D, k); remove(p); }
+}
+
+/* The next start: nothing pending, nothing damaged. A record whose verdict closed
+ * nothing would come back here, and the tag it carries is named. */
+static void next_start_clean(int warns_before)
+{
+    gptps *e; gptps_dq *dq;
+    g_nr = 0;
+    e = open_d(&dq);
+    if (!e) return;
+    CHECK(g_warns == warns_before);
+    CHECK(gptps_dq_set_resubmit_cb(dq, resub_cb, NULL) == GPTPS_OK);
+    CHECK(gptps_dq_recover(dq) == 0);
+    if (g_nr) printf("  the record tagged %d stayed pending\n", g_rp[0]);
+    CHECK(g_nr == 0);
+    gptps_shutdown(e); gptps_dq_close(dq);
+}
+
+static void test_records_no_writer_makes(void)
+{
+    gptps *e; gptps_dq *dq; gptps_handle h; gptps_dq_item it[2];
+    unsigned char t3 = 3, t4 = 4;
+    char copy[64];
+    snprintf(copy, sizeof copy, "%s.corrupt", JOURNAL_D);
+    remove_copies_d();
+    __atomic_store_n(&g_block, 0, __ATOMIC_SEQ_CST);
+    gptps_set_log_sink(warn_sink, NULL);
+
+    /* 1. Two records, the second at 2^64-1. The submit wrote through NULL. */
+    {
+        static const jspec J[] = { { 'P', 1, 1 }, { 'P', SEQ_TOP, 2 } };
+        write_d(J, 2);
+        g_warns = 0; reset_ran();
+        e = open_d(&dq);
+        if (e) {
+            CHECK(gptps_dq_pending(dq) == 1);
+            CHECK(g_warns == 1 && strstr(g_warn, "skipped") != NULL);
+            CHECK(file_size(copy) == REC_D + 29);                /* the original, kept */
+            CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_OK);
+            CHECK(gptps_dq_recover(dq) == 1);
+            step_all(e);
+            CHECK(get(&g_ran[1]) == 1 && get(&g_ran[2]) == 0 && get(&g_ran[3]) == 1);
+            CHECK(gptps_dq_pending(dq) == 0);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        next_start_clean(1);
+        remove_copies_d();
+    }
+
+    /* 2. One record, at 2^64-1: no crash, but its verdict closed nothing, so it ran
+     * again at every start. */
+    {
+        static const jspec J[] = { { 'P', SEQ_TOP, 2 } };
+        write_d(J, 1);
+        g_warns = 0; reset_ran();
+        e = open_d(&dq);
+        if (e) {
+            CHECK(gptps_dq_pending(dq) == 0);
+            CHECK(g_warns == 1);
+            CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_OK);
+            (void)gptps_dq_recover(dq);
+            step_all(e);
+            CHECK(get(&g_ran[2]) == 0 && get(&g_ran[3]) == 1);
+            CHECK(gptps_dq_pending(dq) == 0);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        next_start_clean(1);
+        remove_copies_d();
+    }
+
+    /* 3. A stray marker at 2^64-1, after two records. The open's compaction drops the
+     * marker, so only a submit in the same run as that open met it - which fuzzing a
+     * journal, run after it was compacted, does not reach. */
+    {
+        static const jspec J[] = { { 'P', 1, 1 }, { 'P', 2, 2 }, { 'D', SEQ_TOP, 0 } };
+        write_d(J, 3);
+        g_warns = 0; reset_ran();
+        e = open_d(&dq);
+        if (e) {
+            CHECK(gptps_dq_pending(dq) == 2);
+            CHECK(g_warns == 1);
+            CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_OK);
+            CHECK(gptps_dq_recover(dq) == 2);
+            step_all(e);
+            CHECK(get(&g_ran[1]) == 1 && get(&g_ran[2]) == 1 && get(&g_ran[3]) == 1);
+            CHECK(gptps_dq_pending(dq) == 0);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        next_start_clean(1);
+        remove_copies_d();
+    }
+
+    /* 4. A record at 2^63-1, the highest number allowed, is a record: it runs and
+     * closes. Its number is the last there is, so a submit or a batch now returns
+     * GPTPS_E_FULL, writing nothing - until an open reads a journal without it. The
+     * open says so. */
+    {
+        static const jspec J[] = { { 'P', 1, 1 }, { 'P', SEQ_MAX, 2 } };
+        write_d(J, 2);
+        g_warns = 0; reset_ran();
+        e = open_d(&dq);
+        if (e) {
+            long size = file_size(JOURNAL_D);
+            CHECK(gptps_dq_pending(dq) == 2);
+            CHECK(g_warns == 1 && strstr(g_warn, "GPTPS_E_FULL") != NULL);
+            CHECK(file_size(copy) < 0);                         /* not damage */
+            CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_E_FULL);
+            memset(it, 0, sizeof it);
+            it[0].task_name = "work"; it[0].payload = &t3; it[0].len = 1;
+            CHECK(gptps_dq_submit_batch(dq, it, 1) == GPTPS_E_FULL && it[0].status == GPTPS_E_FULL);
+            CHECK(file_size(JOURNAL_D) == size);              /* nothing written */
+            CHECK(gptps_dq_recover(dq) == 2);
+            step_all(e);
+            CHECK(get(&g_ran[1]) == 1 && get(&g_ran[2]) == 1 && get(&g_ran[3]) == 0);
+            CHECK(gptps_dq_pending(dq) == 0);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        e = open_d(&dq);            /* its markers are still in the journal this open reads */
+        if (e) {
+            CHECK(g_warns == 2);
+            CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_E_FULL);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        e = open_d(&dq);            /* ...and gone from the one it compacted */
+        if (e) {
+            CHECK(g_warns == 2);
+            CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_OK);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        remove_copies_d();
+    }
+
+    /* 5. One number left: a batch of two does not fit, a batch of one does, and then
+     * nothing more. */
+    {
+        static const jspec J[] = { { 'P', SEQ_MAX - 1, 1 } };
+        write_d(J, 1);
+        g_warns = 0; reset_ran();
+        e = open_d(&dq);
+        if (e) {
+            memset(it, 0, sizeof it);
+            it[0].task_name = "work"; it[0].payload = &t3; it[0].len = 1;
+            it[1].task_name = "work"; it[1].payload = &t4; it[1].len = 1;
+            CHECK(gptps_dq_submit_batch(dq, it, 2) == GPTPS_E_FULL);
+            CHECK(it[0].status == GPTPS_E_FULL && it[1].status == GPTPS_E_FULL);
+            CHECK(gptps_dq_submit_batch(dq, it, 1) == GPTPS_OK && it[0].status == GPTPS_OK);
+            CHECK(gptps_dq_submit(dq, "work", &t4, 1, &h) == GPTPS_E_FULL);
+            CHECK(g_warns == 0);                                /* reached here, not read */
+            CHECK(gptps_dq_pending(dq) == 2);
+            CHECK(gptps_dq_recover(dq) == 1);
+            step_all(e);
+            CHECK(get(&g_ran[1]) == 1 && get(&g_ran[3]) == 1 && get(&g_ran[4]) == 0);
+            CHECK(gptps_dq_pending(dq) == 0);
+            gptps_shutdown(e); gptps_dq_close(dq);
+        }
+        remove_copies_d();
+    }
+
+    /* 6. P1 P7 P2, as a stale block could leave them. Record 2 is damage, and every
+     * verdict on the others closes them. Bare, the search lost record 2. */
+    {
+        static const jspec J[] = { { 'P', 1, 1 }, { 'P', 7, 7 }, { 'P', 2, 2 } };
+        int round;
+        for (round = 0; round < 2; ++round) {
+            write_d(J, 3);
+            g_warns = 0; reset_ran();
+            e = open_d(&dq);
+            if (e) {
+                CHECK(gptps_dq_pending(dq) == 2);
+                CHECK(g_warns == 1 && strstr(g_warn, "skipped") != NULL);
+                CHECK(file_size(copy) == 8 + 3 * 29);
+                /* With a submit first, the table was 1 7 2 8, and the search lost
+                 * record 7 instead. */
+                if (round == 1) CHECK(gptps_dq_submit(dq, "work", &t3, 1, &h) == GPTPS_OK);
+                CHECK(gptps_dq_recover(dq) == 2);
+                step_all(e);
+                CHECK(get(&g_ran[1]) == 1 && get(&g_ran[7]) == 1 && get(&g_ran[2]) == 0);
+                CHECK(get(&g_ran[3]) == round);
+                CHECK(gptps_dq_pending(dq) == 0);
+                gptps_shutdown(e); gptps_dq_close(dq);
+            }
+            next_start_clean(1);
+            remove_copies_d();
+        }
+    }
+    gptps_set_log_sink(NULL, NULL);
+    remove(JOURNAL_D); remove_copies_d();
+}
+
 #if defined(TEST_DURABLE_FORK)
 /* gptps_dq_cancel's failure path: "if it cannot be made durable the call returns
  * GPTPS_E_IO, leaving the record open and the execution alone". The journal's
@@ -1532,6 +1771,7 @@ int main(void)
     test_batch();
     test_resubmit_cb();
     test_damaged_journal();
+    test_records_no_writer_makes();
     test_journaling_does_not_stall();
 #if defined(TEST_DURABLE_FORK)
     test_cancel_io();  /* POSIX: the E_IO path, by swapping the journal's fd */

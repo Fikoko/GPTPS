@@ -231,7 +231,14 @@ anything a prior run left pending.
   oldest), and a warning goes to the log sink. A record that claims more bytes than the
   file holds looks like a torn write, so the valid records after it are kept in the
   copy only: if no copy can be made, `gptps_dq_open()` returns NULL and leaves the
-  journal as it was.
+  journal as it was. A record that verifies but that no writer makes is damage too: a
+  submitted record numbered at or below one before it, or any record numbered past
+  2^63-1.
+- **`GPTPS_E_FULL` from a durable submit** is usually `gptps_submit`'s: a bounded
+  engine or the intake is full, and a retry can succeed. It also means the queue has
+  used its last record number, 2^63-1, which only a damaged journal brings about: then
+  nothing is written, every submit returns it until the journal is opened again
+  without that record, and the open says so in the log.
 - **Not for services that exit cleanly.** A `GPTPS_TASK_SERVICE` without
   `GPTPS_TASK_RETIRE_ON_OK` reports `FINISHED` each time its `run()` returns `GPTPS_OK`,
   so its first clean exit closes the record. One that runs until stopped keeps it.

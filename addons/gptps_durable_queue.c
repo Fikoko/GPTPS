@@ -50,6 +50,14 @@
 #define DQ_FNV_SEED   2166136261u
 #define DQ_MAX_NAME   4096u
 #define DQ_MAX_PAYLOAD (256u * 1024u * 1024u)
+/* Seqs count up from 1, one per record, so no journal gets near 2^63: a record with a
+ * seq past it is damage (see replay), and a submit that would number one past it
+ * returns GPTPS_E_FULL. The bound keeps next_seq from wrapping. A record at 2^64-1 - a
+ * stray marker was enough - made it 0, so the next submit took seq 0 and appended it
+ * after a higher one. With two or more records in the table, find_by_seq could not
+ * find it, and gptps_dq_submit dereferenced the NULL it returned; with one, it was the
+ * record at 2^64-1 the search missed, so no verdict closed it. */
+#define DQ_MAX_SEQ    (UINT64_MAX >> 1)
 
 /* ---- crash loops ----
  *
@@ -658,6 +666,8 @@ static dq_rec *find_open(gptps_dq *dq, gptps_handle h)
  *     there must also carry a seq above every 'P' read so far, as every real one does,
  *     which rejects the stale journal blocks a file system without data ordering can
  *     expose after a crash.
+ * A record that verifies but that no writer makes - a 'P' whose seq does not rise, any
+ * seq past DQ_MAX_SEQ - is damage too, wherever it is: skipped whole, and reported.
  * Whatever the damaged bytes held is lost either way. Before the compaction rewrites
  * the file, the original is copied aside (preserve_copy) and a warning goes to the
  * core's log sink (gptps_set_log_sink). Past a cut the copy is the only place the valid
@@ -827,6 +837,21 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
         int k = read_rec(f, end < 0 ? -1 : end - pos, &rr);
         if (k == DQ_READ_END) break;
         if (k == DQ_READ_NOMEM || k == DQ_READ_ERR) { fclose(f); return -1; }
+        if (k == DQ_READ_OK && (rr.seq > DQ_MAX_SEQ || (rr.type == 'P' && rr.seq <= last_p))) {
+            /* A record no writer makes, though it verifies. A 'P' whose seq does not
+             * rise: each one is above the last, and find_by_seq's binary search counts on
+             * that. Applied, one put the table out of order - the events and markers of
+             * other records went unfound, before it as well as after it, so finished
+             * work stayed pending and ran again, and a dead-lettered record was not
+             * quarantined. And any seq past DQ_MAX_SEQ (see there). Both are damage, as
+             * resync already judges such a 'P' it finds: skipped whole, and reported. */
+            long len = DQ_RHDR_LEN + (long)rr.nlen + (long)rr.plen + 4;
+            free(rr.body);
+            if (!dmg->regions++) dmg->first = pos;
+            dmg->bytes += (unsigned long)len;
+            pos += len;
+            continue;
+        }
         if (k != DQ_READ_OK) {
             next = (end < 0) ? -1 : resync(f, pos, end, last_p);
             if (next == -2) { fclose(f); return -1; }
@@ -967,9 +992,9 @@ static void report_damage(const gptps_dq *dq, const dq_damage *d, const char *co
                  dq->path, d->first, d->bytes, kept, copy ? copy : "");
     else
         snprintf(msg, sizeof msg,
-                 "gptps_durable_queue: %s is damaged: %lu unreadable byte(s) in %d place(s), the "
-                 "first at byte %ld, were skipped and every valid record after them kept; whatever "
-                 "they held is lost. %s%s",
+                 "gptps_durable_queue: %s is damaged: %lu byte(s) in %d place(s), the first at "
+                 "byte %ld - unreadable, or a record numbered as no writer numbers one - were "
+                 "skipped and every valid record after them kept; whatever they held is lost. %s%s",
                  dq->path, d->bytes, d->regions, d->first, kept, copy ? copy : "");
     gptps_log(NULL, GPTPS_LOG_WARN, msg);
 }
@@ -1297,6 +1322,15 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path)
                  "is acknowledged until a sync of the directory succeeds.", dq->path);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
+    if (dq->next_seq > DQ_MAX_SEQ) {         /* only replay can bring it here */
+        char msg[512];
+        snprintf(msg, sizeof msg,
+                 "gptps_durable_queue: %s holds a record or marker numbered 2^63-1, the last "
+                 "number there is, so every submit to this queue returns GPTPS_E_FULL. An open "
+                 "of the journal once that record has closed and been compacted away clears it.",
+                 dq->path);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
     warn_if_broke(dq);
     return dq;
 
@@ -1343,6 +1377,9 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     if (!nm || (len && !pl)) { free(nm); free(pl); return GPTPS_E_NOMEM; }
 
     apx_mutex_lock(&dq->mu);
+    /* A seq past DQ_MAX_SEQ is one the next open would call damage. Only a damaged
+     * journal brings next_seq near it, but then the queue is full, not wrong. */
+    if (dq->next_seq > DQ_MAX_SEQ) { apx_mutex_unlock(&dq->mu); free(nm); free(pl); return GPTPS_E_FULL; }
     /* Reserve the in-memory slot, and its place in the handle index, BEFORE
      * journaling, for the reason nm and pl are duplicated first: the reverse order
      * has no rollback. A push_rec that failed after the 'P' was fsync'd returned
@@ -1428,6 +1465,12 @@ gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
     if (bad != GPTPS_OK) goto refuse;
 
     apx_mutex_lock(&dq->mu);
+    /* The batch takes next_seq .. next_seq + n - 1, and the last must not pass
+     * DQ_MAX_SEQ (see gptps_dq_submit). In this order nothing wraps, and n is never
+     * compared with a 64-bit constant a 32-bit size_t cannot reach. */
+    if (dq->next_seq > DQ_MAX_SEQ || (uint64_t)n - 1 > DQ_MAX_SEQ - dq->next_seq) {
+        apx_mutex_unlock(&dq->mu); bad = GPTPS_E_FULL; goto refuse;
+    }
     if (map_reserve(dq, n) != 0) { apx_mutex_unlock(&dq->mu); bad = GPTPS_E_NOMEM; goto refuse; }
     for (pushed = 0; pushed < n && push_rec(dq); ++pushed) { }
     if (pushed < n) {                                 /* reserved before journaling, all or none */

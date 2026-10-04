@@ -144,7 +144,13 @@ typedef struct gptps_dq gptps_dq;
  * holds looks exactly like a torn write, so valid records after it are reported and
  * kept in the copy, but not loaded. Then the copy is the only place they are kept, and
  * if it cannot be made the open fails. Other damage is compacted away even when no
- * copy can be made, with a warning that says so. */
+ * copy can be made, with a warning that says so.
+ * A record that verifies is damage too when no writer could have made it, since the
+ * queue numbers records 1, 2, 3, ... in the order it writes them: a submitted record
+ * ('P') numbered at or below one before it, as a stale block a file system exposes
+ * after a crash can be, and any record numbered past 2^63-1. Such a record is skipped,
+ * copied aside and reported like other damage, and does not stop the open when no
+ * copy can be made. */
 gptps_dq *gptps_dq_open(gptps *e, const char *journal_path);
 
 /* Durable submit: persist (task_name, payload) to the journal and fsync it
@@ -154,7 +160,16 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path);
  * "I/O errors" for the one exception). Calls from several threads share
  * fsyncs, and none of them stalls the engine while it waits. Returns GPTPS_E_INVAL for a NULL dq/task_name, a task_name longer
  * than 4096 bytes, or len above 256 MiB - the journal format's limits, which are
- * rejected here rather than written as a record the replayer would discard. */
+ * rejected here rather than written as a record the replayer would discard.
+ * GPTPS_E_FULL has two meanings here. Usually it is gptps_submit's: a bounded engine
+ * with every item in use, or limits.max_intake_depth reached. The record is then closed
+ * in the journal, and a retry once work drains can succeed. Or the queue has used its
+ * last record number, 2^63-1: nothing is written, and every later submit to this
+ * gptps_dq returns GPTPS_E_FULL too. Only a journal holding a record or marker numbered
+ * near 2^63-1 gets there, and no writer makes one, so the gptps_dq_open that reads it
+ * warns through the core's log sink. It clears at the first open whose journal no
+ * longer holds such a number: once that record has closed and a compaction (an open's,
+ * or gptps_dq_compact) has dropped it and its markers. */
 gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
                              const void *payload, size_t len, gptps_handle *out_handle);
 
@@ -175,7 +190,8 @@ typedef struct {
  * Returns GPTPS_OK once the batch is durable. Each item's status then says whether the
  * engine took it, and an item it refused is closed in the journal, as gptps_dq_submit
  * closes one. GPTPS_E_IO if the batch could not be made durable: nothing is enqueued,
- * and every status is GPTPS_E_IO. GPTPS_E_INVAL (an item past gptps_dq_submit's limits)
+ * and every status is GPTPS_E_IO. GPTPS_E_INVAL (an item past gptps_dq_submit's limits),
+ * GPTPS_E_FULL (the batch needs more record numbers than are left: see gptps_dq_submit)
  * or GPTPS_E_NOMEM before anything is written, with every status set to it - a batch
  * is journaled whole or not at all. n == 0 is GPTPS_OK. The QUEUED events arrive on
  * this thread with the queue's lock held, as gptps_dq_submit's do. */
