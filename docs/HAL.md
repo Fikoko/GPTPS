@@ -117,7 +117,7 @@ decision the scheduler made. Run the failing test's binary with the seed from th
 GPTPS_SIM_SEED=5 GPTPS_SIM_CPUS=4 build-sim/test_orch
 # hal_sim: seed 5 (switch 1 in 16, freedoms 1 in 16, 4 cpus)
 # all orch checks passed
-# hal_sim: seed 5: 3450 steps, 173 switches, 10 ms of virtual time, trace 60a470e157d89776
+# hal_sim: seed 5: 3400 steps, 181 switches, 13 ms of virtual time, trace b6eb7313c0c2b608
 ```
 
 The numbers change with the code, but on one tree the same seed and the same CPU count

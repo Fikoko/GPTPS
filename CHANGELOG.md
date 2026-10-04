@@ -267,8 +267,9 @@ the last four about the `durable_queue` add-on:
   `1 orch check(s) FAILED`. On a loaded machine that was 12 of 200 runs under
   ThreadSanitizer and 2 of 300 of a RelWithDebInfo build, and every run with a 50 ms
   pause put between the two calls. The simulation HAL lost the race on 4 of seeds
-  1-100. The dependency now waits until the gate exists, and the test passed 300 runs,
-  50 under ThreadSanitizer, every run with the pause, and seeds 1-200.
+  1-100 where it was found, and on 1 of them (seed 53) with this release's engine.
+  The dependency now waits until the gate exists, and the test passed 300 runs, 50
+  under ThreadSanitizer, every run with the pause, and seeds 1-200.
 
 ### Added — a config file can describe a whole deployment, and says what is wrong with it
 
@@ -331,6 +332,26 @@ the last four about the `durable_queue` add-on:
   failing); and `regress-*` reproducers of the bugs under "Fixed - found by fuzzing
   the code that reads files". Each replay takes under a second here. The three that read config files need only the core, so a build
   without the `durable_queue` add-on still runs them.
+
+### Added — a randomized stress of the public API
+
+- **`tests/test_stress_api.c` searches where two features meet on two threads.** Eight
+  threads draw operations at random, from one logged seed, out of what the threading
+  contract lets run at once: submit and cancel; settings get, set, reload, save and
+  check, against a config file other threads keep rewriting; pause, clone, unregister
+  and register again, in-process and PROGRAM; re-budgeting; the dead-letter drain; an
+  add-on load that fails. The callbacks re-enter as the contract invites. Rounds vary
+  THREADED and MANUAL, classic and bounded. It checks that every handle gets exactly
+  one terminal event; that cancelling closes every open one and leaves nothing queued,
+  running or reserved; that no setting outlives its task and no live task lacks one;
+  that a saved file reopens; that a drain calls back once for each dead letter it
+  takes; that shutdown keeps its grace; and the sanitizers. A hang fails it too: a
+  watchdog names what each thread was doing, before CTest's timeout. Each round prints
+  its seed: `--seed S --rounds 1` runs it again, and `--replay` runs its operations on
+  one thread, in order. The seed comes from the clock unless `GPTPS_STRESS_SEED` or
+  `--seed` pins it. By default it runs six rounds of 1.5 s; `GPTPS_STRESS_MS` makes it
+  a soak. It found the four defects below, and reviewing their fixes found more of the
+  same kind, fixed with them.
 
 ### Changed — an item's cancel flag lives in the item
 
@@ -518,26 +539,6 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   killed before it sees the end of its input, as an error reading its stdout is
   handled on both. The Windows change is compiled by CI but not run, since the test
   is Linux-only.
-
-### Added — a randomized stress of the public API
-
-- **`tests/test_stress_api.c` searches where two features meet on two threads.** Eight
-  threads draw operations at random, from one logged seed, out of what the threading
-  contract lets run at once: submit and cancel; settings get, set, reload, save and
-  check, against a config file other threads keep rewriting; pause, clone, unregister
-  and register again, in-process and PROGRAM; re-budgeting; the dead-letter drain; an
-  add-on load that fails. The callbacks re-enter as the contract invites. Rounds vary
-  THREADED and MANUAL, classic and bounded. It checks that every handle gets exactly
-  one terminal event; that cancelling closes every open one and leaves nothing queued,
-  running or reserved; that no setting outlives its task and no live task lacks one;
-  that a saved file reopens; that a drain calls back once for each dead letter it
-  takes; that shutdown keeps its grace; and the sanitizers. A hang fails it too: a
-  watchdog names what each thread was doing, before CTest's timeout. Each round prints
-  its seed: `--seed S --rounds 1` runs it again, and `--replay` runs its operations on
-  one thread, in order. The seed comes from the clock unless `GPTPS_STRESS_SEED` or
-  `--seed` pins it. By default it runs six rounds of 1.5 s; `GPTPS_STRESS_MS` makes it
-  a soak. It found the four defects below, and reviewing their fixes found more of the
-  same kind, fixed with them.
 
 ### Fixed — defects the stress test found
 

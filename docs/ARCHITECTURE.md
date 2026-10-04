@@ -598,10 +598,10 @@ wasm runtime CLI). CI runs thirteen jobs: `build-test` (Linux + macOS, a 2-way m
 `werror` (`-O2 -Wall -Wextra -Werror`), `package` (installs, then builds a plug-in
 out-of-tree against the installed package), `windows` (mingw-w64), `msvc` (cl.exe),
 `amalgamation` (+ a licence-notice assertion), `asan` (+ UBSan/LSan, and the
-fuzzers), `tsan`,
-`hal_fast`, `hal_chaos` (the whole suite on the weakest HAL the contract allows),
-`hal_sim` (the suite on a simulation HAL where a seed picks every thread switch, so a
-failure replays), `cross` (i386 + big-endian s390x under QEMU), and `freestanding`.
+fuzzers), `tsan`, `hal_fast`, `hal_chaos` (the whole suite on the weakest HAL the
+contract allows), `hal_sim` (the suite on a simulation HAL where a seed picks every
+thread switch, so a failure replays), `cross` (i386 + big-endian s390x under QEMU),
+and `freestanding`.
 The `tsan`, `hal_chaos`, `hal_sim` and `cross` jobs select tests with an EXCLUDE
 list, so a newly added test is covered by default rather than silently skipped.
 

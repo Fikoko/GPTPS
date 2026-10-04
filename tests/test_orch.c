@@ -102,7 +102,8 @@ static int check_unsatisfiable_gate(void)
      * it terminal, and gptps_orch_after then took its documented fast path: it
      * submitted "no_such_task" at once and returned the engine's GPTPS_E_NOTFOUND,
      * with no gate to converge. A main thread preempted between the two calls lost
-     * that race; the simulation HAL (tests/hal_sim.c) lost it on 4 of seeds 1-100. */
+     * that race; the simulation HAL (tests/hal_sim.c) lost it on 4 of seeds 1-100 on the
+     * tree it was found on, and on 1 of them (seed 53) with the engine it shipped with. */
     __atomic_store_n(&g_hold, 1, __ATOMIC_SEQ_CST);
     if (gptps_submit(e, "dep", NULL, 0, &dep) != GPTPS_OK) ++bad;
     /* payload is non-empty on purpose: a retry copies it, which is the cost being bounded */
