@@ -703,10 +703,13 @@ static gptps_status register_slot(slot *s)
 /* What a register of this slot may return, given the test's view of it. */
 static int register_expected(const slot *s, int was, gptps_status st)
 {
+    /* Where PROGRAM types cannot run, register_slot refuses them itself, before the
+     * engine is asked, so nothing the engine would say applies to them. */
+    if (s->family == F_PROGRAM && !HAVE_PROGRAM) return st == GPTPS_E_INVAL;
     if (g_bounded && get(&g_n.sealed)) return st == GPTPS_E_BUSY;       /* sealed: setup is over */
     if (was) return st == GPTPS_E_DUP;
     if (is_service(s->family) && g_manual) return st == GPTPS_E_INVAL;   /* services are THREADED only */
-    if (s->family == F_PROGRAM && (g_bounded || !HAVE_PROGRAM)) return st == GPTPS_E_INVAL;   /* bounded: in-process only */
+    if (s->family == F_PROGRAM && g_bounded) return st == GPTPS_E_INVAL;   /* bounded: in-process only */
     return st == GPTPS_OK;
 }
 
