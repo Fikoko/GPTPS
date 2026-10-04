@@ -61,6 +61,16 @@ static int count_logged(const char *s)
     return n;
 }
 static int logged(const char *s) { return count_logged(s) > 0; }
+/* `a` was logged, and `b` after it. */
+static int logged_before(const char *a, const char *b)
+{
+    const char *p, *q;
+    gptps_mutex_lock(g_logm);
+    p = strstr(g_log, a);
+    q = p ? strstr(p + strlen(a), b) : NULL;
+    gptps_mutex_unlock(g_logm);
+    return q != NULL;
+}
 
 /* ---- files ---- */
 static void put_bytes(const char *path, const char *b, size_t n)
@@ -226,10 +236,14 @@ static void test_mistakes(void)
         if (e) { gptps_shutdown(e); e = NULL; }
     }
 
-    /* and the file the open could not read at all */
+    /* and the file the open could not read at all: why, then that it cannot be read -
+     * not that it does not parse */
     clear_log();
     CHECK(gptps_open("no_such_dir/none.toml", &e) == GPTPS_E_CONFIG);
     CHECK(logged("no_such_dir/none.toml: cannot open the file"));
+    CHECK(logged_before("no_such_dir/none.toml: cannot open the file",
+                        "config no_such_dir/none.toml: the file cannot be read - the engine was not opened"));
+    CHECK(!logged("does not parse"));
 }
 
 /* Keys only a later definition can claim. */
@@ -350,7 +364,14 @@ static void test_reload(void)
     put(CFG, "[scheduler\nreserve_after_skips = 6\n");
     clear_log();
     CHECK(gptps_settings_reload(e, NULL) == GPTPS_E_CONFIG);        /* does not parse: nothing applies */
-    CHECK(logged(CFG ":1: the table name has no closing ]"));
+    CHECK(logged_before(CFG ":1: the table name has no closing ]",
+                        CFG ": the file does not parse - nothing was reloaded"));
+    CHECK(has_value(e, "scheduler.reserve_after_skips", "5"));
+    clear_log();                                                    /* cannot be read: the same */
+    CHECK(gptps_settings_reload(e, "no_such_dir/none.toml") == GPTPS_E_CONFIG);
+    CHECK(logged_before("no_such_dir/none.toml: cannot open the file",
+                        "config no_such_dir/none.toml: the file cannot be read - nothing was reloaded"));
+    CHECK(!logged("does not parse"));
     CHECK(has_value(e, "scheduler.reserve_after_skips", "5"));
     put(CFG, "addons = []\n[scheduler]\nreserve_after_skips = 5\n");
     CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);

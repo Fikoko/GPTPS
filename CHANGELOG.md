@@ -741,6 +741,12 @@ but these calls did not keep the promise:
   them now return `GPTPS_E_NOMEM` (see "Upgrading from 1.5"). An open that could not
   copy its config path now fails too, rather than open without it: save and reload
   with no path refused with `GPTPS_E_INVAL`.
+- **A config file that cannot be read is not said to be one that does not parse.**
+  `gptps_open`, `gptps_open_ex` and `gptps_settings_reload` logged why the file could
+  not be opened or read - `cannot open the file (Permission denied)` - and then "the
+  file does not parse". They now log "the file cannot be read - the engine was not
+  opened", or "- nothing was reloaded". The result is still `GPTPS_E_CONFIG`.
+  `tests/test_config_strict.c` checks both lines, in that order.
 - **A dead letter could reach the drain's callback named `"?"`.** The drain copies each
   dead letter's task name before it runs a callback, which may unregister the type,
   and `gptps_unregister_task` copies its type's names before it frees it. A copy that

@@ -3364,8 +3364,9 @@ gptps_status gptps_open_ex(const gptps_config *cfg, gptps **out_engine)
         char msg[400];
         *out_engine = NULL;
         if (why == GPTPS_TOML_NOMEM) return GPTPS_E_NOMEM;   /* the file may be fine: nothing to say */
-        cfg_say_parse(err);
-        snprintf(msg, sizeof msg, "config %s: the file does not parse - the engine was not opened", c.config_path);
+        cfg_say_parse(err);              /* why: "cannot open the file (...)", or each bad line */
+        snprintf(msg, sizeof msg, "config %s: the file %s - the engine was not opened", c.config_path,
+                 why == GPTPS_TOML_UNREAD ? "cannot be read" : "does not parse");
         gptps_log(NULL, GPTPS_LOG_ERROR, msg);
         return GPTPS_E_CONFIG;
     }
@@ -4769,8 +4770,9 @@ gptps_status gptps_settings_reload(gptps *e, const char *path)
     if (!t) {
         char msg[400];
         if (why != GPTPS_TOML_NOMEM) {   /* out of memory, the file may be fine: nothing to say */
-            cfg_say_parse(err);
-            snprintf(msg, sizeof msg, "config %s: the file does not parse - nothing was reloaded", path);
+            cfg_say_parse(err);          /* why: "cannot open the file (...)", or each bad line */
+            snprintf(msg, sizeof msg, "config %s: the file %s - nothing was reloaded", path,
+                     why == GPTPS_TOML_UNREAD ? "cannot be read" : "does not parse");
             gptps_log(NULL, GPTPS_LOG_ERROR, msg);
         }
         gptps_mutex_lock(e->m);

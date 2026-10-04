@@ -384,7 +384,9 @@ and the engine's own value wherever it refused the file's.
 Whatever save writes reads back as it was: a setting takes only numbers a file can hold
 (no `nan`, `inf` or hex), and a string is written with every control character escaped.
 Memory that runs out is not a mistake in the file: open, reload and save return
-`GPTPS_E_NOMEM` then, and the same call made again reports whatever else there is.
+`GPTPS_E_NOMEM` then, and the same call made again reports whatever else there is. A file
+that cannot be read at all — missing, a directory, not permitted — is `GPTPS_E_CONFIG`, and
+the log says why and that the file cannot be read.
 
 ## Settings (runtime, introspectable, persistable)
 
