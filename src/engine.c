@@ -3891,6 +3891,11 @@ gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_na
     if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
     if (registry_holder(e, dst_name)) { gptps_mutex_unlock(e->m); return GPTPS_E_DUP; }
     def = r->def;                       /* shares run/cost/user_data; copies exec/cost/policy */
+    /* A service's items run with no timeout whatever its timeout_seconds says (each
+     * submit normalizes them), but a live set of that setting lands here in r->def -
+     * and registration refuses a service with a timeout, so the copy takes the value a
+     * service runs with. */
+    if (r->service) def.default_policy.timeout_seconds = 0;
     prio = r->priority;
     if (def.exec == GPTPS_EXEC_PROGRAM && r->argv_copy) {
         argv_snapshot = argv_dup((const char *const *)r->argv_copy);   /* own a copy across the unlock */

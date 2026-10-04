@@ -401,9 +401,43 @@ static void test_retire_on_ok(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
+/* ---- 8) a live edit of a service's timeout leaves it clonable ----------------- */
+/* tasks.<service>.timeout_seconds takes a value live - a service's items run with no
+ * timeout whatever it says, since each submit normalizes them - and the value lands in
+ * the type's definition. gptps_clone_task copied that definition, and registration
+ * refuses a service with a timeout: the clone failed with GPTPS_E_INVAL. Found by
+ * tests/test_stress_api.c. */
+static void test_clone_after_timeout_edit(void)
+{
+    gptps *e = NULL;
+    uint64_t fl = 0;
+    gptps_task_info info;
+    size_t i, n;
+    int seen = 0;
+
+    CHECK(open_threaded(&e, 2) == GPTPS_OK);
+    if (!e) return;
+    CHECK(reg_service_ex(e, "svc", svc_block, 0, GPTPS_TASK_RETIRE_ON_OK) == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.svc.timeout_seconds", "5") == GPTPS_OK);
+    CHECK(gptps_clone_task(e, "svc", "svc_copy") == GPTPS_OK);          /* was GPTPS_E_INVAL */
+    CHECK(gptps_task_flags(e, "svc_copy", &fl) == GPTPS_OK);
+    CHECK(fl == (GPTPS_TASK_SERVICE | GPTPS_TASK_RETIRE_ON_OK));       /* still a service */
+    n = gptps_task_count(e);
+    for (i = 0; i < n; ++i) {
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        if (gptps_task_get_info(e, i, &info) == GPTPS_OK && strcmp(info.name, "svc_copy") == 0) {
+            seen = 1;
+            CHECK(info.default_policy.timeout_seconds == 0);            /* runs as a service does */
+        }
+    }
+    CHECK(seen == 1);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
 int main(void)
 {
     test_registration_rules();
+    test_clone_after_timeout_edit();
     test_restart_and_cancel();
     test_shutdown_stops_services();
     test_crash_in_done_at_shutdown();

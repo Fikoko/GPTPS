@@ -386,6 +386,11 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   from the start. `tests/test_taskmgmt.c` parks a registration in that window and
   checks each call, and races a clone against an unregister for a second;
   `tests/test_config_strict.c` has `addon_submit`'s watcher try the removal.
+- **A service whose timeout had been set live could not be cloned.** A service's items
+  run with no timeout whatever `tasks.<name>.timeout_seconds` says, but the value is
+  kept in the type's definition. `gptps_clone_task` copied it, and registration refuses
+  a service with a timeout: `GPTPS_E_INVAL`. The copy now takes the policy a service
+  runs with. `tests/test_service.c`.
 
 ### Documentation
 
