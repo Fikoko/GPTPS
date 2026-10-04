@@ -683,6 +683,25 @@ static void test_open_with_addons(void)
     } else printf("%s", g_log);
     snprintf(text, sizeof text, "addons = [\"%s\"]\n[tasks.render.sub]\npriority = 5\n", ADDON_SUBMIT_PATH);
     refused(text, "tasks.render.sub.priority: expects a \"string\" - put 5 in quotes");   /* at open */
+
+    /* An add-on's watcher hears a type's file values on the thread registering it,
+     * and may act on the type by name there: it is there for that thread. But not
+     * removed - the registration still writes into it, and freeing it under that
+     * call was a use-after-free - so the removal is refused with GPTPS_E_BUSY. */
+    snprintf(text, sizeof text, "addons = [\"%s\"]\n[tasks.victim]\n\"sub.remove\" = true\n", ADDON_SUBMIT_PATH);
+    put(CFG, text);
+    clear_log();
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (e) {
+        char want[64];
+        CHECK(reg(e, "victim") == GPTPS_OK);
+        snprintf(want, sizeof want, "sub removing victim: %d, exists 1", (int)GPTPS_E_BUSY);
+        CHECK(logged(want));                                      /* was 0 (OK), and freed */
+        CHECK(gptps_task_exists(e, "victim"));
+        CHECK(has_value(e, "tasks.victim.sub.remove", "true"));
+        CHECK(gptps_unregister_task(e, "victim", GPTPS_REMOVE_CANCEL) == GPTPS_OK);   /* now it may go */
+        gptps_shutdown(e); e = NULL;
+    } else printf("%s", g_log);
 #endif
 }
 

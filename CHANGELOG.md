@@ -44,6 +44,19 @@ Four changes can need a change in a host. The first three are about the config f
     needs two free descriptors above fd 2 for each OOP task it starts: without them
     the attempt fails with `GPTPS_E_IO`, where 1.5 ran a task that printed nothing.
 
+- **A task type is there for other threads once its registration returns.**
+  `gptps_register_task`, and `gptps_clone_task`, which calls it, take the name at once:
+  another registration of it gets `GPTPS_E_DUP`. Until the call returns, the type's
+  settings are still being added, and every call from another thread that names the
+  type treats it as absent: a submit, a pause, a change of its priority or costs, a
+  clone from it and its unregister return `GPTPS_E_NOTFOUND`; `gptps_task_exists`
+  returns 0; `gptps_task_count` and `gptps_task_get_info` leave it out. In 1.5 they
+  all found it from the start, and an item could run before its settings existed. A
+  host that registers on one thread and uses the type from another should do so once
+  the registration has returned. On the registering thread - in an add-on's watcher
+  that hears the type's file values - the type is there, but removing it returns
+  `GPTPS_E_BUSY`.
+
 ### Added — bounded mode: no allocation once work starts (ABI 2.4)
 
 - **`gptps_config.max_items`, `max_payload_bytes` and `max_result_bytes`.** With
@@ -360,6 +373,19 @@ found two ways a failed write ended as a `FINISHED` with the wrong result:
   the unwind removes exactly those; it puts the scheduler back only if the failed
   setup was the last to set it. `tests/test_config_strict.c`, with `addon_waiter`
   given a cue to fail, and an observer, a constraint and a scheduler of its own.
+- **An item could run before its type's settings existed, and an unregister could free
+  a type still being registered.** `gptps_register_task` made a type known, then added
+  its settings. An item another thread submitted in between read its own per-task
+  setting as `GPTPS_E_NOTFOUND`. An unregister in between - a `gptps_clone_task` and a
+  `gptps_unregister_task` of one name, both live calls, are enough - freed the type
+  while the registration was still writing into it. ASan reported that use-after-free
+  in each of 10 runs of the new test without the fix. So could an add-on's watcher
+  that removed the type as it heard the type's file values, on the registering
+  thread. Until its registration returns, a type is now not there for other threads
+  (see "Upgrading from 1.5"), and its own thread cannot remove it; its name is taken
+  from the start. `tests/test_taskmgmt.c` parks a registration in that window and
+  checks each call, and races a clone against an unregister for a second;
+  `tests/test_config_strict.c` has `addon_submit`'s watcher try the removal.
 
 ### Documentation
 

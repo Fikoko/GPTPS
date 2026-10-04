@@ -380,6 +380,22 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
  *    gptps_define_*) is SETUP-time: do it before submitting work or while quiescent.
  *    The one exception is gptps_define_resource on a name already defined: that
  *    re-budgets it, which is safe at any time and takes effect at once.
+ *  - The task control plane is live (TASK MANAGEMENT): gptps_clone_task,
+ *    gptps_set_task_enabled / _priority / _resource_cost and gptps_unregister_task may
+ *    run while other threads submit - and a clone registers its copy through
+ *    gptps_register_task as it runs. While a type is being registered it holds its
+ *    name: another registration or clone into that name returns GPTPS_E_DUP. But
+ *    until the call registering it returns, its settings are still being added, and
+ *    for other threads it is not there yet: a submit, a pause, a change of its
+ *    priority or costs, a clone from it and its unregister all return
+ *    GPTPS_E_NOTFOUND, as before the call; gptps_task_exists returns 0,
+ *    gptps_task_flags GPTPS_E_NOTFOUND, and gptps_task_count and gptps_task_get_info
+ *    leave it out. So an item of it never runs without its per-task settings. The
+ *    thread registering it does see it - an add-on's settings watcher hears the
+ *    type's file values there, and may act on them by its name - but cannot remove
+ *    it until the registration returns: GPTPS_E_BUSY. What stays out of bounds is
+ *    registering a name while its removal runs: the new type's settings collide with
+ *    those of the type being removed.
  *  - Which thread a callback fires on (THREADED mode):
  *      QUEUED                  -> the thread that called gptps_submit;
  *      STARTED/FINISHED/FAILED -> a worker thread;
@@ -592,12 +608,14 @@ typedef struct {
     uint64_t             flags;
 } gptps_task_info;
 
-/* Number of registered task types (includes types that are draining toward removal). */
+/* Number of registered task types (includes types that are draining toward removal,
+ * not one another thread is still registering - see THREADING). */
 GPTPS_API size_t       gptps_task_count(gptps *e);
 /* Fill *out for the task at `index` (0-based; order stable until the registry is
  * mutated). GPTPS_E_NOTFOUND past the end. */
 GPTPS_API gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out);
-/* 1 if a task of this name is registered AND accepting submits (enabled, not draining). */
+/* 1 if a task of this name is registered AND accepting submits (enabled, not draining,
+ * not still being registered by another thread). */
 GPTPS_API int          gptps_task_exists(gptps *e, const char *task_name);
 /* ABI 2.2: the GPTPS_TASK_* flags of the registered type `task_name`, as registered
  * (0 = an ordinary one-shot). Matched by name and copied under the engine lock, so -
@@ -605,8 +623,8 @@ GPTPS_API int          gptps_task_exists(gptps *e, const char *task_name);
  * next changes - it is safe while other threads register or unregister types, and
  * it scans no queue, where each gptps_task_get_info call walks every item the engine
  * holds to fill its counters. A paused type still answers. GPTPS_E_NOTFOUND if no
- * such type is registered (a type draining toward removal included), GPTPS_E_INVAL
- * for a NULL argument. */
+ * such type is registered (a type draining toward removal included, and one another
+ * thread is still registering), GPTPS_E_INVAL for a NULL argument. */
 GPTPS_API gptps_status gptps_task_flags(gptps *e, const char *task_name, uint64_t *out_flags);
 
 /* Pause / resume a task type without removing it: a disabled type keeps its config
@@ -618,7 +636,7 @@ GPTPS_API gptps_status gptps_set_task_enabled(gptps *e, const char *task_name, i
  * config file's [task_defaults]/[tasks.<dst>]; the scheduling priority is carried
  * over from `src` as-is. The most common "tweak a copy" operation - e.g. clone
  * "resize" to "resize_hi" then raise its quality. GPTPS_E_NOTFOUND if `src` is
- * unknown, GPTPS_E_DUP if `dst` already exists. */
+ * unknown, GPTPS_E_DUP if `dst` already exists or is being registered. */
 GPTPS_API gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_name);
 
 /* Remove a task type. `flags` selects the policy (GPTPS_REMOVE_* above). On a
@@ -651,8 +669,10 @@ GPTPS_API gptps_status gptps_clone_task(gptps *e, const char *src_name, const ch
  * backlog and removes immediately - except from inside gptps_step while an instance
  * of the type is running, which is refused with GPTPS_E_BUSY. NOTE: a CANCEL/DRAIN
  * of an in-flight in-process task that never polls gptps_is_cancelled() blocks until
- * it returns (same cooperative limit as timeouts). Do not register/re-register the
- * same name concurrently with its removal (registration is a setup-time operation). */
+ * it returns (same cooperative limit as timeouts). A type another thread is still
+ * registering is not found (GPTPS_E_NOTFOUND), and one this thread is registering -
+ * from an add-on's watcher, say - is GPTPS_E_BUSY: remove it once that call has
+ * returned. Do not register/re-register the same name concurrently with its removal. */
 GPTPS_API gptps_status gptps_unregister_task(gptps *e, const char *task_name, unsigned flags);
 
 /* Load a dynamic add-on (shared library) via the host-table ABI below. The

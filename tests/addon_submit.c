@@ -14,6 +14,11 @@
  * defines a global, sub.level, and only then registers a watcher, which logs what
  * it hears: its own keys must take the file's values after its setup returns, or
  * that watcher would never hear them.
+ *
+ * And a per-task sub.remove: hearing tasks.<name>.sub.remove = true, the watcher
+ * tries to remove <name> and logs what came back. A file value reaches it on the
+ * thread registering <name>, while that registration still writes into the type - so
+ * the removal must be refused, not free the type under it.
  */
 #include "gptps.h"
 #include <stdio.h>
@@ -25,9 +30,19 @@ static const gptps_api_routines *g_api;
 static void heard(const char *key, const char *value, void *ud)
 {
     char msg[300];
-    (void)ud;
+    gptps *e = (gptps *)ud;
+    size_t n = strlen(key), tl = sizeof ".sub.remove" - 1;
     snprintf(msg, sizeof msg, "sub heard %s = %s", key, value);
     g_api->log((gptps_ctx *)NULL, GPTPS_LOG_WARN, msg);
+    if (strncmp(key, "tasks.", 6) == 0 && n > 6 + tl && strcmp(key + n - tl, ".sub.remove") == 0 &&
+        strcmp(value, "true") == 0) {
+        char task[128];
+        gptps_status st;
+        snprintf(task, sizeof task, "%.*s", (int)(n - 6 - tl), key + 6);
+        st = g_api->unregister_task(e, task, GPTPS_REMOVE_CANCEL);
+        snprintf(msg, sizeof msg, "sub removing %s: %d, exists %d", task, (int)st, g_api->task_exists(e, task));
+        g_api->log((gptps_ctx *)NULL, GPTPS_LOG_WARN, msg);
+    }
 }
 
 static gptps_status job(gptps_ctx *ctx, void *ud)
@@ -49,8 +64,10 @@ static gptps_status setup(gptps *e, const gptps_api_routines *api, char **err)
     g_api = api;
     if ((st = api->define_task_setting(e, "sub.priority", GPTPS_SETTING_ENUM, "low", "low|high", 0)) != GPTPS_OK)
         return st;
+    if ((st = api->define_task_setting(e, "sub.remove", GPTPS_SETTING_BOOL, "false", 0, 0)) != GPTPS_OK)
+        return st;
     if ((st = api->define_global(e, "sub.level", GPTPS_SETTING_UINT, "1", 0, 0)) != GPTPS_OK) return st;
-    if ((st = api->settings_watch(e, heard, NULL)) != GPTPS_OK) return st;   /* last, on purpose */
+    if ((st = api->settings_watch(e, heard, e)) != GPTPS_OK) return st;      /* last, on purpose */
     __atomic_store_n(&g_started, 0, __ATOMIC_SEQ_CST);
     if ((st = api->submit(e, "sub.warmup", NULL, 0, &h)) != GPTPS_OK) return st;
     {   /* a threaded engine runs it now; a manual one only when stepped, so give up soon */

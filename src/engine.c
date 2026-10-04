@@ -118,11 +118,13 @@ typedef struct gptps_reg {
     char             **argv_copy;  /* owned NULL-terminated copy for EXEC_PROGRAM */
     int32_t            priority;   /* scheduling priority for this task type (default 0) */
     bool               enabled;    /* false => reject new submits (paused, reversible) */
+    bool               settling;   /* true => gptps_register_task is still adding its settings: hidden from other threads */
     bool               removed;    /* true => tombstoned, draining toward removal */
     bool               cancelling; /* true => removal is CANCEL: drop in-flight items rather than dead-letter */
     bool               service;    /* true => GPTPS_TASK_SERVICE: supervised long-running instances (restart-on-exit) */
     bool               retire_on_ok;/* service only: a clean GPTPS_OK return retires the instance instead of restarting it */
     const void        *load_tag;   /* the add-on load whose setup registered it (e->setup_tag), else NULL */
+    uint64_t           settling_tid;/* while settling: the thread registering it, which does see it */
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
     uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
@@ -797,14 +799,37 @@ static const void *setup_tag_here(const gptps *e)
     return (e->setup_on && e->setup_tid == gptps_hal_thread_id()) ? e->setup_tag : NULL;
 }
 
-/* Find a live (non-tombstoned) task by name. A draining task is logically gone:
- * its name is free to submit-reject / re-register. */
-static gptps_reg *registry_find(const gptps *e, const char *name)
+/* The live (non-tombstoned) task that holds a name, whether or not its registration
+ * is done. A draining task is logically gone: its name is free to re-register. One
+ * still being registered already holds its name, so this is what a new registration
+ * of the name collides with (GPTPS_E_DUP). */
+static gptps_reg *registry_holder(const gptps *e, const char *name)
 {
     gptps_reg *r;
     for (r = e->registry; r; r = r->next)
         if (!r->removed && strcmp(r->name, name) == 0) return r;
     return NULL;
+}
+
+/* A type still being registered, seen from another thread. gptps_register_task links
+ * a type in before it adds its settings, and writes into it until it returns: until
+ * then the type is not there yet for other threads - a submit is refused, and so is a
+ * pause, a clone from it, a change of its priority or costs, and an unregister, which
+ * would free it under that call; each answers GPTPS_E_NOTFOUND, as before the call.
+ * The registering thread sees it: an add-on's settings watcher hears the type's file
+ * values on that thread, as they are applied, and sets what they mean by its name
+ * (gptps_gpu_quota_plugin.c sets the type's cost). Caller holds e->m. */
+static int reg_hidden(const gptps_reg *r)
+{
+    return r->settling && r->settling_tid != gptps_hal_thread_id();
+}
+
+/* Find a task by name, as every operation that names one sees it: not one draining
+ * toward removal, and not one another thread is still registering. */
+static gptps_reg *registry_find(const gptps *e, const char *name)
+{
+    gptps_reg *r = registry_holder(e, name);
+    return (r && !reg_hidden(r)) ? r : NULL;
 }
 
 /* Resolved name for an item (owned copy once detached from a removed reg). */
@@ -3324,7 +3349,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
         if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
         return GPTPS_E_INVAL;
     }
-    if (registry_find(e, def->name)) {
+    if (registry_holder(e, def->name)) {     /* taken, by a type registered or still registering */
         gptps_mutex_unlock(e->m);
         if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
         return GPTPS_E_DUP;
@@ -3364,6 +3389,15 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
     r->priority = 0;
     r->enabled = true;
+    /* Linked in below, under this lock, so the name is taken at once - but its settings
+     * are added after the lock goes (settings->m comes first), and until they are, an
+     * item of it would run without them: a per-task setting its body reads came back
+     * GPTPS_E_NOTFOUND. And this call writes into r until it returns, so another
+     * thread's unregister must not free it meanwhile. Settling, it is found by no call
+     * from another thread that names it (reg_hidden): it takes no work from one, and
+     * none can pause, clone, re-cost or remove it, until this call is done with it. */
+    r->settling = true;
+    r->settling_tid = gptps_hal_thread_id();
     /* Registered by an add-on's setup, on its thread: if that setup fails, this is how
      * the unwind tells its types from those other threads registered meanwhile. */
     r->load_tag = setup_tag_here(e);
@@ -3404,6 +3438,9 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
         snprintf(pre, sizeof pre, "tasks.%s.", name);
         cfg_apply_pending(e, pre);
     }
+    gptps_mutex_lock(e->m);
+    r->settling = false;                  /* set up: from here on it is there for every call */
+    gptps_mutex_unlock(e->m);
     return GPTPS_OK;
 }
 
@@ -3766,7 +3803,8 @@ size_t gptps_task_count(gptps *e)
     if (!e) return 0;
     GPTPS_REFUSE_AFTER_FORK(e, 0);
     gptps_mutex_lock(e->m);
-    for (r = e->registry; r; r = r->next) ++n;   /* includes draining types */
+    for (r = e->registry; r; r = r->next)
+        if (!reg_hidden(r)) ++n;   /* includes draining types; not one another thread is registering */
     gptps_mutex_unlock(e->m);
     return n;
 }
@@ -3781,7 +3819,10 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
     if (out->struct_size < GPTPS_TASK_INFO_MIN_SIZE) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
-    for (r = e->registry; r && i < index; r = r->next) ++i;
+    for (r = e->registry; r; r = r->next) {      /* as gptps_task_count counts them */
+        if (reg_hidden(r)) continue;
+        if (i++ == index) break;
+    }
     if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
     out->name = r->name; out->exec = r->def.exec; out->priority = r->priority;
     out->default_cost = r->def.default_cost; out->default_policy = r->def.default_policy;
@@ -3802,7 +3843,7 @@ gptps_status gptps_task_flags(gptps *e, const char *task_name, uint64_t *out_fla
     if (!e || !task_name || !out_flags) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
-    r = registry_find(e, task_name);          /* skips draining types */
+    r = registry_find(e, task_name);          /* skips draining types, and one still registering elsewhere */
     if (r) f = GPTPS_STRUCT_HAS(gptps_task_def, &r->def, flags) ? r->def.flags : 0u;
     gptps_mutex_unlock(e->m);
     if (!r) return GPTPS_E_NOTFOUND;
@@ -3816,7 +3857,7 @@ int gptps_task_exists(gptps *e, const char *task_name)
     if (!e || !task_name) return 0;
     GPTPS_REFUSE_AFTER_FORK(e, 0);
     gptps_mutex_lock(e->m);
-    r = registry_find(e, task_name);          /* skips draining types */
+    r = registry_find(e, task_name);          /* skips draining types, and one still registering elsewhere */
     yes = (r && r->enabled) ? 1 : 0;
     gptps_mutex_unlock(e->m);
     return yes;
@@ -3848,7 +3889,7 @@ gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_na
     gptps_mutex_lock(e->m);
     r = registry_find(e, src_name);
     if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
-    if (registry_find(e, dst_name)) { gptps_mutex_unlock(e->m); return GPTPS_E_DUP; }
+    if (registry_holder(e, dst_name)) { gptps_mutex_unlock(e->m); return GPTPS_E_DUP; }
     def = r->def;                       /* shares run/cost/user_data; copies exec/cost/policy */
     prio = r->priority;
     if (def.exec == GPTPS_EXEC_PROGRAM && r->argv_copy) {
@@ -3889,6 +3930,10 @@ static gptps_status unregister_task(gptps *e, const char *task_name, unsigned fl
     r = registry_find(e, task_name);
     if (r && only_tag && r->load_tag != only_tag) r = NULL;
     if (!r) { gptps_mutex_unlock(e->m); return GPTPS_E_NOTFOUND; }
+    /* Its registration is running on this very thread - an add-on's watcher hearing
+     * the type's file values, say - and writes into r once this returns: removing it
+     * now would free it under that call. */
+    if (r->settling) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
 
     /* A service's instances run until stopped, so a DRAIN (wait for work to finish)
      * would block forever in THREADED mode / refuse forever in MANUAL. Upgrade it to
@@ -5002,7 +5047,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     if (e->stopping) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_SHUTDOWN; }
 
     r = registry_find(e, task_name);
-    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_NOTFOUND; } /* unknown, draining, or paused */
+    if (!r || !r->enabled) { gptps_mutex_unlock(e->m); item_free(e, it); return GPTPS_E_NOTFOUND; } /* unknown, draining, paused, or still registering */
 
     cost = r->def.default_cost;
     if (r->def.cost) {
