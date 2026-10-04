@@ -336,6 +336,10 @@ cfg.max_dead_letters  = GPTPS_LIMIT_NONE;  /* keep every dead letter (default 10
 cfg.shutdown_grace_ms = 5000;              /* cancel running work after 5 s (default 30 s) */
 ```
 
+`0` means something different from key to key in the file - auto, no limit, none, wait
+forever - while in `gptps_config` it always means not set. [docs/CONFIG.md](docs/CONFIG.md#what-0-means)
+has a table of every key whose `0` is special.
+
 **The file is checked as it is read.** `gptps_open` fails with `GPTPS_E_CONFIG` on a line
 that does not parse, a value out of range or of the wrong type (TOML's types: `"4"` in
 quotes is a string, not a number), a key the engine's own tables (`[limits]`,

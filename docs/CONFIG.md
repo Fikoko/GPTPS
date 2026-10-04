@@ -26,6 +26,38 @@ checked, reloaded and saved is in the [Readme](../Readme.md#configuration-file-o
   change it by its full name, such as `limits.max_intake_depth`. The keys marked
   *file only* are read from the file and are not settings.
 
+## What 0 means
+
+A 0 does not mean the same thing everywhere, so look it up before you write one:
+
+- In `gptps_config` and its `limits`, 0 always means *not set*: the engine takes the
+  config file's value, or else the default.
+- In the config file, and in a live `gptps_settings_set`, 0 is a value, and each key
+  below gives it a meaning of its own. A key not listed takes 0 at face value.
+- For `max_dead_letters` and `shutdown_grace_ms` the file's 0 is not the default, so
+  `gptps_config` writes "no limit" as `GPTPS_LIMIT_NONE`.
+
+The meanings are those the tables below give, from the same descriptions.
+
+| Key | 0 in the file, or set live | In `gptps_config` (0: not set) |
+|---|---|---|
+| `limits.max_memory_bytes` | 3/4 of the machine's memory | `limits.max_memory_bytes` |
+| `limits.max_memory_gb` | auto: 3/4 of the machine's memory | - |
+| `limits.max_concurrent_tasks` | one per logical CPU | `limits.max_concurrent_tasks` |
+| `limits.max_intake_depth` | no limit | `limits.max_intake_depth` |
+| `limits.shutdown_grace_ms` | wait forever | `shutdown_grace_ms`; waiting forever is `GPTPS_LIMIT_NONE` |
+| `limits.max_dead_letters` | no limit | `max_dead_letters`; no limit is `GPTPS_LIMIT_NONE` |
+| `scheduler.reserve_after_skips` | strict priority order | - |
+| `bounded.max_items` | the classic engine | `max_items` |
+| `bounded.max_payload_bytes` | only an empty payload fits | `max_payload_bytes` |
+| `bounded.max_result_bytes` | only an empty result fits | `max_result_bytes` |
+| `tasks.<task>.timeout_seconds` | no limit | - |
+| `tasks.<task>.max_retries` | none | - |
+| `tasks.<task>.retry_backoff_seconds` | at once (a requeue still waits 100 ms) | - |
+| `tasks.<task>.mem_bytes` | none declared: not budgeted, not capped | - |
+| `resources.<name>` | none: a submit that costs any is refused, and queued work that does is dead-lettered (GPTPS_E_BUDGET) - not a pause | - |
+| `tasks.<task>.resources.<name>` | none | - |
+
 ## Top level
 
 Top-level keys, before any `[table]`.
@@ -41,7 +73,7 @@ The engine's size and its admission budget. The keys that size the engine are re
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
 | `max_memory_bytes` | whole number, 0 or more | `0` (auto: 3/4 of the memory the machine has) | at once | memory the running tasks may declare at once, in bytes (each task's mem_bytes); admission waits for room. 0 = 3/4 of the machine's memory |
-| `max_memory_gb` | number, 0 to 1000000000 | `0` (auto) | at once | max_memory_bytes in GiB (2^30 bytes), for a file that would rather not count bytes; if both are set, max_memory_bytes wins (file only) |
+| `max_memory_gb` | number, 0 to 1000000000 | `0` (auto) | at once | max_memory_bytes in GiB (2^30 bytes), for a file that would rather not count bytes; if both are set, max_memory_bytes wins; 0 = auto: 3/4 of the machine's memory (file only) |
 | `max_concurrent_tasks` | whole number, 0 to 65536 | `0` (auto: one worker per logical CPU) | next start | tasks that run at once: the worker pool. 0 = one per logical CPU |
 | `max_intake_depth` | whole number, 0 to 4294967295 | `0` | at once | items that may wait to be admitted; past it gptps_submit returns GPTPS_E_FULL. 0 = no limit |
 | `shutdown_grace_ms` | whole number, 0 to 4294967295 | `30000` | at once | how long gptps_shutdown lets running work finish before it cancels it, in ms. 0 = wait forever |
@@ -62,8 +94,8 @@ Bounded mode: no allocation once work starts ([BOUNDED.md](BOUNDED.md)). `max_it
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
 | `max_items` | whole number, 0 to 4294967295 | `0` | next start | items alive at once in bounded mode: queued, retrying, running, dead-lettered (docs/BOUNDED.md); 0 = the classic engine |
-| `max_payload_bytes` | whole number, 0 to 4294967295 | `0` | next start | bounded mode: each item's payload slot; a longer payload is refused |
-| `max_result_bytes` | whole number, 0 to 4294967295 | `0` | next start | bounded mode: each executing thread's result buffer; a longer result is refused |
+| `max_payload_bytes` | whole number, 0 to 4294967295 | `0` | next start | bounded mode: each item's payload slot; a longer payload is refused; 0 = only an empty payload fits |
+| `max_result_bytes` | whole number, 0 to 4294967295 | `0` | next start | bounded mode: each executing thread's result buffer; a longer result is refused; 0 = only an empty result fits |
 
 ## [resources]
 
@@ -71,7 +103,7 @@ Named resources: each key defines one with the budget the engine admits work aga
 
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
-| `<name>` | whole number, 0 or more | the budget the resource is defined with | at once | a named resource's budget: how much of it the running tasks may hold at once |
+| `<name>` | whole number, 0 or more | the budget the resource is defined with | at once | a named resource's budget: how much of it the running tasks may hold at once; 0 = none: a submit that costs any is refused, and queued work that does is dead-lettered (GPTPS_E_BUDGET) - not a pause |
 
 ## [task_defaults]
 
@@ -80,9 +112,9 @@ Values for every task, applied as it registers. A value in `[tasks.<task>]` wins
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
 | `timeout_seconds` | whole number, 0 to 4294967295 | `0` | at once | seconds one attempt may run before it is timed out; 0 = no limit |
-| `max_retries` | whole number, 0 to 4294967295 | `0` | at once | attempts after the first, before on_failure applies |
-| `retry_backoff_seconds` | whole number, 0 to 4294967295 | `0` | at once | seconds from a failed attempt to the next |
-| `mem_bytes` | whole number, 0 or more | `0` | at once | memory one run declares, in bytes: admission budgets it, the process executors cap it |
+| `max_retries` | whole number, 0 to 4294967295 | `0` | at once | attempts after the first, before on_failure applies; 0 = none |
+| `retry_backoff_seconds` | whole number, 0 to 4294967295 | `0` | at once | seconds from a failed attempt to the next; 0 = at once (a requeue still waits 100 ms) |
+| `mem_bytes` | whole number, 0 or more | `0` | at once | memory one run declares, in bytes: admission budgets it, the process executors cap it; 0 = none declared: not budgeted, not capped |
 | `priority` | whole number, -2147483648 to 2147483647 | `0` | at once | admission order: higher runs first; may be negative |
 | `on_failure` | one of `"dead_letter"`, `"requeue"`, `"drop"` | `"dead_letter"` | at once | once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it |
 
@@ -93,9 +125,9 @@ One task's values, applied when a task of that name registers. A table for a tas
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
 | `timeout_seconds` | whole number, 0 to 4294967295 | `0` | at once | seconds one attempt may run before it is timed out; 0 = no limit |
-| `max_retries` | whole number, 0 to 4294967295 | `0` | at once | attempts after the first, before on_failure applies |
-| `retry_backoff_seconds` | whole number, 0 to 4294967295 | `0` | at once | seconds from a failed attempt to the next |
-| `mem_bytes` | whole number, 0 or more | `0` | at once | memory one run declares, in bytes: admission budgets it, the process executors cap it |
+| `max_retries` | whole number, 0 to 4294967295 | `0` | at once | attempts after the first, before on_failure applies; 0 = none |
+| `retry_backoff_seconds` | whole number, 0 to 4294967295 | `0` | at once | seconds from a failed attempt to the next; 0 = at once (a requeue still waits 100 ms) |
+| `mem_bytes` | whole number, 0 or more | `0` | at once | memory one run declares, in bytes: admission budgets it, the process executors cap it; 0 = none declared: not budgeted, not capped |
 | `priority` | whole number, -2147483648 to 2147483647 | `0` | at once | admission order: higher runs first; may be negative |
 | `on_failure` | one of `"dead_letter"`, `"requeue"`, `"drop"` | `"dead_letter"` | at once | once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it |
 
@@ -105,7 +137,7 @@ What one run of the task costs of each named resource; admission waits until it 
 
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
-| `<name>` | whole number, 0 or more | `0` | at once | how much of the named resource one run of this task holds while it runs |
+| `<name>` | whole number, 0 or more | `0` | at once | how much of the named resource one run of this task holds while it runs; 0 = none |
 
 ## [stats]
 

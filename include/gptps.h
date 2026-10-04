@@ -474,6 +474,10 @@ GPTPS_API void gptps_set_log_sink(gptps_log_sink_fn fn, void *user_data); /* NUL
 /* ============================================================================
  * ENGINE LIFECYCLE
  * ==========================================================================*/
+/* In gptps_limits and gptps_config, 0 always means "not set": the config file's value,
+ * or the default. In the file and in a live gptps_settings_set, 0 is a value whose
+ * meaning depends on the key - auto, no limit, none, wait forever: docs/CONFIG.md,
+ * "What 0 means", lists each one. */
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_limits) */
     uint32_t max_concurrent_tasks; /* 0 => auto (online logical CPUs); 1 => sequential.

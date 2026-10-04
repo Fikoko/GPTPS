@@ -2116,11 +2116,12 @@ static const task_key TASK_KEYS[] = {
     { "timeout_seconds",       GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL,
       "seconds one attempt may run before it is timed out; 0 = no limit", st_rd_timeout, st_wr_timeout },
     { "max_retries",           GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL,
-      "attempts after the first, before on_failure applies", st_rd_retries, st_wr_retries },
+      "attempts after the first, before on_failure applies; 0 = none", st_rd_retries, st_wr_retries },
     { "retry_backoff_seconds", GPTPS_SETTING_UINT, 1, 0, 4294967295.0, NULL,
-      "seconds from a failed attempt to the next", st_rd_backoff, st_wr_backoff },
+      "seconds from a failed attempt to the next; 0 = at once (a requeue still waits 100 ms)", st_rd_backoff, st_wr_backoff },
     { "mem_bytes",             GPTPS_SETTING_UINT, 0, 0, 0, NULL,
-      "memory one run declares, in bytes: admission budgets it, the process executors cap it", st_rd_mem, st_wr_mem },
+      "memory one run declares, in bytes: admission budgets it, the process executors cap it; "
+      "0 = none declared: not budgeted, not capped", st_rd_mem, st_wr_mem },
     { "priority",              GPTPS_SETTING_INT,  1, -2147483648.0, 2147483647.0, NULL,
       "admission order: higher runs first; may be negative", st_rd_prio, st_wr_prio },
     { "on_failure",            GPTPS_SETTING_ENUM, 0, 0, 0, ONFAIL_CHOICES,
@@ -2363,11 +2364,13 @@ static gptps_res_cell *res_cell_prepare(gptps *e, gptps_reg *r, size_t ri, const
     d.struct_size = sizeof d; d.key = key; d.type = GPTPS_SETTING_UINT; d.hot = 1;
     if (r) {
         snprintf(key, sizeof key, "tasks.%s.resources.%s", r->name, rname);
-        d.desc = "how much of the named resource one run of this task holds while it runs";
+        d.desc = "how much of the named resource one run of this task holds while it runs; 0 = none";
         d.read = rs_rd_cost; d.write = rs_wr_cost;
     } else {
         snprintf(key, sizeof key, "resources.%s", rname);
-        d.desc = "a named resource's budget: how much of it the running tasks may hold at once";
+        d.desc = "a named resource's budget: how much of it the running tasks may hold at once; "
+                 "0 = none: a submit that costs any is refused, and queued work that does is dead-lettered "
+                 "(GPTPS_E_BUDGET) - not a pause";
         d.read = rs_rd_budget; d.write = rs_wr_budget;
     }
     d.target = x;
@@ -2566,9 +2569,11 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
                              "items alive at once in bounded mode: queued, retrying, running, dead-lettered "
                              "(docs/BOUNDED.md); 0 = the classic engine", sb_rd_items, sb_wr_items);
     lost += reg_core_setting(e, "bounded.max_payload_bytes", GPTPS_SETTING_UINT, 0, 1, 0, 4294967295.0,
-                             "bounded mode: each item's payload slot; a longer payload is refused", sb_rd_payload, sb_wr_payload);
+                             "bounded mode: each item's payload slot; a longer payload is refused; 0 = only an empty payload fits",
+                             sb_rd_payload, sb_wr_payload);
     lost += reg_core_setting(e, "bounded.max_result_bytes", GPTPS_SETTING_UINT, 0, 1, 0, 4294967295.0,
-                             "bounded mode: each executing thread's result buffer; a longer result is refused",
+                             "bounded mode: each executing thread's result buffer; a longer result is refused; "
+                             "0 = only an empty result fits",
                              sb_rd_result, sb_wr_result);
     if (lost) { s = GPTPS_E_NOMEM; goto fail; }
 

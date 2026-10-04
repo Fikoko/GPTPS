@@ -5,6 +5,27 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Documentation
+
+- **What 0 means, key by key.** In `gptps_config` and its `limits`, 0 always means not
+  set: the config file's value, or the default. In the file and in a live
+  `gptps_settings_set`, 0 is a value, and what it means depends on the key: auto for
+  the worker count and the memory budget, no limit for the intake depth, the dead
+  letters and a task's timeout, wait forever for the shutdown grace, strict priority
+  order for the scheduler's reservation, the classic engine for `bounded.max_items` -
+  and none at all for a resource's budget, which refuses work that costs any of it
+  rather than pause it. `docs/CONFIG.md` now opens with a table of every key whose 0 is
+  special, built from the settings registry's own descriptions, so the
+  `config_reference` test fails if the table and the code disagree. Eight
+  descriptions now say what their 0 means, where they did not: a task's `max_retries`,
+  `retry_backoff_seconds` and `mem_bytes`, its cost of a named resource, a resource's
+  budget, bounded mode's `max_payload_bytes` and `max_result_bytes` (only an empty one
+  fits), and the file's `max_memory_gb`. The dashboard and
+  `gptps_settings_get_info` show the same text. `gptps.h` states the rule at
+  `gptps_limits`, and the Readme points to the table.
+
 ## [1.6.0] - 2026-10-04
 
 ### Upgrading from 1.5

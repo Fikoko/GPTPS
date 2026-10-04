@@ -108,8 +108,40 @@ static const struct { const char *section, *leaf, *type, *def, *applies, *desc; 
       "loader as written, and one that does not load fails the open" },
     { "limits", "max_memory_gb", "number, 0 to 1000000000", "`0` (auto)", "at once",
       "max_memory_bytes in GiB (2^30 bytes), for a file that would rather not count bytes; "
-      "if both are set, max_memory_bytes wins" },
+      "if both are set, max_memory_bytes wins; 0 = auto: 3/4 of the machine's memory" },
 };
+
+/* The keys gptps_config sets at open, where 0 means "not set". Each must be in the
+ * registry and say what its own 0 means, or the generator stops: the table built
+ * from them would go wrong without a word. */
+static const struct { const char *key, *field; } STRUCT_FIELD[] = {
+    { "limits.max_concurrent_tasks", "`limits.max_concurrent_tasks`" },
+    { "limits.max_memory_bytes",     "`limits.max_memory_bytes`" },
+    { "limits.max_intake_depth",     "`limits.max_intake_depth`" },
+    { "limits.max_dead_letters",     "`max_dead_letters`; no limit is `GPTPS_LIMIT_NONE`" },
+    { "limits.shutdown_grace_ms",    "`shutdown_grace_ms`; waiting forever is `GPTPS_LIMIT_NONE`" },
+    { "bounded.max_items",           "`max_items`" },
+    { "bounded.max_payload_bytes",   "`max_payload_bytes`" },
+    { "bounded.max_result_bytes",    "`max_result_bytes`" },
+};
+
+/* What a description says 0 means: the text after its "0 = ", or NULL. */
+static const char *zero_means(const char *desc)
+{
+    const char *z = desc ? strstr(desc, "0 = ") : NULL;
+    return z ? z + 4 : NULL;
+}
+
+static void zero_row(out_t *o, const char *key, const char *meaning)
+{
+    size_t i;
+    put(o, "| `%s` | ", key);
+    cell(o, meaning);
+    put(o, " | ");
+    for (i = 0; i < sizeof STRUCT_FIELD / sizeof STRUCT_FIELD[0]; ++i)
+        if (!strcmp(STRUCT_FIELD[i].key, key)) break;
+    put(o, "%s |\n", i < sizeof STRUCT_FIELD / sizeof STRUCT_FIELD[0] ? STRUCT_FIELD[i].field : "-");
+}
 
 static void kind(out_t *o, const gptps_setting_info *in)
 {
@@ -287,6 +319,45 @@ static void generate(out_t *o)
     put(o, "- Every key is also a setting: `gptps_settings_get` and `gptps_settings_set` read and\n"
            "  change it by its full name, such as `limits.max_intake_depth`. The keys marked\n"
            "  *file only* are read from the file and are not settings.\n");
+
+    /* What 0 means, key by key, from the descriptions the tables below show. */
+    for (i = 0; i < sizeof STRUCT_FIELD / sizeof STRUCT_FIELD[0]; ++i) {
+        size_t j;
+        for (j = 0; j < n; ++j) if (!strcmp(rows[j].key, STRUCT_FIELD[i].key)) break;
+        if (j == n || !zero_means(rows[j].info.desc)) {
+            fprintf(stderr, "%s: %s\n", STRUCT_FIELD[i].key, j == n ? "not in the settings registry"
+                                                                    : "its description does not say what 0 means (\"0 = ...\")");
+            exit(2);
+        }
+    }
+    put(o, "\n## What 0 means\n\n"
+           "A 0 does not mean the same thing everywhere, so look it up before you write one:\n\n"
+           "- In `gptps_config` and its `limits`, 0 always means *not set*: the engine takes the\n"
+           "  config file's value, or else the default.\n"
+           "- In the config file, and in a live `gptps_settings_set`, 0 is a value, and each key\n"
+           "  below gives it a meaning of its own. A key not listed takes 0 at face value.\n"
+           "- For `max_dead_letters` and `shutdown_grace_ms` the file's 0 is not the default, so\n"
+           "  `gptps_config` writes \"no limit\" as `GPTPS_LIMIT_NONE`.\n\n"
+           "The meanings are those the tables below give, from the same descriptions.\n\n");
+    put(o, "| Key | 0 in the file, or set live | In `gptps_config` (0: not set) |\n");
+    put(o, "|---|---|---|\n");
+    for (i = 0; i < n; ++i) {
+        const char *z = zero_means(rows[i].info.desc);
+        if (!rows[i].addon && z) zero_row(o, rows[i].key, z);
+        if (!strcmp(rows[i].key, "limits.max_memory_bytes")) {       /* its file-only spelling */
+            size_t f;
+            for (f = 0; f < sizeof FILE_ONLY / sizeof FILE_ONLY[0]; ++f) {
+                char key[320];
+                if (strcmp(FILE_ONLY[f].section, "limits") || !(z = zero_means(FILE_ONLY[f].desc))) continue;
+                snprintf(key, sizeof key, "limits.%s", FILE_ONLY[f].leaf);
+                zero_row(o, key, z);
+            }
+        }
+    }
+    for (i = 0; i < n; ++i) {                     /* the add-ons' keys, after the engine's */
+        const char *z = zero_means(rows[i].info.desc);
+        if (rows[i].addon && z) zero_row(o, rows[i].key, z);
+    }
 
     for (i = 0; i < sizeof ORDER / sizeof ORDER[0]; ++i) section(o, ORDER[i], rows, n, 0, "##");
     for (i = 0; i < n; ++i) {                     /* any table the list above lacks */
