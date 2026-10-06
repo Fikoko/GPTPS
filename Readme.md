@@ -873,9 +873,9 @@ single-file amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **56** public functions · **ABI 2.3** (append-only; 2.0 was the first
+At a glance: **58** public functions · **ABI 2.4** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **74** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **87** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
