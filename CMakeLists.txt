@@ -680,6 +680,7 @@ if(UNIX)
     target_link_libraries(test_xport_engine PRIVATE gptps_xport)
     add_test(NAME xport_engine COMMAND test_xport_engine)
     set_tests_properties(xport_engine PROPERTIES TIMEOUT 60)
+    if(TARGET gptps_stats)
     add_executable(test_xport_measure tests/test_xport_measure.c) # measurements carried back from worker processes
     target_include_directories(test_xport_measure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
     target_link_libraries(test_xport_measure PRIVATE gptps_xport gptps_stats)
@@ -687,6 +688,7 @@ if(UNIX)
     add_dependencies(test_xport_measure prog_helper)
     add_test(NAME xport_measure COMMAND test_xport_measure)
     set_tests_properties(xport_measure PROPERTIES TIMEOUT 60)
+    endif()
     endif()
 
     add_executable(test_stress tests/test_stress.c) # concurrent-producer submit stress (off-lock copy under contention)
@@ -879,7 +881,9 @@ set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
 
 # --- what a process job actually used (docs/MEASUREMENTS.md) ----------------
 # prog_helper jobs of known size, on every platform; in cgroup mode too, where CI's
-# cgroup step points GPTPS_CGROUP_PARENT at a delegated cgroup.
+# cgroup step points GPTPS_CGROUP_PARENT at a delegated cgroup. It folds them into
+# gptps_stats as well, so a subset build without that add-on skips it.
+if(TARGET gptps_stats)
 add_executable(test_measure tests/test_measure.c)
 target_include_directories(test_measure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_measure PRIVATE gptps_stats)
@@ -887,6 +891,7 @@ target_compile_definitions(test_measure PRIVATE HELPER_PATH="$<TARGET_FILE:prog_
 add_dependencies(test_measure prog_helper)
 add_test(NAME measure COMMAND test_measure)
 set_tests_properties(measure PROPERTIES TIMEOUT 60)
+endif()
 
 # --- teardown always terminates -------------------------------------------
 # The failure mode of every check in here is a HANG, so the TIMEOUT is part of

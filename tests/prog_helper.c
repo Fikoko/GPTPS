@@ -33,8 +33,10 @@
 #  include <unistd.h>
 #endif
 
-/* Kept reachable, so the compiler cannot drop the allocation or its writes. */
+/* Kept reachable, so the compiler cannot drop the allocation or its writes, nor the
+ * "spin" loop's work. */
 char *g_held;
+volatile unsigned long g_spins;
 
 static void sleep_ms(unsigned long ms)
 {
@@ -77,8 +79,7 @@ int main(int argc, char **argv)
     if (strcmp(mode, "spin") == 0) {
         unsigned long ms = (argc > 2) ? strtoul(argv[2], NULL, 10) : 0;
         clock_t until = (clock_t)((double)ms / 1000.0 * (double)CLOCKS_PER_SEC);
-        volatile unsigned long x = 0;
-        while (clock() < until) x++;
+        while (clock() < until) g_spins = g_spins + 1;
         return 0;
     }
     if (strcmp(mode, "zeros") == 0) {
