@@ -6,7 +6,7 @@
  * src/exec_oop_posix.c talks to the kernel more than any other core file, and the
  * other tests only ever see those calls succeed. This one fails them, one at a time:
  * every call the executors make to fork, pipe, pipe2, dup2, poll, read, write,
- * close, waitpid, kill, setrlimit and execvp, and fcntl's F_DUPFD forms, which find
+ * close, wait4, kill, setrlimit and execvp, and fcntl's F_DUPFD forms, which find
  * a descriptor above fd 2. Not failed: fcntl's other commands (on a pipe end the
  * executor has just made, Linux cannot fail F_GETFD, F_SETFD, F_GETFL or an
  * O_NONBLOCK F_SETFL), setpgid, nanosleep, the signal-mask calls, and the cgroup
@@ -107,17 +107,17 @@ int      __real_poll(struct pollfd *fds, nfds_t n, int ms);
 ssize_t  __real_read(int fd, void *buf, size_t n);
 ssize_t  __real_write(int fd, const void *buf, size_t n);
 int      __real_close(int fd);
-pid_t    __real_waitpid(pid_t pid, int *st, int opt);
+pid_t    __real_wait4(pid_t pid, int *st, int opt, struct rusage *ru);
 int      __real_kill(pid_t pid, int sig);
 int      __real_setrlimit(int res, const struct rlimit *rl);
 int      __real_execvp(const char *file, char *const argv[]);
 uint64_t __real_gptps_hal_monotonic_ms(void);
 
 enum { K_FORK, K_PIPE, K_PIPE2, K_DUP2, K_POLL, K_READ, K_WRITE, K_CLOSE,
-       K_WAITPID, K_KILL, K_SETRLIMIT, K_EXECVP, K_DUPFD, K_N };
+       K_WAIT4, K_KILL, K_SETRLIMIT, K_EXECVP, K_DUPFD, K_N };
 static const char *const k_name[K_N] = {
     "fork", "pipe", "pipe2", "dup2", "poll", "read", "write", "close",
-    "waitpid", "kill", "setrlimit", "execvp", "fcntl(F_DUPFD)"
+    "wait4", "kill", "setrlimit", "execvp", "fcntl(F_DUPFD)"
 };
 
 enum { PARENT, CHILD };
@@ -127,7 +127,7 @@ enum { F_ERR,        /* do nothing, return -1 with the errno */
        F_ERR_DONE,   /* do the call, THEN report -1: Linux close() frees the descriptor
                       * whatever it returns, and a kill() can race the child's own exit */
        F_SHORT,      /* read/write: move at most one byte */
-       F_REAPED,     /* waitpid: from this call on, the kernel reaps the child first -
+       F_REAPED,     /* wait4: from this call on, the kernel reaps the child first -
                       * a host with SIGCHLD set to SIG_IGN */
        F_ERR_BOTH }; /* pipe2: fail, and fail the pipe() fallback the same way */
 
@@ -144,7 +144,8 @@ typedef struct { int side, call, how, err, effect; } variant;
  * not get a page - while EIO from read stands for any error the executor cannot
  * expect. Where Linux does the work anyway, so does the wrapper: a failing close()
  * still frees the descriptor, kill() reports ESRCH only once the child is dead, and
- * ECHILD comes from waitpid only with the child really reaped. */
+ * ECHILD comes from wait4 only with the child really reaped. The executors reap with
+ * wait4 rather than waitpid, for the child's resource usage (docs/MEASUREMENTS.md). */
 static const variant k_variants[] = {
     /* the parent: the executor itself */
     { PARENT, K_FORK,      F_ERR,      EAGAIN, X_FAIL   },
@@ -163,8 +164,8 @@ static const variant k_variants[] = {
     { PARENT, K_WRITE,     F_ERR,      ENOMEM, X_FAIL   },  /* no page for the pipe buffer */
     { PARENT, K_CLOSE,     F_ERR_DONE, EINTR,  X_ABSORB },
     { PARENT, K_CLOSE,     F_ERR_DONE, EIO,    X_ABSORB },
-    { PARENT, K_WAITPID,   F_ERR,      EINTR,  X_ABSORB },
-    { PARENT, K_WAITPID,   F_REAPED,   ECHILD, X_LOST   },
+    { PARENT, K_WAIT4,     F_ERR,      EINTR,  X_ABSORB },
+    { PARENT, K_WAIT4,     F_REAPED,   ECHILD, X_LOST   },
     { PARENT, K_KILL,      F_ERR_DONE, ESRCH,  X_ABSORB },
     { PARENT, K_DUPFD,     F_ERR,      EMFILE, X_FAIL   },  /* no descriptor above fd 2 */
     /* the child, between fork and exec() or _exit() */
@@ -191,10 +192,11 @@ static struct {
     unsigned       n[K_N];        /* the parent's calls this run */
     int            fired;         /* the parent's injection happened */
     int            reaped;        /* F_REAPED is in force */
+    int            waited;        /* the executor's wait4 collected the child itself */
     int            pipe_err;      /* F_ERR_BOTH: what the pipe() fallback fails with */
     unsigned       fast;          /* FAST_*: where time may run ahead (see the header) */
     unsigned       cancel_poll;   /* gptps_cancel at the start of this poll, if nonzero */
-    unsigned       cancel_wait;   /* ...or of this waitpid - or the first after it at
+    unsigned       cancel_wait;   /* ...or of this wait4 - or the first after it at
                                    * which the child is ready (see the header) */
     int            cancelled;     /* that cancel was made */
     gptps         *e;             /* what to cancel */
@@ -324,18 +326,19 @@ int __wrap_close(int fd)
     return __real_close(fd);
 }
 
-pid_t __wrap_waitpid(pid_t pid, int *st, int opt)
+pid_t __wrap_wait4(pid_t pid, int *st, int opt, struct rusage *ru)
 {
-    int hit = fi_hit(K_WAITPID), lost;
+    int hit = fi_hit(K_WAIT4), lost;
     pid_t r;
-    fi_cancel_at(K_WAITPID);
+    fi_cancel_at(K_WAIT4);
     if (hit && g.v->how == F_REAPED) g.reaped = 1;
     else if (hit) { errno = g.v->err; return -1; }
     if (g.reaped && pid > 0) {
-        r = __real_waitpid(pid, &lost, opt);
+        r = __real_wait4(pid, &lost, opt, ru);
         if (r == pid) { errno = ECHILD; return -1; }   /* reaped, and its status with it */
     } else {
-        r = __real_waitpid(pid, st, opt);
+        r = __real_wait4(pid, st, opt, ru);
+        if (r == pid && g.armed && !fi_child()) g.waited = 1;
     }
     /* Still running, so the bounded reap naps before it asks again: let each nap
      * count for half a second, and a deadline arrive within a dozen of them. */
@@ -485,6 +488,8 @@ static const scenario k_scenarios[] = {
 
 typedef struct {
     int           started, attempts, terminal, selfcancel;
+    int           measured;          /* the attempt's end carried its mem.peak */
+    int           waited;            /* the executor collected the child itself */
     int           kind;              /* the attempt's FINISHED or FAILED */
     gptps_status  status;
     size_t        len;
@@ -506,12 +511,14 @@ static void on_ev(const gptps_event *ev, void *ud)
     switch (ev->kind) {
     case GPTPS_EV_STARTED:  g_run.started++; break;
     case GPTPS_EV_FINISHED:
+        if (gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) g_run.measured++;
         g_run.attempts++; g_run.terminal++;
         g_run.kind = GPTPS_EV_FINISHED; g_run.status = ev->status;
         g_run.len = ev->result_len;
         if (ev->result && ev->result_len <= sizeof g_run.res) memcpy(g_run.res, ev->result, ev->result_len);
         break;
     case GPTPS_EV_FAILED:
+        if (gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) g_run.measured++;
         g_run.attempts++;
         g_run.kind = GPTPS_EV_FAILED; g_run.status = ev->status; g_run.len = 0;
         if (ev->status == GPTPS_E_CANCELLED) g_run.terminal++;   /* terminal in its own right */
@@ -562,7 +569,7 @@ static void kill_kids(void)
     unsigned i;
     int st;
     for (i = 0; i < g.nkids; ++i) {
-        if (__real_waitpid(g.kids[i], &st, WNOHANG) != 0) continue;   /* reaped, or not ours */
+        if (waitpid(g.kids[i], &st, WNOHANG) != 0) continue;   /* reaped, or not ours */
         (void)__real_kill(-g.kids[i], SIGKILL);
         (void)__real_kill(g.kids[i], SIGKILL);
     }
@@ -639,9 +646,9 @@ static int leftover_children(int *orphans)
     int st, n = 0, tries;
     pid_t r;
     for (i = 0; i < g.nkids; ++i)               /* the executor reaped it: ECHILD */
-        if (__real_waitpid(g.kids[i], &st, WNOHANG) >= 0) ++n;   /* a zombie, or running */
+        if (waitpid(g.kids[i], &st, WNOHANG) >= 0) ++n;   /* a zombie, or running */
     for (tries = 0; tries < 200; ++tries) {
-        while ((r = __real_waitpid(-1, &st, WNOHANG)) > 0)
+        while ((r = waitpid(-1, &st, WNOHANG)) > 0)
             if (!is_kid(r)) ++*orphans;
         if (r < 0 && errno != EINTR) break;     /* ECHILD: no child left */
         kill_all_children();
@@ -698,7 +705,7 @@ static void run_once(const scenario *sc, const variant *v, unsigned nth)
     CHECK(gptps_submit(e, "t", g_big, sc->plen, &h) == GPTPS_OK);
 
     memset(g.n, 0, sizeof g.n);
-    g.v = v; g.nth = nth; g.fired = 0; g.reaped = 0; g.pipe_err = 0;
+    g.v = v; g.nth = nth; g.fired = 0; g.reaped = 0; g.pipe_err = 0; g.waited = 0;
     g.fast = sc->fast; g.cancel_poll = sc->cancel_poll; g.cancel_wait = sc->cancel_wait;
     g.e = e; g.h = h; g.nkids = 0; g.clock = 0; g.cancelled = 0;
     if (!v) snprintf(g_desc, sizeof g_desc, "%s, undisturbed", sc->name);
@@ -734,6 +741,7 @@ static void run_once(const scenario *sc, const variant *v, unsigned nth)
     memcpy(g_run.n[PARENT], g.n, sizeof g.n);
     memcpy(g_run.n[CHILD], g_sh->n, sizeof g_sh->n);
     g_run.clock = g.clock;
+    g_run.waited = g.waited;
     g_run.fired = g.fired || g_sh->fired;
     g_run.hung = g_hung;
     fd_snapshot(fd1);
@@ -779,12 +787,18 @@ static void judge(const scenario *sc, const variant *v, const run *base)
                                              || (s == GPTPS_E_TASK && v->call == K_READ && sc->exec == GPTPS_EXEC_OOP);
         ok = ok && got->kind == GPTPS_EV_FAILED && sensible;
     }
+    /* Measured, or absent (docs/MEASUREMENTS.md): the attempt reports what its child
+     * used exactly when the executor collected that child itself - not when fork
+     * failed, nor when something else reaped it and took its usage along. */
+    ok = ok && got->measured == got->waited;
     ok = ok && got->fd_ok && got->kids == 0 && !got->hung;
     if (!ok || g_verbose) {
-        printf("%s %s: %s/%s, %u bytes (undisturbed: %s/%s, %u bytes); %d started, %d ended, %d terminal%s%s%s%s%s\n",
+        printf("%s %s: %s/%s, %u bytes (undisturbed: %s/%s, %u bytes); %d started, %d ended, %d terminal%s%s%s%s%s%s\n",
                ok ? "ok  " : "FAIL", g_desc, kind_name(got->kind), gptps_strerror(got->status),
                (unsigned)got->len, kind_name(base->kind), gptps_strerror(base->status), (unsigned)base->len,
                got->started, got->attempts, got->terminal,
+               got->measured == got->waited ? "" : got->measured ? "; measured, though nothing was collected"
+                                                                 : "; not measured, though the child was collected",
                got->fd_ok ? "" : "; descriptors leaked or lost",
                got->kids ? "; a child left behind" : "",
                got->hung ? "; hung" : "",
@@ -822,7 +836,7 @@ static void sweep(const scenario *sc)
      * for certain is checked here; main() checks that every wrapped call, and every
      * way of failing one, was at work somewhere. */
     census_fails = fails;
-    CHECK(pc[K_FORK] == 1 && pc[K_PIPE2] >= 1 && pc[K_POLL] >= 1 && pc[K_WAITPID] >= 1 && pc[K_CLOSE] >= 2);
+    CHECK(pc[K_FORK] == 1 && pc[K_PIPE2] >= 1 && pc[K_POLL] >= 1 && pc[K_WAIT4] >= 1 && pc[K_CLOSE] >= 2);
     CHECK(base.clock >= 1);                            /* the wrapped clock is the core's */
     if (sc->exec == GPTPS_EXEC_OOP && !sc->fast) CHECK(pc[K_READ] >= 1);
     if (sc->exec == GPTPS_EXEC_OOP && sc->want_len) CHECK(cc[K_WRITE] >= 3);

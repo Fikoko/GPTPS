@@ -437,9 +437,19 @@ gptps_stats_task(st, "resize", &c);                 // one task type
 ... gptps_shutdown(e); gptps_stats_close(st);       // close AFTER shutdown, like await
 ```
 
+- **Measurements** ([docs/MEASUREMENTS.md](../docs/MEASUREMENTS.md)): what process jobs
+  actually used — `mem.peak`, `cpu.user_ms`, ..., any add-on's names too — folds into
+  rows per task type and for the engine, keyed by name **and method**, each with count,
+  sum, min, max and the latest value: `gptps_stats_measure_get(st, "mrp", "mem.peak",
+  "cgroup.job.resident", &m)`, or enumerate with `gptps_stats_measure_count` /
+  `_at`. Fixed memory per task type (`GPTPS_STATS_MEASURE_ROWS` rows); what cannot be
+  folded is counted in `measures_dropped`. Measurements that arrive any other way — a
+  `gptps_xport` reply's — fold in with `gptps_stats_measure_fold`, into a
+  `gptps_stats_open()` object where the process has no engine of its own.
 - **Scaling:** one `gptps_stats` per engine. With `gptps_pool`, install one on each
-  `gptps_pool_shard(p, i)` and fold them with `gptps_stats_merge()` — the sum is the pool.
-  With `gptps_xport` in engine mode, install it from the `child_init` hook; each worker
+  `gptps_pool_shard(p, i)` and fold them with `gptps_stats_merge()` (and
+  `gptps_stats_measure_merge()` for measurement rows) — the sum is the pool. With
+  `gptps_xport` in engine mode, install it from the `child_init` hook; each worker
   process then has its own.
 - **Order-independent:** events come from several threads, and beyond what `gptps.h`
   documents as ordered nothing orders them. So a fast task can report `STARTED` (or
@@ -564,6 +574,14 @@ gptps_xport_submit(xp, "resize", buf, len, &res, &rlen, &task_status);          
 gptps_xport_submit_async(xp, "resize", buf, len, on_reply, ud, &request_id);    // returns at once
 gptps_xport_close(xp);                                                           // graceful drain
 ```
+
+- **Measurements come back with the reply.** A worker's engine measures what each
+  process job used ([docs/MEASUREMENTS.md](../docs/MEASUREMENTS.md)), and the reply
+  carries the item's last attempt's measurements — the FINISHED one, or the last FAILED
+  one before a dead letter — unknown names included. `gptps_xport_submit_ex` fills a
+  `gptps_xport_reply` (free it with `gptps_xport_result_free`);
+  `gptps_xport_submit_async_ex` hands one to the callback. The plain calls are
+  unchanged and ignore them.
 
 - **Multiplexed links.** Every request carries an id; a reader thread per link matches
   replies to waiters; up to `max_in_flight` requests (default 64) may be outstanding per

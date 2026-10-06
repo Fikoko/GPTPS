@@ -7,7 +7,9 @@
 #   - the flaky job finishes on its second;
 #   - the runaway is stopped by its cap, and ends as a dead letter;
 #   - a job that can never fit the budget is refused at submit;
-#   - the declared memory in flight never passed the budget.
+#   - the declared memory in flight never passed the budget;
+#   - each job that ran reports what GPTPS measured at its peak (docs/MEASUREMENTS.md),
+#     the runaway well past what a normal job takes.
 # The cap is RLIMIT_AS: GPTPS_CGROUP_PARENT is cleared, so the test needs neither
 # cgroups nor Docker.
 #
@@ -52,16 +54,16 @@ endfunction()
 
 expect("exit status 1 (the runaway and too_big fail for good)" "^1$" rc)
 foreach(j a b c)
-    expect("${j} to finish on its first attempt" "\n${j} +24 +1 +[0-9]+ +[0-9]+ +1  finished\n" out)
+    expect("${j} to finish on its first attempt" "\n${j} +24 +[0-9.]+ +1 +[0-9]+ +[0-9]+ +1  finished\n" out)
 endforeach()
 expect("flaky to finish on its second attempt"
-       "\nflaky +24 +1 +[0-9]+ +[0-9]+ +2  finished after a retry\n" out)
+       "\nflaky +24 +[0-9.]+ +1 +[0-9]+ +[0-9]+ +2  finished after a retry\n" out)
 expect("runaway to be a dead letter after 2 attempts"
-       "\nrunaway +24 +1 +[0-9]+ +[0-9]+ +2  dead letter: GPTPS_E_TASK\n" out)
+       "\nrunaway +24 +[0-9.]+ +1 +[0-9]+ +[0-9]+ +2  dead letter: GPTPS_E_TASK\n" out)
 expect("the runaway's allocation to be refused by its cap"
        "fake_infer: --runaway: allocation refused at" err)
 expect("too_big to be refused at submit"
-       "\ntoo_big +100 +1 +- +- +0  refused: GPTPS_E_BUDGET" out)
+       "\ntoo_big +100 +- +1 +- +- +0  refused: GPTPS_E_BUDGET" out)
 expect("the declared peak in flight to be reported"
        "peak declared in flight: [0-9]+ MB of a 64 MB budget, gpu [0-9]+ of 2" out)
 if("${out}" MATCHES "peak declared in flight: ([0-9]+) MB of a 64 MB budget, gpu ([0-9]+) of 2")
@@ -69,6 +71,24 @@ if("${out}" MATCHES "peak declared in flight: ([0-9]+) MB of a 64 MB budget, gpu
         message(SEND_ERROR "example_edge_ai: in flight ${CMAKE_MATCH_1} MB, gpu ${CMAKE_MATCH_2}: over the budget")
         math(EXPR bad "${bad} + 1")
     endif()
+endif()
+# Measured peaks: a normal job took 4 MB, the runaway kept going until its 24 MB cap
+# refused it - so its peak is the larger, and both are real numbers.
+expect("the measured peaks to be reported" "peak MB: measured by GPTPS" out)
+if("${out}" MATCHES "\na +24 +([0-9.]+) " AND NOT "${CMAKE_MATCH_1}" LESS 4)
+    set(a_peak "${CMAKE_MATCH_1}")
+else()
+    message(SEND_ERROR "example_edge_ai: job a's measured peak is missing or under the 4 MB it took")
+    math(EXPR bad "${bad} + 1")
+endif()
+if("${out}" MATCHES "\nrunaway +24 +([0-9.]+) ")
+    if(DEFINED a_peak AND NOT "${CMAKE_MATCH_1}" GREATER "${a_peak}")
+        message(SEND_ERROR "example_edge_ai: the runaway's peak ${CMAKE_MATCH_1} MB is not above job a's ${a_peak} MB")
+        math(EXPR bad "${bad} + 1")
+    endif()
+else()
+    message(SEND_ERROR "example_edge_ai: the runaway's measured peak is missing")
+    math(EXPR bad "${bad} + 1")
 endif()
 if(EXISTS "${mark}")
     message(SEND_ERROR "example_edge_ai: the flaky job's retry should have removed ${mark}")

@@ -61,6 +61,26 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error
+      # Cgroup mode: the per-job memory cap, and the measurements read from the job's
+      # cgroup (docs/MEASUREMENTS.md). The runner has no delegated cgroup, so this
+      # makes one the way systemd's Delegate=yes does: a subtree the runner owns, with
+      # the memory and io controllers on for the jobs, and this shell moved into a
+      # leaf of it - the jobs' cgroups then share an ancestor the runner may write to.
+      - name: Test cgroup mode (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          CG=/sys/fs/cgroup/gptps-ci
+          echo "cgroup: $(stat -fc %T /sys/fs/cgroup), controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+          sudo mkdir -p "$CG/host" "$CG/jobs"
+          echo "+memory +io" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null || true
+          echo "+memory +io" | sudo tee "$CG/cgroup.subtree_control" >/dev/null
+          echo "+memory +io" | sudo tee "$CG/jobs/cgroup.subtree_control" >/dev/null
+          sudo chown -R "$(id -u):$(id -g)" "$CG"
+          echo $$ | sudo tee "$CG/host/cgroup.procs" >/dev/null
+          export GPTPS_CGROUP_PARENT="$CG/jobs" GPTPS_TEST_EXPECT_CGROUP=1
+          build/test_cgroup
+          build/test_measure
 
   # Optimised build with warnings as errors. Every other job builds -O0, which
   # makes the whole FLOW-SENSITIVE diagnostic family (-Wformat-truncation,
@@ -431,13 +451,13 @@ jobs:
             export GPTPS_STRESS_SEED=$GPTPS_SIM_SEED
             echo "sim seed $GPTPS_SIM_SEED (replay: GPTPS_SIM_SEED=$GPTPS_SIM_SEED GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$GPTPS_SIM_SEED GPTPS_STRESS_MS=1500)"
             ctest --test-dir build-sim --output-on-failure --no-tests=error \
-              -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|xport|xport_engine|gptps_bench_pool|gptps_bench_balance)$'
+              -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|xport|xport_engine|xport_measure|gptps_bench_pool|gptps_bench_balance)$'
           done
       - name: The tests on real processes, paced to real time
         run: |
           export GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 GPTPS_SIM_SEED=$(( ${{ github.run_number }} * 3 ))
           ctest --test-dir build-sim --output-on-failure --no-tests=error \
-            -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai)$'
+            -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure)$'
 
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
@@ -491,7 +511,7 @@ jobs:
           # A test not named here RUNS: adding one and forgetting this list makes the
           # job fail loudly, which is the right direction to be wrong in.
           ctest --test-dir build-s390x --output-on-failure --no-tests=error \
-            -E '^(oop|program|program_helper|exec_faults|cgroup|addon|addon_ns|hal_conformance_dl|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|xport_engine|wasm|tui|hang|durable|durable_crash|stress|stress_api|gptps_bench_pool|gptps_bench_balance|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm|example_edge_ai)$'
+            -E '^(oop|program|program_helper|exec_faults|cgroup|addon|addon_ns|hal_conformance_dl|fork|conformance_demo|conformance_bad|conformance_greedy|conformance_greedy_run|xport|xport_engine|wasm|tui|hang|durable|durable_crash|stress|stress_api|gptps_bench_pool|gptps_bench_balance|gptps_demo|example_config|example_task_control|example_embedded|example_dashboard|example_program|example_wasm|example_edge_ai|measure|xport_measure)$'
 
   # Prove the C99 core runs "on any hardware": compile under -ffreestanding
   # -fno-builtin against a stub HAL, link NO pthread/dl, and run a task in MANUAL

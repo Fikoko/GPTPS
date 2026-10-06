@@ -70,15 +70,31 @@ typedef struct {
  * it is still on its way, so the slot must outlive a terminal event to meet it. */
 #define OWES_RETRIED(sl) ((sl)->att > 1 && (sl)->ann < (sl)->att)
 
+/* One measurement row (docs/MEASUREMENTS.md): a name and a method, and what was
+ * folded into it. A table of them is allocated, at its fixed size, by the first
+ * measurement a task type reports, so an in-process task never pays for one. */
+typedef struct {
+    char                name[GPTPS_STATS_NAME_MAX];
+    char                method[GPTPS_STATS_NAME_MAX];
+    gptps_stats_measure m;
+} stats_mrow;
+
+typedef struct {
+    stats_mrow *rows;              /* GPTPS_STATS_MEASURE_ROWS of them, or NULL */
+    size_t      n;
+} stats_mtab;
+
 typedef struct {
     char                *name;
     gptps_stats_counters c;
+    stats_mtab           mt;
 } stats_task;
 
 struct gptps_stats {
     gptps                *e;
     apx_mutex             mu;
     gptps_stats_counters  total;
+    stats_mtab            mtotal;  /* the engine's measurement rows */
     stats_task           *tasks;
     size_t                ntasks, taskcap;
     stats_slot           *tab;   /* open addressing, power-of-two, keyed by handle */
@@ -162,7 +178,73 @@ static uint32_t task_index(gptps_stats *s, const char *name)
     strcpy(s->tasks[s->ntasks].name, name);
     memset(&s->tasks[s->ntasks].c, 0, sizeof s->tasks[s->ntasks].c);
     s->tasks[s->ntasks].c.struct_size = sizeof(gptps_stats_counters);
+    s->tasks[s->ntasks].mt.rows = NULL; s->tasks[s->ntasks].mt.n = 0;
     return (uint32_t)s->ntasks++;
+}
+
+/* ---- measurement rows ---- */
+static void mrow_fold(gptps_stats_measure *m, uint64_t v, uint64_t ts)
+{
+    if (m->count == 0 || v < m->min) m->min = v;
+    if (m->count == 0 || v > m->max) m->max = v;
+    m->sum = (m->sum > UINT64_MAX - v) ? UINT64_MAX : m->sum + v;
+    m->count += 1;
+    if (m->count == 1 || ts >= m->last_ms) { m->last = v; m->last_ms = ts; }
+}
+
+/* Fold one value into a table: its row by name and method, made if there is room.
+ * 0 if it could not be folded (the caller counts it as dropped). */
+static int mtab_fold(stats_mtab *mt, const gptps_measure *x, uint64_t ts)
+{
+    size_t i;
+    stats_mrow *r;
+    for (i = 0; i < mt->n; ++i) {
+        r = &mt->rows[i];
+        if (strcmp(r->name, x->name) == 0 && strcmp(r->method, x->method) == 0) {
+            if (r->m.unit != x->unit || r->m.kind != x->kind) return 0;   /* never mix units */
+            mrow_fold(&r->m, x->value, ts);
+            return 1;
+        }
+    }
+    if (!mt->rows) {
+        mt->rows = (stats_mrow *)calloc(GPTPS_STATS_MEASURE_ROWS, sizeof *mt->rows);
+        if (!mt->rows) return 0;
+    }
+    if (mt->n >= GPTPS_STATS_MEASURE_ROWS) return 0;
+    r = &mt->rows[mt->n];
+    memset(r, 0, sizeof *r);
+    strcpy(r->name, x->name);              /* lengths checked by the caller */
+    strcpy(r->method, x->method);
+    r->m.struct_size = sizeof r->m;
+    r->m.unit = x->unit; r->m.kind = x->kind;
+    mrow_fold(&r->m, x->value, ts);
+    mt->n += 1;
+    return 1;
+}
+
+/* Fold an array of measurements into the engine's rows and a task type's. */
+static void fold_array(gptps_stats *s, gptps_stats_counters *t, stats_mtab *tmt,
+                       const gptps_measure *arr, size_t n, uint64_t ts)
+{
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        const gptps_measure *x = &arr[i];
+        int ok = x->name && x->method &&
+                 strlen(x->name) < GPTPS_STATS_NAME_MAX && strlen(x->method) < GPTPS_STATS_NAME_MAX;
+        /* Each table counts what it could not take: the engine's and the task type's
+         * fill up independently. */
+        if (!ok || !mtab_fold(&s->mtotal, x, ts)) s->total.measures_dropped += 1;
+        if (t && (!ok || !tmt || !mtab_fold(tmt, x, ts))) t->measures_dropped += 1;
+    }
+}
+
+/* Everything an event measured. Its array is read only if its struct_size says it
+ * has one. */
+static void fold_measures(gptps_stats *s, gptps_stats_counters *t, stats_mtab *tmt,
+                          const gptps_event *ev)
+{
+    if (ev->struct_size < offsetof(gptps_event, n_measures) + sizeof(size_t) || !ev->measures) return;
+    fold_array(s, t, tmt, ev->measures, ev->n_measures, ev->ts_ms);
 }
 
 /* ---- the observer ---- */
@@ -221,11 +303,20 @@ static void stats_observe(const gptps_event *ev, void *ud)
     uint32_t ti;
 
     apx_mutex_lock(&s->mu);
+    if (ev->kind == GPTPS_EV_SAMPLE) {          /* a running job's values: no state moves */
+        ti = task_index(s, ev->task_name);
+        fold_measures(s, ti != UINT32_MAX ? &s->tasks[ti].c : NULL,
+                      ti != UINT32_MAX ? &s->tasks[ti].mt : NULL, ev);
+        apx_mutex_unlock(&s->mu);
+        return;
+    }
     slot = tab_find(s, ev->handle);
     /* The task row: from the slot if we have one (the name pointer is only valid for
      * this call, so the row index is what we keep), else by name. */
     ti = slot ? slot->task : task_index(s, ev->task_name);
     if (ti != UINT32_MAX) t = &s->tasks[ti].c;
+    if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED)
+        fold_measures(s, t, ti != UINT32_MAX ? &s->tasks[ti].mt : NULL, ev);
     if (!slot) {
         slot = tab_insert(s, ev->handle);
         if (slot) { slot->task = ti; slot->state = ST_NONE; }
@@ -366,7 +457,8 @@ void gptps_stats_close(gptps_stats *s)
     /* No unregister: this runs AFTER gptps_shutdown, which freed the engine and its
      * observer list. See the contract in the header. */
     apx_mutex_destroy(&s->mu);
-    for (i = 0; i < s->ntasks; ++i) free(s->tasks[i].name);
+    for (i = 0; i < s->ntasks; ++i) { free(s->tasks[i].name); free(s->tasks[i].mt.rows); }
+    free(s->mtotal.rows);
     free(s->tasks);
     free(s->tab);
     free(s);
@@ -436,7 +528,8 @@ void gptps_stats_reset(gptps_stats *s)
     if (!s) return;
     apx_mutex_lock(&s->mu);
     reset_row(&s->total);
-    for (i = 0; i < s->ntasks; ++i) reset_row(&s->tasks[i].c);
+    s->mtotal.n = 0;
+    for (i = 0; i < s->ntasks; ++i) { reset_row(&s->tasks[i].c); s->tasks[i].mt.n = 0; }
     apx_mutex_unlock(&s->mu);
 }
 
@@ -452,4 +545,108 @@ void gptps_stats_merge(gptps_stats_counters *d, const gptps_stats_counters *a)
     if (a->wait_ms_max > d->wait_ms_max) d->wait_ms_max = a->wait_ms_max;
     d->run_samples += a->run_samples; d->run_ms_sum += a->run_ms_sum;
     if (a->run_ms_max > d->run_ms_max) d->run_ms_max = a->run_ms_max;
+    if (a->struct_size >= offsetof(gptps_stats_counters, measures_dropped) + sizeof(uint64_t))
+        d->measures_dropped += a->measures_dropped;
+}
+
+/* The table for `task` (NULL: the engine's), or NULL if that task type is unknown.
+ * Caller holds s->mu. */
+static stats_mtab *mtab_for(gptps_stats *s, const char *task)
+{
+    size_t i;
+    if (!task) return &s->mtotal;
+    for (i = 0; i < s->ntasks; ++i)
+        if (strcmp(s->tasks[i].name, task) == 0) return &s->tasks[i].mt;
+    return NULL;
+}
+
+static void copy_out(char *buf, size_t cap, const char *src)
+{
+    size_t n;
+    if (!buf || !cap) return;
+    n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, src, n); buf[n] = 0;
+}
+
+gptps_status gptps_stats_measure_get(gptps_stats *s, const char *task, const char *name,
+                                     const char *method, gptps_stats_measure *out)
+{
+    stats_mtab *mt;
+    size_t i;
+    gptps_status st = GPTPS_E_NOTFOUND;
+    if (!s || !name || !method || !out) return GPTPS_E_INVAL;
+    apx_mutex_lock(&s->mu);
+    mt = mtab_for(s, task);
+    for (i = 0; mt && i < mt->n; ++i)
+        if (strcmp(mt->rows[i].name, name) == 0 && strcmp(mt->rows[i].method, method) == 0) {
+            *out = mt->rows[i].m; st = GPTPS_OK; break;
+        }
+    apx_mutex_unlock(&s->mu);
+    return st;
+}
+
+size_t gptps_stats_measure_count(gptps_stats *s, const char *task)
+{
+    stats_mtab *mt;
+    size_t n = 0;
+    if (!s) return 0;
+    apx_mutex_lock(&s->mu);
+    if ((mt = mtab_for(s, task)) != NULL) n = mt->n;
+    apx_mutex_unlock(&s->mu);
+    return n;
+}
+
+gptps_status gptps_stats_measure_at(gptps_stats *s, const char *task, size_t index,
+                                    char *name_buf, size_t name_cap,
+                                    char *method_buf, size_t method_cap,
+                                    gptps_stats_measure *out)
+{
+    stats_mtab *mt;
+    gptps_status st = GPTPS_E_NOTFOUND;
+    if (!s) return GPTPS_E_INVAL;
+    apx_mutex_lock(&s->mu);
+    mt = mtab_for(s, task);
+    if (mt && index < mt->n) {
+        copy_out(name_buf, name_cap, mt->rows[index].name);
+        copy_out(method_buf, method_cap, mt->rows[index].method);
+        if (out) *out = mt->rows[index].m;
+        st = GPTPS_OK;
+    }
+    apx_mutex_unlock(&s->mu);
+    return st;
+}
+
+gptps_status gptps_stats_measure_fold(gptps_stats *s, const char *task,
+                                      const gptps_measure *m, size_t n, uint64_t ts_ms)
+{
+    uint32_t ti;
+    if (!s || !task || (n && !m)) return GPTPS_E_INVAL;
+    apx_mutex_lock(&s->mu);
+    ti = task_index(s, task);
+    fold_array(s, ti != UINT32_MAX ? &s->tasks[ti].c : NULL,
+               ti != UINT32_MAX ? &s->tasks[ti].mt : NULL, m, n, ts_ms);
+    apx_mutex_unlock(&s->mu);
+    return GPTPS_OK;
+}
+
+gptps_stats *gptps_stats_open(void)
+{
+    gptps_stats *s = (gptps_stats *)calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->total.struct_size = sizeof s->total;
+    apx_mutex_init(&s->mu);
+    return s;
+}
+
+void gptps_stats_measure_merge(gptps_stats_measure *d, const gptps_stats_measure *a)
+{
+    if (!d || !a || a->count == 0) return;
+    d->struct_size = sizeof *d;
+    if (d->count == 0) { *d = *a; d->struct_size = sizeof *d; return; }
+    if (a->min < d->min) d->min = a->min;
+    if (a->max > d->max) d->max = a->max;
+    d->sum = (d->sum > UINT64_MAX - a->sum) ? UINT64_MAX : d->sum + a->sum;
+    d->count += a->count;
+    if (a->last_ms >= d->last_ms) { d->last = a->last; d->last_ms = a->last_ms; }
 }

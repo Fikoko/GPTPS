@@ -96,6 +96,34 @@ typedef void (*gptps_xport_reply_fn)(uint64_t request_id, gptps_status io,
                                      gptps_status task_status, const void *res, size_t len,
                                      void *user_data);
 
+/* MEASUREMENTS (docs/MEASUREMENTS.md). In engine mode a worker's engine measures what
+ * each process job used, and the reply carries the measurements of the item's LAST
+ * attempt back: the FINISHED one, or the last FAILED one before its dead letter.
+ * Unknown names pass through. In-process tasks, and handler mode, carry none. At most
+ * GPTPS_XPORT_MAX_MEASURES travel with one reply, each name and method at most
+ * GPTPS_XPORT_MEASURE_STR - 1 bytes; an item that reports more than that has the rest
+ * left out, and `measures_cut` says so. */
+#define GPTPS_XPORT_MAX_MEASURES 64u
+#define GPTPS_XPORT_MEASURE_STR  256u
+
+/* What the _ex calls report. In a callback every pointer is valid only for the call;
+ * from gptps_xport_submit_ex the result and the measurements are the caller's, freed
+ * with gptps_xport_result_free. */
+typedef struct {
+    size_t               struct_size;   /* = sizeof(gptps_xport_reply) */
+    uint64_t             request_id;
+    gptps_status         io;            /* GPTPS_OK: the worker answered; GPTPS_E_IO: the
+                                         * link died first, and the rest is unset */
+    gptps_status         task_status;   /* the item's own status, as for gptps_xport_submit */
+    const void          *result;
+    size_t               result_len;
+    const gptps_measure *measures;      /* NULL / 0 when nothing was measured */
+    size_t               n_measures;
+    int                  measures_cut;  /* the worker left some out (see above) */
+} gptps_xport_reply;
+
+typedef void (*gptps_xport_reply_ex_fn)(const gptps_xport_reply *reply, void *user_data);
+
 /* ENGINE MODE hook: runs in EACH worker process, after its engine is open and the
  * task table registered, before the first request. Define named resources, register
  * constraints, install gptps_stats / gptps_durable_queue, set priorities - anything
@@ -165,6 +193,22 @@ gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
                                       const void *payload, size_t len,
                                       gptps_xport_reply_fn cb, void *user_data,
                                       uint64_t *out_request_id);
+
+/* gptps_xport_submit, with the reply's measurements. *out is filled (its struct_size
+ * set by the caller) when this returns GPTPS_OK; free it with gptps_xport_result_free.
+ * The same returns as gptps_xport_submit otherwise, and *out is then left empty. */
+gptps_status gptps_xport_submit_ex(gptps_xport *xp, const char *task,
+                                   const void *payload, size_t len, gptps_xport_reply *out);
+/* Free what gptps_xport_submit_ex put in *r (the result and the measurements), and
+ * empty it. Safe on an empty or already freed reply. */
+void gptps_xport_result_free(gptps_xport_reply *r);
+
+/* gptps_xport_submit_async, with the reply's measurements: the same one-outcome rule,
+ * and the same rules for what the callback may do. */
+gptps_status gptps_xport_submit_async_ex(gptps_xport *xp, const char *task,
+                                         const void *payload, size_t len,
+                                         gptps_xport_reply_ex_fn cb, void *user_data,
+                                         uint64_t *out_request_id);
 
 /* Graceful drain (see header), then reap and free. Not from a reply callback. */
 void gptps_xport_close(gptps_xport *xp);

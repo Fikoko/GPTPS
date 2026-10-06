@@ -7,8 +7,10 @@
  * GPTPS_CGROUP_PARENT, then runs out-of-process tasks: one that blows past its
  * memory cap (must be OOM-killed and reported GPTPS_E_NOMEM) and one that stays
  * under it (must finish). SKIPS (exit 0) where cgroup v2 delegation is absent
- * (CI runners, macOS) - there the executor falls back to RLIMIT_AS, covered by
- * test_oop.
+ * (macOS, a runner with no delegated cgroup) - there the executor falls back to
+ * RLIMIT_AS, covered by test_oop. A GPTPS_CGROUP_PARENT already set names a
+ * delegated parent to use as it is: CI's cgroup step makes one by hand, and runs
+ * this test (and test_measure) inside it.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "gptps.h"
@@ -23,14 +25,24 @@ static int fails = 0;
 
 static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
-static int c_hog_nomem, c_small_ok;
+static int c_hog_nomem, c_small_ok, c_hog_cap_hit, c_small_measured;
 
 static void on_ev(const gptps_event *ev, void *ud)
 {
+    const gptps_measure *m;
     (void)ud;
     if (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_NOMEM &&
-        strcmp(ev->task_name, "hog") == 0) inc(&c_hog_nomem);
-    if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "small") == 0) inc(&c_small_ok);
+        strcmp(ev->task_name, "hog") == 0) {
+        inc(&c_hog_nomem);
+        /* the job's cgroup recorded reaching its cap (docs/MEASUREMENTS.md) */
+        m = gptps_event_measure(ev, GPTPS_M_MEM_CAP_HIT);
+        if (m && m->value == 1 && strcmp(m->method, "cgroup.job") == 0) inc(&c_hog_cap_hit);
+    }
+    if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "small") == 0) {
+        inc(&c_small_ok);
+        m = gptps_event_measure(ev, GPTPS_M_MEM_CAP_HIT);
+        if (m && m->value == 0 && gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) inc(&c_small_measured);
+    }
 }
 
 /* OOP task bodies (run in the forked child) */
@@ -64,11 +76,29 @@ static int cg_write(const char *dir, const char *file, const char *val)
 
 /* Find the systemd user-delegation boundary and prepare a memory-enabled parent
  * cgroup under it. Returns 1 (sets GPTPS_CGROUP_PARENT + fills `parent`) or 0. */
+static int g_owned;   /* the parent is this test's own, to remove at the end */
+
+static int probe_parent(const char *parent)
+{
+    char probe[1088];
+    if ((size_t)snprintf(probe, sizeof probe, "%s/_probe", parent) >= sizeof probe) return 0;
+    if (mkdir(probe, 0700) != 0) return 0;
+    if (cg_write(probe, "memory.max", "33554432") != 0) { rmdir(probe); return 0; }
+    rmdir(probe);
+    return 1;
+}
+
 static int setup_parent(char *parent, size_t pn)
 {
     char line[1024], base[1024], probe[1088];
     char *nl, *at, *svc;
-    FILE *f = fopen("/proc/self/cgroup", "r");
+    const char *given = getenv("GPTPS_CGROUP_PARENT");
+    FILE *f;
+    if (given && *given) {                       /* delegated already: use it as it is */
+        if ((size_t)snprintf(parent, pn, "%s", given) >= pn) return 0;
+        return probe_parent(parent);
+    }
+    f = fopen("/proc/self/cgroup", "r");
     if (!f) return 0;
     if (!fgets(line, sizeof line, f)) { fclose(f); return 0; }
     fclose(f);
@@ -94,6 +124,7 @@ static int setup_parent(char *parent, size_t pn)
     rmdir(probe);
 
     setenv("GPTPS_CGROUP_PARENT", parent, 1);
+    g_owned = 1;
     return 1;
 }
 
@@ -134,9 +165,11 @@ int main(void)
 
         CHECK(get(&c_small_ok) == 1);   /* under-cap task finished */
         CHECK(get(&c_hog_nomem) == 1);  /* over-cap task OOM-killed -> GPTPS_E_NOMEM */
+        CHECK(get(&c_hog_cap_hit) == 1);     /* ...and its measurements say it hit the cap */
+        CHECK(get(&c_small_measured) == 1);  /* the other did not, and has its peak */
     }
 
-    rmdir(parent); /* GPTPS removed its per-task children already */
+    if (g_owned) rmdir(parent); /* GPTPS removed its per-task children already */
     if (fails) { printf("%d cgroup check(s) FAILED\n", fails); return 1; }
     printf("all cgroup checks passed\n");
     return 0;

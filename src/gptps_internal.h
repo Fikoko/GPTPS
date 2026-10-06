@@ -117,9 +117,28 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
  * GPTPS_E_TIMEOUT for the deadline, GPTPS_E_IO for a pump failure - so an operator's
  * cancel is never mistaken for a deadline breach. A child that stops talking without
  * exiting is reaped with a bounded grace period, never an unbounded waitpid(). */
+/* What a process executor measured (docs/MEASUREMENTS.md). The engine passes one per
+ * attempt; the executor fills m[] as the attempt ends, with at most one entry per name,
+ * every name and method a string literal (so the entries stay valid after it returns,
+ * and nothing is allocated). While the job runs, and only if sample_ms is non-zero, it
+ * calls sample() about every sample_ms with the job's current values. `meter` may be
+ * NULL: then nothing is measured. */
+#define GPTPS_EXEC_MEASURES_MAX 8
+typedef struct gptps_exec_meter {
+    gptps_measure m[GPTPS_EXEC_MEASURES_MAX];
+    size_t        n;
+    uint32_t      sample_ms;                  /* 0 = no samples */
+    void        (*sample)(struct gptps_exec_meter *mt, const gptps_measure *cur, size_t n);
+    void         *sample_ud;                  /* the engine's, for sample() */
+} gptps_exec_meter;
+
+/* Append one measurement to `mt` (no-op when mt is NULL or full). */
+void gptps_meter_put(gptps_exec_meter *mt, const char *name, uint64_t value,
+                     unsigned unit, unsigned kind, const char *method);
+
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
-                               void **out_result, size_t *out_len);
+                               void **out_result, size_t *out_len, gptps_exec_meter *meter);
 
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
 typedef struct gptps_toml gptps_toml;
@@ -277,6 +296,6 @@ int             gptps_settings_publish_locked(gptps_settings *r, gptps_setting_p
  * goes silent and keeps running is SIGKILLed after a grace period. */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
-                                   void **out_result, size_t *out_len);
+                                   void **out_result, size_t *out_len, gptps_exec_meter *meter);
 
 #endif /* GPTPS_INTERNAL_H */

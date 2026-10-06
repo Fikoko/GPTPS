@@ -10,6 +10,13 @@
  *  - gptps_oop_execute: the OOP executor runs an in-process task FUNCTION inside an
  *    isolated child, which is built on POSIX fork(); Windows has no equivalent, so
  *    it reports GPTPS_E_INVAL (EXEC_OOP is POSIX-only).
+ *
+ * Measurements (docs/MEASUREMENTS.md): the job object accounts for every process in
+ * it, so the program and everything it starts are measured together - memory as
+ * COMMITTED (what the processes reserved), not resident. Without a job object, the
+ * program's own process handle is measured instead, and the method says so. Hitting
+ * the memory cap is not reported: Windows announces it on a completion port whose
+ * delivery it does not guarantee, and a missed message would read as "not hit".
  */
 #if defined(_WIN32)
 
@@ -17,6 +24,7 @@
 #include "gptps_internal.h"
 
 #include <windows.h>
+#include <psapi.h>     /* PROCESS_MEMORY_COUNTERS_EX: the type only; see pmi_fn */
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,11 +43,179 @@
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
-                               void **out_result, size_t *out_len)
+                               void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
-    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel;
+    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel; (void)meter;
     *out_result = NULL; *out_len = 0;
     return GPTPS_E_INVAL; /* fork-based isolation is POSIX-only */
+}
+
+/* ---- measurements (docs/MEASUREMENTS.md) ----------------------------------
+ * Names and methods are string literals, so the meter's entries outlive this file's
+ * frames; gptps_meter_put keeps the first value per name, so the job object's view
+ * goes in before the process handle's. */
+
+/* K32GetProcessMemoryInfo lives in kernel32 from Windows 7 on. Looked up at run time
+ * so the library neither links psapi nor stops loading on an older system, where the
+ * memory figures that need it are simply not reported. */
+typedef BOOL (WINAPI *pmi_fn)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+static pmi_fn get_pmi(void)
+{
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    return k ? (pmi_fn)(void (*)(void))GetProcAddress(k, "K32GetProcessMemoryInfo") : NULL;
+}
+
+static uint64_t ft_ms(LARGE_INTEGER t100ns) { return (uint64_t)t100ns.QuadPart / 10000u; }
+static uint64_t filetime_ms(FILETIME f)
+{
+    ULARGE_INTEGER u;
+    u.LowPart = f.dwLowDateTime; u.HighPart = f.dwHighDateTime;
+    return u.QuadPart / 10000u;   /* 100 ns units */
+}
+
+/* What the attempt used, after its processes have ended. The job object covers the
+ * program and everything it started; the process handle covers the program alone.
+ * Both are read, and two facts that need no guessing decide which is reported:
+ *   - a job contains its program, so a job figure BELOW the program's own is not a
+ *     measurement (an emulation such as wine answers the job queries with zeros);
+ *   - every process commits memory, so a committed peak of 0 is not one either.
+ * Where neither holds up, the name is left out (docs/MEASUREMENTS.md, rule 2). */
+static void win_measure(gptps_exec_meter *mt, HANDLE job, int assigned, HANDLE proc)
+{
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION x;
+    JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION a;
+    PROCESS_MEMORY_COUNTERS_EX pm;
+    FILETIME c, ex, k, u;
+    IO_COUNTERS io;
+    pmi_fn pmi = get_pmi();
+    int have_x = 0, have_a = 0, have_pm = 0, have_t = 0, have_io = 0;
+    uint64_t p_peak = 0, p_user = 0, p_sys = 0, p_rd = 0, p_wr = 0;
+    if (!mt) return;
+    if (proc) {
+        memset(&pm, 0, sizeof pm);
+        pm.cb = sizeof pm;
+        if (pmi && pmi(proc, (PPROCESS_MEMORY_COUNTERS)&pm, sizeof pm)) { have_pm = 1; p_peak = (uint64_t)pm.PeakPagefileUsage; }
+        if (GetProcessTimes(proc, &c, &ex, &k, &u)) { have_t = 1; p_user = filetime_ms(u); p_sys = filetime_ms(k); }
+        if (GetProcessIoCounters(proc, &io)) {
+            have_io = 1; p_rd = (uint64_t)io.ReadTransferCount; p_wr = (uint64_t)io.WriteTransferCount;
+        }
+    }
+    if (job && assigned) {
+        memset(&x, 0, sizeof x);
+        memset(&a, 0, sizeof a);
+        have_x = QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &x, sizeof x, NULL) != 0;
+        have_a = QueryInformationJobObject(job, JobObjectBasicAndIoAccountingInformation, &a, sizeof a, NULL) != 0;
+    }
+    /* mem.peak */
+    if (have_x && x.PeakJobMemoryUsed > 0 && (!have_pm || (uint64_t)x.PeakJobMemoryUsed >= p_peak))
+        gptps_meter_put(mt, GPTPS_M_MEM_PEAK, (uint64_t)x.PeakJobMemoryUsed,
+                        GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK, "jobobject.tree.committed");
+    else if (have_pm && p_peak > 0)
+        gptps_meter_put(mt, GPTPS_M_MEM_PEAK, p_peak, GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK, "process.committed");
+    /* cpu.* */
+    if (have_a && (!have_t || (ft_ms(a.BasicInfo.TotalUserTime) >= p_user &&
+                               ft_ms(a.BasicInfo.TotalKernelTime) >= p_sys))) {
+        gptps_meter_put(mt, GPTPS_M_CPU_USER_MS, ft_ms(a.BasicInfo.TotalUserTime),
+                        GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "jobobject.tree");
+        gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS, ft_ms(a.BasicInfo.TotalKernelTime),
+                        GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "jobobject.tree");
+    } else if (have_t) {
+        gptps_meter_put(mt, GPTPS_M_CPU_USER_MS, p_user, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "process");
+        gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS,  p_sys,  GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "process");
+    }
+    /* io.* */
+    if (have_a && (!have_io || ((uint64_t)a.IoInfo.ReadTransferCount >= p_rd &&
+                                (uint64_t)a.IoInfo.WriteTransferCount >= p_wr))) {
+        gptps_meter_put(mt, GPTPS_M_IO_READ_BYTES, (uint64_t)a.IoInfo.ReadTransferCount,
+                        GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "jobobject.tree.all");
+        gptps_meter_put(mt, GPTPS_M_IO_WRITE_BYTES, (uint64_t)a.IoInfo.WriteTransferCount,
+                        GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "jobobject.tree.all");
+    } else if (have_io) {
+        gptps_meter_put(mt, GPTPS_M_IO_READ_BYTES,  p_rd, GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "process.all");
+        gptps_meter_put(mt, GPTPS_M_IO_WRITE_BYTES, p_wr, GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "process.all");
+    }
+}
+
+/* The committed memory of every process in the job right now, or 0 with *ok = 0 when
+ * it cannot be known whole: more processes than the list holds, or one that cannot be
+ * read. A process that exits between the list and the read has no memory left. */
+#define GPTPS_WIN_SAMPLE_PIDS 64
+static uint64_t job_committed_now(HANDLE job, int *ok)
+{
+    struct { JOBOBJECT_BASIC_PROCESS_ID_LIST h; ULONG_PTR more[GPTPS_WIN_SAMPLE_PIDS - 1]; } pl;
+    pmi_fn pmi = get_pmi();
+    uint64_t sum = 0;
+    DWORD i;
+    *ok = 0;
+    if (!pmi) return 0;
+    memset(&pl, 0, sizeof pl);
+    if (!QueryInformationJobObject(job, JobObjectBasicProcessIdList, &pl, sizeof pl, NULL)) return 0;
+    if (pl.h.NumberOfProcessIdsInList < pl.h.NumberOfAssignedProcesses) return 0;
+    for (i = 0; i < pl.h.NumberOfProcessIdsInList; ++i) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE,
+                               (DWORD)pl.h.ProcessIdList[i]);
+        PROCESS_MEMORY_COUNTERS_EX pm;
+        if (!h) {
+            if (GetLastError() == ERROR_INVALID_PARAMETER) continue;   /* already gone */
+            return 0;                                                    /* cannot read it */
+        }
+        memset(&pm, 0, sizeof pm);
+        pm.cb = sizeof pm;
+        if (!pmi(h, (PPROCESS_MEMORY_COUNTERS)&pm, sizeof pm)) { CloseHandle(h); return 0; }
+        sum += (uint64_t)pm.PrivateUsage;
+        CloseHandle(h);
+    }
+    *ok = sum > 0;                    /* a running job commits memory: 0 is not a reading */
+    return sum;
+}
+
+/* Samples of a running job, about every sample_ms (at least 10), from the wait loop. */
+typedef struct { gptps_exec_meter *mt; uint64_t next; uint32_t iv; } win_sampler;
+
+static void win_sampler_init(win_sampler *sm, gptps_exec_meter *mt)
+{
+    sm->mt = (mt && mt->sample_ms && mt->sample) ? mt : NULL;
+    sm->iv = sm->mt ? (mt->sample_ms < 10u ? 10u : mt->sample_ms) : 0;
+    sm->next = sm->mt ? gptps_hal_monotonic_ms() + sm->iv : 0;
+}
+
+static DWORD win_sampler_slice(const win_sampler *sm, DWORD slice)
+{
+    uint64_t now;
+    if (!sm->mt) return slice;
+    now = gptps_hal_monotonic_ms();
+    if (now >= sm->next) return 0;
+    return (sm->next - now < (uint64_t)slice) ? (DWORD)(sm->next - now) : slice;
+}
+
+static void win_sampler_tick(win_sampler *sm, HANDLE job, int assigned, HANDLE proc)
+{
+    gptps_measure cur[1];
+    uint64_t now;
+    int ok = 0;
+    if (!sm->mt) return;
+    now = gptps_hal_monotonic_ms();
+    if (now < sm->next) return;
+    sm->next = now + sm->iv;
+    if (job && assigned) {
+        cur[0].value = job_committed_now(job, &ok);
+        cur[0].method = "jobobject.tree.committed";
+    }
+    if (!ok) {                        /* no job object, or no whole reading of it */
+        pmi_fn pmi = get_pmi();
+        PROCESS_MEMORY_COUNTERS_EX pm;
+        memset(&pm, 0, sizeof pm);
+        pm.cb = sizeof pm;
+        if (pmi && pmi(proc, (PPROCESS_MEMORY_COUNTERS)&pm, sizeof pm) && pm.PrivateUsage > 0) {
+            cur[0].value = (uint64_t)pm.PrivateUsage;
+            cur[0].method = "process.committed";
+            ok = 1;
+        }
+    }
+    if (!ok) return;
+    cur[0].name = GPTPS_M_MEM_CURRENT;
+    cur[0].unit = GPTPS_UNIT_BYTES; cur[0].kind = GPTPS_MEASURE_CURRENT; cur[0].flags = 0;
+    sm->mt->sample(sm->mt, cur, 1);
 }
 
 /* Quote argv into one CreateProcess command line (MSDN argv parsing rules). */
@@ -169,7 +345,7 @@ static DWORD WINAPI reader_proc(LPVOID p)
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
-                                   void **out_result, size_t *out_len)
+                                   void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
@@ -248,13 +424,17 @@ return GPTPS_E_NOMEM; }
      * stdout deadlock to solve here (unlike the POSIX single-thread pump). */
     {
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
+        win_sampler sm;
+        win_sampler_init(&sm, meter);
         for (;;) {
             DWORD slice = 200;
+            win_sampler_tick(&sm, job, assigned, pi.hProcess);   /* a sample, when due */
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
                 if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; break; }
                 if (deadline - now < (uint64_t)slice) slice = (DWORD)(deadline - now);
             }
+            slice = win_sampler_slice(&sm, slice);
             waited = WaitForSingleObject(pi.hProcess, slice);
             if (waited == WAIT_OBJECT_0) break;                       /* child exited */
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
@@ -307,6 +487,9 @@ return GPTPS_E_NOMEM; }
         WaitForSingleObject(rt, INFINITE); CloseHandle(rt);
     }
     GetExitCodeProcess(pi.hProcess, &code);
+    /* Every process of the job has ended (TerminateJobObject above), so its totals are
+     * final; the handles are still open, which is all the queries need. */
+    win_measure(meter, job, assigned, pi.hProcess);
 
     if (outR) CloseHandle(outR);          /* no reader thread was ever started */
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);

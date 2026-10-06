@@ -18,6 +18,11 @@
  *  - timeout_s==0 => no deadline of its own, but NOT unstoppable: the parent polls
  *    the cancel flag in bounded slices, so gptps_cancel / task removal / the
  *    shutdown grace still hard-kill the child. Nothing here waits forever.
+ *
+ * Measurements (docs/MEASUREMENTS.md): the child is collected with wait4(), which
+ * returns its resource usage in the same call, and in cgroup mode the job's own
+ * cgroup files are read before the cgroup is removed. Both executors report them
+ * through the engine's gptps_exec_meter, best method first.
  */
 
 /* feature-test macros before any system header (see hal_posix.c) */
@@ -46,6 +51,19 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#  include <libproc.h>   /* proc_pidinfo: a running child's resident memory (samples) */
+#endif
+
+/* wait4() hands back the reaped child's struct rusage. Not POSIX, but every system
+ * this backend targets has it; elsewhere children are reaped with waitpid() and
+ * nothing is measured (docs/MEASUREMENTS.md, rule 2: measured, or absent). */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || \
+    defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#  define GPTPS_HAVE_WAIT4 1
+#else
+#  define GPTPS_HAVE_WAIT4 0
+#endif
 
 #define GPTPS_OOP_MEMCAP_FLOOR (16ull * 1024ull * 1024ull) /* below this, a mem cap is meaningless */
 
@@ -60,6 +78,20 @@
  * we escalate to SIGKILL (see reap_bounded). */
 #define GPTPS_EXEC_EXIT_GRACE_MS 2000
 
+/* waitpid(), plus the child's resource usage where the system reports it: *have_ru
+ * is set when `ru` was filled for the child this call reaped. */
+static pid_t wait_child(pid_t pid, int *wstatus, int options, struct rusage *ru, int *have_ru)
+{
+#if GPTPS_HAVE_WAIT4
+    pid_t r = wait4(pid, wstatus, options, ru);
+    if (r == pid) *have_ru = 1;
+    return r;
+#else
+    (void)ru; (void)have_ru;
+    return waitpid(pid, wstatus, options);
+#endif
+}
+
 /* Reap `pid` WITHOUT blocking forever. A child that closes its stdout but keeps
  * running - or ignores every signal short of SIGKILL - would otherwise pin this
  * worker inside waitpid(), which is exactly the hang these executors promise never
@@ -73,14 +105,15 @@
  * success. Callers must refuse to interpret wstatus when *reaped is 0.
  * Returns GPTPS_OK if the child exited on its own, else why it had to be killed. */
 static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group,
-                                 uint64_t deadline, const uint32_t *cancel)
+                                 uint64_t deadline, const uint32_t *cancel,
+                                 struct rusage *ru, int *have_ru)
 {
     gptps_status why = GPTPS_OK;
     int waited = 0;
     *reaped = 0;
     for (;;) {
         struct timespec ts;
-        pid_t r = waitpid(pid, wstatus, WNOHANG);
+        pid_t r = wait_child(pid, wstatus, WNOHANG, ru, have_ru);
         if (r == pid) { *reaped = 1; return why; }
         /* Not an error we can act on (the host already reaped it): keep returning
          * GPTPS_OK - both call sites map a non-OK return onto "we had to kill it",
@@ -315,6 +348,231 @@ static void cgroup_destroy(char *dir)
 }
 #endif /* __linux__ */
 
+/* ---- measurements (docs/MEASUREMENTS.md) ----------------------------------
+ * Every name and method below is a string literal, so the meter's entries stay valid
+ * after the executor returns. gptps_meter_put keeps the first value per name, so a
+ * caller puts the better method first and the fallback after it. */
+
+#if defined(__linux__)
+/* Read a small cgroup or /proc file into buf (NUL-terminated); its length, or -1. On
+ * the stack, with open/read: these files are a few lines long. */
+static long read_small(const char *dir, const char *file, char *buf, size_t cap)
+{
+    char path[512];
+    int fd, n;
+    long len = 0;
+    n = snprintf(path, sizeof path, "%s/%s", dir, file);
+    if (n < 0 || (size_t)n >= sizeof path || cap == 0) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    for (;;) {
+        ssize_t r = read(fd, buf + len, cap - 1 - (size_t)len);
+        if (r < 0) { if (errno == EINTR) continue; close(fd); return -1; }
+        if (r == 0 || (size_t)(len + r) >= cap - 1) { len += (r > 0 ? r : 0); break; }
+        len += r;
+    }
+    close(fd);
+    buf[len] = 0;
+    return len;
+}
+
+/* The value after `key ` on a line of a "key value" file, e.g. memory.events. */
+static int kv_find(const char *text, const char *key, uint64_t *out)
+{
+    size_t kl = strlen(key);
+    const char *p = text;
+    while (p && *p) {
+        if (strncmp(p, key, kl) == 0 && p[kl] == ' ') {
+            *out = (uint64_t)strtoull(p + kl + 1, NULL, 10);
+            return 1;
+        }
+        p = strchr(p, '\n');
+        if (p) ++p;
+    }
+    return 0;
+}
+
+/* The job's cgroup: what every process in it used. Read after the child is reaped
+ * and before the cgroup is removed. A file the kernel does not have (memory.peak
+ * before 5.19, io.stat without the io controller) leaves its names to the fallback. */
+static void cgroup_measure(gptps_exec_meter *mt, const char *dir)
+{
+    char buf[4096];
+    uint64_t v, w;
+    if (!mt || !dir) return;
+    if (read_small(dir, "memory.peak", buf, sizeof buf) > 0)
+        gptps_meter_put(mt, GPTPS_M_MEM_PEAK, (uint64_t)strtoull(buf, NULL, 10),
+                        GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK, "cgroup.job.resident");
+    if (read_small(dir, "memory.events", buf, sizeof buf) > 0 &&
+        kv_find(buf, "max", &v) && kv_find(buf, "oom_kill", &w))
+        gptps_meter_put(mt, GPTPS_M_MEM_CAP_HIT, (v > 0 || w > 0) ? 1u : 0u,
+                        GPTPS_UNIT_FLAG, GPTPS_MEASURE_FLAG, "cgroup.job");
+    if (read_small(dir, "cpu.stat", buf, sizeof buf) > 0 &&
+        kv_find(buf, "user_usec", &v) && kv_find(buf, "system_usec", &w)) {
+        gptps_meter_put(mt, GPTPS_M_CPU_USER_MS, v / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
+        gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS,  w / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
+    }
+    /* io.stat: one line per device, "MAJ:MIN rbytes=N wbytes=N rios=N ...". It
+     * exists only where the io controller is enabled for the job's cgroup, and an
+     * empty one means no block I/O at all - a real 0. */
+    if (read_small(dir, "io.stat", buf, sizeof buf) >= 0) {
+        uint64_t rb = 0, wb = 0;
+        const char *p = buf;
+        while (*p) {
+            const char *r = strstr(p, "rbytes="), *wr = strstr(p, "wbytes="), *nl = strchr(p, '\n');
+            if (r && (!nl || r < nl))  rb += (uint64_t)strtoull(r + 7, NULL, 10);
+            if (wr && (!nl || wr < nl)) wb += (uint64_t)strtoull(wr + 7, NULL, 10);
+            if (!nl) break;
+            p = nl + 1;
+        }
+        gptps_meter_put(mt, GPTPS_M_IO_READ_BYTES,  rb, GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "cgroup.job.block");
+        gptps_meter_put(mt, GPTPS_M_IO_WRITE_BYTES, wb, GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "cgroup.job.block");
+    }
+}
+
+/* ru_inblock / ru_oublock come from per-task I/O accounting, a kernel option: without
+ * it they read 0 whatever the job did, so they are reported only where /proc/self/io
+ * shows the accounting exists. 0 = not checked yet, 1 = absent, 2 = present. */
+static uint32_t g_task_io = 0;
+static int task_io_accounting(void)
+{
+    uint32_t v = gptps_hal_load_acquire_u32(&g_task_io);
+    if (v == 0) {
+        v = (access("/proc/self/io", R_OK) == 0) ? 2u : 1u;
+        gptps_hal_store_release_u32(&g_task_io, v);
+    }
+    return v == 2u;
+}
+#endif /* __linux__ */
+
+#if GPTPS_HAVE_WAIT4
+/* wait4's rusage: the job's process and the children it waited for. ru_maxrss is the
+ * resident peak of the largest of those processes, not their sum: in KiB on Linux and
+ * the BSDs, in bytes on macOS. */
+static void rusage_measure(gptps_exec_meter *mt, const struct rusage *ru)
+{
+    uint64_t rss;
+    if (!mt) return;
+#if defined(__APPLE__)
+    rss = (uint64_t)ru->ru_maxrss;
+#else
+    rss = (uint64_t)ru->ru_maxrss * 1024u;
+#endif
+    gptps_meter_put(mt, GPTPS_M_MEM_PEAK, rss, GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK,
+                    "rusage.largest_process.resident");
+    gptps_meter_put(mt, GPTPS_M_CPU_USER_MS,
+                    (uint64_t)ru->ru_utime.tv_sec * 1000u + (uint64_t)ru->ru_utime.tv_usec / 1000u,
+                    GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "rusage.process");
+    gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS,
+                    (uint64_t)ru->ru_stime.tv_sec * 1000u + (uint64_t)ru->ru_stime.tv_usec / 1000u,
+                    GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "rusage.process");
+#if defined(__linux__)
+    /* Linux counts these in 512-byte units of block-device I/O; elsewhere they are
+     * counts of operations, which are not bytes, so they are not reported. */
+    if (task_io_accounting()) {
+        gptps_meter_put(mt, GPTPS_M_IO_READ_BYTES, (uint64_t)ru->ru_inblock * 512u,
+                        GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "rusage.process.block");
+        gptps_meter_put(mt, GPTPS_M_IO_WRITE_BYTES, (uint64_t)ru->ru_oublock * 512u,
+                        GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "rusage.process.block");
+    }
+#endif
+}
+#endif
+
+/* Everything an ended attempt reports: the cgroup's view first (the whole job), then
+ * wait4's (the process). `cgdir` is NULL outside cgroup mode. */
+static void meter_finish(gptps_exec_meter *mt, const char *cgdir, const struct rusage *ru, int have_ru)
+{
+    if (!mt) return;
+#if defined(__linux__)
+    cgroup_measure(mt, cgdir);
+#else
+    (void)cgdir;
+#endif
+#if GPTPS_HAVE_WAIT4
+    if (have_ru) rusage_measure(mt, ru);
+#else
+    (void)ru; (void)have_ru;
+#endif
+}
+
+/* Samples of a running job, about every sample_ms (at least 10), driven by the
+ * executor's own wait loop: sampler_slice shortens a wait to the next sample, and
+ * sampler_tick takes it when it is due. */
+typedef struct { gptps_exec_meter *mt; uint64_t next; uint32_t iv; } sampler;
+
+static void sampler_init(sampler *sm, gptps_exec_meter *mt)
+{
+    sm->mt = (mt && mt->sample_ms && mt->sample) ? mt : NULL;
+    sm->iv = sm->mt ? (mt->sample_ms < 10u ? 10u : mt->sample_ms) : 0;
+    sm->next = sm->mt ? gptps_hal_monotonic_ms() + sm->iv : 0;
+}
+
+static int sampler_slice(const sampler *sm, int slice)
+{
+    uint64_t now;
+    if (!sm->mt) return slice;
+    now = gptps_hal_monotonic_ms();
+    if (now >= sm->next) return 0;
+    return (sm->next - now < (uint64_t)slice) ? (int)(sm->next - now) : slice;
+}
+
+/* The job's memory now: its cgroup's on Linux in cgroup mode, else its main
+ * process's. Nothing where neither can be read. */
+static void sampler_tick(sampler *sm, pid_t pid, const char *cgdir)
+{
+    gptps_measure cur[1];
+    size_t n = 0;
+    uint64_t now;
+    if (!sm->mt) return;
+    now = gptps_hal_monotonic_ms();
+    if (now < sm->next) return;
+    sm->next = now + sm->iv;
+#if defined(__linux__)
+    {
+        char buf[256];
+        if (cgdir && read_small(cgdir, "memory.current", buf, sizeof buf) > 0) {
+            cur[0].value = (uint64_t)strtoull(buf, NULL, 10);
+            cur[0].method = "cgroup.job.resident";
+            n = 1;
+        } else {
+            char dir[64], *end;
+            long size, pages;
+            snprintf(dir, sizeof dir, "/proc/%ld", (long)pid);
+            /* statm: "size resident shared ...", in pages. A process that has exited
+             * and not been reaped yet reads all zeros: it has no memory left to
+             * sample, so a size of 0 is no sample rather than a sample of 0. */
+            if (read_small(dir, "statm", buf, sizeof buf) > 0) {
+                size = strtol(buf, &end, 10);
+                pages = (end != buf) ? strtol(end, NULL, 10) : -1;
+                if (size > 0 && pages >= 0) {
+                    cur[0].value = (uint64_t)pages * (uint64_t)sysconf(_SC_PAGESIZE);
+                    cur[0].method = "procfs.process.resident";
+                    n = 1;
+                }
+            }
+        }
+    }
+#elif defined(__APPLE__)
+    {
+        struct proc_taskinfo ti;
+        (void)cgdir;
+        if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, (int)sizeof ti) == (int)sizeof ti) {
+            cur[0].value = (uint64_t)ti.pti_resident_size;
+            cur[0].method = "libproc.process.resident";
+            n = 1;
+        }
+    }
+#else
+    (void)pid; (void)cgdir;
+#endif
+    if (n) {
+        cur[0].name = GPTPS_M_MEM_CURRENT;
+        cur[0].unit = GPTPS_UNIT_BYTES; cur[0].kind = GPTPS_MEASURE_CURRENT; cur[0].flags = 0;
+        sm->mt->sample(sm->mt, cur, n);
+    }
+}
+
 static int write_all(int fd, const void *buf, size_t n)
 {
     const char *p = (const char *)buf; size_t off = 0;
@@ -341,7 +599,7 @@ static int read_all(int fd, void *buf, size_t n)
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
-                               void **out_result, size_t *out_len)
+                               void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     int p[2];
     pid_t pid;
@@ -419,6 +677,15 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         gptps_status eff;
         gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
+        struct rusage ru;                          /* the child's, from wait4 */
+        int have_ru = 0;
+        sampler sm;
+        const char *cg = NULL;                     /* the job's cgroup, in cgroup mode */
+#if defined(__linux__)
+        cg = cgdir;
+#endif
+        memset(&ru, 0, sizeof ru);
+        sampler_init(&sm, meter);
 
         exec_close(p[1]);
         pfd.fd = p[0]; pfd.events = POLLIN; pfd.revents = 0;
@@ -428,11 +695,13 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
          * instead of blocking this worker forever - including when timeout_s==0. */
         for (;;) {
             int slice = 200;
+            sampler_tick(&sm, pid, cg);            /* a sample, when one is due */
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
                 if (now >= deadline) { kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_TIMEOUT; break; }
                 if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
+            slice = sampler_slice(&sm, slice);
             pr = poll(&pfd, 1, slice);
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
@@ -464,10 +733,10 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         }
         exec_close(p[0]);
         if (killed) {
-            while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
+            while (wait_child(pid, &wstatus, 0, &ru, &have_ru) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
         } else {
             /* The child owes us nothing more, but it has not necessarily exited. */
-            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel, &ru, &have_ru);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
@@ -485,6 +754,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         } else {
             eff = (gptps_status)st32;
         }
+        meter_finish(meter, cg, &ru, have_ru);   /* before the cgroup goes */
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -497,7 +767,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
-                                   void **out_result, size_t *out_len)
+                                   void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     const char *const *argv = def ? def->argv : NULL;
     int inp[2], outp[2];
@@ -589,9 +859,18 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         size_t wleft = plen;
         int in_open = 1;                           /* inp[1] still open for writing */
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
+        struct rusage ru;                          /* the child's, from wait4 */
+        int have_ru = 0;
+        sampler sm;
+        const char *cg = NULL;                     /* the job's cgroup, in cgroup mode */
 #if !defined(F_SETNOSIGPIPE)
         sigset_t sp_old; int sp_masked = 0;
 #endif
+#if defined(__linux__)
+        cg = cgdir;
+#endif
+        memset(&ru, 0, sizeof ru);
+        sampler_init(&sm, meter);
 
         exec_close(inp[0]); exec_close(outp[1]);
         setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
@@ -617,11 +896,15 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             oidx = nfd; pfd[nfd].fd = outp[0]; pfd[nfd].events = POLLIN;  pfd[nfd].revents = 0; nfd++;
             if (in_open) { iidx = nfd; pfd[nfd].fd = inp[1]; pfd[nfd].events = POLLOUT; pfd[nfd].revents = 0; nfd++; }
 
+            /* Every pass, not only on an idle slice: a program that writes all the
+             * time would otherwise never be sampled. */
+            sampler_tick(&sm, pid, cg);
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
                 if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; kill(-pid, SIGKILL); break; }
                 if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
+            slice = sampler_slice(&sm, slice);
             pr = poll(pfd, (nfds_t)nfd, slice);
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
@@ -688,13 +971,13 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         }
 #endif
         if (killed || oversize || nomem) {
-            while (waitpid(pid, &wstatus, 0) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
+            while (wait_child(pid, &wstatus, 0, &ru, &have_ru) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
         } else {
             /* Loop exited on stdout EOF - which says the child closed its stdout, NOT
              * that it exited. A program that keeps running (or ignores signals) would
              * otherwise pin this worker in waitpid() forever, orphaning the child at
              * shutdown. Give it a bounded grace period, then SIGKILL. */
-            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel, &ru, &have_ru);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
@@ -712,6 +995,9 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 #if defined(__linux__)
         if (cgdir && eff != GPTPS_OK && eff != GPTPS_E_TIMEOUT && cgroup_oom_killed(cgdir))
             eff = GPTPS_E_NOMEM;     /* exceeded the memory cap */
+#endif
+        meter_finish(meter, cg, &ru, have_ru);   /* before the cgroup goes */
+#if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
 

@@ -78,10 +78,11 @@ extern "C" {
  * gptps_task_flags, so a caller can finally see whether a registered type is a
  * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*); 2.4 appends to
  * gptps_config the bounded-mode fields, then max_dead_letters and shutdown_grace_ms
- * (with GPTPS_LIMIT_NONE). Additive, and the loader compares MAJOR only, so no
- * existing add-on is refused. */
+ * (with GPTPS_LIMIT_NONE); 2.5 appends `measures` / `n_measures` to gptps_event
+ * (gptps_measure, docs/MEASUREMENTS.md) and adds the GPTPS_EV_SAMPLE kind. Additive,
+ * and the loader compares MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 4u
+#define GPTPS_ABI_VERSION_MINOR 5u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -906,6 +907,11 @@ GPTPS_API gptps_status gptps_shutdown(gptps *e);
  * its FAILED / GPTPS_E_CANCELLED at once, ahead of the triggering event for every
  * observer still to see that event.
  *
+ * SAMPLE (ABI 2.5) is emitted only while sampling is on (the measure.sample_ms
+ * setting; 0, the default, is off), by the thread running a process job, between
+ * that attempt's STARTED and its FINISHED or FAILED - so it is ordered with them.
+ * An observer that does not know a kind must ignore it: a later engine may add one.
+ *
  * So read QUEUED as "this handle exists", not as "this handle is new", and let
  * an event that arrives first stand until its QUEUED catches up.
  * addons/gptps_stats.c is the worked example - a terminal event that outruns
@@ -922,8 +928,60 @@ typedef enum {
     /* v1.9: terminal event after retries are exhausted under the DROP policy
      * (the item is discarded, not retained). Lets an observer reconcile every
      * submitted item - DROP previously emitted no terminal event. */
-    GPTPS_EV_DROPPED
+    GPTPS_EV_DROPPED,
+    /* ABI 2.5: a running process job's measurements at one moment (kind
+     * GPTPS_MEASURE_CURRENT, e.g. mem.current). Emitted only when the host sets
+     * measure.sample_ms; never part of an item's life cycle. */
+    GPTPS_EV_SAMPLE
 } gptps_event_kind;
+
+/* ============================================================================
+ * MEASUREMENTS (ABI 2.5): what an attempt actually used. docs/MEASUREMENTS.md is
+ * the design record; in short:
+ *   - Reported on FINISHED / FAILED of an attempt that ran as a separate process
+ *     (GPTPS_EXEC_PROGRAM, GPTPS_EXEC_OOP), and on SAMPLE events. Never for an
+ *     in-process task, which shares the host's memory and threads.
+ *   - Report, never act: no measurement changes admission, a declaration or a retry.
+ *   - Measured, or absent: never estimated, and 0 is a real value.
+ *   - Every value carries its method ("cgroup.job.resident", ...), because one name
+ *     can mean different things on different platforms; never mix methods.
+ *   - One unit per name, everywhere. Names are dotted like settings keys; the core
+ *     owns mem., cpu. and io., an add-on uses its own namespace. Ignore a name you
+ *     do not know.
+ * gptps_measure is the element of an array, so it is FROZEN: it never grows. New
+ * information arrives as new names, units, kinds or flag bits.
+ * ==========================================================================*/
+typedef enum {
+    GPTPS_UNIT_BYTES = 1,
+    GPTPS_UNIT_MS    = 2,
+    GPTPS_UNIT_COUNT = 3,
+    GPTPS_UNIT_FLAG  = 4       /* 0 or 1 */
+} gptps_measure_unit;
+
+typedef enum {
+    GPTPS_MEASURE_PEAK    = 1, /* the highest value during the attempt: combine by max */
+    GPTPS_MEASURE_TOTAL   = 2, /* accumulated over the attempt: combine by sum */
+    GPTPS_MEASURE_FLAG    = 3, /* 1 if it happened at least once: combine by or */
+    GPTPS_MEASURE_CURRENT = 4  /* the value at one moment (a sample): the latest wins */
+} gptps_measure_kind;
+
+typedef struct {
+    const char *name;          /* "mem.peak", ... or "<addon>.<name>" */
+    uint64_t    value;
+    uint16_t    unit;          /* gptps_measure_unit */
+    uint16_t    kind;          /* gptps_measure_kind */
+    uint32_t    flags;         /* 0 today; ignore bits you do not know */
+    const char *method;        /* how it was measured: source.scope[.what] */
+} gptps_measure;
+
+/* The core's names (docs/MEASUREMENTS.md has the methods behind each, by platform). */
+#define GPTPS_M_MEM_PEAK       "mem.peak"        /* bytes, peak */
+#define GPTPS_M_MEM_CURRENT    "mem.current"     /* bytes, current (SAMPLE only) */
+#define GPTPS_M_MEM_CAP_HIT    "mem.cap_hit"     /* flag: reached its memory cap */
+#define GPTPS_M_CPU_USER_MS    "cpu.user_ms"     /* ms, total */
+#define GPTPS_M_CPU_SYS_MS     "cpu.sys_ms"      /* ms, total */
+#define GPTPS_M_IO_READ_BYTES  "io.read_bytes"   /* bytes, total */
+#define GPTPS_M_IO_WRITE_BYTES "io.write_bytes"  /* bytes, total */
 
 typedef struct {
     size_t           struct_size;   /* = sizeof(gptps_event) */
@@ -934,10 +992,8 @@ typedef struct {
     gptps_status     status;        /* terminal status for FINISHED/FAILED */
     uint32_t         attempt;
     /* memory: the task's DECLARED cost (cost.mem_bytes), for both in-process and
-     * OOP/PROGRAM tasks. RSS is not reported here: in-process it is not observable
-     * in a shared address space, and although an OOP/PROGRAM task's cap is ENFORCED
-     * (cgroup memory.max on Linux, else RLIMIT_AS), its measured peak RSS is not
-     * plumbed back into this field. */
+     * OOP/PROGRAM tasks - never a measurement. What a process job actually used is
+     * in `measures` (ABI 2.5) below, next to this declaration. */
     uint64_t         mem_bytes;
     /* task result bytes, present on GPTPS_EV_FINISHED (NULL/0 otherwise).
      * Valid only for the duration of the callback - copy it if you need it. */
@@ -949,6 +1005,18 @@ typedef struct {
      * does a binary add-on built against an older header that emits through the
      * host table's emit_event - its struct reaches the event callback as is. */
     uint32_t         flags;
+    /* ABI 2.5: always 0, never read. Where uint64_t aligns to 8 on a 32-bit ABI
+     * (ARMv7, Win32) a 2.4 event ended in 4 bytes of tail padding after `flags`, and
+     * its struct_size counts them. This fills them, so `measures` starts past the end
+     * of a 2.4 event on every ABI and a struct_size check can tell the two apart. */
+    uint32_t         reserved;
+    /* ABI 2.5: what the attempt used (see MEASUREMENTS above), on FINISHED / FAILED of
+     * a process job and on SAMPLE; NULL / 0 everywhere else, and when nothing could be
+     * measured. At most one entry per name. Valid only for the duration of the
+     * callback - copy what you keep. Read them only if struct_size covers them, or
+     * use gptps_event_measure(), which checks. */
+    const gptps_measure *measures;
+    size_t               n_measures;
 } gptps_event;
 
 /* On a GPTPS_EV_DEAD_LETTERED or GPTPS_EV_DROPPED: teardown imposed this disposition
@@ -966,6 +1034,10 @@ typedef struct {
  * outside was requested by the time the attempt ended - even if the body had
  * already returned the status on its own. Never set on any other kind of event. */
 #define GPTPS_EV_FLAG_SELF_CANCELLED 0x2u
+
+/* The event's measurement called `name`, or NULL: none by that name, an event from a
+ * build before 2.5 (struct_size too short), or a NULL argument. */
+GPTPS_API const gptps_measure *gptps_event_measure(const gptps_event *ev, const char *name);
 
 typedef void (*gptps_event_cb)(const gptps_event *ev, void *user_data);
 GPTPS_API gptps_status gptps_set_event_cb(gptps *e, gptps_event_cb cb, void *user_data);

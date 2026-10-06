@@ -35,6 +35,7 @@ static void on_event(const gptps_event *ev, void *ud)
         case GPTPS_EV_DEAD_LETTERED: ev_deadletter++; break;
         case GPTPS_EV_DROPPED:       break;   /* not exercised here; named so -Wswitch
                                                * keeps flagging the NEXT event kind added */
+        case GPTPS_EV_SAMPLE:        break;   /* sampling is off here (measure.sample_ms 0) */
     }
 }
 

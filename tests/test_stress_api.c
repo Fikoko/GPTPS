@@ -478,6 +478,12 @@ static void check_event_shape(const gptps_event *ev)
     if (ev->kind == GPTPS_EV_FAILED || ev->kind == GPTPS_EV_DEAD_LETTERED)
         CHECKF(ev->status != GPTPS_OK, "a %d event with status OK", (int)ev->kind);
     if (ev->kind != GPTPS_EV_FINISHED) CHECKF(ev->result == NULL && ev->result_len == 0, "a result on event kind %d", (int)ev->kind);
+    /* Measurements (ABI 2.5) come only with an attempt's end, and the array is there
+     * exactly when it has entries. */
+    CHECKF((ev->measures == NULL) == (ev->n_measures == 0), "measures %p with n_measures %u",
+           (const void *)ev->measures, (unsigned)ev->n_measures);
+    if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_FAILED)
+        CHECKF(ev->n_measures == 0, "measurements on event kind %d", (int)ev->kind);
     if (shutdown) CHECKF(ev->kind == GPTPS_EV_DEAD_LETTERED || ev->kind == GPTPS_EV_DROPPED,
                          "GPTPS_EV_FLAG_SHUTDOWN on event kind %d", (int)ev->kind);
     if (self) CHECKF(ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED,
@@ -519,6 +525,7 @@ static void observer(const gptps_event *ev, void *ud)
         case GPTPS_EV_RETRIED:       inc(&r->retried); break;
         case GPTPS_EV_DEAD_LETTERED: inc(&r->dead); break;
         case GPTPS_EV_DROPPED:       inc(&r->dropped); break;
+        case GPTPS_EV_SAMPLE:        break;   /* sampling is off here: never emitted */
     }
     if (closes(ev)) {
         inc(&r->terminal);

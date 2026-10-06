@@ -680,6 +680,13 @@ if(UNIX)
     target_link_libraries(test_xport_engine PRIVATE gptps_xport)
     add_test(NAME xport_engine COMMAND test_xport_engine)
     set_tests_properties(xport_engine PROPERTIES TIMEOUT 60)
+    add_executable(test_xport_measure tests/test_xport_measure.c) # measurements carried back from worker processes
+    target_include_directories(test_xport_measure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(test_xport_measure PRIVATE gptps_xport gptps_stats)
+    target_compile_definitions(test_xport_measure PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+    add_dependencies(test_xport_measure prog_helper)
+    add_test(NAME xport_measure COMMAND test_xport_measure)
+    set_tests_properties(xport_measure PROPERTIES TIMEOUT 60)
     endif()
 
     add_executable(test_stress tests/test_stress.c) # concurrent-producer submit stress (off-lock copy under contention)
@@ -870,6 +877,17 @@ add_dependencies(test_program_helper prog_helper)
 add_test(NAME program_helper COMMAND test_program_helper)
 set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
 
+# --- what a process job actually used (docs/MEASUREMENTS.md) ----------------
+# prog_helper jobs of known size, on every platform; in cgroup mode too, where CI's
+# cgroup step points GPTPS_CGROUP_PARENT at a delegated cgroup.
+add_executable(test_measure tests/test_measure.c)
+target_include_directories(test_measure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_measure PRIVATE gptps_stats)
+target_compile_definitions(test_measure PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_measure prog_helper)
+add_test(NAME measure COMMAND test_measure)
+set_tests_properties(measure PROPERTIES TIMEOUT 60)
+
 # --- teardown always terminates -------------------------------------------
 # The failure mode of every check in here is a HANG, so the TIMEOUT is part of
 # the assertion, not just a safety net. It uses prog_helper for the stuck-child
@@ -894,7 +912,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_exec_faults tests/test_exec_faults.c)
     target_include_directories(test_exec_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(test_exec_faults PRIVATE gptps)
-    set(_wrapped fork pipe pipe2 dup2 poll read write close waitpid kill setrlimit execvp
+    set(_wrapped fork pipe pipe2 dup2 poll read write close wait4 kill setrlimit execvp
                  fcntl gptps_hal_monotonic_ms)
     # The names glibc gives two of those calls in some builds: setrlimit64 and fcntl64
     # with -D_FILE_OFFSET_BITS=64, __fcntl_time64 with a 32-bit -D_TIME_BITS=64. The

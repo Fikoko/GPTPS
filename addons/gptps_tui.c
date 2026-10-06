@@ -60,6 +60,11 @@ typedef struct {
     unsigned started, finished, failed, retried, dead, dropped;
     uint64_t lat_sum_ms, lat_max_ms;   /* queue->finish latency accumulators */
     unsigned lat_n;
+    /* The highest mem.peak an attempt reported (docs/MEASUREMENTS.md), with its method:
+     * values measured differently are not compared, so a different method replaces the
+     * column's value and its method rather than joining them. */
+    uint64_t mem_peak;
+    char     mem_method[40];
 } tui_task;
 
 typedef struct { uint64_t ts; int kind; char name[64]; uint64_t handle; gptps_status status; } tui_event;
@@ -146,6 +151,9 @@ static void tui_on_event(const gptps_event *ev, void *ud)
     gptps_tui *t = (gptps_tui *)ud;
     tui_task *tk;
     if (t->off) return;              /* KPI OFF: before the lock, deliberately - see the field */
+    /* A running job's samples (measure.sample_ms) are not part of any item's life: they
+     * would only flood the log. The peak column reads the attempts' own measurements. */
+    if (ev->kind == GPTPS_EV_SAMPLE) return;
     mu_lock(&t->mu);
     switch (ev->kind) {
         case GPTPS_EV_QUEUED:        t->q++;    break;
@@ -213,6 +221,16 @@ static void tui_on_event(const gptps_event *ev, void *ud)
     }
 
     if ((tk = task_for(t, ev->task_name)) != NULL) {
+        const gptps_measure *pm = gptps_event_measure(ev, GPTPS_M_MEM_PEAK);
+        if (pm && pm->method) {
+            if (strncmp(tk->mem_method, pm->method, sizeof tk->mem_method - 1) != 0) {
+                strncpy(tk->mem_method, pm->method, sizeof tk->mem_method - 1);
+                tk->mem_method[sizeof tk->mem_method - 1] = 0;
+                tk->mem_peak = pm->value;
+            } else if (pm->value > tk->mem_peak) {
+                tk->mem_peak = pm->value;
+            }
+        }
         switch (ev->kind) {
             case GPTPS_EV_STARTED:       tk->started++;  break;
             case GPTPS_EV_FINISHED:
@@ -273,6 +291,7 @@ static const char *kind_str(int k)
         case GPTPS_EV_RETRIED:       return "RETRIED";
         case GPTPS_EV_DEAD_LETTERED: return "DEAD";
         case GPTPS_EV_DROPPED:       return "DROPPED";
+        case GPTPS_EV_SAMPLE:        return "SAMPLE";
         default:                     return "?";
     }
 }
@@ -749,11 +768,11 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 
     if (t->show_tasks && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
-        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s  key%s\n",
-                      D, "label", "run", "ok", "fail", "dead", "drop", "ok%", "avg ms", X);
+        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s %8s  key%s\n",
+                      D, "label", "run", "ok", "fail", "dead", "drop", "ok%", "avg ms", "peak MB", X);
         for (i = 0; i < t->ntasks; ++i) {
             tui_task *k = &t->tasks[i];
-            char key[8], pct[8], lat[12];
+            char key[8], pct[8], lat[12], peak[32];
             unsigned terminal = k->finished + k->dead + k->dropped;
             const char *pc = "";
             if (k->hotkey) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
@@ -775,9 +794,13 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
                 if (color) pc = (okp >= 90) ? G : (okp >= 50) ? "\x1b[33m" : R;   /* green/yellow/red */
             } else strcpy(pct, "  --");
             if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum_ms / k->lat_n); else strcpy(lat, "      --");
-            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %5u %s%5s%s %8s  %s\n",
+            /* What a process job's attempts measured at their peak (docs/MEASUREMENTS.md);
+             * "--" for an in-process task, which is never measured. */
+            if (k->mem_method[0]) snprintf(peak, sizeof peak, "%8.1f", (double)k->mem_peak / 1048576.0);
+            else                  strcpy(peak, "      --");
+            pos = appendf(buf, cap, pos, "  %-16.16s %5u %5u %5u %5u %5u %s%5s%s %8s %8s  %s\n",
                           k->label, k->started, k->finished, k->failed, k->dead, k->dropped,
-                          pc, pct, color ? X : "", lat, key);
+                          pc, pct, color ? X : "", lat, peak, key);
         }
     }
 

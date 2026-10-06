@@ -30,6 +30,12 @@
  *     timestamps the core stamps (monotonic ms), so they measure the engine, not the
  *     observer.
  *   - Thread-safe: snapshot from any thread while the engine runs.
+ *
+ * Measurements (docs/MEASUREMENTS.md): what process jobs actually used - mem.peak,
+ * cpu.user_ms, ..., and any name an add-on reports - folded per task type and for
+ * the engine, into rows keyed by name AND method, because one name measured two ways
+ * is two different numbers. A row keeps count, sum, min, max and the latest value;
+ * no individual value is kept, so memory follows the vocabulary, not the job count.
  */
 #ifndef GPTPS_STATS_H
 #define GPTPS_STATS_H
@@ -72,7 +78,60 @@ typedef struct {
     uint64_t run_samples;          /* FINISHED/FAILED events with a known start time */
     uint64_t run_ms_sum;           /* STARTED -> FINISHED/FAILED */
     uint64_t run_ms_max;
+    /* (1.7) Measurements not folded into a row: the row's table was full
+     * (GPTPS_STATS_MEASURE_ROWS), a name or method was longer than
+     * GPTPS_STATS_NAME_MAX - 1, or a name came with a different unit or kind than its
+     * row has. Counted, never dropped silently. Read it only if struct_size covers it. */
+    uint64_t measures_dropped;
 } gptps_stats_counters;
+
+/* ---- measurements -------------------------------------------------------- */
+#define GPTPS_STATS_MEASURE_ROWS 32   /* rows per task type, and for the engine */
+#define GPTPS_STATS_NAME_MAX     64   /* a name or a method, with its NUL */
+
+typedef struct {
+    size_t   struct_size;          /* = sizeof(gptps_stats_measure) */
+    uint32_t unit;                 /* gptps_measure_unit, as the name reported it */
+    uint32_t kind;                 /* gptps_measure_kind: how values combine */
+    uint64_t count;                /* values folded in: attempts, or samples for mem.current */
+    uint64_t sum;                  /* saturates at UINT64_MAX */
+    uint64_t min, max;
+    uint64_t last;                 /* the latest value ... */
+    uint64_t last_ms;              /* ... and its event's ts_ms (monotonic) */
+} gptps_stats_measure;
+
+/* One row: `task` names a task type, or NULL for the engine as a whole. Both `name`
+ * and `method` must match ("mem.peak", "cgroup.job.resident"). GPTPS_E_NOTFOUND if no
+ * such value has been folded in since install (or the last reset). */
+gptps_status gptps_stats_measure_get(gptps_stats *s, const char *task, const char *name,
+                                     const char *method, gptps_stats_measure *out);
+
+/* Enumerate a task type's rows (task NULL: the engine's), in first-seen order. The
+ * name and method are copied into the buffers, truncated to fit; any output may be
+ * NULL. */
+size_t       gptps_stats_measure_count(gptps_stats *s, const char *task);
+gptps_status gptps_stats_measure_at(gptps_stats *s, const char *task, size_t index,
+                                    char *name_buf, size_t name_cap,
+                                    char *method_buf, size_t method_cap,
+                                    gptps_stats_measure *out);
+
+/* dst += src, for rows of the SAME name and method from several engines (gptps_pool
+ * shards): counts and sums add, min and max take the extreme, and the latest value is
+ * the one with the later last_ms. A src with count 0 changes nothing. */
+void gptps_stats_measure_merge(gptps_stats_measure *dst, const gptps_stats_measure *src);
+
+/* Fold measurements that did not arrive as this engine's events - a gptps_xport
+ * reply's, for one - into `task`'s rows and the engine's, exactly as an event's are.
+ * ts_ms orders the latest value (gptps_now_ms(NULL) will do). GPTPS_E_INVAL for a
+ * NULL stats, task or array with n > 0; what cannot be folded counts in
+ * measures_dropped, as above. */
+gptps_status gptps_stats_measure_fold(gptps_stats *s, const char *task,
+                                      const gptps_measure *m, size_t n, uint64_t ts_ms);
+
+/* A stats object that no engine feeds: only gptps_stats_measure_fold fills it - in a
+ * process that sends work through gptps_xport and keeps no engine of its own. Its
+ * counters stay 0. Free it with gptps_stats_close. NULL on allocation failure. */
+gptps_stats *gptps_stats_open(void);
 
 /* Install on an engine: registers one observer. NULL on allocation failure or if
  * the core refuses the observer. Call BEFORE submitting work. */
@@ -94,8 +153,8 @@ gptps_status gptps_stats_task_at(gptps_stats *s, size_t index,
                                  char *name_buf, size_t name_cap,
                                  gptps_stats_counters *out);   /* any of the outputs may be NULL */
 
-/* Zero the totals and latencies (engine-wide and per task). The gauges are the live
- * truth and are left alone. */
+/* Zero the totals and latencies (engine-wide and per task), and forget every
+ * measurement row. The gauges are the live truth and are left alone. */
 void gptps_stats_reset(gptps_stats *s);
 
 /* dst += src, for folding shards or task rows into one view. Totals and gauges add;

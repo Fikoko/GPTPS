@@ -47,6 +47,7 @@ The meanings are those the tables below give, from the same descriptions.
 | `limits.max_intake_depth` | no limit | `limits.max_intake_depth` |
 | `limits.shutdown_grace_ms` | wait forever | `shutdown_grace_ms`; waiting forever is `GPTPS_LIMIT_NONE` |
 | `limits.max_dead_letters` | no limit | `max_dead_letters`; no limit is `GPTPS_LIMIT_NONE` |
+| `measure.sample_ms` | never: no SAMPLE events | - |
 | `scheduler.reserve_after_skips` | strict priority order | - |
 | `bounded.max_items` | the classic engine | `max_items` |
 | `bounded.max_payload_bytes` | only an empty payload fits | `max_payload_bytes` |
@@ -146,6 +147,12 @@ Counters. They read through the settings API; `gptps_settings_save` never writes
 | Key | Type | Default | Applies | What it does |
 |---|---|---|---|---|
 | `dead_letters_evicted` | whole number, 0 or more | `0` | at once | dead letters dropped because limits.max_dead_letters was reached; write 0 to reset it |
+
+## [measure]
+
+| Key | Type | Default | Applies | What it does |
+|---|---|---|---|---|
+| `sample_ms` | whole number, 0 to 3600000 | `0` | at once | how often a running process job reports its current memory, as a GPTPS_EV_SAMPLE event, in ms (under 10 counts as 10; applies to jobs started after a change; docs/MEASUREMENTS.md). 0 = never: no SAMPLE events |
 
 ## Add-ons
 

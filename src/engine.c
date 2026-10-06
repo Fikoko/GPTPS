@@ -341,6 +341,10 @@ struct gptps {
      * 0 => wait forever (the pre-1.0 behaviour, now opt-in). */
     uint32_t       shutdown_grace_ms;
     uint64_t       stop_deadline_ms;   /* monotonic; 0 = not shutting down / no bound */
+    /* measure.sample_ms (docs/MEASUREMENTS.md): how often a running process job emits
+     * a GPTPS_EV_SAMPLE; 0 = never. Read by the executing thread with no lock held,
+     * so it is accessed through the HAL's acquire/release pair. */
+    uint32_t       sample_ms;
     bool           workers_exit;
     bool           manual;         /* MANUAL mode: no threads; driven by gptps_step() */
 
@@ -889,7 +893,11 @@ static void item_drop(gptps *e, gptps_item *it)
     item_free(e, it);
 }
 
-static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p)
+/* Emit `p`, with the measurements an attempt reported (docs/MEASUREMENTS.md): only
+ * a process job's FINISHED / FAILED and its SAMPLEs carry any. They live on the
+ * executing thread's stack, which outlives this synchronous emit. */
+static void emit_with(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p,
+                      const gptps_measure *m, size_t nm)
 {
     gptps_event ev;
     gptps_observer *o;
@@ -901,8 +909,38 @@ static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_
     ev.attempt = p->attempt; ev.mem_bytes = p->mem;
     ev.result = p->result; ev.result_len = p->result_len;
     ev.flags = p->flags;
+    ev.measures = nm ? m : NULL; ev.n_measures = nm;
     if (cb) cb(&ev, ud);
     for (o = e->observers; o; o = o->next) o->fn(&ev, o->ud); /* extra sinks */
+}
+
+static void emit_now(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending_ev *p)
+{
+    emit_with(e, cb, ud, p, NULL, 0);
+}
+
+void gptps_meter_put(gptps_exec_meter *mt, const char *name, uint64_t value,
+                     unsigned unit, unsigned kind, const char *method)
+{
+    size_t i;
+    if (!mt || !name || !method) return;
+    for (i = 0; i < mt->n; ++i)
+        if (strcmp(mt->m[i].name, name) == 0) return;   /* one value per name: the first,
+                                                         * best method wins */
+    if (mt->n >= GPTPS_EXEC_MEASURES_MAX) return;
+    mt->m[mt->n].name = name; mt->m[mt->n].value = value;
+    mt->m[mt->n].unit = (uint16_t)unit; mt->m[mt->n].kind = (uint16_t)kind;
+    mt->m[mt->n].flags = 0; mt->m[mt->n].method = method;
+    mt->n += 1;
+}
+
+const gptps_measure *gptps_event_measure(const gptps_event *ev, const char *name)
+{
+    size_t i;
+    if (!ev || !name || !GPTPS_STRUCT_HAS(gptps_event, ev, n_measures) || !ev->measures) return NULL;
+    for (i = 0; i < ev->n_measures; ++i)
+        if (ev->measures[i].name && strcmp(ev->measures[i].name, name) == 0) return &ev->measures[i];
+    return NULL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1009,6 +1047,28 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
 /* worker                                                                    */
 /* ------------------------------------------------------------------------- */
 
+/* What a running process job's SAMPLE needs to reach the event sinks: the engine,
+ * the callback pair execute() snapshotted, and the attempt's event. */
+typedef struct {
+    gptps_exec_meter        meter;      /* first: the executor hands back &meter */
+    gptps                  *e;
+    gptps_event_cb          cb;
+    void                   *ud;
+    const gptps_pending_ev *p;
+} exec_sampler;
+
+/* Called by a process executor, on the executing thread with no lock held, about
+ * every measure.sample_ms while the job runs (docs/MEASUREMENTS.md). */
+static void emit_sample(gptps_exec_meter *mt, const gptps_measure *cur, size_t n)
+{
+    exec_sampler *sp = (exec_sampler *)(void *)mt;
+    gptps_pending_ev q = *sp->p;
+    if (!n) return;
+    q.kind = GPTPS_EV_SAMPLE; q.status = GPTPS_OK;
+    q.result = NULL; q.result_len = 0; q.flags = 0;
+    emit_with(sp->e, sp->cb, sp->ud, &q, cur, n);
+}
+
 /* cb/ud are snapshotted under the lock by the caller so a concurrent
  * gptps_set_event_cb cannot pair a new callback with a stale user_data. */
 /* `slot` is the executing thread's: a worker's index, or nworkers for gptps_step. It
@@ -1022,10 +1082,16 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     size_t oop_len = 0;
     bool inproc = (it->def->exec == GPTPS_EXEC_INPROC);
     bool raised = false;           /* the cancel flag, read ONCE after the attempt */
+    exec_sampler sp;               /* a process job's measurements (docs/MEASUREMENTS.md) */
 
     p.handle = it->handle; ev_set_name(p.name, item_name(it)); p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
     p.result = NULL; p.result_len = 0; p.flags = 0;
     p.kind = GPTPS_EV_STARTED; p.status = GPTPS_OK; emit_now(e, cb, ud, &p);
+
+    memset(&sp, 0, sizeof sp);
+    sp.e = e; sp.cb = cb; sp.ud = ud; sp.p = &p;
+    sp.meter.sample_ms = gptps_hal_load_acquire_u32(&e->sample_ms);
+    sp.meter.sample = emit_sample;
 
     if (inproc) {
         /* in-process path: cooperative cancel via the deadline flag */
@@ -1054,11 +1120,13 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed.
          * it->cancel lets gptps_cancel / shutdown / removal hard-kill the child. */
         st = gptps_oop_execute(it->def, it->payload, it->payload_len,
-                               it->cost.mem_bytes, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len);
+                               it->cost.mem_bytes, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len,
+                               &sp.meter);
     } else if (it->def->exec == GPTPS_EXEC_PROGRAM) {
         /* enforced path: fork+exec an external program; payload->stdin, stdout->result */
         st = gptps_program_execute(it->def, it->payload, it->payload_len,
-                                   it->cost.mem_bytes, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len);
+                                   it->cost.mem_bytes, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len,
+                                   &sp.meter);
     } else {
         /* Unreachable: gptps_register_task rejects an out-of-range exec kind. This is a
          * hard stop rather than the fallthrough it replaces, and the difference matters
@@ -1090,7 +1158,7 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         if (inproc) { if (ctx.result_set) { p.result = ctx.result; p.result_len = ctx.result_len; } }
         else        { p.result = oop_res; p.result_len = oop_len; }
     }
-    emit_now(e, cb, ud, &p);
+    emit_with(e, cb, ud, &p, sp.meter.m, sp.meter.n);   /* an in-process attempt has none */
 
     if (inproc) ctx_clear_result(&ctx);
     else        gptps_free(oop_res);
@@ -2031,6 +2099,8 @@ static size_t       sc_rd_intake(void *t, char *b, size_t c) { gptps *e = (gptps
 static gptps_status sc_wr_intake(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->limits.max_intake_depth = (uint32_t)strtoul(v, NULL, 10); gptps_cond_signal(e->cv_disp); gptps_mutex_unlock(e->m); return GPTPS_OK; }
 static size_t       sc_rd_grace(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->shutdown_grace_ms); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_grace(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->shutdown_grace_ms = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
+static size_t       sc_rd_sample(void *t, char *b, size_t c) { gptps *e = (gptps *)t; return rd_u32(b, c, gptps_hal_load_acquire_u32(&e->sample_ms)); }
+static gptps_status sc_wr_sample(void *t, const char *v) { gptps *e = (gptps *)t; gptps_hal_store_release_u32(&e->sample_ms, (uint32_t)strtoul(v, NULL, 10)); return GPTPS_OK; }
 static size_t       sc_rd_dlcap(void *t, char *b, size_t c) { gptps *e = (gptps *)t; size_t n; gptps_mutex_lock(e->m); n = rd_u32(b, c, e->max_dead_letters); gptps_mutex_unlock(e->m); return n; }
 static gptps_status sc_wr_dlcap(void *t, const char *v) { gptps *e = (gptps *)t; gptps_mutex_lock(e->m); e->max_dead_letters = (uint32_t)strtoul(v, NULL, 10); gptps_mutex_unlock(e->m); return GPTPS_OK; }
 /* Count of dead-letter entries evicted by the cap. Writable so an operator can zero
@@ -2563,6 +2633,10 @@ static gptps_status open_engine(const gptps_config *cfg, gptps **out_engine)
     lost += reg_core_setting(e, "stats.dead_letters_evicted", GPTPS_SETTING_UINT, 1, 0, 0, 0,
                              "dead letters dropped because limits.max_dead_letters was reached; write 0 to reset it", sc_rd_devict, sc_wr_devict);
     gptps_settings_nosave(e->settings, "stats.dead_letters_evicted");   /* a count, not configuration */
+    lost += reg_core_setting(e, "measure.sample_ms", GPTPS_SETTING_UINT, 1, 1, 0, 3600000,
+                             "how often a running process job reports its current memory, as a GPTPS_EV_SAMPLE event, "
+                             "in ms (under 10 counts as 10; applies to jobs started after a change; docs/MEASUREMENTS.md). "
+                             "0 = never: no SAMPLE events", sc_rd_sample, sc_wr_sample);
     lost += reg_core_setting(e, "scheduler.reserve_after_skips", GPTPS_SETTING_UINT, 1, 1, 0, 4294967295.0,
                              "times smaller work may pass a waiting top-priority task that does not fit, before the scheduler holds room for it. 0 = strict priority order", sc_rd_resv, sc_wr_resv);
     lost += reg_core_setting(e, "bounded.max_items", GPTPS_SETTING_UINT, 0, 1, 0, 4294967295.0,

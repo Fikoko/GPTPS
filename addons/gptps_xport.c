@@ -9,7 +9,9 @@
  *
  * Wire (native-endian, unversioned: both ends are the same forked binary):
  *   request  [u64 id][u32 tlen][task][u64 plen][payload]
- *   reply    [u64 id][i32 status][u64 rlen][result]
+ *   reply    [u64 id][i32 status][u64 rlen][result][u32 mlen][measurements]
+ * The measurements (docs/MEASUREMENTS.md) are those of the item's last attempt, as
+ * meas_encode lays them out; mlen is 0 when there are none, as in handler mode.
  *
  * PARENT: submit() registers a pending record under the link's pmu (bounded by
  * max_in_flight -> E_FULL), writes the frame under the link's wmu, and either waits
@@ -94,14 +96,107 @@ static void set_nosigpipe(int fd)
 #endif
 }
 
+/* ---- measurements on the wire -------------------------------------------
+ * [u32 n][u8 cut] then n x { [u64 value][u16 unit][u16 kind][u32 flags]
+ * [u16 name_len][name, NUL included][u16 method_len][method, NUL included] }.
+ * At most GPTPS_XPORT_MAX_MEASURES entries, each string under
+ * GPTPS_XPORT_MEASURE_STR bytes; what does not fit is left out and `cut` says so. */
+#define XP_MEAS_HDR   5u
+#define XP_MEAS_ENTRY (8u + 2u + 2u + 4u + 2u + 2u)
+#define XP_MEAS_CAP   (XP_MEAS_HDR + GPTPS_XPORT_MAX_MEASURES * (XP_MEAS_ENTRY + 2u * GPTPS_XPORT_MEASURE_STR))
+
+static int meas_fits(const gptps_measure *m)
+{
+    return m->name && m->method && strlen(m->name) < GPTPS_XPORT_MEASURE_STR &&
+           strlen(m->method) < GPTPS_XPORT_MEASURE_STR;
+}
+
+/* The event's measurements as a malloc'd blob (*len its size), or NULL when it has
+ * none - or when no memory could be had for them, which is then a cut. */
+static unsigned char *meas_encode(const gptps_event *ev, uint32_t *len)
+{
+    size_t i, sz = XP_MEAS_HDR, at;
+    uint32_t n = 0;
+    unsigned char cut = 0, *b;
+    *len = 0;
+    if (ev->struct_size < offsetof(gptps_event, n_measures) + sizeof(size_t) ||
+        !ev->measures || !ev->n_measures) return NULL;
+    for (i = 0; i < ev->n_measures; ++i) {
+        if (n == GPTPS_XPORT_MAX_MEASURES || !meas_fits(&ev->measures[i])) { cut = 1; continue; }
+        sz += XP_MEAS_ENTRY + strlen(ev->measures[i].name) + 1 + strlen(ev->measures[i].method) + 1;
+        ++n;
+    }
+    b = (unsigned char *)malloc(sz);
+    if (!b) return NULL;
+    memcpy(b, &n, 4); b[4] = cut;
+    at = XP_MEAS_HDR;
+    for (i = 0, n = 0; i < ev->n_measures; ++i) {
+        const gptps_measure *m = &ev->measures[i];
+        uint16_t nl, ml;
+        if (n == GPTPS_XPORT_MAX_MEASURES || !meas_fits(m)) continue;
+        nl = (uint16_t)(strlen(m->name) + 1); ml = (uint16_t)(strlen(m->method) + 1);
+        memcpy(b + at, &m->value, 8); at += 8;
+        memcpy(b + at, &m->unit, 2);  at += 2;
+        memcpy(b + at, &m->kind, 2);  at += 2;
+        memcpy(b + at, &m->flags, 4); at += 4;
+        memcpy(b + at, &nl, 2); at += 2; memcpy(b + at, m->name, nl); at += nl;
+        memcpy(b + at, &ml, 2); at += 2; memcpy(b + at, m->method, ml); at += ml;
+        ++n;
+    }
+    *len = (uint32_t)at;
+    return b;
+}
+
+/* Decode a blob into ONE malloc'd block - the array, then the strings it points at -
+ * so a single free releases it. 0 on success (*out NULL when there are none), -1 if
+ * the blob does not add up: the frame is then not trusted. */
+static int meas_decode(const unsigned char *b, uint32_t len, gptps_measure **out, size_t *nout, int *cut)
+{
+    uint32_t n, i;
+    size_t at = XP_MEAS_HDR, strbytes;
+    gptps_measure *arr;
+    char *sp;
+    *out = NULL; *nout = 0; *cut = 0;
+    if (len == 0) return 0;
+    if (len < XP_MEAS_HDR) return -1;
+    memcpy(&n, b, 4); *cut = b[4] != 0;
+    if (n > GPTPS_XPORT_MAX_MEASURES) return -1;
+    strbytes = len;                     /* the strings take less than the whole blob */
+    arr = (gptps_measure *)malloc((size_t)n * sizeof *arr + strbytes + 1);
+    if (!arr) return -1;
+    sp = (char *)(arr + n);
+    for (i = 0; i < n; ++i) {
+        uint16_t nl, ml;
+        if (len - at < XP_MEAS_ENTRY) { free(arr); return -1; }
+        memcpy(&arr[i].value, b + at, 8); at += 8;
+        memcpy(&arr[i].unit, b + at, 2);  at += 2;
+        memcpy(&arr[i].kind, b + at, 2);  at += 2;
+        memcpy(&arr[i].flags, b + at, 4); at += 4;
+        memcpy(&nl, b + at, 2); at += 2;
+        if (nl == 0 || len - at < nl || b[at + nl - 1] != 0) { free(arr); return -1; }
+        memcpy(sp, b + at, nl); arr[i].name = sp; sp += nl; at += nl;
+        if (len - at < 2) { free(arr); return -1; }
+        memcpy(&ml, b + at, 2); at += 2;
+        if (ml == 0 || len - at < ml || b[at + ml - 1] != 0) { free(arr); return -1; }
+        memcpy(sp, b + at, ml); arr[i].method = sp; sp += ml; at += ml;
+    }
+    if (at != len) { free(arr); return -1; }
+    if (n == 0) { free(arr); return 0; }
+    *out = arr; *nout = n;
+    return 0;
+}
+
 /* One reply frame. The status is clamped to the frame cap on the way out so the
  * channel stays byte-synchronised whatever the result size (see the worker). */
-static int write_reply(int fd, uint64_t id, int32_t st, const void *res, uint64_t rlen)
+static int write_reply(int fd, uint64_t id, int32_t st, const void *res, uint64_t rlen,
+                       const unsigned char *meas, uint32_t mlen)
 {
     if (sock_write_all(fd, &id, sizeof id) != 0) return -1;
     if (sock_write_all(fd, &st, sizeof st) != 0) return -1;
     if (sock_write_all(fd, &rlen, sizeof rlen) != 0) return -1;
     if (rlen && sock_write_all(fd, res, (size_t)rlen) != 0) return -1;
+    if (sock_write_all(fd, &mlen, sizeof mlen) != 0) return -1;
+    if (mlen && sock_write_all(fd, meas, mlen) != 0) return -1;
     return 0;
 }
 
@@ -146,7 +241,7 @@ static void worker_handler_main(int fd, gptps_xport_run_fn run, void *ud)
              * an empty body instead: an honest status, and the channel stays in sync. */
             free(res); res = NULL; st32 = (int32_t)GPTPS_E_BUDGET; rl = 0;
         }
-        {   int w = write_reply(fd, id, st32, res, rl);
+        {   int w = write_reply(fd, id, st32, res, rl, NULL, 0);
             free(res); free(payload); free(task);
             if (w != 0) break; }
     }
@@ -157,7 +252,9 @@ static void worker_handler_main(int fd, gptps_xport_run_fn run, void *ud)
 /* ============================================================================
  * WORKER, engine mode (runs in the forked child; never returns)
  * ==========================================================================*/
-typedef struct { gptps_handle h; uint64_t id; } inflight;
+/* An item in flight in the worker's engine, and the measurements of its latest
+ * FAILED attempt, kept for the dead letter (or drop) that may follow it. */
+typedef struct { gptps_handle h; uint64_t id; unsigned char *meas; uint32_t mlen; } inflight;
 
 typedef struct {
     int             fd;
@@ -182,13 +279,40 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
     worker_engine_ctx *c = (worker_engine_ctx *)ud;
     size_t i; uint64_t id = 0; int found = 0;
     int32_t st;
-    if (!is_terminal(ev)) return;
+    unsigned char *meas = NULL, *mine;
+    uint32_t mlen = 0, ml;
+    if (!is_terminal(ev)) {
+        /* A failed attempt that is not the end: keep its measurements for the dead
+         * letter or drop that may close the item, which carries none of its own. */
+        if (ev->kind != GPTPS_EV_FAILED) return;
+        mine = meas_encode(ev, &ml);
+        apx_mutex_lock(&c->mmu);
+        for (i = 0; i < c->n; ++i)
+            if (c->tab[i].h == ev->handle) {
+                free(c->tab[i].meas);
+                c->tab[i].meas = mine; c->tab[i].mlen = ml; mine = NULL;
+                break;
+            }
+        apx_mutex_unlock(&c->mmu);
+        free(mine);                                /* not ours */
+        return;
+    }
 
     apx_mutex_lock(&c->mmu);
     for (i = 0; i < c->n; ++i)
-        if (c->tab[i].h == ev->handle) { id = c->tab[i].id; c->tab[i] = c->tab[--c->n]; found = 1; break; }
+        if (c->tab[i].h == ev->handle) {
+            id = c->tab[i].id; meas = c->tab[i].meas; mlen = c->tab[i].mlen;
+            c->tab[i] = c->tab[--c->n]; found = 1; break;
+        }
     apx_mutex_unlock(&c->mmu);
     if (!found) return;                            /* not ours (e.g. child_init's own work) */
+
+    /* FINISHED and a cancelled FAILED end an attempt, and carry its measurements
+     * themselves; a dead letter or drop carries the last failed attempt's, kept above. */
+    if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) {
+        free(meas);
+        meas = meas_encode(ev, &mlen);
+    }
 
     /* FINISHED carries status OK + the result; DEAD_LETTERED / DROPPED carry the
      * failure status (E_TASK, E_TIMEOUT, E_DENIED, E_BUDGET, E_SHUTDOWN, ...);
@@ -196,10 +320,12 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
     st = (int32_t)(ev->kind == GPTPS_EV_FINISHED ? GPTPS_OK : ev->status);
     apx_mutex_lock(&c->wmu);
     if (ev->kind == GPTPS_EV_FINISHED && (uint64_t)ev->result_len <= GPTPS_XPORT_MAX_MSG)
-        write_reply(c->fd, id, st, ev->result, (uint64_t)ev->result_len);
+        write_reply(c->fd, id, st, ev->result, (uint64_t)ev->result_len, meas, meas ? mlen : 0);
     else
-        write_reply(c->fd, id, ev->kind == GPTPS_EV_FINISHED ? (int32_t)GPTPS_E_BUDGET : st, NULL, 0);
+        write_reply(c->fd, id, ev->kind == GPTPS_EV_FINISHED ? (int32_t)GPTPS_E_BUDGET : st, NULL, 0,
+                    meas, meas ? mlen : 0);
     apx_mutex_unlock(&c->wmu);
+    free(meas);
     /* A failed write means the parent is gone; the main loop will see EOF and shut
      * down, so there is nothing to do here. */
 }
@@ -244,7 +370,10 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
         }
         if (c.n < c.cap) {
             st = gptps_submit(e, task, payload, (size_t)plen, &h);
-            if (st == GPTPS_OK) { c.tab[c.n].h = h; c.tab[c.n].id = id; c.n += 1; }
+            if (st == GPTPS_OK) {
+                c.tab[c.n].h = h; c.tab[c.n].id = id; c.tab[c.n].meas = NULL; c.tab[c.n].mlen = 0;
+                c.n += 1;
+            }
         } else {
             st = GPTPS_E_NOMEM;
         }
@@ -254,7 +383,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
         if (st != GPTPS_OK) {                      /* rejected at submit: answer now */
             int w;
             apx_mutex_lock(&c.wmu);
-            w = write_reply(fd, id, (int32_t)st, NULL, 0);
+            w = write_reply(fd, id, (int32_t)st, NULL, 0, NULL, 0);
             apx_mutex_unlock(&c.wmu);
             if (w != 0) break;
         }
@@ -267,6 +396,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
     close(fd);
     apx_mutex_destroy(&c.wmu);
     apx_mutex_destroy(&c.mmu);
+    for (i = 0; i < c.n; ++i) free(c.tab[i].meas);
     free(c.tab);
     _exit(0);
 }
@@ -284,10 +414,30 @@ typedef struct pending {
     int32_t          st;
     void            *res;
     uint64_t         rlen;
+    gptps_measure   *meas;      /* decoded, one block (meas_decode); the waiter's to free */
+    size_t           nmeas;
+    int              cut;
     /* async: malloc'd; completed on the reader thread, no lock held */
-    gptps_xport_reply_fn cb;
+    gptps_xport_reply_fn    cb;
+    gptps_xport_reply_ex_fn cb_ex;   /* the _ex form, when set instead of cb */
     void            *ud;
 } pending;
+
+/* Run an async record's callback, in whichever form it asked for. */
+static void complete_async(pending *p, gptps_status io, gptps_status st, const void *res,
+                           size_t len, const gptps_measure *m, size_t nm, int cut)
+{
+    if (p->cb_ex) {
+        gptps_xport_reply r;
+        memset(&r, 0, sizeof r);
+        r.struct_size = sizeof r; r.request_id = p->id; r.io = io;
+        r.task_status = st; r.result = res; r.result_len = len;
+        r.measures = nm ? m : NULL; r.n_measures = nm; r.measures_cut = cut;
+        p->cb_ex(&r, p->ud);
+    } else {
+        p->cb(p->id, io, st, res, len, p->ud);
+    }
+}
 
 typedef struct {
     pid_t       pid;
@@ -380,7 +530,7 @@ static void fail_all(gptps_xport *xp, size_t idx)
     apx_mutex_unlock(&w->pmu);
     while (async_list) {                            /* callbacks, no lock held */
         pending *n = async_list->next;
-        async_list->cb(async_list->id, GPTPS_E_IO, GPTPS_E_IO, NULL, 0, async_list->ud);
+        complete_async(async_list, GPTPS_E_IO, GPTPS_E_IO, NULL, 0, NULL, 0, 0);
         free(async_list);
         async_list = n;
     }
@@ -397,6 +547,8 @@ static void *reader_main(void *arg)
 
     for (;;) {
         uint64_t id, rl; int32_t st; void *res = NULL; pending *p;
+        uint32_t ml = 0; unsigned char *mb = NULL;
+        gptps_measure *meas = NULL; size_t nmeas = 0; int cut = 0;
         if (sock_read_all(w->fd, &id, sizeof id) != 0) break;
         if (sock_read_all(w->fd, &st, sizeof st) != 0) break;
         if (sock_read_all(w->fd, &rl, sizeof rl) != 0) break;
@@ -405,20 +557,31 @@ static void *reader_main(void *arg)
             res = malloc((size_t)rl);
             if (!res || sock_read_all(w->fd, res, (size_t)rl) != 0) { free(res); break; }
         }
+        /* The measurements: a frame whose block does not add up is not trusted, and
+         * neither is the link after it. */
+        if (sock_read_all(w->fd, &ml, sizeof ml) != 0 || ml > XP_MEAS_CAP) { free(res); break; }
+        if (ml) {
+            mb = (unsigned char *)malloc(ml);
+            if (!mb || sock_read_all(w->fd, mb, ml) != 0 ||
+                meas_decode(mb, ml, &meas, &nmeas, &cut) != 0) { free(mb); free(res); break; }
+            free(mb);
+        }
         apx_mutex_lock(&w->pmu);
         p = pend_take(w, id);
         if (p && !p->is_async) {                      /* complete the waiter under pmu */
             p->st = st; p->res = res; p->rlen = rl; p->io = GPTPS_OK; p->done = 1;
+            p->meas = meas; p->nmeas = nmeas; p->cut = cut;
             apx_cond_broadcast(&w->pcv);
-            res = NULL;
+            res = NULL; meas = NULL;
             p = NULL;                                 /* its stack may be gone after the unlock */
         }
         apx_mutex_unlock(&w->pmu);
         if (p) {                                      /* async: callback with no lock held */
-            p->cb(p->id, GPTPS_OK, (gptps_status)st, res, (size_t)rl, p->ud);
+            complete_async(p, GPTPS_OK, (gptps_status)st, res, (size_t)rl, meas, nmeas, cut);
             free(p);
         }
         free(res);                                    /* unknown id (should not happen): drop */
+        free(meas);
     }
     /* EOF or a broken frame. Wake a writer that may be blocked on a dead socket and
      * make sure nobody speaks to this link again, then fail what is outstanding. */
@@ -646,11 +809,54 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     while (!p.done) apx_cond_wait_ms(&w->pcv, &w->pmu, 1000u);   /* periodic re-check only; no timeout */
     apx_mutex_unlock(&w->pmu);
 
+    free(p.meas);                                  /* this form does not report them */
     if (p.io != GPTPS_OK) { free(p.res); return GPTPS_E_IO; }
     if (out_task_status) *out_task_status = (gptps_status)p.st;
     if (out_result) *out_result = p.res; else free(p.res);
     if (out_len) *out_len = (size_t)p.rlen;
     return GPTPS_OK;
+}
+
+gptps_status gptps_xport_submit_ex(gptps_xport *xp, const char *task,
+                                   const void *payload, size_t len, gptps_xport_reply *out)
+{
+    pending p;
+    xport_worker *w = NULL;
+    gptps_status st;
+    uint64_t id;
+
+    if (!out || out->struct_size < sizeof *out) return GPTPS_E_INVAL;
+    memset(out, 0, sizeof *out);
+    out->struct_size = sizeof *out;
+    out->io = GPTPS_E_IO; out->task_status = GPTPS_E_IO;
+    if (xp && on_reader_thread(xp)) return GPTPS_E_BUSY;   /* see gptps_xport_submit */
+
+    memset(&p, 0, sizeof p);
+    st = send_request(xp, task, payload, len, &p, &w, &id);
+    if (st != GPTPS_OK) return st;
+
+    apx_mutex_lock(&w->pmu);
+    while (!p.done) apx_cond_wait_ms(&w->pcv, &w->pmu, 1000u);
+    apx_mutex_unlock(&w->pmu);
+
+    out->request_id = id;
+    if (p.io != GPTPS_OK) { free(p.res); free(p.meas); return GPTPS_E_IO; }
+    out->io = GPTPS_OK;
+    out->task_status = (gptps_status)p.st;
+    out->result = p.res; out->result_len = (size_t)p.rlen;
+    out->measures = p.meas; out->n_measures = p.nmeas; out->measures_cut = p.cut;
+    return GPTPS_OK;
+}
+
+void gptps_xport_result_free(gptps_xport_reply *r)
+{
+    size_t sz;
+    if (!r) return;
+    sz = r->struct_size;
+    free((void *)(uintptr_t)r->result);            /* the caller's, from submit_ex */
+    free((void *)(uintptr_t)r->measures);          /* one block: the array and its strings */
+    memset(r, 0, sizeof *r);
+    r->struct_size = sz;
 }
 
 gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
@@ -672,6 +878,27 @@ gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
     if (st != GPTPS_OK) { free(p); return st; }
     /* Do not touch `p` from here: the reader may already have completed and freed it. */
     if (out_request_id) *out_request_id = id;
+    return GPTPS_OK;
+}
+
+gptps_status gptps_xport_submit_async_ex(gptps_xport *xp, const char *task,
+                                         const void *payload, size_t len,
+                                         gptps_xport_reply_ex_fn cb, void *user_data,
+                                         uint64_t *out_request_id)
+{
+    pending *p;
+    xport_worker *w = NULL;
+    gptps_status st;
+    uint64_t id;
+
+    if (out_request_id) *out_request_id = 0;
+    if (!cb) return GPTPS_E_INVAL;
+    p = (pending *)calloc(1, sizeof *p);
+    if (!p) return GPTPS_E_NOMEM;
+    p->is_async = 1; p->cb_ex = cb; p->ud = user_data;
+    st = send_request(xp, task, payload, len, p, &w, &id);
+    if (st != GPTPS_OK) { free(p); return st; }
+    if (out_request_id) *out_request_id = id;      /* `p` may already be gone: see above */
     return GPTPS_OK;
 }
 

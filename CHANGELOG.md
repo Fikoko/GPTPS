@@ -7,6 +7,65 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
+ABI 2.5, additive over 1.6.0's 2.4: `gptps_event` appends `reserved`, `measures` and
+`n_measures`; `gptps_measure`, `gptps_event_measure` and the `GPTPS_EV_SAMPLE` kind are
+new.
+
+### Added — measurements: what a process job actually used
+
+- **Every attempt of an `OOP` or `PROGRAM` job reports what it used.** Admission counts
+  what a task declares, and until now a host had to measure its jobs itself to know
+  whether the declaration was right. The executors collect each job's process when it
+  ends, so the operating system hands GPTPS - and only GPTPS - its peak memory, CPU time
+  and I/O. Each attempt's `FINISHED` or `FAILED` now carries them in
+  `gptps_event.measures`, next to the declaration in `mem_bytes`, as `gptps_measure`
+  entries: a name (`mem.peak`, `cpu.user_ms`, `cpu.sys_ms`, `io.read_bytes`,
+  `io.write_bytes`, `mem.cap_hit`), a value in the name's fixed unit, a kind that says
+  how values combine, and the method that measured it. `gptps_event_measure(ev, name)`
+  finds one and checks `struct_size` for you. An ERP night window can print "MRP:
+  declared 24 GB, peaked at 19.3 GB" and tighten its declarations from evidence.
+- **The method travels with every value, because one name measures differently by
+  platform.** In cgroup mode the job's own cgroup (`memory.peak`, `cpu.stat`,
+  `io.stat`, `memory.events`: the whole job, resident memory); without a cgroup,
+  `wait4()`'s rusage on Linux, macOS and the BSDs (the largest single process's
+  resident peak; block I/O on Linux, where task I/O accounting exists); on Windows the
+  job object (the whole process tree, **committed** memory, all I/O), or the program's
+  process handle without one. `mem.cap_hit` comes only from cgroups: `RLIMIT_AS`
+  records nothing, and Windows' memory-limit notifications are not guaranteed to
+  arrive. What a platform cannot measure is absent, never estimated, and a Windows job
+  figure below its program's own, or a committed peak of 0, is not reported as one.
+- **Sampling, opt-in.** `measure.sample_ms` (config `[measure] sample_ms`, default 0 =
+  off) makes a running process job emit `GPTPS_EV_SAMPLE` events with its current
+  memory (`mem.current`), between its `STARTED` and its end, on the thread running it.
+- **Aggregation and transport.** `gptps_stats` folds measurements per task type and for
+  the engine into rows keyed by name and method (`gptps_stats_measure_get`, `_count`,
+  `_at`, `_merge`), in fixed memory, counting what it cannot fold in the counters' new
+  `measures_dropped`; `gptps_stats_measure_fold` and `gptps_stats_open` aggregate
+  measurements that arrive any other way. `gptps_xport` replies carry the measurements
+  of an item's last attempt back from the worker process (`gptps_xport_submit_ex`,
+  `gptps_xport_submit_async_ex`, `gptps_xport_result_free`). `gptps_balance` forwards
+  them with each event, and the dashboard shows each task's measured peak.
+- **The rules are written down:** [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) is the
+  design record - report and never act, measured or absent, the method on every value,
+  fixed units, nothing allocated, an open vocabulary add-ons extend under their own
+  namespace, and anything that costs opt-in - with the vocabulary, the methods by
+  platform, and how to add a measurement without touching the event, the stats add-on
+  or the transports.
+- **The edge-AI demo** reports each job's measured peak next to its declaration: in the
+  synthetic night every job peaked about 17 MB under what it declared, and the runaway
+  at 98 of its 100 MB, where its cap stopped it.
+
+### Changed
+
+- **The POSIX executors reap with `wait4()`** where the system has it (Linux, macOS, the
+  BSDs), for the child's resource usage; `waitpid()` elsewhere. `test_exec_faults` now
+  wraps `wait4`, and checks in each of its runs that an attempt is measured exactly
+  when the executor collected its child itself.
+- **An observer that does not know an event kind must ignore it.** `GPTPS_EV_SAMPLE` is
+  emitted only when the host turns sampling on, so no existing observer sees it unless
+  asked; the edge-AI demo and the dashboard, which treated or logged any other kind,
+  now ignore it.
+
 ### Added — an edge-AI demo: admission against a board's shared memory
 
 - **`examples/edge_ai/`: several AI jobs on one board's memory.** On a Jetson the CPU and

@@ -19,7 +19,7 @@ is a container with a memory limit. Nothing here needs a GPU.
 
 | File | What it is |
 |---|---|
-| `edge_admission.c` | The GPTPS host: about 500 lines of C99 on the public API. It reads a jobs file, registers one `GPTPS_EXEC_PROGRAM` task per job, submits them all, waits until every one has ended, and prints what happened. `--naive` forks every job at once instead, without GPTPS. |
+| `edge_admission.c` | The GPTPS host: about 500 lines of C99 on the public API. It reads a jobs file, registers one `GPTPS_EXEC_PROGRAM` task per job, submits them all, waits until every one has ended, and prints what happened - including each job's measured peak memory next to what it declared. `--naive` forks every job at once instead, without GPTPS. |
 | `fake_infer.c` | A stand-in for a model. It takes N MB over the first quarter of its run, writing every page so the memory is resident, and holds it (`--mb N --ms T`). It can fail its first attempt (`--fail-first FILE`) or keep allocating past N (`--runaway`). |
 | `jobs.txt` | A synthetic night for a 1 GB board: eight jobs that declare 1920 MB between them, 2.5 times the 768 MB budget. One of them is flaky and one is a runaway. |
 | `jobs.jetson.txt` | A template for real jobs (`trtexec`, `python3`), with `mem_mb` left for you to measure. |
@@ -96,6 +96,11 @@ outside a container only when given `--unsafe-host`.
 - For your own jobs, start from `jobs.jetson.txt`. Measure each job's peak with
   `tegrastats`, put it in `mem_mb`, set `--budget-mb` to what the board can spare, and read
   the two sections below first: for CUDA jobs, the cgroup mode is not optional.
+- The "peak MB" column helps there too, with one limit: it is the memory GPTPS can see
+  the job use, and a CUDA job's GPU allocations may not be part of it - whether the
+  driver charges them to the job's cgroup is the open question below. Until that is
+  settled on your board, keep tegrastats as the measure for `mem_mb`, and read "peak
+  MB" as the CPU side.
 - To run CUDA jobs in a container, NVIDIA's base image is `nvcr.io/nvidia/l4t-jetpack`,
   with the tag of the board's L4T release. Pass it to `docker build` as both `BUILD_IMAGE`
   and `RUN_IMAGE`, and run with NVIDIA's runtime (`--runtime nvidia`). Inside a default
@@ -117,40 +122,41 @@ own stderr.
 edge_admission: 8 jobs, budget 768 MB, gpu 4 slots, cap: RLIMIT_AS
     time  event   job              in flight (declared)
    0.000  start   detect_cam0       300/768 MB  gpu 2/4
-   0.001  start   detect_cam1       600/768 MB  gpu 4/4
-   2.015  done    detect_cam0       300/768 MB  gpu 2/4
-   2.015  start   segment_yard      660/768 MB  gpu 4/4
-   2.015  done    detect_cam1       360/768 MB  gpu 2/4
-   2.016  start   classify_plates   480/768 MB  gpu 3/4
-   2.018  start   classify_ppe      600/768 MB  gpu 4/4
-   3.221  done    classify_plates   480/768 MB  gpu 3/4
-   3.221  start   reid_flaky        640/768 MB  gpu 4/4
+   0.000  start   detect_cam1       600/768 MB  gpu 4/4
+   2.010  done    detect_cam0       300/768 MB  gpu 2/4
+   2.010  start   segment_yard      660/768 MB  gpu 4/4
+   2.011  done    detect_cam1       360/768 MB  gpu 2/4
+   2.011  start   classify_plates   480/768 MB  gpu 3/4
+   2.011  start   classify_ppe      600/768 MB  gpu 4/4
+   3.216  done    classify_plates   480/768 MB  gpu 3/4
+   3.216  start   reid_flaky        640/768 MB  gpu 4/4
+   3.218  done    classify_ppe      520/768 MB  gpu 3/4
 fake_infer: --fail-first: failing this first attempt on purpose
-   3.224  failed  reid_flaky        480/768 MB  gpu 3/4   attempt 1: GPTPS_E_TASK
-   3.224  start   track_runaway     580/768 MB  gpu 4/4
-   3.228  done    classify_ppe      460/768 MB  gpu 3/4
-   3.229  start   reid_flaky        620/768 MB  gpu 4/4   attempt 2
+   3.218  start   track_runaway     620/768 MB  gpu 4/4
+   3.218  failed  reid_flaky        460/768 MB  gpu 3/4   attempt 1: GPTPS_E_TASK
+   3.218  start   reid_flaky        620/768 MB  gpu 4/4   attempt 2
 fake_infer: --runaway: allocation refused at 96 MB
-   3.793  failed  track_runaway     520/768 MB  gpu 3/4   attempt 1: GPTPS_E_TASK
-   3.793  start   track_runaway     620/768 MB  gpu 4/4   attempt 2
-   4.237  done    reid_flaky        460/768 MB  gpu 3/4
+   3.784  failed  track_runaway     520/768 MB  gpu 3/4   attempt 1: GPTPS_E_TASK
+   3.784  start   track_runaway     620/768 MB  gpu 4/4   attempt 2
+   4.225  done    reid_flaky        460/768 MB  gpu 3/4
 fake_infer: --runaway: allocation refused at 96 MB
-   4.362  failed  track_runaway     360/768 MB  gpu 2/4   attempt 2: GPTPS_E_TASK
-   4.362  dead    track_runaway     360/768 MB  gpu 2/4   GPTPS_E_TASK
-   4.537  done    segment_yard        0/768 MB  gpu 0/4
-   4.537  start   llm_summary       460/768 MB  gpu 3/4
-   7.564  done    llm_summary         0/768 MB  gpu 0/4
+   4.351  failed  track_runaway     360/768 MB  gpu 2/4   attempt 2: GPTPS_E_TASK
+   4.351  dead    track_runaway     360/768 MB  gpu 2/4   GPTPS_E_TASK
+   4.523  done    segment_yard        0/768 MB  gpu 0/4
+   4.523  start   llm_summary       460/768 MB  gpu 3/4
+   7.538  done    llm_summary         0/768 MB  gpu 0/4
 
-job                mem MB   gpu  start ms    end ms  tries  result
-detect_cam0           300     2         0      2015      1  finished
-detect_cam1           300     2         1      2015      1  finished
-segment_yard          360     2      2015      4537      1  finished
-llm_summary           460     3      4537      7564      1  finished
-classify_plates       120     1      2016      3221      1  finished
-classify_ppe          120     1      2018      3228      1  finished
-reid_flaky            160     1      3221      4237      2  finished after a retry
-track_runaway         100     1      3224      4362      2  dead letter: GPTPS_E_TASK
+job                mem MB  peak MB   gpu  start ms    end ms  tries  result
+detect_cam0           300    282.6     2         0      2010      1  finished
+detect_cam1           300    282.6     2         0      2011      1  finished
+segment_yard          360    342.8     2      2010      4523      1  finished
+llm_summary           460    443.2     3      4523      7538      1  finished
+classify_plates       120    101.8     1      2011      3216      1  finished
+classify_ppe          120    101.8     1      2011      3218      1  finished
+reid_flaky            160    142.3     1      3216      4225      2  finished after a retry
+track_runaway         100     98.0     1      3218      4351      2  dead letter: GPTPS_E_TASK
 
+peak MB: measured by GPTPS, the highest of a job's attempts (rusage.largest_process.resident)
 peak declared in flight: 660 MB of a 768 MB budget, gpu 4 of 4
 all at once they would declare 1920 MB (2.5x the budget)
 7 of 8 jobs finished
@@ -158,14 +164,22 @@ all at once they would declare 1920 MB (2.5x the budget)
 
 - "In flight" is what the running jobs declare, as the host counts it from GPTPS's
   events. It never passed 660 of the 768 MB, or 4 gpu units.
+- "peak MB" is what each job actually used at its peak, as GPTPS measured it when it
+  collected the job's process ([docs/MEASUREMENTS.md](../../docs/MEASUREMENTS.md)): the
+  `mem.peak` on each attempt's FINISHED or FAILED event, next to the `mem MB` the job
+  declared. Here every declaration held, with about 17 MB to spare - the margin
+  `jobs.txt` gave each one. With real jobs, this column is how you tune `mem_mb`: start
+  generous, then bring it down toward the measured peak plus a margin.
 - `llm_summary` (460 MB, 3 units) did not fit until 4.5 s, when the segmenter ended.
   Smaller jobs went ahead of it into the room there was, rather than leave it unused.
 - `reid_flaky` failed its first attempt on purpose, and finished on its second.
 - `track_runaway` declared 100 MB and kept allocating past its 64. GPTPS capped it at
   its 100 MB with `RLIMIT_AS`, as no `GPTPS_CGROUP_PARENT` was set: its allocation was
   refused at 96 MB, it exited, failed its retry the same way, and ended as a dead letter
-  with `GPTPS_E_TASK`. No other job was touched. In the cgroup mode the kernel would have
-  OOM-killed it inside its own cgroup, and GPTPS would report `GPTPS_E_NOMEM`.
+  with `GPTPS_E_TASK`. Its measured peak, 98 MB, is the cap at work. No other job was
+  touched. In the cgroup mode the kernel would have OOM-killed it inside its own
+  cgroup, GPTPS would report `GPTPS_E_NOMEM`, and its measurements would include
+  `mem.cap_hit` = 1.
 - The exit status was 1: one job failed for good.
 
 ### Naive mode

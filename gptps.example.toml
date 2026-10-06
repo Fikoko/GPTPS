@@ -62,6 +62,13 @@ max_dead_letters = 1024
 # 0 => never backfill (strict priority order); omitted => 8.
 reserve_after_skips = 8
 
+# Measurements (docs/MEASUREMENTS.md). Every attempt of a job that runs as its own
+# process (GPTPS_EXEC_PROGRAM or GPTPS_EXEC_OOP) reports what it used - peak memory,
+# CPU time, I/O - on its FINISHED or FAILED event, always. sample_ms adds GPTPS_EV_SAMPLE
+# events with a running job's current memory, every so many ms. 0 => no samples.
+[measure]
+sample_ms = 0
+
 # Named resources: anything a task holds while it runs, other than memory - GPUs,
 # licences, database connections. Each key defines one, with the budget admission
 # works against; the name is yours. What a task costs of one goes under

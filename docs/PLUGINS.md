@@ -89,6 +89,22 @@ uint32_t fl = (ev->struct_size >= offsetof(gptps_event, flags) + sizeof ev->flag
             ? ev->flags : 0u;
 ```
 
+`measures` and `n_measures` (ABI 2.5, [MEASUREMENTS.md](MEASUREMENTS.md)) are guarded
+the same way. `gptps_event_measure()` does it for you, but it is a core function and a
+plug-in links no core symbol, so a plug-in reads the array itself:
+
+```c
+size_t i, n = (ev->struct_size >= offsetof(gptps_event, n_measures) + sizeof ev->n_measures)
+            ? ev->n_measures : 0u;
+for (i = 0; i < n; ++i)
+    if (strcmp(ev->measures[i].name, GPTPS_M_MEM_PEAK) == 0) { /* ... */ }
+```
+
+A plug-in that measures something of its own names it under its namespace
+(`mytool.queue_depth`) and gives every value its method; MEASUREMENTS.md has the rules.
+Observers - yours included - must ignore an event kind they do not know: a later engine
+may add one, as 2.5 added `GPTPS_EV_SAMPLE`.
+
 Routines by the version that introduced them: v1.0 `register_task`, `emit_event`,
 `log`, `result_set`, `payload` · v1.1 `register_constraint`, `register_observer` ·
 v1.4 `register_setting` · v1.8 `unregister_task`, `task_exists`, `define_global`,

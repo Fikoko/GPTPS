@@ -65,6 +65,8 @@ typedef struct {
     gptps_status  status;             /* why it is a dead letter, or was refused */
     long          start_ms, end_ms;   /* from the start of the run; -1 = never */
     unsigned      attempts;
+    uint64_t      peak;               /* the highest mem.peak an attempt measured (bytes) */
+    char          peak_method[40];    /* how it was measured; "" = never measured */
     pid_t         pid;                /* --naive */
     int           wstatus;            /* --naive: how the process ended */
 } job;
@@ -204,8 +206,19 @@ static void on_event(const gptps_event *ev, void *ud)
     run *r = (run *)ud;
     job *j = find(r, ev->task_name);
     char more[64];
-    if (!j || ev->kind == GPTPS_EV_QUEUED || ev->kind == GPTPS_EV_RETRIED) return;
+    const gptps_measure *pk;
+    if (!j) return;
+    /* The kinds this host acts on; any other - QUEUED, RETRIED, a SAMPLE, or one a
+     * later engine adds - is ignored, never mistaken for an ending. */
+    if (ev->kind != GPTPS_EV_STARTED && ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_FAILED &&
+        ev->kind != GPTPS_EV_DEAD_LETTERED && ev->kind != GPTPS_EV_DROPPED) return;
     pthread_mutex_lock(&r->m);
+    /* What the attempt actually used, measured by GPTPS (docs/MEASUREMENTS.md), next
+     * to what the job declared. */
+    if ((pk = gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) != NULL && pk->value >= j->peak) {
+        j->peak = pk->value;
+        snprintf(j->peak_method, sizeof j->peak_method, "%s", pk->method);
+    }
     switch (ev->kind) {
     case GPTPS_EV_STARTED:
         if (j->start_ms < 0) j->start_ms = (long)(ev->ts_ms - r->t0);
@@ -227,7 +240,7 @@ static void on_event(const gptps_event *ev, void *ud)
         snprintf(more, sizeof more, "attempt %u: %s", (unsigned)ev->attempt, status_name(ev->status));
         log_line(r, ev->ts_ms, "failed", j, more);
         break;
-    default:                            /* DEAD_LETTERED (or DROPPED, which no job here uses) */
+    default:                            /* DEAD_LETTERED, or DROPPED (which no job here uses) */
         j->state = DEAD; j->status = ev->status; j->end_ms = (long)(ev->ts_ms - r->t0);
         r->ended++;
         log_line(r, ev->ts_ms, "dead", j, status_name(ev->status));
@@ -433,9 +446,14 @@ static int report(const run *r, int naive)
 {
     unsigned long all_mem = 0, all_gpu = 0;
     int i, finished = 0;
-    char start[24], end[24], result[64];
+    char start[24], end[24], result[64], peak[24];
+    const char *method = NULL;
+    int methods = 0;
 
-    printf("\njob                mem MB   gpu  start ms    end ms  tries  result\n");
+    /* GPTPS mode adds what each job measured at its peak (docs/MEASUREMENTS.md) next
+     * to what it declared; naive mode has no GPTPS to measure anything. */
+    if (naive) printf("\njob                mem MB   gpu  start ms    end ms  tries  result\n");
+    else       printf("\njob                mem MB  peak MB   gpu  start ms    end ms  tries  result\n");
     for (i = 0; i < r->n; ++i) {
         const job *j = &r->jobs[i];
         all_mem += j->mem_mb;
@@ -454,10 +472,24 @@ static int report(const run *r, int naive)
         } else {
             snprintf(result, sizeof result, "dead letter: %s", status_name(j->status));
         }
-        printf("%-16s %8lu %5lu %9s %9s %6u  %s\n", j->name, j->mem_mb, j->gpu, start, end,
+        if (naive) {
+            printf("%-16s %8lu %5lu %9s %9s %6u  %s\n", j->name, j->mem_mb, j->gpu, start, end,
+                   j->attempts, result);
+            continue;
+        }
+        if (j->peak_method[0]) {
+            snprintf(peak, sizeof peak, "%.1f", (double)j->peak / 1048576.0);
+            if (!method || strcmp(method, j->peak_method) != 0) { method = j->peak_method; ++methods; }
+        } else {
+            strcpy(peak, "-");
+        }
+        printf("%-16s %8lu %8s %5lu %9s %9s %6u  %s\n", j->name, j->mem_mb, peak, j->gpu, start, end,
                j->attempts, result);
     }
     printf("\n");
+    if (!naive && method)
+        printf("peak MB: measured by GPTPS, the highest of a job's attempts (%s)\n",
+               methods == 1 ? method : "methods differ by job: see docs/MEASUREMENTS.md");
     if (naive) {
         printf("all at once they declared %lu MB", all_mem);
         if (r->budget_mb) printf(" (%.1fx a %lu MB budget)", (double)all_mem / (double)r->budget_mb, r->budget_mb);

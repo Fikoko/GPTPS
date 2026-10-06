@@ -24,7 +24,7 @@ processes, or swap the scheduler — never baked into the mechanism-only core.
 - [Embedded / single-threaded mode](#embedded-and-single-threaded-mode) · [Resource budgets & failures](#resource-budgets-failures-add-ons)
 - [Add-ons and plug-ins](#add-ons-and-plug-ins) — the two tiers, namespaces, and taking a subset
 - [Project layout](#project-layout) · [Status](#status) · [Design notes](#design-notes)
-- Reference: [Config keys](docs/CONFIG.md) · [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Bounded mode](docs/BOUNDED.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
+- Reference: [Config keys](docs/CONFIG.md) · [Measurements](docs/MEASUREMENTS.md) · [Writing a plug-in](docs/PLUGINS.md) · [Porting: the HAL contract](docs/HAL.md) · [Bounded mode](docs/BOUNDED.md) · [Packaging / install](docs/PACKAGING.md) · [Architecture](docs/ARCHITECTURE.md) · [Security posture](docs/SECURITY.md) · [Safety artifacts](docs/SAFETY.md)
 - [Safety artifacts (commercial)](#safety-artifacts-commercial) · [License](#license)
 
 ## Quick start
@@ -661,6 +661,24 @@ points at a memory-delegated cgroup (e.g. a systemd `Delegate=yes` scope), else 
 `RLIMIT_AS` cap; on Windows the program executor uses a **Job Object** (memory limit +
 kill-on-close). Either way it's real, killable enforcement the in-process path can't give.
 
+**What a job actually used.** Admission counts what a task *declares*; the
+out-of-process executors also report what each attempt *used*, because they collect its
+process when it ends. Every `FINISHED` and `FAILED` of an `OOP` or `PROGRAM` attempt
+carries its measurements — peak memory, CPU time, I/O, and in cgroup mode whether it hit
+its cap — each with the method that measured it, so a host can print "declared 24 GB,
+peaked at 19.3 GB" and tune its declarations from evidence:
+
+```c
+const gptps_measure *m = gptps_event_measure(ev, GPTPS_M_MEM_PEAK);
+if (m) printf("%s: declared %llu, peaked at %llu (%s)\n", ev->task_name,
+              (unsigned long long)ev->mem_bytes, (unsigned long long)m->value, m->method);
+```
+
+GPTPS reports these and never acts on them. Set `measure.sample_ms` to sample a running
+job's memory as well. [`gptps_stats`](addons/gptps_stats.h) aggregates measurements per task,
+the dashboard shows the peak, and [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) is the
+design record: the rules, the vocabulary, and what each platform measures and how.
+
 **WebAssembly.** A `.wasm` module is portable, sandboxed task code — and a wasm runtime CLI
 is just a program, so you can run one through `GPTPS_EXEC_PROGRAM` with **no new code**:
 `def.argv = {"wasmtime", "run", "module.wasm", NULL}` (argv[0] is PATH-resolved). The payload
@@ -866,16 +884,18 @@ add-ons cannot silently fight over it), **scale-up** (`gptps_pool` shards) and
 (`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the settings editor), the
 crash-durable queue, a blocking `wait(handle)`, run-after/fan-in dependencies, GPU-quota
 and WASM-executor add-ons, **observer-seam stats** (`gptps_stats`: totals, gauges,
-latency, per task, mergeable across shards), the examples + benchmark, CMake + CI +
-single-file amalgamation.
+latency, per task, mergeable across shards), **measurements** of what each process job
+actually used (peak memory, CPU, I/O, cap hit; sampled while it runs if asked; carried
+back from `gptps_xport` workers), the examples + benchmark, CMake + CI + single-file
+amalgamation.
 
 **Binary plug-ins work** as of ABI 2.1 — see [Add-ons and plug-ins](#add-ons-and-plug-ins).
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **58** public functions · **ABI 2.4** (append-only; 2.0 was the first
+At a glance: **59** public functions · **ABI 2.5** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **87** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **89** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

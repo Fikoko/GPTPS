@@ -13,16 +13,39 @@
  *                       blocked in waitpid() with no deadline to rescue it.
  *             "zeros" : write exactly argv[2] zero bytes, then exit 0 - a result of
  *                       a chosen size, for the 16 MiB result cap.
+ *             "mem"   : take argv[2] MiB, writing every page so it is resident and
+ *                       committed, hold it argv[3] ms, then exit argv[4] (default 0) -
+ *                       a job of known size, for test_measure.
+ *             "spin"  : burn argv[2] ms of CPU time, then exit 0.
  */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(_WIN32)
 #  include <io.h>
 #  include <fcntl.h>
+#  include <windows.h>
 #else
 #  include <unistd.h>
 #endif
+
+/* Kept reachable, so the compiler cannot drop the allocation or its writes. */
+char *g_held;
+
+static void sleep_ms(unsigned long ms)
+{
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u); ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0) { }
+#endif
+}
 
 int main(int argc, char **argv)
 {
@@ -41,6 +64,22 @@ int main(int argc, char **argv)
         close(STDOUT_FILENO);
 #endif
         for (;;) { /* alive but silent: the parent must not wait for us forever */ }
+    }
+    if (strcmp(mode, "mem") == 0) {
+        size_t mb = (argc > 2) ? (size_t)strtoul(argv[2], NULL, 10) : 0;
+        unsigned long hold = (argc > 3) ? strtoul(argv[3], NULL, 10) : 0;
+        g_held = (char *)malloc(mb ? mb << 20 : 1);
+        if (!g_held) return 3;
+        memset(g_held, 1, mb << 20);
+        sleep_ms(hold);
+        return (argc > 4) ? atoi(argv[4]) : 0;
+    }
+    if (strcmp(mode, "spin") == 0) {
+        unsigned long ms = (argc > 2) ? strtoul(argv[2], NULL, 10) : 0;
+        clock_t until = (clock_t)((double)ms / 1000.0 * (double)CLOCKS_PER_SEC);
+        volatile unsigned long x = 0;
+        while (clock() < until) x++;
+        return 0;
     }
     if (strcmp(mode, "zeros") == 0) {
         static char chunk[65536];                    /* zero-initialised */

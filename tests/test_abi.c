@@ -136,6 +136,39 @@ int main(void)
         CHECK(GPTPS_LIMIT_NONE == 0xFFFFFFFFu);
     }
 
+    /* 5) What 2.5 appends to gptps_event starts past the end of a 2.4 event on every
+     *    ABI. Where uint64_t aligns to 8 on a 32-bit ABI (ARMv7, Win32) the 2.4 struct
+     *    ended in 4 bytes of tail padding after `flags`; `reserved` fills them, so
+     *    `measures` cannot land there, where a 2.4 struct_size would cover it. The 2.4
+     *    layout, rebuilt from the same members: */
+    {
+        typedef struct { size_t struct_size; gptps_event_kind kind; gptps_handle handle;
+                         const char *task_name; uint64_t ts_ms; gptps_status status;
+                         uint32_t attempt; uint64_t mem_bytes; const void *result;
+                         size_t result_len; uint32_t flags; } event_2_4;
+        typedef char measures_grow[
+            (offsetof(gptps_event, measures) >= sizeof(event_2_4)) ? 1 : -1];
+        typedef char flags_unmoved[
+            (offsetof(gptps_event, flags) == offsetof(event_2_4, flags)) ? 1 : -1];
+        typedef char count_inside[
+            (offsetof(gptps_event, n_measures) + sizeof(size_t) <= sizeof(gptps_event)) ? 1 : -1];
+        /* gptps_measure is an array element, so it is frozen: these are its fields, in
+         * this order, for good. */
+        typedef char measure_order[
+            (offsetof(gptps_measure, name) == 0 &&
+             offsetof(gptps_measure, value) < offsetof(gptps_measure, unit) &&
+             offsetof(gptps_measure, unit) + sizeof(uint16_t) == offsetof(gptps_measure, kind) &&
+             offsetof(gptps_measure, kind) + sizeof(uint16_t) == offsetof(gptps_measure, flags) &&
+             offsetof(gptps_measure, flags) + sizeof(uint32_t) <= offsetof(gptps_measure, method)) ? 1 : -1];
+        (void)sizeof(measures_grow);
+        (void)sizeof(flags_unmoved);
+        (void)sizeof(count_inside);
+        (void)sizeof(measure_order);
+        CHECK(GPTPS_EV_SAMPLE == GPTPS_EV_DROPPED + 1);
+        CHECK(GPTPS_UNIT_BYTES == 1 && GPTPS_UNIT_FLAG == 4);
+        CHECK(GPTPS_MEASURE_PEAK == 1 && GPTPS_MEASURE_CURRENT == 4);
+    }
+
     if (fails) { printf("%d abi check(s) FAILED\n", fails); return 1; }
     printf("all abi (append-safe guard) checks passed\n");
     return 0;

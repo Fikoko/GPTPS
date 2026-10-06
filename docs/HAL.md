@@ -142,11 +142,11 @@ CI's two commands, for each seed in turn:
 for s in $(seq 1 500); do
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$s GPTPS_STRESS_MS=1500 \
     ctest --test-dir build-sim -j4 --no-tests=error \
-    -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|xport|xport_engine|gptps_bench_pool|gptps_bench_balance)$' \
+    -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|xport|xport_engine|xport_measure|gptps_bench_pool|gptps_bench_balance)$' \
     > sim-$s.log 2>&1 || echo "seed $s failed: see sim-$s.log"
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 \
     ctest --test-dir build-sim --no-tests=error \
-    -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai)$' \
+    -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure)$' \
     > sim-paced-$s.log 2>&1 || echo "seed $s failed paced: see sim-paced-$s.log"
 done
 ```
@@ -160,7 +160,8 @@ The tests the first command leaves out, and why:
 | `hal_conformance` | Its real-time rate check, above. The second command runs it paced. |
 | `oop`, `program`, `program_helper`, `exec_faults`, `durable_crash`, `hang`, `example_program`, `example_wasm` | They are about child processes, which live in real time: the executor polls a child in real 200 ms slices and holds it to deadlines and shutdown graces. Every run of them forks, so none replays, and the second command runs them once, paced from the start. Before a run was paced from its first fork they failed unpaced: `exec_faults` with every undisturbed run timed out, `example_program` in 18 of 400 runs under load. The seed still draws every switch, but real time moves the clock. (`example_wasm` runs a child only where a wasm runtime is installed; without one it skips. `durable_crash` forks a child for each of its about 11,800 crash and power-cut runs; it passes unpaced too, in 37-41 s on three seeds that switch at every point, but runs once, paced.) |
 | `example_edge_ai` | Its jobs are child processes as well: `fake_infer`, which takes its memory and holds it for real milliseconds, under the cap the executor sets. So it runs with the tests above, once, paced. It also passed unpaced, on seeds 1-40, but a run that forks does not replay. |
-| `xport`, `xport_engine` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
+| `measure` | Its jobs are child processes too, measured as they end and sampled while they run on the executor's clock, so it runs paced, with the tests above. |
+| `xport`, `xport_engine`, `xport_measure` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
 
 `stress_api` runs in the first command, shortened to one round of 1.5 s by
 `GPTPS_STRESS_MS=1500`. Its rounds last 1.5 s of the clock. Once a round runs one of

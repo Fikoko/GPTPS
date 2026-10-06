@@ -338,6 +338,17 @@ full copy of the host address space, its file descriptors, and its environment.
 See [SECURITY.md](SECURITY.md) for the trust boundary and what `child_setup` is
 for.
 
+**Measurements.** Because these executors collect their child, they can say what it
+used: `wait4()` hands back its resource usage with its exit status, the job's cgroup
+keeps its own peak, CPU and I/O counters, and a Windows job object accounts for its
+whole process tree. `execute()` passes each attempt a `gptps_exec_meter` on its stack;
+the executor fills it as the attempt ends, every name and method a string literal, and
+`execute()` emits it on the attempt's FINISHED or FAILED (`gptps_event.measures`). While
+the job runs, and only if `measure.sample_ms` asks, the executor's own wait loop calls
+the meter's `sample` hook, which emits a GPTPS_EV_SAMPLE on the same thread. Nothing is
+allocated for any of it, and nothing in the core reads the numbers: they are reported,
+never acted on. [MEASUREMENTS.md](MEASUREMENTS.md) is the design record.
+
 ---
 
 ## 8. The HAL (`gptps_hal.h`)
