@@ -1245,6 +1245,47 @@ static void arm(unsigned ms, const char *what)
     g_wd_what = what;
     gptps_mutex_unlock(g_wdm);
 }
+/* Where the engine's work is, as its public API reports it: each task type's queued
+ * and running items - a type being removed included - and each resource's units in
+ * flight. A hang then says whether it waits on work still queued, on work running,
+ * or on nothing at all, a wake that never came. Asked on a thread of its own, as the
+ * engine lock may be what is stuck; the watchdog does not wait for it past a few
+ * seconds, and says so. */
+static int g_engine_dumped;
+static void *engine_dump_main(void *a)
+{
+    static const char *const RES[] = { "gpu", "io", "lic" };
+    gptps *e = (gptps *)a;
+    size_t i, n = gptps_task_count(e);
+    printf("  the engine's task types (%u):\n", (unsigned)n);
+    for (i = 0; i < n; ++i) {
+        gptps_task_info ti;
+        memset(&ti, 0, sizeof ti);
+        ti.struct_size = sizeof ti;
+        if (gptps_task_get_info(e, i, &ti) != GPTPS_OK) continue;
+        printf("    %s%s%s: queued %u, running %u, dead letters %u\n", ti.name ? ti.name : "?",
+               ti.removed ? " (being removed)" : "", ti.enabled ? "" : " (paused)",
+               (unsigned)ti.queued, (unsigned)ti.running, (unsigned)ti.dead);
+    }
+    for (i = 0; i < sizeof RES / sizeof RES[0]; ++i) {
+        uint64_t held = 0, budget = 0;
+        if (gptps_resource_usage(e, RES[i], &held, &budget) == GPTPS_OK)
+            printf("    resource %s: %llu of %llu in flight\n", RES[i],
+                   (unsigned long long)held, (unsigned long long)budget);
+    }
+    fflush(stdout);
+    put(&g_engine_dumped, 1);
+    return NULL;
+}
+
+static void dump_engine(void)
+{
+    int waited;
+    if (!g_e || !gptps_thread_start(engine_dump_main, g_e)) return;
+    for (waited = 0; waited < 3000 && !get(&g_engine_dumped); waited += 50) nap(50);
+    if (!get(&g_engine_dumped)) printf("  the engine did not answer in 3 s: its lock is held\n");
+}
+
 static void *watchdog_main(void *a)
 {
     (void)a;
@@ -1253,6 +1294,7 @@ static void *watchdog_main(void *a)
         if (g_wd_deadline && gptps_now_ms(NULL) > g_wd_deadline) {
             printf("FAIL: HANG - %s did not finish in time\n", g_wd_what);
             dump_state();
+            dump_engine();
             dump_log();
             fflush(stdout);
             abort();
