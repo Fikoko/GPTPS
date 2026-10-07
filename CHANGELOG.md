@@ -5,11 +5,30 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.7.0] - 2026-10-07
 
-ABI 2.5, additive over 1.6.0's 2.4: `gptps_event` appends `reserved`, `measures` and
-`n_measures`; `gptps_measure`, `gptps_event_measure` and the `GPTPS_EV_SAMPLE` kind are
-new.
+### Upgrading from 1.6
+
+No API changed incompatibly. The ABI is 2.5, additive over 1.6.0's 2.4: `gptps_event`
+appends `reserved`, `measures` and `n_measures`; `gptps_measure`,
+`gptps_event_measure` and the `GPTPS_EV_SAMPLE` kind are new, and so are
+`gptps_stats_measure_*`, `gptps_stats_open` and `gptps_xport_submit_ex`,
+`gptps_xport_submit_async_ex` and `gptps_xport_result_free` in the add-ons. Three
+changes can need a change in a host:
+
+- **An observer must ignore an event kind it does not know.** `GPTPS_EV_SAMPLE` is
+  new, and an engine emits it only once the host sets `measure.sample_ms`, so a host
+  that never turns sampling on never sees it. One that does must first check that its
+  observers - and the add-ons it loads - do not treat every kind they do not name as
+  an ending or a failure.
+- **`[measure]` is one of the engine's own tables in a config file.** A key under it
+  that the engine does not have fails `gptps_open`, as one under `[limits]` does. A
+  host that kept settings of its own under `measure.` moves them to a table of its own.
+- **A process job holds one more pipe while it runs.** Each `GPTPS_EXEC_OOP` and
+  `GPTPS_EXEC_PROGRAM` attempt on POSIX opens two more descriptors, close-on-exec, for
+  its child's report (see "Changed"). They count against the process's descriptor
+  limit; an attempt that cannot have them fails with `GPTPS_E_IO`, as when its other
+  pipes cannot be made.
 
 ### Added — measurements: what a process job actually used
 
