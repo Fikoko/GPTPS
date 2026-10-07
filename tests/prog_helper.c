@@ -16,6 +16,10 @@
  *             "mem"   : take argv[2] MiB, writing every page so it is resident and
  *                       committed, hold it argv[3] ms, then exit argv[4] (default 0) -
  *                       a job of known size, for test_measure.
+ *             "memstep": "mem" whose size depends on the attempt: argv[2] names a
+ *                       file; the run that finds it missing creates it and takes
+ *                       argv[3] MiB, every later run takes argv[4] MiB; then exit
+ *                       argv[5] (default 0) - attempts told apart, for test_xport_measure.
  *             "spin"  : burn argv[2] ms of CPU time, then exit 0.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
@@ -37,6 +41,31 @@
  * "spin" loop's work. */
 char *g_held;
 volatile unsigned long g_spins;
+
+/* CPU time this process has used, in ms. clock() measures that on POSIX, but on the
+ * Windows CRT it is wall time since the process started. */
+static unsigned long cpu_ms(void)
+{
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    ULARGE_INTEGER a, b;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return (unsigned long)-1;
+    a.LowPart = k.dwLowDateTime; a.HighPart = k.dwHighDateTime;
+    b.LowPart = u.dwLowDateTime; b.HighPart = u.dwHighDateTime;
+    return (unsigned long)((a.QuadPart + b.QuadPart) / 10000u);   /* 100 ns units */
+#else
+    return (unsigned long)((double)clock() * 1000.0 / (double)CLOCKS_PER_SEC);
+#endif
+}
+
+/* Take `mb` MiB, every page written so it is resident and committed. */
+static int take_mb(size_t mb)
+{
+    g_held = (char *)malloc(mb ? mb << 20 : 1);
+    if (!g_held) return -1;
+    memset(g_held, 1, mb << 20);
+    return 0;
+}
 
 static void sleep_ms(unsigned long ms)
 {
@@ -70,16 +99,23 @@ int main(int argc, char **argv)
     if (strcmp(mode, "mem") == 0) {
         size_t mb = (argc > 2) ? (size_t)strtoul(argv[2], NULL, 10) : 0;
         unsigned long hold = (argc > 3) ? strtoul(argv[3], NULL, 10) : 0;
-        g_held = (char *)malloc(mb ? mb << 20 : 1);
-        if (!g_held) return 3;
-        memset(g_held, 1, mb << 20);
+        if (take_mb(mb) != 0) return 3;
         sleep_ms(hold);
         return (argc > 4) ? atoi(argv[4]) : 0;
     }
+    if (strcmp(mode, "memstep") == 0) {
+        FILE *f = (argc > 2) ? fopen(argv[2], "rb") : NULL;
+        int first = (f == NULL);
+        size_t mb;
+        if (f) fclose(f);
+        else if (argc > 2 && (f = fopen(argv[2], "wb")) != NULL) fclose(f);
+        mb = (size_t)strtoul(argc > (first ? 3 : 4) ? argv[first ? 3 : 4] : "0", NULL, 10);
+        if (take_mb(mb) != 0) return 3;
+        return (argc > 5) ? atoi(argv[5]) : 0;
+    }
     if (strcmp(mode, "spin") == 0) {
         unsigned long ms = (argc > 2) ? strtoul(argv[2], NULL, 10) : 0;
-        clock_t until = (clock_t)((double)ms / 1000.0 * (double)CLOCKS_PER_SEC);
-        while (clock() < until) g_spins = g_spins + 1;
+        while (cpu_ms() < ms) g_spins = g_spins + 1;
         return 0;
     }
     if (strcmp(mode, "zeros") == 0) {

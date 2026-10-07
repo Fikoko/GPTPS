@@ -477,7 +477,8 @@ static const scenario k_scenarios[] = {
     { "eofhang timeout", GPTPS_EXEC_PROGRAM, NULL,    "eofhang", NULL, 16,      5,  FAST_WAIT, 0, 0, GPTPS_EV_FAILED,   GPTPS_E_TIMEOUT,   NULL,  0,            0 },
     { "eofhang cancel",  GPTPS_EXEC_PROGRAM, NULL,    "eofhang", NULL, 16,      0,  0,         0, 3, GPTPS_EV_FAILED,   GPTPS_E_CANCELLED, NULL,  0,            0 },
     /* A host that daemonised: fds 0 and 1 free, so pipe() returns those two. The OOP
-     * parent moves its pipe above fd 2 (fd_above_stdio), the PROGRAM child its
+     * parent moves its pipes - the result's and the child's report - above fd 2
+     * (fd_above_stdio), the PROGRAM child its
      * ends (the hoist before its dup2s); both use fcntl's F_DUPFD, failed here too. */
     { "oop daemon",      GPTPS_EXEC_OOP,     t_ok,    NULL,      NULL, 0,       30, 0,         0, 0, GPTPS_EV_FINISHED, GPTPS_OK,          k_res, sizeof k_res, 1 },
     { "program daemon",  GPTPS_EXEC_PROGRAM, NULL,    "cat",     NULL, 4096,    30, 0,         0, 0, GPTPS_EV_FINISHED, GPTPS_OK,          g_big, 4096,         1 }
@@ -488,7 +489,7 @@ static const scenario k_scenarios[] = {
 
 typedef struct {
     int           started, attempts, terminal, selfcancel;
-    int           measured;          /* the attempt's end carried its mem.peak */
+    int           measured;          /* the attempt's end carried its CPU time */
     int           waited;            /* the executor collected the child itself */
     int           kind;              /* the attempt's FINISHED or FAILED */
     gptps_status  status;
@@ -511,14 +512,14 @@ static void on_ev(const gptps_event *ev, void *ud)
     switch (ev->kind) {
     case GPTPS_EV_STARTED:  g_run.started++; break;
     case GPTPS_EV_FINISHED:
-        if (gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) g_run.measured++;
+        if (gptps_event_measure(ev, GPTPS_M_CPU_USER_MS)) g_run.measured++;
         g_run.attempts++; g_run.terminal++;
         g_run.kind = GPTPS_EV_FINISHED; g_run.status = ev->status;
         g_run.len = ev->result_len;
         if (ev->result && ev->result_len <= sizeof g_run.res) memcpy(g_run.res, ev->result, ev->result_len);
         break;
     case GPTPS_EV_FAILED:
-        if (gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) g_run.measured++;
+        if (gptps_event_measure(ev, GPTPS_M_CPU_USER_MS)) g_run.measured++;
         g_run.attempts++;
         g_run.kind = GPTPS_EV_FAILED; g_run.status = ev->status; g_run.len = 0;
         if (ev->status == GPTPS_E_CANCELLED) g_run.terminal++;   /* terminal in its own right */
@@ -789,7 +790,9 @@ static void judge(const scenario *sc, const variant *v, const run *base)
     }
     /* Measured, or absent (docs/MEASUREMENTS.md): the attempt reports what its child
      * used exactly when the executor collected that child itself - not when fork
-     * failed, nor when something else reaped it and took its usage along. */
+     * failed, nor when something else reaped it and took its usage along. CPU time
+     * is the witness: wait4 always has it, while a program's mem.peak may be absent
+     * on Linux for a reason of its own (the copy of the host it began as). */
     ok = ok && got->measured == got->waited;
     ok = ok && got->fd_ok && got->kids == 0 && !got->hung;
     if (!ok || g_verbose) {
@@ -845,7 +848,7 @@ static void sweep(const scenario *sc)
     if (sc->exec == GPTPS_EXEC_PROGRAM && sc->want_len) CHECK(pc[K_WRITE] >= 1 && pc[K_READ] >= 1);
     if (sc->want_status == GPTPS_E_TIMEOUT || sc->want_status == GPTPS_E_CANCELLED)
         CHECK(pc[K_KILL] >= 1);                        /* it ends with the child killed */
-    if (sc->daemon && sc->exec == GPTPS_EXEC_OOP) CHECK(pc[K_DUPFD] == 2);       /* both pipe ends */
+    if (sc->daemon && sc->exec == GPTPS_EXEC_OOP) CHECK(pc[K_DUPFD] == 4);       /* both ends of both pipes */
     if (sc->daemon && sc->exec == GPTPS_EXEC_PROGRAM) CHECK(cc[K_DUPFD] == 2);   /* stdin's pipe */
     if (fails != census_fails) printf("  (the census of %s)\n", sc->name);
 

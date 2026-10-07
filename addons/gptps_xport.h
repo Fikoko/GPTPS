@@ -102,7 +102,8 @@ typedef void (*gptps_xport_reply_fn)(uint64_t request_id, gptps_status io,
  * Unknown names pass through. In-process tasks, and handler mode, carry none. At most
  * GPTPS_XPORT_MAX_MEASURES travel with one reply, each name and method at most
  * GPTPS_XPORT_MEASURE_STR - 1 bytes; an item that reports more than that has the rest
- * left out, and `measures_cut` says so. */
+ * left out, and `measures_cut` says so - as it does when the worker could not have
+ * the memory to send them. */
 #define GPTPS_XPORT_MAX_MEASURES 64u
 #define GPTPS_XPORT_MEASURE_STR  256u
 

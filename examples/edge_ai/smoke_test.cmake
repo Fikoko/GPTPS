@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Fikoko. See LICENSE for the full text.
 #
 # smoke_test.cmake - CTest's example_edge_ai: edge_admission in GPTPS mode on a tiny
-# night, a few hundred ms in all, and checks on what it reports:
+# night, under a second in all, and checks on what it reports:
 #   - every normal job finishes, on its first attempt;
 #   - the flaky job finishes on its second;
 #   - the runaway is stopped by its cap, and ends as a dead letter;
@@ -21,24 +21,27 @@ foreach(v EDGE_ADMISSION FAKE_INFER_DIR WORK_DIR)
     endif()
 endforeach()
 
-# 24 MB each against a 64 MB budget: two jobs at a time at most. The runaway takes
-# 2.5 ms per MB and passes its 24 MB cap within about 50 ms.
+# 64 MB each against a 160 MB budget: two jobs at a time at most. A job takes 48 MB:
+# well above what edge_admission itself holds, even under a sanitizer, which on Linux
+# is what lets a program's own peak be told from the copy of the host it was forked
+# as (docs/MEASUREMENTS.md). The runaway takes 2.5 ms per MB and passes its 64 MB cap
+# within about 40 ms of its 48.
 set(jobs "${WORK_DIR}/edge_ai_smoke_jobs.txt")
 set(mark "${WORK_DIR}/edge_ai_smoke.mark")
 file(WRITE "${jobs}" "\
 # name   mem_mb gpu timeout_s retries command
-a           24   1       10       0  fake_infer --mb 4 --ms 40
-b           24   1       10       0  fake_infer --mb 4 --ms 40
-c           24   1       10       0  fake_infer --mb 4 --ms 40
-flaky       24   1       10       1  fake_infer --mb 4 --ms 40 --fail-first ${mark}
-runaway     24   1       10       1  fake_infer --mb 4 --ms 40 --runaway
-too_big    100   1       10       0  fake_infer --mb 4 --ms 40
+a           64   1       10       0  fake_infer --mb 48 --ms 120
+b           64   1       10       0  fake_infer --mb 48 --ms 120
+c           64   1       10       0  fake_infer --mb 48 --ms 120
+flaky       64   1       10       1  fake_infer --mb 48 --ms 120 --fail-first ${mark}
+runaway     64   1       10       1  fake_infer --mb 48 --ms 120 --runaway
+too_big    200   1       10       0  fake_infer --mb 48 --ms 120
 ")
 file(REMOVE "${mark}")
 set(ENV{PATH} "${FAKE_INFER_DIR}:$ENV{PATH}")
 unset(ENV{GPTPS_CGROUP_PARENT})
 
-execute_process(COMMAND "${EDGE_ADMISSION}" --budget-mb 64 --gpu-slots 2 "${jobs}"
+execute_process(COMMAND "${EDGE_ADMISSION}" --budget-mb 160 --gpu-slots 2 "${jobs}"
                 WORKING_DIRECTORY "${WORK_DIR}"
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 message("${out}${err}")
@@ -53,35 +56,37 @@ function(expect what regex var)          # var: the NAME of the variable to sear
 endfunction()
 
 expect("exit status 1 (the runaway and too_big fail for good)" "^1$" rc)
+# The peak column prints with one decimal ("49.6"), so it cannot pass for the gpu
+# column of a table printed without it.
 foreach(j a b c)
-    expect("${j} to finish on its first attempt" "\n${j} +24 +[0-9.]+ +1 +[0-9]+ +[0-9]+ +1  finished\n" out)
+    expect("${j} to finish on its first attempt" "\n${j} +64 +[0-9]+\\.[0-9] +1 +[0-9]+ +[0-9]+ +1  finished\n" out)
 endforeach()
 expect("flaky to finish on its second attempt"
-       "\nflaky +24 +[0-9.]+ +1 +[0-9]+ +[0-9]+ +2  finished after a retry\n" out)
+       "\nflaky +64 +[0-9]+\\.[0-9] +1 +[0-9]+ +[0-9]+ +2  finished after a retry\n" out)
 expect("runaway to be a dead letter after 2 attempts"
-       "\nrunaway +24 +[0-9.]+ +1 +[0-9]+ +[0-9]+ +2  dead letter: GPTPS_E_TASK\n" out)
+       "\nrunaway +64 +[0-9]+\\.[0-9] +1 +[0-9]+ +[0-9]+ +2  dead letter: GPTPS_E_TASK\n" out)
 expect("the runaway's allocation to be refused by its cap"
        "fake_infer: --runaway: allocation refused at" err)
 expect("too_big to be refused at submit"
-       "\ntoo_big +100 +- +1 +- +- +0  refused: GPTPS_E_BUDGET" out)
+       "\ntoo_big +200 +- +1 +- +- +0  refused: GPTPS_E_BUDGET" out)
 expect("the declared peak in flight to be reported"
-       "peak declared in flight: [0-9]+ MB of a 64 MB budget, gpu [0-9]+ of 2" out)
-if("${out}" MATCHES "peak declared in flight: ([0-9]+) MB of a 64 MB budget, gpu ([0-9]+) of 2")
-    if(CMAKE_MATCH_1 GREATER 64 OR CMAKE_MATCH_2 GREATER 2)
+       "peak declared in flight: [0-9]+ MB of a 160 MB budget, gpu [0-9]+ of 2" out)
+if("${out}" MATCHES "peak declared in flight: ([0-9]+) MB of a 160 MB budget, gpu ([0-9]+) of 2")
+    if(CMAKE_MATCH_1 GREATER 160 OR CMAKE_MATCH_2 GREATER 2)
         message(SEND_ERROR "example_edge_ai: in flight ${CMAKE_MATCH_1} MB, gpu ${CMAKE_MATCH_2}: over the budget")
         math(EXPR bad "${bad} + 1")
     endif()
 endif()
-# Measured peaks: a normal job took 4 MB, the runaway kept going until its 24 MB cap
+# Measured peaks: a normal job took 48 MB, the runaway kept going until its 64 MB cap
 # refused it - so its peak is the larger, and both are real numbers.
 expect("the measured peaks to be reported" "peak MB: measured by GPTPS" out)
-if("${out}" MATCHES "\na +24 +([0-9.]+) " AND NOT "${CMAKE_MATCH_1}" LESS 4)
+if("${out}" MATCHES "\na +64 +([0-9]+\\.[0-9]) " AND NOT "${CMAKE_MATCH_1}" LESS 48)
     set(a_peak "${CMAKE_MATCH_1}")
 else()
-    message(SEND_ERROR "example_edge_ai: job a's measured peak is missing or under the 4 MB it took")
+    message(SEND_ERROR "example_edge_ai: job a's measured peak is missing or under the 48 MB it took")
     math(EXPR bad "${bad} + 1")
 endif()
-if("${out}" MATCHES "\nrunaway +24 +([0-9.]+) ")
+if("${out}" MATCHES "\nrunaway +64 +([0-9]+\\.[0-9]) ")
     if(DEFINED a_peak AND NOT "${CMAKE_MATCH_1}" GREATER "${a_peak}")
         message(SEND_ERROR "example_edge_ai: the runaway's peak ${CMAKE_MATCH_1} MB is not above job a's ${a_peak} MB")
         math(EXPR bad "${bad} + 1")

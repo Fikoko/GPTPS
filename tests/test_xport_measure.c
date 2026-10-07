@@ -10,7 +10,8 @@
  *     its CPU, and gptps_xport_result_free releases them;
  *   - gptps_xport_submit_async_ex: the callback sees them too;
  *   - a program that fails twice and is dead-lettered: the reply carries the LAST
- *     failed attempt's measurements, though the dead letter itself has none;
+ *     failed attempt's measurements, though the dead letter itself has none (the
+ *     attempts differ in size, so the first one's would show);
  *   - an in-process task, and handler mode: no measurements, and nothing breaks;
  *   - the plain gptps_xport_submit still answers on the same links;
  *   - a parent with no engine folds the replies into gptps_stats_open().
@@ -34,7 +35,8 @@ static int fails = 0;
 #define MiB (1024ull * 1024ull)
 
 static const char *const av_take[] = { HELPER_PATH, "mem", "32", "50", NULL };
-static const char *const av_fail[] = { HELPER_PATH, "mem", "8", "0", "3", NULL };
+static char        g_step[64];        /* memstep's file: absent until the first attempt */
+static const char *av_fail[] = { HELPER_PATH, "memstep", g_step, "8", "40", "3", NULL };
 
 static gptps_status t_inproc(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 
@@ -85,11 +87,13 @@ int main(void)
     const gptps_measure *pk;
     void *res = NULL; size_t rl = 0; gptps_status ts = GPTPS_E_IO;
 
+    snprintf(g_step, sizeof g_step, "/tmp/gptps_xpm_%ld", (long)getpid());
+    remove(g_step);
     memset(tasks, 0, sizeof tasks);
     tasks[0].struct_size = sizeof tasks[0]; tasks[0].name = "take";
     tasks[0].exec = GPTPS_EXEC_PROGRAM; tasks[0].argv = av_take;
     tasks[1].struct_size = sizeof tasks[1]; tasks[1].name = "fail";
-    tasks[1].exec = GPTPS_EXEC_PROGRAM; tasks[1].argv = av_fail;
+    tasks[1].exec = GPTPS_EXEC_PROGRAM; tasks[1].argv = (const char *const *)av_fail;
     tasks[1].default_policy.struct_size = sizeof tasks[1].default_policy;
     tasks[1].default_policy.max_retries = 1;
     tasks[1].default_policy.on_failure = GPTPS_ON_FAILURE_DEAD_LETTER;
@@ -134,13 +138,16 @@ int main(void)
     pthread_mutex_unlock(&g_mu);
     CHECK(g_io == GPTPS_OK && g_peak >= 32 * MiB && g_has_cpu);
 
-    /* 3) dead-lettered after two failed attempts: the last attempt's measurements */
+    /* 3) dead-lettered after two failed attempts: the last attempt's measurements -
+     * 40 MiB; the first took 8 */
     memset(&r, 0, sizeof r); r.struct_size = sizeof r;
     CHECK(gptps_xport_submit_ex(xp, "fail", NULL, 0, &r) == GPTPS_OK);
     CHECK(r.io == GPTPS_OK && r.task_status == GPTPS_E_TASK);
     pk = find(r.measures, r.n_measures, GPTPS_M_MEM_PEAK);
-    CHECK(pk != NULL && pk->value >= 8 * MiB);
+    CHECK(pk != NULL && pk->value >= 40 * MiB);
+    if (pk && pk->value < 40 * MiB) printf("  dead letter: mem.peak %llu via %s\n", (unsigned long long)pk->value, pk->method);
     gptps_xport_result_free(&r);
+    remove(g_step);
 
     /* 4) an in-process task: answered, nothing measured */
     memset(&r, 0, sizeof r); r.struct_size = sizeof r;

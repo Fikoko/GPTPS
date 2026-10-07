@@ -344,7 +344,7 @@ has a table of every key whose `0` is special.
 **The file is checked as it is read.** `gptps_open` fails with `GPTPS_E_CONFIG` on a line
 that does not parse, a value out of range or of the wrong type (TOML's types: `"4"` in
 quotes is a string, not a number), a key the engine's own tables (`[limits]`,
-`[scheduler]`, `[bounded]`, `[stats]`) do not have, a table name a letter or two from one
+`[scheduler]`, `[bounded]`, `[stats]`, `[measure]`) do not have, a table name a letter or two from one
 of the engine's when the key under it is that table's (`[limit] max_concurrent_tasks`),
 an add-on that does not load, and a plug-in's own key that its plug-in refuses. One attempt
 reports every problem, not just the first: every line that does not parse, or, once the

@@ -102,7 +102,7 @@ if (m) printf("%s: peak %llu bytes (%s)\n", ev->task_name,
 |---|---|---|---|
 | `mem.peak` | bytes | peak | the attempt's highest memory use |
 | `mem.current` | bytes | current | memory in use at the moment of a sample |
-| `mem.cap_hit` | flag | flag | 1 if the attempt reached its memory cap (Linux cgroup mode only) |
+| `mem.cap_hit` | flag | flag | 1 if the attempt reached its memory cap, page cache included (Linux cgroup mode only) |
 | `cpu.user_ms` | ms | total | CPU time spent in the job's own code |
 | `cpu.sys_ms` | ms | total | CPU time the kernel spent on the job's behalf |
 | `io.read_bytes` | bytes | total | bytes the job read |
@@ -121,12 +121,15 @@ some method could measure it.
 |---|---|---|---|
 | `cgroup.job.resident` | Linux, cgroup mode | every process in the job's own cgroup | `mem.peak` (`memory.peak`), `mem.current` (`memory.current`): resident memory charged to the job, page cache included |
 | `cgroup.job` | Linux, cgroup mode | the job's cgroup | `cpu.*` (`cpu.stat`), `mem.cap_hit` (`memory.events`: `max` or `oom_kill` above 0) |
-| `cgroup.job.block` | Linux, cgroup mode with the io controller | the job's cgroup | `io.*` (`io.stat`): bytes moved to and from block devices |
-| `rusage.largest_process.resident` | Linux, macOS, BSD | the job's process and the children it waited for | `mem.peak` (`ru_maxrss`): the resident peak of the largest single process, not their sum |
+| `rusage.largest_process.resident` | Linux, macOS | a program's process and the children it waited for | `mem.peak` (`ru_maxrss`): the resident peak of the largest single process, not their sum. On Linux, only where it is the program's own (see below) |
+| `rusage.host_fork.resident` | Linux, macOS, BSD | an OOP job's process - a fork of the host - and the children it waited for | `mem.peak` (`ru_maxrss`): as above, host pages included (see below) |
 | `rusage.process` | Linux, macOS, BSD | the job's process and the children it waited for | `cpu.*` (`ru_utime`, `ru_stime`) |
-| `rusage.process.block` | Linux | the job's process and the children it waited for | `io.*` (`ru_inblock`, `ru_oublock`, in 512-byte units): block-device I/O |
-| `procfs.process.resident` | Linux without a cgroup | the job's main process | `mem.current` (`/proc/<pid>/statm`) |
-| `libproc.process.resident` | macOS | the job's main process | `mem.current` (`proc_pidinfo`) |
+| `rusage.process.block` | Linux | the job's process and the children it waited for | `io.*` (`ru_inblock`, `ru_oublock`, in 512-byte units): block-device I/O, a write counted when it is made |
+| `cgroup.job.block` | Linux, cgroup mode with the io controller | the job's cgroup | `io.*` (`io.stat`): bytes that reached block devices by the time the job ended - writes still in the page cache are not in it. Reported only where `rusage.process.block` is not |
+| `procfs.process.resident` | Linux, outside a cgroup | a program's main process, once it has exec'd | `mem.current` (`/proc/<pid>/statm`) |
+| `procfs.host_fork.resident` | Linux, outside a cgroup | an OOP job's process | `mem.current` (`/proc/<pid>/statm`), host pages included |
+| `libproc.process.resident` | macOS | a program's main process, once it has exec'd | `mem.current` (`proc_pidinfo`) |
+| `libproc.host_fork.resident` | macOS | an OOP job's process | `mem.current` (`proc_pidinfo`), host pages it touched included |
 | `jobobject.tree.committed` | Windows | every process in the job object, which holds the program and everything it starts | `mem.peak` (`PeakJobMemoryUsed`), `mem.current` (summed over the job's processes): **committed** memory, not resident |
 | `jobobject.tree` | Windows | the job object | `cpu.*` (basic accounting) |
 | `jobobject.tree.all` | Windows | the job object | `io.*` (I/O accounting): every read and write, files, pipes and network alike |
@@ -136,14 +139,21 @@ some method could measure it.
 
 Where the cgroup files are missing - an older kernel without `memory.peak`, a parent
 without the io controller delegated - the executor falls back to the next method in the
-table for that name, and the method says so.
+table for that name, and the method says so. The cgroup's files are read only once the
+job's process has said it is in its cgroup: a process that could not join one falls
+back to `RLIMIT_AS` and leaves the cgroup empty, and reading that would report zeros
+the job never had. Before a process exec's its program, it is a copy of the host, and
+nothing about it is reported as the program's.
 
 On Windows both the job object and the program's process handle are read, and two facts
 that need no guessing decide which is reported: a job contains its program, so a job
-figure below the program's own is not a measurement; and every process commits memory,
-so a committed peak of 0 is not one either. A figure that fails either check is
-replaced by the process's, or left out. (Wine, which does not implement job accounting,
-answers the job queries with zeros; this is how that answer stays out of the numbers.)
+figure of 0 where the program's own is above 0 is not a measurement; and every process
+commits memory, so a committed peak of 0 is not one either. A figure that fails either
+check is replaced by the process's, or left out. Only that contradiction counts: job and
+process accounting are kept apart and can differ by a tick as the program exits, and
+switching method over that would flip one task's values between methods. (Wine, which
+does not implement job accounting, answers the job queries with zeros; this is how that
+answer stays out of the numbers.)
 
 Notes that matter when reading the numbers:
 
@@ -156,10 +166,26 @@ Notes that matter when reading the numbers:
 - **`mem.cap_hit` comes from cgroups only.** A cgroup records reaching its cap in
   `memory.events`. `RLIMIT_AS` records nothing, and Windows announces a job's memory
   limit on a completion port whose delivery it documents as not guaranteed - a missed
-  message would read as "not hit", so it is not reported (rule 2).
-- **An OOP job starts as a copy of the host.** Its process maps the host's memory from
-  the fork on, so its `rusage.largest_process.resident` includes host pages it touched.
-  In cgroup mode only the pages charged to the job's cgroup count.
+  message would read as "not hit", so it is not reported (rule 2). Reaching the cap
+  includes page cache filling up to it, which the kernel then reclaims: a job that
+  reads or writes a lot of file data can hit its cap without running short. A job the
+  cap killed also fails with `GPTPS_E_NOMEM`.
+- **A program's peak on Linux, outside a cgroup.** GPTPS starts a program by forking
+  a copy of the host and exec'ing the program in it. Linux starts that copy's resident
+  high-water mark at the host's own resident size and carries it across exec into
+  `ru_maxrss`, so `ru_maxrss` is the program's peak only where it is above that mark.
+  Just before exec the process reads the most the mark can be - the larger of its
+  `VmHWM` and its exact resident size (`smaps_rollup`) - and `mem.peak` is reported
+  only above it, plus 64 pages for what exec itself touches. A program that peaked
+  lower than its host's resident size has no `mem.peak` this way; cgroup mode measures
+  every program exactly. macOS starts the program's count afresh at exec, and CI checks
+  that it does; on the BSDs that is not checked, so a program's `mem.peak` is not
+  reported there.
+- **An OOP job is a fork of the host.** Its process holds the host's pages, shared
+  copy-on-write, so its resident size includes them: on Linux every page the fork
+  copied, from the start, and on macOS the ones the job touched. Its methods say
+  `host_fork` so that no one reads that as the job's own memory. In cgroup mode only
+  the pages charged to the job's cgroup count, which is the job's own.
 - **GPU memory is not measured yet.** On a Jetson the GPU shares DRAM, and whether the
   driver charges a job's GPU allocations to its cgroup is not known (see
   `examples/edge_ai/README.md`). A GPU measurement will be its own name, from the add-on
@@ -175,8 +201,10 @@ running job. A change applies to attempts that start after it.
 
 A sample carries `mem.current` (kind `current`) with the method the platform offers: the
 job's cgroup, its main process (`/proc` on Linux, `proc_pidinfo` on macOS), or on
-Windows the job object's processes summed, else the program's own. A process that has
-exited but not been collected yet has nothing to sample, and is not sampled.
+Windows the job object's processes summed, else the program's own. A program's process
+is sampled only once it has exec'd, and a cgroup only once the job's process is in it.
+A process that has exited but not been collected yet has nothing to sample, and is not
+sampled; a cgroup still holds the page cache the job left charged to it, and is.
 Samples are emitted by the thread running the job, between that attempt's `STARTED` and
 its `FINISHED` or `FAILED`, so they arrive in order with them; an observer that blocks
 delays the job's executor, as with every other event. Observers that do not know
@@ -227,7 +255,7 @@ history, and history belongs to the host, which keeps its own ledger.
   unknown names included: `gptps_xport_submit_ex` (free with
   `gptps_xport_result_free`) and `gptps_xport_submit_async_ex`. At most
   `GPTPS_XPORT_MAX_MEASURES` travel with one reply, and `measures_cut` says when an item
-  reported more.
+  reported more, or the worker could not have the memory to send them.
 - **`gptps_remote`:** the version 1 wire format's reply has no extension slot, by
   design (see `gptps_remote.h`). Measurements will travel in version 2's tagged payload,
   which arrives with the first network transport - not before, as that header asks.

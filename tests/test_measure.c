@@ -8,7 +8,11 @@
  * on this thread, in order. Each attempt's FINISHED or FAILED must carry:
  *   - mem.peak at least what the job took, in bytes, kind peak, by the method this
  *     platform offers: the job's cgroup in cgroup mode, wait4's largest process on
- *     Linux and macOS, the job object's committed memory on Windows;
+ *     Linux and macOS (for an OOP job, its own host_fork method), the job object's
+ *     committed memory on Windows. On Linux without a cgroup a program's peak may be
+ *     absent, but only where the host is about as big as the job (docs/
+ *     MEASUREMENTS.md: the copy of the host it was forked as) - and a host far
+ *     bigger than its job must never pass its own size off as the job's;
  *   - cpu.user_ms and cpu.sys_ms, kind total - and a job that spins for 400 ms shows
  *     at least half of it;
  *   - io.* where the platform reports bytes (Linux with task I/O accounting, a cgroup
@@ -51,9 +55,25 @@ static int fails = 0;
 /* ---- what the platform should report ------------------------------------ */
 static int g_cgroup;          /* GPTPS_CGROUP_PARENT is set: jobs may run in cgroups */
 static int g_cgroup_strict;   /* ...and CI says they must */
+#if !defined(_WIN32)
+static int g_fork;            /* the attempt running is an OOP job: a fork of this host */
+#endif
 
 #if defined(__linux__)
 static int task_io_accounting(void) { return access("/proc/self/io", R_OK) == 0; }
+
+/* This process's resident size now, in bytes. */
+static uint64_t host_rss(void)
+{
+    unsigned long size = 0, res = 0;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) return 0;
+    if (fscanf(f, "%lu %lu", &size, &res) != 2) res = 0;
+    fclose(f);
+    return (uint64_t)res * (uint64_t)sysconf(_SC_PAGESIZE);
+}
+#else
+static uint64_t host_rss(void) { return 0; }
 #endif
 
 static int one_of(const char *s, const char *a, const char *b)
@@ -61,17 +81,18 @@ static int one_of(const char *s, const char *a, const char *b)
     return s && ((a && strcmp(s, a) == 0) || (b && strcmp(s, b) == 0));
 }
 
-/* mem.peak's method, as this platform measures a process job. */
+/* mem.peak's method, as this platform measures a process job (an OOP one: g_fork). */
 static int peak_method_ok(const char *m)
 {
 #if defined(_WIN32)
     return one_of(m, "jobobject.tree.committed", NULL);
-#elif defined(__linux__)
-    if (g_cgroup_strict) return one_of(m, "cgroup.job.resident", NULL);
-    if (g_cgroup) return one_of(m, "cgroup.job.resident", "rusage.largest_process.resident");
-    return one_of(m, "rusage.largest_process.resident", NULL);
 #else
-    return one_of(m, "rusage.largest_process.resident", NULL);
+    const char *rusage = g_fork ? "rusage.host_fork.resident" : "rusage.largest_process.resident";
+#  if defined(__linux__)
+    if (g_cgroup_strict) return one_of(m, "cgroup.job.resident", NULL);
+    if (g_cgroup) return one_of(m, "cgroup.job.resident", rusage);
+#  endif
+    return one_of(m, rusage, NULL);
 #endif
 }
 
@@ -93,11 +114,12 @@ static int sample_method_ok(const char *m)
 #if defined(_WIN32)
     return one_of(m, "jobobject.tree.committed", NULL);
 #elif defined(__linux__)
+    const char *procfs = g_fork ? "procfs.host_fork.resident" : "procfs.process.resident";
     if (g_cgroup_strict) return one_of(m, "cgroup.job.resident", NULL);
-    if (g_cgroup) return one_of(m, "cgroup.job.resident", "procfs.process.resident");
-    return one_of(m, "procfs.process.resident", NULL);
+    if (g_cgroup) return one_of(m, "cgroup.job.resident", procfs);
+    return one_of(m, procfs, NULL);
 #elif defined(__APPLE__)
-    return one_of(m, "libproc.process.resident", NULL);
+    return one_of(m, g_fork ? "libproc.host_fork.resident" : "libproc.process.resident", NULL);
 #else
     (void)m; return 0;
 #endif
@@ -116,8 +138,9 @@ typedef struct {
     char          sample_method[64];
 } attempt;
 
-static attempt g_at;
-static int     g_measures_on_other_kinds;   /* a measurement where none belongs */
+static attempt  g_at;
+static int      g_measures_on_other_kinds;   /* a measurement where none belongs */
+static uint64_t g_host;                      /* host_rss() as the attempt started */
 
 static void reset_attempt(void)
 {
@@ -191,14 +214,24 @@ static void check_shape(void)
     }
 }
 
-/* What every measured process attempt reports, whatever it did. */
-static void check_process_end(uint64_t at_least_mem, int in_cgroup)
+/* What every measured process attempt reports, whatever it did. `host` is this
+ * process's resident size when the job started (Linux; else 0). */
+static void check_process_end(uint64_t at_least_mem, int in_cgroup, uint64_t host)
 {
     const gptps_measure *pk = find(GPTPS_M_MEM_PEAK), *u = find(GPTPS_M_CPU_USER_MS),
                         *sy = find(GPTPS_M_CPU_SYS_MS), *r = find(GPTPS_M_IO_READ_BYTES),
                         *w = find(GPTPS_M_IO_WRITE_BYTES), *cap = find(GPTPS_M_MEM_CAP_HIT);
+    int may_lack_peak = 0;
+#if defined(__linux__)
+    /* A program's own peak is told apart from the copy of the host it was forked as
+     * only above that copy's size: one that took less than the host holds may have
+     * no peak, and one that took clearly more must have one. */
+    may_lack_peak = !in_cgroup && !g_fork && host + 4 * MiB >= at_least_mem;
+#else
+    (void)host;
+#endif
     check_shape();
-    CHECK(pk != NULL);
+    CHECK(pk != NULL || may_lack_peak);
     if (pk) {
         CHECK(pk->unit == GPTPS_UNIT_BYTES && pk->kind == GPTPS_MEASURE_PEAK);
         CHECK(peak_method_ok(pk->method));
@@ -273,6 +306,7 @@ static void run_one(gptps *e, const char *task)
     size_t ran = 1;
     int guard = 0;
     reset_attempt();
+    g_host = host_rss();
     CHECK(gptps_submit(e, task, NULL, 0, &h) == GPTPS_OK);
     while (gptps_step(e, &ran) == GPTPS_OK && ran && ++guard < 8) { }
     CHECK(g_at.started == 1 && g_at.ended == 1 && g_at.order_ok);
@@ -349,6 +383,7 @@ int main(void)
     static const char *const av_fail[]  = { HELPER_PATH, "mem", "8", "0", "3", NULL };
     static const char *const av_slow[]  = { HELPER_PATH, "mem", "48", "900", NULL };
     static const char *const av_over[]  = { HELPER_PATH, "mem", "96", "200", NULL };
+    static const char *const av_small[] = { HELPER_PATH, "mem", "8", "0", NULL };
     const char *cg = getenv("GPTPS_CGROUP_PARENT"), *strict = getenv("GPTPS_TEST_EXPECT_CGROUP");
     uint64_t declare;
     gptps_config cfg;
@@ -394,6 +429,7 @@ int main(void)
     reg_program(e, "spin", av_spin, declare);
     reg_program(e, "fail", av_fail, declare);
     reg_program(e, "slow", av_slow, declare);
+    reg_program(e, "small", av_small, declare);
 #if !defined(_WIN32)
     memset(&d, 0, sizeof d);
     d.struct_size = sizeof d; d.name = "oop"; d.run = oop_take; d.exec = GPTPS_EXEC_OOP;
@@ -409,13 +445,13 @@ int main(void)
     /* 2) a program that takes 64 MiB: its peak, CPU and I/O, by this platform's method */
     run_one(e, "big"); ++prog_attempts;
     CHECK(g_at.end_kind == GPTPS_EV_FINISHED);
-    check_process_end(64 * MiB, g_cgroup_strict);
+    check_process_end(64 * MiB, g_cgroup_strict, g_host);
     if (g_cgroup_strict) { const gptps_measure *c = find(GPTPS_M_MEM_CAP_HIT); CHECK(c && c->value == 0); }
 
     /* 3) CPU time: a 400 ms spin shows at least half of it */
     run_one(e, "spin"); ++prog_attempts;
     CHECK(g_at.end_kind == GPTPS_EV_FINISHED);
-    check_process_end(0, g_cgroup_strict);
+    check_process_end(0, g_cgroup_strict, g_host);
     {
         const gptps_measure *u = find(GPTPS_M_CPU_USER_MS), *sy = find(GPTPS_M_CPU_SYS_MS);
         CHECK(u && sy && u->value + sy->value >= 200);
@@ -426,13 +462,42 @@ int main(void)
     /* 4) a failed attempt reports what it used, on its FAILED */
     run_one(e, "fail"); ++prog_attempts;
     CHECK(g_at.end_kind == GPTPS_EV_FAILED && g_at.end_status == GPTPS_E_TASK);
-    check_process_end(8 * MiB, g_cgroup_strict);
+    check_process_end(8 * MiB, g_cgroup_strict, g_host);
 
 #if !defined(_WIN32)
-    /* 5) the OOP executor measures its forked child the same way */
+    /* 5) the OOP executor measures its forked child the same way, under the method
+     * that says the process is a fork of the host */
+    g_fork = 1;
     run_one(e, "oop");
     CHECK(g_at.end_kind == GPTPS_EV_FINISHED);
-    check_process_end(24 * MiB, g_cgroup_strict);
+    check_process_end(24 * MiB, g_cgroup_strict, g_host);
+    g_fork = 0;
+
+    /* 5b) a host far bigger than its program: whatever is reported is the program's
+     * own. Linux starts a fork's resident high-water mark at the host's resident size
+     * and carries it across exec into ru_maxrss, so there the peak must be absent
+     * (or the cgroup's); a peak of the host's size would be the host's. */
+    {
+        size_t n = (size_t)(192 * MiB), i;
+        volatile char *fat = (volatile char *)malloc(n);
+        const gptps_measure *pk;
+        CHECK(fat != NULL);
+        if (fat) {
+            for (i = 0; i < n; i += 4096) fat[i] = 1;
+            run_one(e, "small");
+            CHECK(g_at.end_kind == GPTPS_EV_FINISHED);
+            check_process_end(8 * MiB, g_cgroup_strict, g_host);
+            pk = find(GPTPS_M_MEM_PEAK);
+            CHECK(pk == NULL || pk->value < 96 * MiB);
+#  if defined(__linux__)
+            if (!g_cgroup) CHECK(pk == NULL);
+#  endif
+            if (pk && pk->value >= 96 * MiB)
+                printf("  small program under a 192 MiB host: mem.peak %llu via %s\n",
+                       (unsigned long long)pk->value, pk->method);
+            free((void *)fat);
+        }
+    }
 #endif
 
     /* 6) sampling: off, no SAMPLE; on, samples inside the attempt, each mem.current */
@@ -458,9 +523,11 @@ int main(void)
         reg_program(e, "over", av_over, 32 * MiB);
         run_one(e, "over");
         CHECK(g_at.end_kind == GPTPS_EV_FAILED && g_at.end_status == GPTPS_E_NOMEM);
-        check_process_end(0, 1);
+        check_process_end(0, 1, g_host);
         { const gptps_measure *c = find(GPTPS_M_MEM_CAP_HIT); CHECK(c && c->value == 1); }
-        { const gptps_measure *p = find(GPTPS_M_MEM_PEAK); CHECK(p && p->value <= 32 * MiB); }
+        /* at the cap, give or take: the kernel lets a task it is killing charge a little
+         * past memory.max on its way out */
+        { const gptps_measure *p = find(GPTPS_M_MEM_PEAK); CHECK(p && p->value >= 24 * MiB && p->value <= 40 * MiB); }
     }
 
     CHECK(g_measures_on_other_kinds == 0);

@@ -348,6 +348,85 @@ static void cgroup_destroy(char *dir)
 }
 #endif /* __linux__ */
 
+/* ---- the child's report on how it started ---------------------------------
+ * The child writes fixed-size records on a close-on-exec pipe of its own:
+ *  - REPORT_STARTED, once it is set up and before it runs anything: whether it joined
+ *    the job's cgroup. Only then do the cgroup's files describe the job. A child that
+ *    could not join falls back to RLIMIT_AS and leaves the cgroup empty, and reading
+ *    that would report zeros the job never had.
+ *  - REPORT_EXEC, a program's, the last thing before exec: its resident high-water
+ *    mark in KiB (Linux). fork() starts the copy's high-water mark at the host's own
+ *    resident size, and exec() carries it into the ru_maxrss wait4 returns, so
+ *    ru_maxrss is the program's own peak only where it is above this mark.
+ * A program's pipe reaches EOF once exec has replaced the copy of the host, from when
+ * a sample of its process describes the program. A record is 16 bytes, under
+ * PIPE_BUF, so each write is whole and cannot block on a pipe this empty. A child
+ * that cannot write one cannot talk to its parent and gives up, as it does when its
+ * result cannot be written. */
+#define REPORT_STARTED     1u
+#define REPORT_EXEC        2u
+#define GPTPS_HWM_UNKNOWN  UINT64_MAX
+/* exec may fault in a few pages after the mark is read - execvp's own code and stack -
+ * and they count toward the copy's mark too, so a peak this close above it is not
+ * told apart from it. */
+#define GPTPS_EXEC_HWM_SLACK_PAGES 64u
+typedef struct { uint32_t stage; uint32_t joined; uint64_t hwm_kb; } child_report;
+
+static int write_all(int fd, const void *buf, size_t n);
+
+/* In the child: one record, or _exit. */
+static void report_send(int fd, uint32_t stage, int joined, uint64_t hwm_kb)
+{
+    child_report r;
+    memset(&r, 0, sizeof r);
+    r.stage = stage; r.joined = joined ? 1u : 0u; r.hwm_kb = hwm_kb;
+    if (write_all(fd, &r, sizeof r) != 0) _exit(127);
+}
+
+/* What the parent knows about the job it waits for. */
+typedef struct {
+    pid_t        pid;
+    const char  *cgdir;      /* the job's cgroup in cgroup mode, else NULL */
+    int          host_fork;  /* an OOP job: a copy of the host that never execs */
+    int          fd;         /* the report pipe's read end, non-blocking; -1 after EOF */
+    int          failed;     /* reading it failed: the attempt fails with GPTPS_E_IO */
+    int          started, joined, at_exec;
+    uint64_t     hwm_kb;
+    size_t       got;
+    child_report cur;
+} job_watch;
+
+/* Take what the child has reported so far, without blocking. */
+static void report_poll(job_watch *jw)
+{
+    while (jw->fd >= 0) {
+        ssize_t n = read(jw->fd, (char *)&jw->cur + jw->got, sizeof jw->cur - jw->got);
+        if (n > 0) {
+            jw->got += (size_t)n;
+            if (jw->got < sizeof jw->cur) continue;
+            jw->got = 0;
+            if (jw->cur.stage == REPORT_STARTED)   { jw->started = 1; jw->joined = jw->cur.joined != 0; }
+            else if (jw->cur.stage == REPORT_EXEC) { jw->at_exec = 1; jw->hwm_kb = jw->cur.hwm_kb; }
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (n < 0) jw->failed = 1;
+        exec_close(jw->fd);          /* EOF - every write end closed - or an error */
+        jw->fd = -1;
+    }
+}
+
+#if defined(__linux__)
+/* The job's cgroup describes the job: there is one, and the child joined it. */
+static int jw_cgroup(const job_watch *jw) { return jw->cgdir && jw->started && jw->joined; }
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
+/* The job's process is the program now, not the copy of the host it began as. */
+static int jw_exec_done(const job_watch *jw) { return jw->at_exec && jw->fd < 0 && !jw->failed; }
+#endif
+
 /* ---- measurements (docs/MEASUREMENTS.md) ----------------------------------
  * Every name and method below is a string literal, so the meter's entries stay valid
  * after the executor returns. gptps_meter_put keeps the first value per name, so a
@@ -355,7 +434,8 @@ static void cgroup_destroy(char *dir)
 
 #if defined(__linux__)
 /* Read a small cgroup or /proc file into buf (NUL-terminated); its length, or -1. On
- * the stack, with open/read: these files are a few lines long. */
+ * the stack, with open/read: these files are a few lines long. Close-on-exec, as the
+ * executors' pipes are: another executor may fork and exec while this one reads. */
 static long read_small(const char *dir, const char *file, char *buf, size_t cap)
 {
     char path[512];
@@ -363,7 +443,7 @@ static long read_small(const char *dir, const char *file, char *buf, size_t cap)
     long len = 0;
     n = snprintf(path, sizeof path, "%s/%s", dir, file);
     if (n < 0 || (size_t)n >= sizeof path || cap == 0) return -1;
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
     for (;;) {
         ssize_t r = read(fd, buf + len, cap - 1 - (size_t)len);
@@ -393,8 +473,11 @@ static int kv_find(const char *text, const char *key, uint64_t *out)
 }
 
 /* The job's cgroup: what every process in it used. Read after the child is reaped
- * and before the cgroup is removed. A file the kernel does not have (memory.peak
- * before 5.19, io.stat without the io controller) leaves its names to the fallback. */
+ * and before the cgroup is removed, and only once the child said it joined (see the
+ * child's report). A file the kernel does not have (memory.peak before 5.19) leaves
+ * its names to the fallback. memory.events' `max` counts every time the job reached
+ * its cap, page cache filling up to it included; `oom_kill` the times the kernel
+ * killed for it. */
 static void cgroup_measure(gptps_exec_meter *mt, const char *dir)
 {
     char buf[4096];
@@ -412,9 +495,17 @@ static void cgroup_measure(gptps_exec_meter *mt, const char *dir)
         gptps_meter_put(mt, GPTPS_M_CPU_USER_MS, v / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
         gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS,  w / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
     }
-    /* io.stat: one line per device, "MAJ:MIN rbytes=N wbytes=N rios=N ...". It
-     * exists only where the io controller is enabled for the job's cgroup, and an
-     * empty one means no block I/O at all - a real 0. */
+}
+
+/* io.stat: one line per device, "MAJ:MIN rbytes=N wbytes=N rios=N ...". It exists
+ * only where the io controller is enabled for the job's cgroup, and an empty one means
+ * no block I/O at all - a real 0. It counts bytes as they reach the device, so writes
+ * still in the page cache when the job ends are not in it: the fallback to wait4's
+ * figures, which count a write when it is made (meter_finish). */
+static void cgroup_io_measure(gptps_exec_meter *mt, const char *dir)
+{
+    char buf[4096];
+    if (!mt || !dir) return;
     if (read_small(dir, "io.stat", buf, sizeof buf) >= 0) {
         uint64_t rb = 0, wb = 0;
         const char *p = buf;
@@ -443,23 +534,67 @@ static int task_io_accounting(void)
     }
     return v == 2u;
 }
+
+/* The value after `key` in a /proc/self file of "Key:   N kB" lines, or -1. */
+static int64_t self_kb(const char *file, const char *key)
+{
+    char buf[4096];
+    const char *p;
+    if (read_small("/proc/self", file, buf, sizeof buf) <= 0) return -1;
+    p = strstr(buf, key);
+    return p ? (int64_t)strtoll(p + strlen(key), NULL, 10) : -1;
+}
+
+/* The most this process can bring to exec as its resident high-water mark, in KiB, or
+ * GPTPS_HWM_UNKNOWN. Runs in the forked child: open and read, on the stack.
+ * The mark exec takes is the larger of the one recorded at fork (VmHWM, which also
+ * covers pages reclaimed since) and the resident size at exec. The kernel's resident
+ * counters are per-CPU and approximate, so that size can sit above VmHWM as read a
+ * moment earlier; it cannot sit above the exact resident size smaps_rollup counts,
+ * except by the pages faulted in after this read (GPTPS_EXEC_HWM_SLACK_PAGES). */
+static uint64_t self_hwm_kb(void)
+{
+    int64_t hwm = self_kb("status", "\nVmHWM:"), rss = self_kb("smaps_rollup", "\nRss:");
+    if (hwm < 0 || rss < 0) return GPTPS_HWM_UNKNOWN;
+    return (uint64_t)(hwm > rss ? hwm : rss);
+}
 #endif /* __linux__ */
 
 #if GPTPS_HAVE_WAIT4
 /* wait4's rusage: the job's process and the children it waited for. ru_maxrss is the
  * resident peak of the largest of those processes, not their sum: in KiB on Linux and
- * the BSDs, in bytes on macOS. */
-static void rusage_measure(gptps_exec_meter *mt, const struct rusage *ru)
+ * the BSDs, in bytes on macOS.
+ *  - An OOP job's process is a fork of the host and its resident set holds host pages
+ *    (on Linux all the fork copied, from the start), so it has its own method.
+ *  - On Linux a program's ru_maxrss also covers the copy of the host it was forked
+ *    as, before exec: it is the program's own only above that copy's high-water mark
+ *    (the child's report), and absent otherwise. */
+static void rusage_measure(gptps_exec_meter *mt, const struct rusage *ru, const job_watch *jw)
 {
     uint64_t rss;
+    int own = 1;
     if (!mt) return;
 #if defined(__APPLE__)
     rss = (uint64_t)ru->ru_maxrss;
 #else
     rss = (uint64_t)ru->ru_maxrss * 1024u;
 #endif
-    gptps_meter_put(mt, GPTPS_M_MEM_PEAK, rss, GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK,
-                    "rusage.largest_process.resident");
+#if defined(__linux__)
+    if (!jw->host_fork) {
+        uint64_t slack_kb = (uint64_t)GPTPS_EXEC_HWM_SLACK_PAGES * (uint64_t)sysconf(_SC_PAGESIZE) / 1024u;
+        own = jw->at_exec && jw->hwm_kb != GPTPS_HWM_UNKNOWN &&
+              (uint64_t)ru->ru_maxrss > jw->hwm_kb + slack_kb;
+    }
+#elif !defined(__APPLE__)
+    own = 0;   /* macOS starts a program's count afresh at exec (test_measure checks it);
+                * on the BSDs that is not checked, so it is not reported (rule 2) */
+#endif
+    if (jw->host_fork)
+        gptps_meter_put(mt, GPTPS_M_MEM_PEAK, rss, GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK,
+                        "rusage.host_fork.resident");
+    else if (own)
+        gptps_meter_put(mt, GPTPS_M_MEM_PEAK, rss, GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK,
+                        "rusage.largest_process.resident");
     gptps_meter_put(mt, GPTPS_M_CPU_USER_MS,
                     (uint64_t)ru->ru_utime.tv_sec * 1000u + (uint64_t)ru->ru_utime.tv_usec / 1000u,
                     GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "rusage.process");
@@ -479,20 +614,24 @@ static void rusage_measure(gptps_exec_meter *mt, const struct rusage *ru)
 }
 #endif
 
-/* Everything an ended attempt reports: the cgroup's view first (the whole job), then
- * wait4's (the process). `cgdir` is NULL outside cgroup mode. */
-static void meter_finish(gptps_exec_meter *mt, const char *cgdir, const struct rusage *ru, int have_ru)
+/* Everything an ended attempt reports, best method first: the cgroup's memory, cap
+ * and CPU (the whole job), then wait4's (the process), then the cgroup's I/O as the
+ * fallback for wait4's, which counts writes when they are made. */
+static void meter_finish(gptps_exec_meter *mt, const job_watch *jw, const struct rusage *ru, int have_ru)
 {
     if (!mt) return;
 #if defined(__linux__)
-    cgroup_measure(mt, cgdir);
-#else
-    (void)cgdir;
+    if (jw_cgroup(jw)) cgroup_measure(mt, jw->cgdir);
 #endif
 #if GPTPS_HAVE_WAIT4
-    if (have_ru) rusage_measure(mt, ru);
+    if (have_ru) rusage_measure(mt, ru, jw);
 #else
     (void)ru; (void)have_ru;
+#endif
+#if defined(__linux__)
+    if (jw_cgroup(jw)) cgroup_io_measure(mt, jw->cgdir);
+#else
+    (void)jw;
 #endif
 }
 
@@ -518,8 +657,9 @@ static int sampler_slice(const sampler *sm, int slice)
 }
 
 /* The job's memory now: its cgroup's on Linux in cgroup mode, else its main
- * process's. Nothing where neither can be read. */
-static void sampler_tick(sampler *sm, pid_t pid, const char *cgdir)
+ * process's - a program's only once it has exec'd, an OOP job's under its own method
+ * (rusage_measure says why). Nothing where none of that can be read yet. */
+static void sampler_tick(sampler *sm, job_watch *jw)
 {
     gptps_measure cur[1];
     size_t n = 0;
@@ -528,17 +668,22 @@ static void sampler_tick(sampler *sm, pid_t pid, const char *cgdir)
     now = gptps_hal_monotonic_ms();
     if (now < sm->next) return;
     sm->next = now + sm->iv;
+    report_poll(jw);
 #if defined(__linux__)
     {
         char buf[256];
-        if (cgdir && read_small(cgdir, "memory.current", buf, sizeof buf) > 0) {
-            cur[0].value = (uint64_t)strtoull(buf, NULL, 10);
-            cur[0].method = "cgroup.job.resident";
-            n = 1;
-        } else {
+        if (jw_cgroup(jw)) {
+            if (read_small(jw->cgdir, "memory.current", buf, sizeof buf) > 0) {
+                cur[0].value = (uint64_t)strtoull(buf, NULL, 10);
+                cur[0].method = "cgroup.job.resident";
+                n = 1;
+            }
+        } else if (jw->cgdir && !jw->started && jw->fd >= 0) {
+            /* not known yet whether the child is in its cgroup: no sample this time */
+        } else if (jw->host_fork || jw_exec_done(jw)) {
             char dir[64], *end;
             long size, pages;
-            snprintf(dir, sizeof dir, "/proc/%ld", (long)pid);
+            snprintf(dir, sizeof dir, "/proc/%ld", (long)jw->pid);
             /* statm: "size resident shared ...", in pages. A process that has exited
              * and not been reaped yet reads all zeros: it has no memory left to
              * sample, so a size of 0 is no sample rather than a sample of 0. */
@@ -547,7 +692,7 @@ static void sampler_tick(sampler *sm, pid_t pid, const char *cgdir)
                 pages = (end != buf) ? strtol(end, NULL, 10) : -1;
                 if (size > 0 && pages >= 0) {
                     cur[0].value = (uint64_t)pages * (uint64_t)sysconf(_SC_PAGESIZE);
-                    cur[0].method = "procfs.process.resident";
+                    cur[0].method = jw->host_fork ? "procfs.host_fork.resident" : "procfs.process.resident";
                     n = 1;
                 }
             }
@@ -556,15 +701,13 @@ static void sampler_tick(sampler *sm, pid_t pid, const char *cgdir)
 #elif defined(__APPLE__)
     {
         struct proc_taskinfo ti;
-        (void)cgdir;
-        if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, (int)sizeof ti) == (int)sizeof ti) {
+        if ((jw->host_fork || jw_exec_done(jw)) &&
+            proc_pidinfo(jw->pid, PROC_PIDTASKINFO, 0, &ti, (int)sizeof ti) == (int)sizeof ti) {
             cur[0].value = (uint64_t)ti.pti_resident_size;
-            cur[0].method = "libproc.process.resident";
+            cur[0].method = jw->host_fork ? "libproc.host_fork.resident" : "libproc.process.resident";
             n = 1;
         }
     }
-#else
-    (void)pid; (void)cgdir;
 #endif
     if (n) {
         cur[0].name = GPTPS_M_MEM_CURRENT;
@@ -601,7 +744,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
                                uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
-    int p[2];
+    int p[2], rp[2];
     pid_t pid;
 #if defined(__linux__)
     char *cgdir = cgroup_create(mem_cap);
@@ -620,10 +763,21 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #endif
         return GPTPS_E_IO;
     }
-
-    pid = exec_fork_sweep(p, 2);   /* keep our own ends; shed every other executor's */
-    if (pid < 0) {
+    if (exec_pipe(rp, 1) != 0) {   /* the child's report: above fd 2 for the same reason */
         exec_close(p[0]); exec_close(p[1]);
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
+
+    {
+        int keep[4];
+        keep[0] = p[0]; keep[1] = p[1]; keep[2] = rp[0]; keep[3] = rp[1];
+        pid = exec_fork_sweep(keep, 4);   /* keep our own ends; shed every other executor's */
+    }
+    if (pid < 0) {
+        exec_close(p[0]); exec_close(p[1]); exec_close(rp[0]); exec_close(rp[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -637,11 +791,13 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         gptps_status st;
         int joined = 0;
         signal(SIGPIPE, SIG_IGN);
-        close(p[0]);
+        close(p[0]); close(rp[0]);
 #if defined(__linux__)
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap */
 #endif
         if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
+        report_send(rp[1], REPORT_STARTED, joined, GPTPS_HWM_UNKNOWN);
+        close(rp[1]);                                          /* nothing more to report */
         if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook */
         st = gptps_run_capture(def, payload, plen, &res, &rlen);
         st32 = (int32_t)st;
@@ -680,14 +836,17 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         struct rusage ru;                          /* the child's, from wait4 */
         int have_ru = 0;
         sampler sm;
-        const char *cg = NULL;                     /* the job's cgroup, in cgroup mode */
+        job_watch jw;
+        memset(&jw, 0, sizeof jw);
+        jw.pid = pid; jw.host_fork = 1; jw.fd = rp[0];
 #if defined(__linux__)
-        cg = cgdir;
+        jw.cgdir = cgdir;
 #endif
         memset(&ru, 0, sizeof ru);
         sampler_init(&sm, meter);
 
-        exec_close(p[1]);
+        exec_close(p[1]); exec_close(rp[1]);
+        (void)fcntl(rp[0], F_SETFL, fcntl(rp[0], F_GETFL) | O_NONBLOCK);
         pfd.fd = p[0]; pfd.events = POLLIN; pfd.revents = 0;
 
         /* Wait for the child's result in bounded slices so a raised cancel flag (a
@@ -695,7 +854,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
          * instead of blocking this worker forever - including when timeout_s==0. */
         for (;;) {
             int slice = 200;
-            sampler_tick(&sm, pid, cg);            /* a sample, when one is due */
+            sampler_tick(&sm, &jw);                /* a sample, when one is due */
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
                 if (now >= deadline) { kill(pid, SIGKILL); killed = 1; kill_st = GPTPS_E_TIMEOUT; break; }
@@ -754,7 +913,12 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         } else {
             eff = (gptps_status)st32;
         }
-        meter_finish(meter, cg, &ru, have_ru);   /* before the cgroup goes */
+        report_poll(&jw);                          /* the child is gone: all of it */
+        if (jw.fd >= 0) exec_close(jw.fd);         /* a write end lives on elsewhere */
+        if (jw.failed && eff == GPTPS_OK) {        /* our own pipe failed us */
+            gptps_free(res); res = NULL; len64 = 0; eff = GPTPS_E_IO;
+        }
+        meter_finish(meter, &jw, &ru, have_ru);   /* before the cgroup goes */
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -770,7 +934,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     const char *const *argv = def ? def->argv : NULL;
-    int inp[2], outp[2];
+    int inp[2], outp[2], rp[2];
     pid_t pid;
 #if defined(__linux__)
     char *cgdir = cgroup_create(mem_cap);
@@ -796,14 +960,25 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 #endif
         return GPTPS_E_IO;
     }
+    /* The child's report, above fd 2: its ends are not among those the child hoists
+     * before its dup2s, and close-on-exec takes the write end away at exec. */
+    if (exec_pipe(rp, 1) != 0) {
+        exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_IO;
+    }
 
     {
-        int keep[4];
+        int keep[6];
         keep[0] = inp[0]; keep[1] = inp[1]; keep[2] = outp[0]; keep[3] = outp[1];
-        pid = exec_fork_sweep(keep, 4);
+        keep[4] = rp[0]; keep[5] = rp[1];
+        pid = exec_fork_sweep(keep, 6);
     }
     if (pid < 0) {
         exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
+        exec_close(rp[0]); exec_close(rp[1]);
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -834,13 +1009,19 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             }
         }
         if (dup2(inp[0], STDIN_FILENO) < 0 || dup2(outp[1], STDOUT_FILENO) < 0) _exit(127);
-        close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]);
+        close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]); close(rp[0]);
         setpgid(0, 0); /* own process group: a timeout kill takes down the program AND its children */
 #if defined(__linux__)
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap before exec */
 #endif
         if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
+        report_send(rp[1], REPORT_STARTED, joined, GPTPS_HWM_UNKNOWN);
         if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook (chdir/seccomp/drop-privs/...) */
+#if defined(__linux__)
+        report_send(rp[1], REPORT_EXEC, joined, self_hwm_kb()); /* the last thing before exec */
+#else
+        report_send(rp[1], REPORT_EXEC, joined, GPTPS_HWM_UNKNOWN);
+#endif
         execvp(argv[0], (char *const *)argv); /* PATH-resolves a bare name (e.g. "wasmtime") */
         _exit(127); /* exec failed */
     }
@@ -862,17 +1043,20 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         struct rusage ru;                          /* the child's, from wait4 */
         int have_ru = 0;
         sampler sm;
-        const char *cg = NULL;                     /* the job's cgroup, in cgroup mode */
+        job_watch jw;
 #if !defined(F_SETNOSIGPIPE)
         sigset_t sp_old; int sp_masked = 0;
 #endif
+        memset(&jw, 0, sizeof jw);
+        jw.pid = pid; jw.fd = rp[0];
 #if defined(__linux__)
-        cg = cgdir;
+        jw.cgdir = cgdir;
 #endif
         memset(&ru, 0, sizeof ru);
         sampler_init(&sm, meter);
 
-        exec_close(inp[0]); exec_close(outp[1]);
+        exec_close(inp[0]); exec_close(outp[1]); exec_close(rp[1]);
+        (void)fcntl(rp[0], F_SETFL, fcntl(rp[0], F_GETFL) | O_NONBLOCK);
         setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
         /* A write to the child's closed stdin must EPIPE, not kill us - but suppress
          * SIGPIPE WITHOUT mutating the host's process-wide disposition: per-fd on
@@ -898,7 +1082,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 
             /* Every pass, not only on an idle slice: a program that writes all the
              * time would otherwise never be sampled. */
-            sampler_tick(&sm, pid, cg);
+            sampler_tick(&sm, &jw);
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
                 if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; kill(-pid, SIGKILL); break; }
@@ -996,7 +1180,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (cgdir && eff != GPTPS_OK && eff != GPTPS_E_TIMEOUT && cgroup_oom_killed(cgdir))
             eff = GPTPS_E_NOMEM;     /* exceeded the memory cap */
 #endif
-        meter_finish(meter, cg, &ru, have_ru);   /* before the cgroup goes */
+        report_poll(&jw);                          /* the child is gone: all of it */
+        if (jw.fd >= 0) exec_close(jw.fd);         /* a write end lives on elsewhere */
+        if (jw.failed && eff == GPTPS_OK) eff = GPTPS_E_IO;   /* our own pipe failed us */
+        meter_finish(meter, &jw, &ru, have_ru);   /* before the cgroup goes */
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif

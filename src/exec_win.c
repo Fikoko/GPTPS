@@ -76,10 +76,14 @@ static uint64_t filetime_ms(FILETIME f)
 /* What the attempt used, after its processes have ended. The job object covers the
  * program and everything it started; the process handle covers the program alone.
  * Both are read, and two facts that need no guessing decide which is reported:
- *   - a job contains its program, so a job figure BELOW the program's own is not a
- *     measurement (an emulation such as wine answers the job queries with zeros);
+ *   - a job contains its program, so a job figure of 0 where the program's own is
+ *     above 0 is not a measurement (an emulation such as wine answers the job
+ *     queries with zeros);
  *   - every process commits memory, so a committed peak of 0 is not one either.
- * Where neither holds up, the name is left out (docs/MEASUREMENTS.md, rule 2). */
+ * Only that contradiction counts. Job and process accounting are kept separately and
+ * may differ by a tick as the program exits; switching method over that would make
+ * one task's values flip between methods from attempt to attempt. Where neither
+ * figure holds up, the name is left out (docs/MEASUREMENTS.md, rule 2). */
 static void win_measure(gptps_exec_meter *mt, HANDLE job, int assigned, HANDLE proc)
 {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION x;
@@ -89,13 +93,17 @@ static void win_measure(gptps_exec_meter *mt, HANDLE job, int assigned, HANDLE p
     IO_COUNTERS io;
     pmi_fn pmi = get_pmi();
     int have_x = 0, have_a = 0, have_pm = 0, have_t = 0, have_io = 0;
+    int p_ran = 0;                     /* the program used any CPU time, unrounded */
     uint64_t p_peak = 0, p_user = 0, p_sys = 0, p_rd = 0, p_wr = 0;
     if (!mt) return;
     if (proc) {
         memset(&pm, 0, sizeof pm);
         pm.cb = sizeof pm;
         if (pmi && pmi(proc, (PPROCESS_MEMORY_COUNTERS)&pm, sizeof pm)) { have_pm = 1; p_peak = (uint64_t)pm.PeakPagefileUsage; }
-        if (GetProcessTimes(proc, &c, &ex, &k, &u)) { have_t = 1; p_user = filetime_ms(u); p_sys = filetime_ms(k); }
+        if (GetProcessTimes(proc, &c, &ex, &k, &u)) {
+            have_t = 1; p_user = filetime_ms(u); p_sys = filetime_ms(k);
+            p_ran = (u.dwLowDateTime | u.dwHighDateTime | k.dwLowDateTime | k.dwHighDateTime) != 0;
+        }
         if (GetProcessIoCounters(proc, &io)) {
             have_io = 1; p_rd = (uint64_t)io.ReadTransferCount; p_wr = (uint64_t)io.WriteTransferCount;
         }
@@ -107,14 +115,14 @@ static void win_measure(gptps_exec_meter *mt, HANDLE job, int assigned, HANDLE p
         have_a = QueryInformationJobObject(job, JobObjectBasicAndIoAccountingInformation, &a, sizeof a, NULL) != 0;
     }
     /* mem.peak */
-    if (have_x && x.PeakJobMemoryUsed > 0 && (!have_pm || (uint64_t)x.PeakJobMemoryUsed >= p_peak))
+    if (have_x && x.PeakJobMemoryUsed > 0)
         gptps_meter_put(mt, GPTPS_M_MEM_PEAK, (uint64_t)x.PeakJobMemoryUsed,
                         GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK, "jobobject.tree.committed");
     else if (have_pm && p_peak > 0)
         gptps_meter_put(mt, GPTPS_M_MEM_PEAK, p_peak, GPTPS_UNIT_BYTES, GPTPS_MEASURE_PEAK, "process.committed");
     /* cpu.* */
-    if (have_a && (!have_t || (ft_ms(a.BasicInfo.TotalUserTime) >= p_user &&
-                               ft_ms(a.BasicInfo.TotalKernelTime) >= p_sys))) {
+    if (have_a && !(a.BasicInfo.TotalUserTime.QuadPart == 0 && a.BasicInfo.TotalKernelTime.QuadPart == 0 &&
+                    have_t && p_ran)) {
         gptps_meter_put(mt, GPTPS_M_CPU_USER_MS, ft_ms(a.BasicInfo.TotalUserTime),
                         GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "jobobject.tree");
         gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS, ft_ms(a.BasicInfo.TotalKernelTime),
@@ -124,8 +132,8 @@ static void win_measure(gptps_exec_meter *mt, HANDLE job, int assigned, HANDLE p
         gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS,  p_sys,  GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "process");
     }
     /* io.* */
-    if (have_a && (!have_io || ((uint64_t)a.IoInfo.ReadTransferCount >= p_rd &&
-                                (uint64_t)a.IoInfo.WriteTransferCount >= p_wr))) {
+    if (have_a && !(a.IoInfo.ReadTransferCount == 0 && a.IoInfo.WriteTransferCount == 0 &&
+                    have_io && (p_rd > 0 || p_wr > 0))) {
         gptps_meter_put(mt, GPTPS_M_IO_READ_BYTES, (uint64_t)a.IoInfo.ReadTransferCount,
                         GPTPS_UNIT_BYTES, GPTPS_MEASURE_TOTAL, "jobobject.tree.all");
         gptps_meter_put(mt, GPTPS_M_IO_WRITE_BYTES, (uint64_t)a.IoInfo.WriteTransferCount,

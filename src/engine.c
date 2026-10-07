@@ -2992,7 +2992,8 @@ static int cfg_core_key(const char *key)
 {
     if (!key[cfg_first_len(key)]) return 0;      /* no table part: see the near misses */
     return cfg_first_is(key, "limits") || cfg_first_is(key, "scheduler") ||
-           cfg_first_is(key, "stats") || cfg_first_is(key, "bounded");
+           cfg_first_is(key, "stats") || cfg_first_is(key, "bounded") ||
+           cfg_first_is(key, "measure");
 }
 
 /* [resources]: the dotted key past "resources." is the resource's name. */
@@ -3002,8 +3003,8 @@ static int cfg_is_resource(const char *key)
 }
 
 /* Every table the engine reads. */
-static const char *const CFG_OWN[] = { "limits", "scheduler", "stats", "bounded", "resources",
-                                       "task_defaults", "tasks", 0 };
+static const char *const CFG_OWN[] = { "limits", "scheduler", "stats", "bounded", "measure",
+                                       "resources", "task_defaults", "tasks", 0 };
 
 /* The engine table `first` is a near miss of - one or two letters off, and longer
  * than three - or NULL. With `d`, how far off. */

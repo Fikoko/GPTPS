@@ -181,6 +181,9 @@ static void test_mistakes(void)
     refused("[task_defaults]\nmax_retrys = 1\n", "[task_defaults] has no such key (did you mean max_retries?)");
     refused("[schedular]\nreserve_after_skips = 4\n",
             "there is no [schedular] table (did you mean [scheduler]?)");
+    refused("[measure]\nsampl_ms = 50\n",
+            "measure.sampl_ms: [measure] has no such key (did you mean measure.sample_ms?)");
+    refused("[measures]\nsample_ms = 50\n", "there is no [measures] table (did you mean [measure]?)");
     /* an add-on that does not load */
     refused("addons = [\"./no_such_gptps_addon.so\"]\n", "the add-on ./no_such_gptps_addon.so did not load");
     refused("addons = \"./x.so\"\n", "addons: expects a [\"list\"] of add-on paths");

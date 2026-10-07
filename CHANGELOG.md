@@ -26,14 +26,26 @@ new.
   declared 24 GB, peaked at 19.3 GB" and tighten its declarations from evidence.
 - **The method travels with every value, because one name measures differently by
   platform.** In cgroup mode the job's own cgroup (`memory.peak`, `cpu.stat`,
-  `io.stat`, `memory.events`: the whole job, resident memory); without a cgroup,
-  `wait4()`'s rusage on Linux, macOS and the BSDs (the largest single process's
-  resident peak; block I/O on Linux, where task I/O accounting exists); on Windows the
-  job object (the whole process tree, **committed** memory, all I/O), or the program's
-  process handle without one. `mem.cap_hit` comes only from cgroups: `RLIMIT_AS`
-  records nothing, and Windows' memory-limit notifications are not guaranteed to
-  arrive. What a platform cannot measure is absent, never estimated, and a Windows job
-  figure below its program's own, or a committed peak of 0, is not reported as one.
+  `memory.events`: the whole job, resident memory), read only once the job's process
+  has said it joined it; without a cgroup, `wait4()`'s rusage on Linux, macOS and the
+  BSDs (the largest single process's resident peak and CPU; block I/O on Linux, where
+  task I/O accounting exists, ahead of the cgroup's `io.stat`, which misses writes
+  still in the page cache); on Windows the job object (the whole process tree,
+  **committed** memory, all I/O), or the program's process handle without one.
+  `mem.cap_hit` comes only from cgroups: `RLIMIT_AS` records nothing, and Windows'
+  memory-limit notifications are not guaranteed to arrive. What a platform cannot
+  measure is absent, never estimated, and a Windows job figure of 0 where its program's
+  own is above 0, or a committed peak of 0, is not reported as one.
+- **A copy of the host is never reported as the job.** A PROGRAM job starts as a fork
+  of the host, and Linux carries that copy's resident high-water mark across exec into
+  `ru_maxrss`. Just before exec the process reads the most that mark can be (`VmHWM`
+  and the exact `smaps_rollup` size) and reports it to the executor, which reports a
+  program's `mem.peak` only above it: a program smaller than its host has none outside
+  cgroup mode, which measures every program exactly. An OOP job's process is a fork
+  of the host for its whole life, so its resident figures carry their own methods,
+  `rusage.host_fork.resident` and `procfs`/`libproc.host_fork.resident`. A program is
+  sampled only once it has exec'd. On the BSDs, where whether exec starts the count
+  afresh is not checked, a program's `mem.peak` is not reported.
 - **Sampling, opt-in.** `measure.sample_ms` (config `[measure] sample_ms`, default 0 =
   off) makes a running process job emit `GPTPS_EV_SAMPLE` events with its current
   memory (`mem.current`), between its `STARTED` and its end, on the thread running it.
@@ -53,14 +65,25 @@ new.
   or the transports.
 - **The edge-AI demo** reports each job's measured peak next to its declaration: in the
   synthetic night every job peaked about 17 MB under what it declared, and the runaway
-  at 98 of its 100 MB, where its cap stopped it.
+  at 98 of its 100 MB, where its cap stopped it. Its smoke test's jobs now take 48 MB,
+  well above what the host itself holds even under a sanitizer, so their peaks are
+  the programs' own.
+- **`[measure]` is one of the engine's own tables in a config file:** a key it does
+  not have (`[measure] sampl_ms`), or a table name a letter off (`[measures]`), fails
+  `gptps_open` with a suggestion, as in `[limits]`.
 
 ### Changed
 
 - **The POSIX executors reap with `wait4()`** where the system has it (Linux, macOS, the
   BSDs), for the child's resource usage; `waitpid()` elsewhere. `test_exec_faults` now
-  wraps `wait4`, and checks in each of its runs that an attempt is measured exactly
-  when the executor collected its child itself.
+  wraps `wait4`, and checks in each of its runs that an attempt is measured (its CPU
+  time) exactly when the executor collected its child itself.
+- **Each forked child reports how it started, on a pipe of its own.** Both POSIX
+  executors open one more close-on-exec pipe per job, above fd 2, on which the child
+  says whether it joined its cgroup and, for a program, its high-water mark just
+  before exec. A failure to create it fails the attempt with `GPTPS_E_IO`, like the
+  executors' other pipes; a child that cannot write to it exits, as when its result
+  cannot be written. The files the executors read to measure are opened close-on-exec.
 - **An observer that does not know an event kind must ignore it.** `GPTPS_EV_SAMPLE` is
   emitted only when the host turns sampling on, so no existing observer sees it unless
   asked; the edge-AI demo and the dashboard, which treated or logged any other kind,

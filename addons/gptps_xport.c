@@ -105,14 +105,23 @@ static void set_nosigpipe(int fd)
 #define XP_MEAS_ENTRY (8u + 2u + 2u + 4u + 2u + 2u)
 #define XP_MEAS_CAP   (XP_MEAS_HDR + GPTPS_XPORT_MAX_MEASURES * (XP_MEAS_ENTRY + 2u * GPTPS_XPORT_MEASURE_STR))
 
+/* What meas_encode hands back when it cannot have the memory for an event's
+ * measurements: none of them, and `cut` set, so the parent learns they were there. */
+static const unsigned char k_meas_lost[XP_MEAS_HDR] = { 0, 0, 0, 0, 1 };
+
+static void meas_free(unsigned char *b)
+{
+    if (b != k_meas_lost) free(b);
+}
+
 static int meas_fits(const gptps_measure *m)
 {
     return m->name && m->method && strlen(m->name) < GPTPS_XPORT_MEASURE_STR &&
            strlen(m->method) < GPTPS_XPORT_MEASURE_STR;
 }
 
-/* The event's measurements as a malloc'd blob (*len its size), or NULL when it has
- * none - or when no memory could be had for them, which is then a cut. */
+/* The event's measurements as a blob (*len its size) to release with meas_free, or
+ * NULL when it has none. Without the memory for them, the blob says they were cut. */
 static unsigned char *meas_encode(const gptps_event *ev, uint32_t *len)
 {
     size_t i, sz = XP_MEAS_HDR, at;
@@ -127,7 +136,7 @@ static unsigned char *meas_encode(const gptps_event *ev, uint32_t *len)
         ++n;
     }
     b = (unsigned char *)malloc(sz);
-    if (!b) return NULL;
+    if (!b) { *len = XP_MEAS_HDR; return (unsigned char *)(uintptr_t)k_meas_lost; }
     memcpy(b, &n, 4); b[4] = cut;
     at = XP_MEAS_HDR;
     for (i = 0, n = 0; i < ev->n_measures; ++i) {
@@ -289,12 +298,12 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
         apx_mutex_lock(&c->mmu);
         for (i = 0; i < c->n; ++i)
             if (c->tab[i].h == ev->handle) {
-                free(c->tab[i].meas);
+                meas_free(c->tab[i].meas);
                 c->tab[i].meas = mine; c->tab[i].mlen = ml; mine = NULL;
                 break;
             }
         apx_mutex_unlock(&c->mmu);
-        free(mine);                                /* not ours */
+        meas_free(mine);                           /* not ours */
         return;
     }
 
@@ -307,11 +316,14 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
     apx_mutex_unlock(&c->mmu);
     if (!found) return;                            /* not ours (e.g. child_init's own work) */
 
-    /* FINISHED and a cancelled FAILED end an attempt, and carry its measurements
-     * themselves; a dead letter or drop carries the last failed attempt's, kept above. */
+    /* FINISHED ends an attempt and carries its measurements itself; a dead letter or
+     * drop carries the last failed attempt's, kept above. A cancelled FAILED carries
+     * the attempt's it cancelled - or none, when the cancel found the item waiting to
+     * retry, and then the last attempt is the failed one kept above. */
     if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) {
-        free(meas);
-        meas = meas_encode(ev, &mlen);
+        uint32_t el = 0;
+        unsigned char *own = meas_encode(ev, &el);
+        if (own || ev->kind == GPTPS_EV_FINISHED) { meas_free(meas); meas = own; mlen = el; }
     }
 
     /* FINISHED carries status OK + the result; DEAD_LETTERED / DROPPED carry the
@@ -325,7 +337,7 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
         write_reply(c->fd, id, ev->kind == GPTPS_EV_FINISHED ? (int32_t)GPTPS_E_BUDGET : st, NULL, 0,
                     meas, meas ? mlen : 0);
     apx_mutex_unlock(&c->wmu);
-    free(meas);
+    meas_free(meas);
     /* A failed write means the parent is gone; the main loop will see EOF and shut
      * down, so there is nothing to do here. */
 }
@@ -396,7 +408,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
     close(fd);
     apx_mutex_destroy(&c.wmu);
     apx_mutex_destroy(&c.mmu);
-    for (i = 0; i < c.n; ++i) free(c.tab[i].meas);
+    for (i = 0; i < c.n; ++i) meas_free(c.tab[i].meas);
     free(c.tab);
     _exit(0);
 }
