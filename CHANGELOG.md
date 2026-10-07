@@ -65,7 +65,7 @@ new.
   or the transports.
 - **The edge-AI demo** reports each job's measured peak next to its declaration: in the
   synthetic night every job peaked about 17 MB under what it declared, and the runaway
-  at 98 of its 100 MB, where its cap stopped it. Its smoke test's jobs now take 48 MB,
+  at 98 of its 100 MB, where its cap stopped it. Its smoke test's jobs now take 128 MB,
   well above what the host itself holds even under a sanitizer, so their peaks are
   the programs' own.
 - **`[measure]` is one of the engine's own tables in a config file:** a key it does

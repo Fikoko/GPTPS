@@ -6,7 +6,7 @@
  * In engine mode a gptps_xport worker runs its own engine, so a process job's
  * measurements are taken there; the reply carries those of the item's last attempt
  * back to the parent. Checks, over the link:
- *   - gptps_xport_submit_ex: a 32 MiB program's reply carries mem.peak >= 32 MiB and
+ *   - gptps_xport_submit_ex: a 128 MiB program's reply carries mem.peak >= 128 MiB and
  *     its CPU, and gptps_xport_result_free releases them;
  *   - gptps_xport_submit_async_ex: the callback sees them too;
  *   - a program that fails twice and is dead-lettered: the reply carries the LAST
@@ -15,7 +15,10 @@
  *   - an in-process task, and handler mode: no measurements, and nothing breaks;
  *   - the plain gptps_xport_submit still answers on the same links;
  *   - a parent with no engine folds the replies into gptps_stats_open().
- * POSIX only (fork + socketpair), like gptps_xport.
+ * POSIX only (fork + socketpair), like gptps_xport. The programs are big next to the
+ * worker that starts them, a fork of this test - tens of MB under a sanitizer - since
+ * on Linux a program's peak is told from the copy it was forked as only above that
+ * copy's size (docs/MEASUREMENTS.md).
  */
 #define _POSIX_C_SOURCE 200809L
 #include "gptps_xport.h"
@@ -34,9 +37,9 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 #define MiB (1024ull * 1024ull)
 
-static const char *const av_take[] = { HELPER_PATH, "mem", "32", "50", NULL };
+static const char *const av_take[] = { HELPER_PATH, "mem", "128", "50", NULL };
 static char        g_step[64];        /* memstep's file: absent until the first attempt */
-static const char *av_fail[] = { HELPER_PATH, "memstep", g_step, "8", "40", "3", NULL };
+static const char *av_fail[] = { HELPER_PATH, "memstep", g_step, "8", "128", "3", NULL };
 
 static gptps_status t_inproc(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 
@@ -117,7 +120,7 @@ int main(void)
     CHECK(gptps_xport_submit_ex(xp, "take", NULL, 0, &r) == GPTPS_OK);
     CHECK(r.io == GPTPS_OK && r.task_status == GPTPS_OK && r.request_id != 0 && !r.measures_cut);
     pk = find(r.measures, r.n_measures, GPTPS_M_MEM_PEAK);
-    CHECK(pk != NULL && pk->value >= 32 * MiB && pk->unit == GPTPS_UNIT_BYTES && pk->kind == GPTPS_MEASURE_PEAK);
+    CHECK(pk != NULL && pk->value >= 128 * MiB && pk->unit == GPTPS_UNIT_BYTES && pk->kind == GPTPS_MEASURE_PEAK);
     CHECK(pk != NULL && pk->method != NULL && strlen(pk->method) > 0);
     CHECK(find(r.measures, r.n_measures, GPTPS_M_CPU_USER_MS) != NULL);
     if (st) CHECK(gptps_stats_measure_fold(st, "take", r.measures, r.n_measures, 1) == GPTPS_OK);
@@ -136,16 +139,16 @@ int main(void)
     pthread_mutex_lock(&g_mu);
     while (!g_done) pthread_cond_wait(&g_cv, &g_mu);
     pthread_mutex_unlock(&g_mu);
-    CHECK(g_io == GPTPS_OK && g_peak >= 32 * MiB && g_has_cpu);
+    CHECK(g_io == GPTPS_OK && g_peak >= 128 * MiB && g_has_cpu);
 
     /* 3) dead-lettered after two failed attempts: the last attempt's measurements -
-     * 40 MiB; the first took 8 */
+     * 128 MiB; the first took 8 */
     memset(&r, 0, sizeof r); r.struct_size = sizeof r;
     CHECK(gptps_xport_submit_ex(xp, "fail", NULL, 0, &r) == GPTPS_OK);
     CHECK(r.io == GPTPS_OK && r.task_status == GPTPS_E_TASK);
     pk = find(r.measures, r.n_measures, GPTPS_M_MEM_PEAK);
-    CHECK(pk != NULL && pk->value >= 40 * MiB);
-    if (pk && pk->value < 40 * MiB) printf("  dead letter: mem.peak %llu via %s\n", (unsigned long long)pk->value, pk->method);
+    CHECK(pk != NULL && pk->value >= 128 * MiB);
+    if (pk && pk->value < 128 * MiB) printf("  dead letter: mem.peak %llu via %s\n", (unsigned long long)pk->value, pk->method);
     gptps_xport_result_free(&r);
     remove(g_step);
 
