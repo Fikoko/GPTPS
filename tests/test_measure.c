@@ -246,6 +246,8 @@ static void check_process_end(uint64_t at_least_mem, int in_cgroup, uint64_t hos
         CHECK(u->unit == GPTPS_UNIT_MS && u->kind == GPTPS_MEASURE_TOTAL && cpu_method_ok(u->method));
         CHECK(sy->unit == GPTPS_UNIT_MS && sy->kind == GPTPS_MEASURE_TOTAL && cpu_method_ok(sy->method));
         CHECK(strcmp(u->method, sy->method) == 0);
+        if (!cpu_method_ok(u->method) || !cpu_method_ok(sy->method))
+            printf("  cpu.user via %s, cpu.sys via %s\n", u->method, sy->method);
     }
     /* io: bytes where the platform counts bytes, absent where it does not */
 #if defined(_WIN32)
