@@ -50,14 +50,18 @@ static gptps_status t_hang(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; for 
 static gptps_status t_bigmem(gptps_ctx *ctx, void *ud)
 {
     /* 1 GiB: over the 512 MiB cap, and fits a 32-bit size_t (4 GiB would truncate
-     * to 0 there). Triggers an RLIMIT_AS denial or a cgroup OOM-kill on memset. */
-    size_t big = (size_t)1024 * 1024 * 1024;
-    void *p;
+     * to 0 there). Triggers an RLIMIT_AS denial or a cgroup OOM-kill on the writes.
+     * The writes go through a volatile pointer: a malloc/memset/free whose memory is
+     * never read is dead code, and an optimising compiler may delete all of it -
+     * then the task "succeeds" at -O2 without allocating a byte (clang does this,
+     * and so does the GCC on the Ubuntu 26.04 runner image). */
+    size_t big = (size_t)1024 * 1024 * 1024, i;
+    volatile unsigned char *p;
     (void)ctx; (void)ud;
-    p = malloc(big);
+    p = (volatile unsigned char *)malloc(big);
     if (!p) return GPTPS_E_TASK;
-    memset(p, 1, big);
-    free(p);
+    for (i = 0; i < big; i += 4096) p[i] = 1;
+    free((void *)p);
     return GPTPS_OK;
 }
 #endif
