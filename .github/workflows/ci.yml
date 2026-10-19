@@ -482,7 +482,7 @@ jobs:
         timeout-minutes: 8
         run: |
           sudo apt-get update
-          sudo apt-get install -y -o Acquire::Retries=3 gcc-s390x-linux-gnu qemu-user-static
+          sudo apt-get install -y -o Acquire::Retries=3 gcc-s390x-linux-gnu qemu-user
       - name: big-endian (s390x) build + serialization tests under QEMU
         run: |
           cmake -S . -B build-s390x -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchain-s390x.cmake"
