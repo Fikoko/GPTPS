@@ -465,11 +465,15 @@ jobs:
   # serialization and every fixed-width type are validated here.
   cross:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 45, not 20: the two apt-get installs below fetch ~60 MB between them, and on
+    # 2026-10-23 the runner's Ubuntu mirror served them at ~40 KB/s - the i386
+    # install took 6m45s and the s390x one (~40 MB) needed ~17 min. 20 each covers
+    # a day like that; a mirror that sends NOTHING still fails, just later.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the i386 toolchain
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           sudo apt-get update
           sudo apt-get install -y -o Acquire::Retries=3 gcc-multilib
@@ -479,7 +483,7 @@ jobs:
           cmake --build build32 -j
           ctest --test-dir build32 --output-on-failure --no-tests=error
       - name: install the s390x cross toolchain + QEMU
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           sudo apt-get update
           sudo apt-get install -y -o Acquire::Retries=3 gcc-s390x-linux-gnu qemu-user
