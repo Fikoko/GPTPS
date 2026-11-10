@@ -182,7 +182,7 @@ calls `dlopen`, so it needs `-ldl`). Pick which add-ons get built with
 | `gptps_register_task(e, &def)` | register a task type (in-process fn **or** external program) |
 | `gptps_set_task_priority(e, name, prio)` | set a task type's scheduling priority (higher runs first) |
 | `gptps_define_resource(e, name, budget)` · `gptps_set_task_resource_cost(e, name, res, n)` | declare a named admission budget (GPU/IO/seats/quota) and a task's per-item cost against it |
-| `gptps_submit(e, name, payload, len, &handle)` / `gptps_submit_ex(…, &opts, …)` | enqueue work (`_ex`: per-submit priority / policy / deadline) |
+| `gptps_submit(e, name, payload, len, &handle)` / `gptps_submit_ex(…, &opts, …)` | enqueue work (`_ex`: per-submit priority / policy / timeout / due time) |
 | `gptps_cancel(e, handle)` | cancel one queued / in-flight item |
 | `gptps_task_count/get_info/exists(e, …)` | enumerate / introspect registered task types |
 | `gptps_set_task_enabled(e, name, on)` | pause / resume a task type (reversible) |
@@ -557,18 +557,28 @@ dispatch key chosen by the peer.
 (skip-to-fit, budget, starvation guard) is fixed; the *ordering* is a hook. Return a score
 per item and the dispatcher admits the highest that fits — so deadline-first, per-tenant
 fair-share, cost-aware, or aging disciplines compose without a core fork (default is
-priority/FIFO). The hook sees the task name, priority, attempt, queue age and payload; a
-deadline is yours to supply, here as the payload's first 8 bytes:
+priority/FIFO). The hook sees the task name, priority, attempt, queue age, payload and
+(ABI 2.6) the item's **due time**, which a submit gives with `GPTPS_SUBMIT_DEADLINE`:
 
 ```c
 static int64_t earliest_deadline_first(const gptps_sched_input *in, void *ud) {
-    int64_t deadline = INT64_MAX;                     /* no deadline: last */
-    (void)ud;
-    if (in->payload_len >= sizeof deadline) memcpy(&deadline, in->payload, sizeof deadline);
-    return deadline == INT64_MIN ? INT64_MAX : -deadline;   /* sooner = higher score */
+    (void)ud;   /* deadline_ms: monotonic, on enqueue_ms's clock; 0 = none given */
+    return in->deadline_ms ? INT64_MAX - (int64_t)in->deadline_ms : INT64_MIN;
 }
 gptps_set_scheduler(e, earliest_deadline_first, NULL);
+
+gptps_submit_options o = { sizeof o };
+o.flags = GPTPS_SUBMIT_DEADLINE; o.deadline_in_ms = 250;     /* due in 250 ms */
+gptps_submit_ex(e, "frame", buf, len, &o, &h);
 ```
+
+A due time is an ordering **input**, never acted on by the core: nothing is cancelled or
+dropped for being late. The constraint seam sees it too (with `now_ms`), which is where
+"refuse work that is already late" lives. You need not write either:
+[`gptps_sched`](addons/README.md#sched--edf-aging-and-fair-share-orderings-shed-late-work)
+ships **EDF**, **priority with aging**, **weighted fair share** between tenants, and a
+**shed-late** constraint, each installed with one call and each refusing to take a
+scheduler seam someone else owns.
 
 **Faster locks (`-DGPTPS_HAL_FAST`).** An opt-in build knob swaps in adaptive
 (spin-then-block) mutexes on glibc — a latency knob for the engine's contended critical
@@ -661,6 +671,18 @@ points at a memory-delegated cgroup (e.g. a systemd `Delegate=yes` scope), else 
 `RLIMIT_AS` cap; on Windows the program executor uses a **Job Object** (memory limit +
 kill-on-close). Either way it's real, killable enforcement the in-process path can't give.
 
+**CPU and I/O caps (ABI 2.6).** A process job can also be held to a CPU rate and to a
+block-device bandwidth: `def.cpu_max_millicpus` (1000 = one CPU; throttled past it, never
+killed), `def.io_max_read_bps` / `def.io_max_write_bps` (bytes per second, on each
+device), or live as `tasks.<name>.cpu_max_millicpus` etc. These bound what a job that has
+started may *use*; what may *start* is still admission's business (a CPU budget for that is
+a named resource: `gptps_define_resource(e, "cpu", 8000)`). They are enforced as `cpu.max`
+/ `io.max` on the job's cgroup in cgroup mode (the parent must delegate `+cpu` / `+io`),
+and the CPU cap through the job object's hard CPU-rate limit on Windows. Where nothing can
+hold one, the job still runs and the log sink gets **one** `WARN` per cap per task type —
+never silence. A CPU cap held by a cgroup reports `cpu.throttled_ms` on the job's
+`FINISHED` / `FAILED`: the evidence that the cap is why it was slow.
+
 **What a job actually used.** Admission counts what a task *declares*; the
 out-of-process executors also report what each attempt *used*, because they collect its
 process when it ends. Every `FINISHED` and `FAILED` of an `OOP` or `PROGRAM` attempt
@@ -674,7 +696,10 @@ if (m) printf("%s: declared %llu, peaked at %llu (%s)\n", ev->task_name,
               (unsigned long long)ev->mem_bytes, (unsigned long long)m->value, m->method);
 ```
 
-GPTPS reports these and never acts on them. Set `measure.sample_ms` to sample a running
+GPTPS reports these and never acts on them; acting on them is policy, and
+[`gptps_adapt`](addons/README.md#adapt--memory-declarations-from-measured-peaks) is that
+policy for memory — it suggests (or, if you ask, applies) a task's `mem_bytes` from its
+measured peaks. Set `measure.sample_ms` to sample a running
 job's memory as well. [`gptps_stats`](addons/gptps_stats.h) aggregates measurements per task,
 the dashboard shows the peak, and [`docs/MEASUREMENTS.md`](docs/MEASUREMENTS.md) is the
 design record: the rules, the vocabulary, and what each platform measures and how.
@@ -841,6 +866,7 @@ gptps/
 │   ├── gptps_pool.c     scale-UP: N engine shards + a router;  gptps_xport.c  scale-OUT: worker processes, an engine in each
 │   ├── gptps_balance.c  late-binding load balancer above pool (join-shortest-queue; any task size)
 │   ├── gptps_stats.c    counters / gauges / latency on the observer seam (per engine, per task, mergeable)
+│   ├── gptps_sched.c    EDF / aging / weighted fair share orderings + shed-late;  gptps_adapt.c  mem_bytes from measured peaks
 │   ├── gptps_await.c    blocking wait(handle);  gptps_orch.c  run-after / fan-in dependencies
 │   ├── gptps_durable_queue.c  crash-durable journal;  gptps_gpu_quota.c  named-resource quota
 │   ├── gptps_wasm_exec.c  module-as-task;  gptps_tui.c  live terminal dashboard
@@ -883,7 +909,9 @@ add-ons cannot silently fight over it), **scale-up** (`gptps_pool` shards) and
 **scale-out** (`gptps_xport` worker processes, each with its own engine), the optional platform-optimized HAL
 (`-DGPTPS_HAL_FAST`), the **live terminal dashboard** (with the settings editor), the
 crash-durable queue, a blocking `wait(handle)`, run-after/fan-in dependencies, GPU-quota
-and WASM-executor add-ons, **observer-seam stats** (`gptps_stats`: totals, gauges,
+and WASM-executor add-ons, **ready-made admission disciplines** (`gptps_sched`: EDF, aging,
+weighted fair share, shed-late) over a per-item **due time**, **CPU and I/O caps** for process
+jobs, **declarations from evidence** (`gptps_adapt`), **observer-seam stats** (`gptps_stats`: totals, gauges,
 latency, per task, mergeable across shards), **measurements** of what each process job
 actually used (peak memory, CPU, I/O, cap hit; sampled while it runs if asked; carried
 back from `gptps_xport` workers), the examples + benchmark, CMake + CI + single-file
@@ -893,9 +921,9 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **59** public functions · **ABI 2.5** (append-only; 2.0 was the first
-and, by design, the last breaking change) · **11** add-on modules + 1 example binary
-plug-in · **89** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+At a glance: **59** public functions · **ABI 2.6** (append-only; 2.0 was the first
+and, by design, the last breaking change) · **13** add-on modules + 1 example binary
+plug-in · **93** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

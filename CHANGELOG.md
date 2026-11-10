@@ -5,6 +5,70 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Upgrading from 1.7
+
+No API changed incompatibly. The ABI is 2.6, additive over 1.7.0's 2.5:
+`gptps_task_def` appends `cpu_max_millicpus`, `io_max_read_bps` and `io_max_write_bps`;
+`gptps_submit_options` appends `deadline_in_ms` (with the `GPTPS_SUBMIT_DEADLINE` flag);
+`gptps_sched_input` appends `deadline_ms`, and `gptps_constraint_input` appends
+`deadline_ms` and `now_ms`; `GPTPS_M_CPU_THROTTLED_MS` is a new measurement name. Two
+add-ons are new: `gptps_sched` and `gptps_adapt`. Two changes can need a change in a host:
+
+- **Every task type has three more settings**: `tasks.<name>.cpu_max_millicpus`,
+  `.io_max_read_bps` and `.io_max_write_bps`. A host that counts a task's settings, or
+  defined per-task settings of its own under those leaves (refused now with
+  `GPTPS_E_DUP`), sees the difference.
+- **A cap that cannot be enforced logs once.** A task that asks for a CPU or I/O cap
+  where nothing can hold it gets one `GPTPS_LOG_WARN` per cap through the log sink.
+
+### Added — CPU and I/O caps for process jobs
+
+- `def.cpu_max_millicpus` holds an `OOP` or `PROGRAM` job to a CPU rate (1000 = one CPU;
+  throttled, never killed), `def.io_max_read_bps` / `def.io_max_write_bps` to a
+  block-device bandwidth on each device. Read at submit, like `default_cost`, and live
+  as per-task settings. Enforced as `cpu.max` / `io.max` on the job's own cgroup in
+  cgroup mode, and the CPU cap through the job object's hard CPU-rate limit on Windows.
+  A job's cgroup is now made for any of the three caps, not only a memory cap: a parent
+  that delegates `cpu` but not `memory` still holds a CPU cap, and the memory cap falls
+  back to `RLIMIT_AS` as before.
+- **Never silent, never fatal.** Where a cap cannot be held (no cgroup, a controller not
+  delegated, macOS, Windows' I/O) the job runs and the log sink is told once per cap per
+  task type. Where the CPU cap is held by a cgroup, `FINISHED` / `FAILED` carries
+  `cpu.throttled_ms` - how long the cap held the job back.
+- Ignored for in-process tasks, as `child_setup` is.
+
+### Added — a due time, for deadline-aware ordering
+
+- `GPTPS_SUBMIT_DEADLINE` + `deadline_in_ms` give an item a due time, which the core
+  turns into `deadline_ms` on the scheduler and constraint inputs (on the clock of
+  `enqueue_ms` and `gptps_now_ms`). It belongs to the item, so a retry keeps it. The
+  core acts on none of it: nothing is reordered, cancelled or dropped for being late
+  unless a scheduler or a constraint says so. Before this a deadline had to be smuggled
+  in the payload.
+
+### Added — `gptps_sched`: EDF, aging, weighted fair share, shed-late
+
+- Three orderings for the scheduler seam - earliest deadline first, priority with
+  aging (stable scores, nothing starves), and start-time fair queuing between tenants
+  with weights and no banking for idle tenants - and a shed-late constraint that
+  dead-letters work past its due time plus a grace. The orderings take the seam only if
+  it is free (`GPTPS_E_BUSY` otherwise), as add-ons must.
+
+### Added — `gptps_adapt`: memory declarations from evidence
+
+- On the observer seam: per task type, the largest measured `mem.peak` (in one method)
+  and the cap hits become a suggested `mem_bytes` - peak plus headroom after enough
+  samples, or growth from a declaration that was hit, at once. `gptps_adapt_apply`
+  writes it to the task's setting; `auto_apply` does so as it changes. The core still
+  never acts on a measurement.
+
+### Changed
+
+- `gptps_define_task_setting` refuses every built-in per-task leaf from the same table
+  the engine registers them from, rather than a hand-kept copy of it.
+
 ## [1.7.0] - 2026-10-07
 
 ### Upgrading from 1.6

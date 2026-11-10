@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int fails = 0;
@@ -26,6 +27,7 @@ static int fails = 0;
 static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
 static int c_hog_nomem, c_small_ok, c_hog_cap_hit, c_small_measured;
+static int c_spin_ok, c_spin_throttled, c_spin_unthrottled;
 
 static void on_ev(const gptps_event *ev, void *ud)
 {
@@ -38,6 +40,14 @@ static void on_ev(const gptps_event *ev, void *ud)
         m = gptps_event_measure(ev, GPTPS_M_MEM_CAP_HIT);
         if (m && m->value == 1 && strcmp(m->method, "cgroup.job") == 0) inc(&c_hog_cap_hit);
     }
+    /* the CPU cap (ABI 2.6): the capped job is held back, and says so */
+    if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "spin") == 0) {
+        inc(&c_spin_ok);
+        m = gptps_event_measure(ev, GPTPS_M_CPU_THROTTLED_MS);
+        if (m && m->value > 0 && strcmp(m->method, "cgroup.job") == 0) inc(&c_spin_throttled);
+    }
+    if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "small") == 0 &&
+        gptps_event_measure(ev, GPTPS_M_CPU_THROTTLED_MS) == NULL) inc(&c_spin_unthrottled);
     if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "small") == 0) {
         inc(&c_small_ok);
         m = gptps_event_measure(ev, GPTPS_M_MEM_CAP_HIT);
@@ -61,6 +71,17 @@ static gptps_status task_small(gptps_ctx *ctx, void *ud)
     char *b = (char *)malloc(4u << 20); (void)ctx; (void)ud; /* 4 MiB, under the cap */
     if (!b) return GPTPS_E_NOMEM;
     memset(b, 1, 4u << 20); free(b);
+    return GPTPS_OK;
+}
+
+/* Burn 100 ms of CPU. Under a 50-millicpu cap that is two seconds of wall time, nearly
+ * all of it throttled; uncapped it is 100 ms and never throttled. */
+static gptps_status task_spin(gptps_ctx *ctx, void *ud)
+{
+    volatile unsigned long x = 0;
+    clock_t start = clock();
+    (void)ctx; (void)ud;
+    while ((double)(clock() - start) / CLOCKS_PER_SEC < 0.1) x += 1;
     return GPTPS_OK;
 }
 
@@ -117,6 +138,7 @@ static int setup_parent(char *parent, size_t pn)
         return 0;
     if (mkdir(parent, 0700) != 0) return 0;      /* no delegation here -> skip */
     if (cg_write(parent, "cgroup.subtree_control", "+memory") != 0) { rmdir(parent); return 0; }
+    (void)cg_write(parent, "cgroup.subtree_control", "+cpu");   /* best effort: see cpu_delegated */
     /* verify a child can actually take a memory cap */
     if ((size_t)snprintf(probe, sizeof probe, "%s/_probe", parent) >= sizeof probe) { rmdir(parent); return 0; }
     if (mkdir(probe, 0700) != 0) { rmdir(parent); return 0; }
@@ -126,6 +148,19 @@ static int setup_parent(char *parent, size_t pn)
     setenv("GPTPS_CGROUP_PARENT", parent, 1);
     g_owned = 1;
     return 1;
+}
+
+/* Can a job's cgroup under the parent take a CPU cap? The CPU part of this test needs
+ * it and skips without it; the memory part does not. */
+static int cpu_delegated(const char *parent)
+{
+    char probe[1088];
+    int ok;
+    if ((size_t)snprintf(probe, sizeof probe, "%s/_cpuprobe", parent) >= sizeof probe) return 0;
+    if (mkdir(probe, 0700) != 0) return 0;
+    ok = cg_write(probe, "cpu.max", "5000 100000") == 0;
+    rmdir(probe);
+    return ok;
 }
 
 static void def_oop(gptps_task_def *d, const char *name, gptps_run_fn run)
@@ -167,6 +202,25 @@ int main(void)
         CHECK(get(&c_hog_nomem) == 1);  /* over-cap task OOM-killed -> GPTPS_E_NOMEM */
         CHECK(get(&c_hog_cap_hit) == 1);     /* ...and its measurements say it hit the cap */
         CHECK(get(&c_small_measured) == 1);  /* the other did not, and has its peak */
+        CHECK(get(&c_spin_unthrottled) == 1); /* no CPU cap: no throttling figure at all */
+    }
+
+    if (!cpu_delegated(parent)) {
+        printf("cgroup CPU-cap check skipped (cpu controller not delegated)\n");
+    } else {
+        e = NULL;
+        CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+        if (e) {
+            gptps_set_event_cb(e, on_ev, NULL);
+            def_oop(&d, "spin", task_spin);
+            d.default_cost.mem_bytes = 0;            /* a CPU cap alone still makes a cgroup */
+            d.cpu_max_millicpus = 50;                /* 5% of one CPU */
+            CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+            CHECK(gptps_submit(e, "spin", NULL, 0, &h) == GPTPS_OK);
+            gptps_shutdown(e);
+            CHECK(get(&c_spin_ok) == 1);
+            CHECK(get(&c_spin_throttled) == 1);      /* held back by cpu.max, and measured */
+        }
     }
 
     if (g_owned) rmdir(parent); /* GPTPS removed its per-task children already */

@@ -108,8 +108,9 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
  * child on timeout (returns GPTPS_E_TIMEOUT) - real enforcement the in-process
  * path cannot provide. The memory cap is accurate cgroup v2 (memory.max +
  * swap.max=0, exceeding it => GPTPS_E_NOMEM) when GPTPS_CGROUP_PARENT names a
- * memory-delegated cgroup; otherwise a coarse RLIMIT_AS fallback. mem_cap==0 or
- * below a floor => no cap. `cancel` (may be NULL) is the running item's cooperative
+ * memory-delegated cgroup; otherwise a coarse RLIMIT_AS fallback. caps->mem==0 or
+ * below a floor => no cap. The CPU and I/O caps exist only in that cgroup (cpu.max,
+ * io.max), and have no fallback. `cancel` (may be NULL) is the running item's cooperative
  * cancel flag: the parent waits in bounded slices and hard-kills the child when it is
  * raised, so a cancel / shutdown / task-removal stops even a no-timeout (timeout_s==0)
  * child instead of blocking its worker forever.
@@ -136,8 +137,23 @@ typedef struct gptps_exec_meter {
 void gptps_meter_put(gptps_exec_meter *mt, const char *name, uint64_t value,
                      unsigned unit, unsigned kind, const char *method);
 
+/* What one attempt of a process job may use (ABI 2.6 grew it from a bare mem_cap).
+ * Snapshotted into the item at submit, so a live tasks.<name>.* edit cannot change an
+ * attempt under the executor. The executor reports back in `applied` the caps it put
+ * in force, so the engine can say - once - which ones it could not (see
+ * gptps_task_def.cpu_max_millicpus). */
+#define GPTPS_CAP_CPU    0x1u   /* cpu_max_millicpus is in force */
+#define GPTPS_CAP_IO     0x2u   /* io_max_*_bps is in force on at least one device */
+#define GPTPS_CAP_MEM_CG 0x4u   /* the memory cap is the cgroup's, not RLIMIT_AS (POSIX) */
+typedef struct {
+    uint64_t mem;              /* bytes; 0 or below the executor's floor = no cap */
+    uint64_t cpu_millicpus;    /* 0 = no cap */
+    uint64_t io_rbps, io_wbps; /* 0 = no cap, per direction */
+    unsigned applied;          /* OUT: GPTPS_CAP_*; the engine sets it 0 */
+} gptps_exec_caps;
+
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                               gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter);
 
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
@@ -295,7 +311,7 @@ int             gptps_settings_publish_locked(gptps_settings *r, gptps_setting_p
  * child closed its output, NOT that it exited, so the reap is bounded: a program that
  * goes silent and keeps running is SIGKILLed after a grace period. */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                                   gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter);
 
 #endif /* GPTPS_INTERNAL_H */

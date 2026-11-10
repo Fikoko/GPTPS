@@ -13,7 +13,7 @@
 # two engines in one process. The dlopen tier is the supported way to get a binary
 # boundary, and it works precisely BECAUSE a plug-in links no core symbols at all.
 
-set(GPTPS_ADDON_ALL await balance durable_queue gpu_quota orch pool remote stats tui wasm_exec xport)
+set(GPTPS_ADDON_ALL adapt await balance durable_queue gpu_quota orch pool remote sched stats tui wasm_exec xport)
 
 # GPTPS_ADDONS is the human knob; the per-add-on GPTPS_ADDON_<NAME> booleans are what
 # a distro packager scripts against. The list only sets their DEFAULTS.
@@ -107,6 +107,7 @@ function(gptps_addon name)
     set(_built ${_built} ${name} PARENT_SCOPE)
 endfunction()
 
+gptps_addon(adapt         SOURCE gptps_adapt.c         HEADER gptps_adapt.h         DESC "memory declarations from measured peaks")
 gptps_addon(await         SOURCE gptps_await.c         HEADER gptps_await.h         DESC "blocking wait(handle) on the observer seam")
 gptps_addon(durable_queue SOURCE gptps_durable_queue.c HEADER gptps_durable_queue.h DESC "crash-durable submission journal")
 gptps_addon(gpu_quota     SOURCE gptps_gpu_quota.c     HEADER gptps_gpu_quota.h     DESC "named-resource admission quota")
@@ -126,6 +127,7 @@ gptps_addon(remote        SOURCE gptps_remote.c        HEADER gptps_remote.h    
 # tui is TTY-dependent at RUNTIME only - gptps_tui_run self-skips without a TTY, and
 # render/press are headless and unit-tested. It compiles everywhere (POSIX termios and
 # the Windows console are both handled inside the add-on), so there is nothing to gate.
+gptps_addon(sched         SOURCE gptps_sched.c         HEADER gptps_sched.h         DESC "EDF, aging and fair-share orderings; shed late work")
 gptps_addon(stats         SOURCE gptps_stats.c         HEADER gptps_stats.h         DESC "counters, gauges and latency on the observer seam")
 gptps_addon(tui           SOURCE gptps_tui.c           HEADER gptps_tui.h           DESC "real-time terminal dashboard")
 gptps_addon(wasm_exec     SOURCE gptps_wasm_exec.c     HEADER gptps_wasm_exec.h     DESC "module-as-task, pluggable runtime")

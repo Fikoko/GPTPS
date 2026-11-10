@@ -107,6 +107,7 @@ if (m) printf("%s: peak %llu bytes (%s)\n", ev->task_name,
 | `cpu.sys_ms` | ms | total | CPU time the kernel spent on the job's behalf |
 | `io.read_bytes` | bytes | total | bytes the job read |
 | `io.write_bytes` | bytes | total | bytes the job wrote |
+| `cpu.throttled_ms` | ms | total | time the job was held back by its CPU cap (`cpu_max_millicpus`, ABI 2.6). Present only where a cgroup held that cap - `cgroup.job`, from `cpu.stat`'s `throttled_usec` - so its presence is also the proof the cap was in force; 0 means it never bit |
 
 CPU time divided by run time (`STARTED` to `FINISHED`) is the average number of cores
 the attempt kept busy - the check on a declared CPU-seat resource.
