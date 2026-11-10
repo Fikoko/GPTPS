@@ -429,8 +429,11 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams can simply be compiled into the host. **Eleven** ship
+and the observer/constraint seams can simply be compiled into the host. **Thirteen** ship
 in `addons/`: `durable_queue.c` (observer seam → crash-durable journal),
+`gptps_sched.c` (scheduler + observer + constraint seams → EDF, aging, weighted fair
+share, shed-late), `gptps_adapt.c` (observer seam + settings → `mem_bytes` from measured
+peaks),
 `gpu_quota.c` (a thin wrapper over the core's named-resource budgets),
 `wasm_exec.c` (module-as-task with a pluggable wasm runtime), `tui.c` (observer +
 settings → live dashboard), `gptps_orch.c` (observer + submit → run-after/fan-in

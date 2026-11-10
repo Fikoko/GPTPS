@@ -79,10 +79,15 @@ extern "C" {
  * SERVICE; 2.3 appends `flags` to gptps_event (GPTPS_EV_FLAG_*); 2.4 appends to
  * gptps_config the bounded-mode fields, then max_dead_letters and shutdown_grace_ms
  * (with GPTPS_LIMIT_NONE); 2.5 appends `measures` / `n_measures` to gptps_event
- * (gptps_measure, docs/MEASUREMENTS.md) and adds the GPTPS_EV_SAMPLE kind. Additive,
- * and the loader compares MAJOR only, so no existing add-on is refused. */
+ * (gptps_measure, docs/MEASUREMENTS.md) and adds the GPTPS_EV_SAMPLE kind; 2.6
+ * appends the process executors' CPU and I/O caps to gptps_task_def
+ * (cpu_max_millicpus, io_max_read_bps, io_max_write_bps) with the cpu.throttled_ms
+ * measurement, and a due time: GPTPS_SUBMIT_DEADLINE + deadline_in_ms on
+ * gptps_submit_options, carried to the seams as deadline_ms on gptps_sched_input and
+ * gptps_constraint_input (which also gains now_ms). Additive, and the loader compares
+ * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 5u
+#define GPTPS_ABI_VERSION_MINOR 6u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -331,6 +336,40 @@ typedef struct {
      * struct_size feature-detection unambiguous even on 32-bit ABIs (ARM32/AAPCS,
      * MIPS32) where a uint32_t here would have hidden in that padding. */
     uint64_t flags;
+    /* ABI 2.6 - CPU and I/O CAPS for the process executors (GPTPS_EXEC_OOP,
+     * GPTPS_EXEC_PROGRAM). Enforcement, like the memory cap, not admission: what may
+     * START is still decided by the declared cost and the named-resource budgets (a
+     * CPU budget is gptps_define_resource(e, "cpu", <millicpus>) plus a per-task
+     * cost). These bound what a job that has started may USE. 0 = no cap. Live as
+     * tasks.<name>.cpu_max_millicpus / .io_max_read_bps / .io_max_write_bps, and
+     * read at submit, as default_cost is.
+     *
+     *   cpu_max_millicpus  CPU RATE: 1000 = one whole CPU, 500 = half of one, 4000 =
+     *                      four. A job that wants more is throttled, not killed.
+     *   io_max_read_bps    block-device read / write bandwidth in bytes per second,
+     *   io_max_write_bps   applied to EACH block device separately.
+     *
+     * Where each is enforced:
+     *   - Linux in cgroup mode (GPTPS_CGROUP_PARENT, see the memory cap): cpu.max and
+     *     io.max on the job's own cgroup. The parent must delegate the cpu / io
+     *     controller (cgroup.subtree_control "+cpu +io").
+     *   - Windows: the CPU cap through the job object's hard CPU-rate limit. Windows
+     *     has no per-device read/write split, so the I/O caps are not enforced there.
+     *   - Anywhere else, and wherever a controller is not delegated: NOT enforced.
+     * A cap that is not enforced is never silent: the first attempt of a task type
+     * that asked for one and did not get it logs a GPTPS_LOG_WARN naming the cap, once
+     * per task type and engine. The job runs anyway, as a memory cap that falls back
+     * to RLIMIT_AS does - refusing the work would make a portable program fail on the
+     * one platform it was not tested on. Where the CPU cap is enforced through a
+     * cgroup, the job's FINISHED / FAILED carries GPTPS_M_CPU_THROTTLED_MS: how long
+     * it was held back, the evidence that the cap was the reason it was slow.
+     *
+     * Ignored for GPTPS_EXEC_INPROC, as child_setup is: an in-process task shares the
+     * host's threads, and no OS can cap one function in a process. uint64_t, each, so
+     * that every one GROWS sizeof (see `flags`). */
+    uint64_t cpu_max_millicpus;
+    uint64_t io_max_read_bps;
+    uint64_t io_max_write_bps;
 } gptps_task_def;
 
 /* ============================================================================
@@ -788,12 +827,26 @@ GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,
 #define GPTPS_SUBMIT_PRIORITY    0x1u  /* apply `priority`   */
 #define GPTPS_SUBMIT_POLICY      0x2u  /* apply `policy`     (timeout/retries/backoff/on_failure) */
 #define GPTPS_SUBMIT_TIMEOUT_MS  0x4u  /* apply `timeout_ms` (sub-second deadline; in-process cooperative path) */
+/* ABI 2.6: apply `deadline_in_ms` - when the item is DUE, as an ordering input. Not a
+ * timeout: nothing is cancelled, dropped or reordered by the core because of it. The
+ * core turns it into an absolute time on the engine's monotonic clock (the clock of
+ * gptps_sched_input.enqueue_ms) and hands it to the scheduler and constraint seams as
+ * their `deadline_ms`, which is where "earliest deadline first" (a scheduler) and
+ * "shed work that is already late" (a constraint) are built - addons/gptps_sched has
+ * both. It survives retries (it belongs to the item, not to an attempt). */
+#define GPTPS_SUBMIT_DEADLINE    0x8u  /* apply `deadline_in_ms` (ABI 2.6) */
 typedef struct {
     size_t               struct_size;  /* = sizeof(gptps_submit_options) */
     unsigned             flags;        /* OR of GPTPS_SUBMIT_* selecting which overrides apply */
     int32_t              priority;     /* this item's scheduling priority (higher runs first) */
     gptps_failure_policy policy;       /* this item's failure policy */
     uint32_t             timeout_ms;   /* this item's deadline in ms (in-process cooperative path) */
+    /* ABI 2.6: ms from this submit until the item is due (GPTPS_SUBMIT_DEADLINE). 0 is
+     * "due now". Read only when struct_size covers it, so an older caller has none.
+     * uint64_t so that it always GROWS sizeof and never sits in the 2.5 struct's tail
+     * padding, where struct_size could not tell an older caller's leftover bytes from
+     * a value. */
+    uint64_t             deadline_in_ms;
 } gptps_submit_options;
 
 /* Like gptps_submit, but applies the per-item overrides in `opts` (NULL =>
@@ -982,6 +1035,10 @@ typedef struct {
 #define GPTPS_M_CPU_SYS_MS     "cpu.sys_ms"      /* ms, total */
 #define GPTPS_M_IO_READ_BYTES  "io.read_bytes"   /* bytes, total */
 #define GPTPS_M_IO_WRITE_BYTES "io.write_bytes"  /* bytes, total */
+/* ABI 2.6: time the job spent held back by its CPU cap (cpu_max_millicpus). Reported
+ * only where that cap was enforced through the job's cgroup, so its presence is also
+ * the proof the cap was in force; 0 is a real value - the cap never bit. */
+#define GPTPS_M_CPU_THROTTLED_MS "cpu.throttled_ms" /* ms, total */
 
 typedef struct {
     size_t           struct_size;   /* = sizeof(gptps_event) */
@@ -1367,6 +1424,13 @@ typedef struct {
     gptps_handle      handle;        /* the submitted work item being admitted */
     const void       *payload;       /* item payload bytes (NULL if none) */
     size_t            payload_len;
+    /* ABI 2.6: when the item is due, on the engine's monotonic clock (the clock of
+     * gptps_sched_input.enqueue_ms and of gptps_now_ms); 0 = no deadline was given
+     * (GPTPS_SUBMIT_DEADLINE). `now_ms` is that clock as this admission decision is
+     * made, so a hook can tell "late" without a clock of its own that might not be
+     * the engine's. Check struct_size before reading either. */
+    uint64_t          deadline_ms;
+    uint64_t          now_ms;
 } gptps_constraint_input;
 
 /* A constraint hook is consulted at admission time (in the dispatcher, so it
@@ -1392,6 +1456,11 @@ typedef struct {
     uint64_t          enqueue_ms;    /* monotonic time it first entered intake */
     const void       *payload;
     size_t            payload_len;
+    /* ABI 2.6: when the item is due, on the clock of enqueue_ms; 0 = none given
+     * (GPTPS_SUBMIT_DEADLINE). It does not move while the item waits, so -deadline_ms
+     * is the stable key the NOTE on the scheduler seam asks for. Check struct_size
+     * before reading it. */
+    uint64_t          deadline_ms;
 } gptps_sched_input;
 typedef int64_t (*gptps_sched_fn)(const gptps_sched_input *in, void *user_data);
 

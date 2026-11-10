@@ -344,6 +344,12 @@ set_tests_properties(toml PROPERTIES TIMEOUT 30)
 # the config file: strict checks, deferred keys, gptps_config_check, reload, and
 # gptps_settings_save editing a file in place
 
+add_executable(test_deadline tests/test_deadline.c)   # due time (ABI 2.6) on the scheduler / constraint seams
+target_include_directories(test_deadline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_deadline PRIVATE gptps)
+add_test(NAME deadline COMMAND test_deadline)
+set_tests_properties(deadline PROPERTIES TIMEOUT 30)
+
 add_executable(test_scheduler tests/test_scheduler.c) # priority + skip-to-fit + reservation
 target_include_directories(test_scheduler
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -645,6 +651,20 @@ if(UNIX)
     add_test(NAME oop COMMAND test_oop)
     set_tests_properties(oop PROPERTIES TIMEOUT 30)
 
+    add_executable(test_caps tests/test_caps.c)     # CPU / I/O caps where nothing can hold them: warned once
+    target_include_directories(test_caps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_caps PRIVATE gptps)
+    add_test(NAME caps COMMAND test_caps)
+    set_tests_properties(caps PROPERTIES TIMEOUT 30)
+
+    if(TARGET gptps_adapt)
+    add_executable(test_adapt tests/test_adapt.c)   # declarations from measured peaks (OOP jobs)
+    target_include_directories(test_adapt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(test_adapt PRIVATE gptps_adapt)
+    add_test(NAME adapt COMMAND test_adapt)
+    set_tests_properties(adapt PROPERTIES TIMEOUT 60)
+    endif()
+
     add_executable(test_result tests/test_result.c) # exercises the OOP executor too
     target_include_directories(test_result
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -771,6 +791,14 @@ target_include_directories(test_remote_codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(test_remote_codec PRIVATE gptps_remote)
 add_test(NAME remote_codec COMMAND test_remote_codec)
 set_tests_properties(remote_codec PROPERTIES TIMEOUT 30)
+endif()
+
+if(TARGET gptps_sched)
+add_executable(test_sched_addon tests/test_sched_addon.c)   # EDF / aging / fair share / shed late
+target_include_directories(test_sched_addon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_sched_addon PRIVATE gptps_sched)
+add_test(NAME sched_addon COMMAND test_sched_addon)
+set_tests_properties(sched_addon PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_await)

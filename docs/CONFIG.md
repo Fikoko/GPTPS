@@ -56,6 +56,9 @@ The meanings are those the tables below give, from the same descriptions.
 | `tasks.<task>.max_retries` | none | - |
 | `tasks.<task>.retry_backoff_seconds` | at once (a requeue still waits 100 ms) | - |
 | `tasks.<task>.mem_bytes` | none declared: not budgeted, not capped | - |
+| `tasks.<task>.cpu_max_millicpus` | no cap | - |
+| `tasks.<task>.io_max_read_bps` | no cap | - |
+| `tasks.<task>.io_max_write_bps` | no cap | - |
 | `resources.<name>` | none: a submit that costs any is refused, and queued work that does is dead-lettered (GPTPS_E_BUDGET) - not a pause | - |
 | `tasks.<task>.resources.<name>` | none | - |
 
@@ -118,6 +121,9 @@ Values for every task, applied as it registers. A value in `[tasks.<task>]` wins
 | `mem_bytes` | whole number, 0 or more | `0` | at once | memory one run declares, in bytes: admission budgets it, the process executors cap it; 0 = none declared: not budgeted, not capped |
 | `priority` | whole number, -2147483648 to 2147483647 | `0` | at once | admission order: higher runs first; may be negative |
 | `on_failure` | one of `"dead_letter"`, `"requeue"`, `"drop"` | `"dead_letter"` | at once | once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it |
+| `cpu_max_millicpus` | whole number, 0 or more | `0` | at once | CPU a process job (oop/program) may use, in thousandths of one CPU; throttled past it, never killed. Enforced in cgroup mode and on Windows; elsewhere warned once. 0 = no cap |
+| `io_max_read_bps` | whole number, 0 or more | `0` | at once | block-device reads a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
+| `io_max_write_bps` | whole number, 0 or more | `0` | at once | block-device writes a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
 
 ## [tasks.<task>]
 
@@ -131,6 +137,9 @@ One task's values, applied when a task of that name registers. A table for a tas
 | `mem_bytes` | whole number, 0 or more | `0` | at once | memory one run declares, in bytes: admission budgets it, the process executors cap it; 0 = none declared: not budgeted, not capped |
 | `priority` | whole number, -2147483648 to 2147483647 | `0` | at once | admission order: higher runs first; may be negative |
 | `on_failure` | one of `"dead_letter"`, `"requeue"`, `"drop"` | `"dead_letter"` | at once | once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it |
+| `cpu_max_millicpus` | whole number, 0 or more | `0` | at once | CPU a process job (oop/program) may use, in thousandths of one CPU; throttled past it, never killed. Enforced in cgroup mode and on Windows; elsewhere warned once. 0 = no cap |
+| `io_max_read_bps` | whole number, 0 or more | `0` | at once | block-device reads a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
+| `io_max_write_bps` | whole number, 0 or more | `0` | at once | block-device writes a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
 
 ## [tasks.<task>.resources]
 

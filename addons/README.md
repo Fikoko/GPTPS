@@ -63,6 +63,37 @@ cc -std=c99 myapp.c out/gptps.c out/gptps_durable_queue.c out/gptps_pool.c -Iout
 
 ---
 
+## adapt — memory declarations from measured peaks
+
+`gptps_adapt.c` / `gptps_adapt.h`. Admission budgets what a task *declares*; since ABI 2.5
+every process job also reports what it *used*. The core never connects the two — a
+measurement changing a declaration is policy, with knobs a mechanism should not pick. This
+add-on is that policy, on the observer seam:
+
+```c
+gptps_adapt *a = gptps_adapt_open(e, NULL);         // BEFORE you submit anything
+...
+gptps_adapt_report r = { sizeof r };
+gptps_adapt_get(a, "mrp", &r);                      // r.peak, r.samples, r.cap_hits, r.suggested
+gptps_adapt_apply(a, "mrp");                        // -> tasks.mrp.mem_bytes
+... gptps_shutdown(e); gptps_adapt_close(a);        // close AFTER shutdown
+```
+
+- **The rule.** No cap hit: the largest `mem.peak` plus `headroom_pct` (25%), once
+  `min_samples` (5) attempts were measured. A cap hit (`mem.cap_hit`, or a process job that
+  failed with `GPTPS_E_NOMEM`): at least the declaration that was hit plus `grow_pct` (50%),
+  at once — a job that hits its cap fails every time. Rounded up to a MiB, raised to
+  `floor_bytes`. It goes down as well as up.
+- **Nothing changes unless asked.** `gptps_adapt_apply` writes one task's suggestion to
+  its live setting (so `gptps_settings_save` keeps it); `cfg.auto_apply = 1` writes each
+  suggestion as it changes.
+- **One method per task** (MEASUREMENTS.md: never mix methods): the first `mem.peak`
+  method seen is the one a task's evidence is kept in; peaks measured another way are
+  counted in `other_method`, not folded in.
+- **Limits.** Only process jobs are adapted — an in-process task has no measurements.
+  Only the task type's default declaration is written: a task with a `cost()` function
+  declares per item, and that wins.
+
 ## await — block until a handle finishes
 
 `gptps_await.c` / `gptps_await.h`. The core is event-driven by design and "futures /
@@ -416,6 +447,40 @@ What a network commits to that a socketpair does not, and what this fixes:
 peer. On a listening socket that is remote code *selection* by whoever can connect.
 There is no authentication and no encryption here by design — run it inside a trusted
 boundary (loopback, WireGuard, a TLS terminator, an SSH tunnel), never on an open port.
+
+## sched — EDF, aging and fair-share orderings; shed late work
+
+`gptps_sched.c` / `gptps_sched.h`. The scheduler seam has always promised that
+deadline-first, fair-share and aging "compose without a core fork". These are those
+disciplines, written once, plus the policy a due time is usually wanted for:
+
+```c
+gptps_sched *s, *late;
+gptps_sched_edf(e, &s);                 // or gptps_sched_aging(e, 50, &s), gptps_sched_fair(...)
+gptps_sched_shed_late(e, 100, &late);   // a constraint: composes with any of them
+gptps_submit_options o = { sizeof o };
+o.flags = GPTPS_SUBMIT_DEADLINE; o.deadline_in_ms = 250;
+gptps_submit_ex(e, "frame", buf, len, &o, &h);
+... gptps_shutdown(e); gptps_sched_close(s); gptps_sched_close(late);   // AFTER shutdown
+```
+
+- **EDF** — items with a due time (`GPTPS_SUBMIT_DEADLINE`, ABI 2.6) first, earliest
+  first; the rest after, by priority. The key never moves while an item waits.
+- **Aging** — `priority * ms_per_level - enqueue_ms`: one level of priority is worth
+  `ms_per_level` of waiting, so low-priority work is delayed, never starved, and the
+  score is stable from pass to pass (what the starvation guard needs).
+- **Weighted fair share** — start-time fair queuing between tenants named by a function
+  of the item (default: the task name). Each item is tagged when first seen, so one pass
+  that fills several slots still interleaves tenants; virtual time follows what starts,
+  so a tenant that was idle comes back at par instead of with banked turns.
+  `gptps_sched_fair_weight` sets a tenant's share. A share of *admissions*, not CPU time.
+- **Shed late** — a constraint: an item more than `grace_ms` past due when it comes up
+  for admission is refused (dead-lettered, `GPTPS_E_DENIED`); items without a due time
+  never are. `gptps_sched_shed_count` counts them.
+- **Owning the seam.** The three orderings install with `flags == 0` and return
+  `GPTPS_E_BUSY` if the scheduler seam is taken — the rule `gptps_set_scheduler_ex` sets
+  for add-ons. None of them changes the mechanism: skip-to-fit, budgets and the
+  starvation guard apply as before.
 
 ## stats — counters, gauges and latency on the observer seam
 

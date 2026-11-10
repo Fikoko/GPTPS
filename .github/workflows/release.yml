@@ -190,6 +190,8 @@ jobs:
             dist/LICENSE
             dist/SHA256SUMS
             dist/gptps-addons.tar.gz
+            dist/gptps_adapt.c
+            dist/gptps_adapt.h
             dist/gptps_await.c
             dist/gptps_await.h
             dist/gptps_balance.c
@@ -202,6 +204,8 @@ jobs:
             dist/gptps_orch.h
             dist/gptps_pool.c
             dist/gptps_pool.h
+            dist/gptps_sched.c
+            dist/gptps_sched.h
             dist/gptps_tui.c
             dist/gptps_tui.h
             dist/gptps_wasm_exec.c

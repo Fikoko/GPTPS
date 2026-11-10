@@ -42,10 +42,10 @@
 #endif
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                               gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
-    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel; (void)meter;
+    (void)def; (void)payload; (void)plen; (void)caps; (void)timeout_s; (void)cancel; (void)meter;
     *out_result = NULL; *out_len = 0;
     return GPTPS_E_INVAL; /* fork-based isolation is POSIX-only */
 }
@@ -351,10 +351,47 @@ static DWORD WINAPI reader_proc(LPVOID p)
     return 0;
 }
 
+/* The CPU cap (gptps_task_def.cpu_max_millicpus) as the job object's HARD CPU-rate
+ * limit: Windows 8 and later throttle every process in the job to CpuRate / 10000 of
+ * the whole machine. The struct and the class are spelled out here rather than taken
+ * from <winnt.h>, which declares them only for _WIN32_WINNT >= 0x0602 in some SDKs -
+ * and a build targeting an older Windows must still compile and run; there the call
+ * simply fails and the cap is reported as not in force. Windows' I/O rate control is a
+ * single figure for reads and writes together, and per volume, so it cannot keep
+ * io_max_read_bps / io_max_write_bps as declared: those are not set, and the engine
+ * says so rather than enforce something else under their name. 1 if the cap is set. */
+typedef struct {
+    DWORD ControlFlags;
+    DWORD CpuRate;             /* a union in winnt.h; CpuRate is the member used */
+} gptps_win_cpu_rate_info;
+#define GPTPS_WIN_JOB_CPU_RATE_CLASS 15      /* JobObjectCpuRateControlInformation */
+#define GPTPS_WIN_CPU_RATE_ENABLE    0x1u    /* JOB_OBJECT_CPU_RATE_CONTROL_ENABLE */
+#define GPTPS_WIN_CPU_RATE_HARD_CAP  0x4u    /* JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP */
+static unsigned win_cpu_rate(HANDLE job, uint64_t millicpus)
+{
+    gptps_win_cpu_rate_info r;
+    SYSTEM_INFO sys;
+    uint64_t ncpu, rate;
+    GetSystemInfo(&sys);
+    ncpu = sys.dwNumberOfProcessors ? (uint64_t)sys.dwNumberOfProcessors : 1u;
+    /* millicpus of ONE cpu, as a share of all of them in 1/10000ths, rounded up so a
+     * small cap never becomes 0 - which Windows refuses */
+    if (millicpus >= ncpu * 1000u) rate = 10000u;   /* the whole machine, or more: and no overflow below */
+    else                           rate = (millicpus * 10u + ncpu - 1u) / ncpu;
+    if (rate < 1u)     rate = 1u;
+    if (rate > 10000u) rate = 10000u;
+    memset(&r, 0, sizeof r);
+    r.ControlFlags = GPTPS_WIN_CPU_RATE_ENABLE | GPTPS_WIN_CPU_RATE_HARD_CAP;
+    r.CpuRate      = (DWORD)rate;
+    return SetInformationJobObject(job, (JOBOBJECTINFOCLASS)GPTPS_WIN_JOB_CPU_RATE_CLASS, &r, sizeof r) ? 1u : 0u;
+}
+
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                                   gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
+    const uint64_t mem_cap = caps->mem;
+    unsigned cpu_set = 0;              /* the job object took the CPU-rate cap */
     const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
     HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
@@ -390,6 +427,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             jeli.ProcessMemoryLimit = (SIZE_T)mem_cap;
         }
         SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof jeli);
+        if (caps->cpu_millicpus) cpu_set = win_cpu_rate(job, caps->cpu_millicpus);
     }
 
     cmd = build_cmdline(argv);
@@ -415,6 +453,9 @@ return GPTPS_E_NOMEM; }
     CloseHandle(inR); CloseHandle(outW); /* child owns these; parent keeps inW + outR */
 
     if (job && AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
+    /* A cap on a job the program is not in holds nothing. The I/O caps are never set
+     * here (see win_cpu_rate), so the engine reports them as not in force. */
+    caps->applied = (assigned && cpu_set) ? GPTPS_CAP_CPU : 0u;
     ResumeThread(pi.hThread);
 
     wc.h = inW; wc.data = (const char *)payload; wc.len = plen; wc.ioerr = 0;

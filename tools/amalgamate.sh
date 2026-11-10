@@ -39,12 +39,14 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # buildable (addons/CMakeLists.txt builds it, and the suite tests it) but out of the
 # distributed set until a transport - and a user who wants one - exists.
 # tools/check_addon_coverage.sh has a matching exemption.
-ADDONS="await|gptps_await.c|gptps_await.h|blocking wait(handle) on the observer seam
+ADDONS="adapt|gptps_adapt.c|gptps_adapt.h|memory declarations from measured peaks
+await|gptps_await.c|gptps_await.h|blocking wait(handle) on the observer seam
 balance|gptps_balance.c|gptps_balance.h|late-binding load balancer above pool (needs pool)
 durable_queue|gptps_durable_queue.c|gptps_durable_queue.h|crash-durable submission journal
 gpu_quota|gptps_gpu_quota.c|gptps_gpu_quota.h|named-resource admission quota
 orch|gptps_orch.c|gptps_orch.h|run-after / fan-in orchestration
 pool|gptps_pool.c|gptps_pool.h|N-shard engine router (scale-up)
+sched|gptps_sched.c|gptps_sched.h|EDF, aging and fair-share orderings; shed late work
 stats|gptps_stats.c|gptps_stats.h|counters, gauges and latency on the observer seam
 tui|gptps_tui.c|gptps_tui.h|real-time terminal dashboard
 wasm_exec|gptps_wasm_exec.c|gptps_wasm_exec.h|module-as-task, pluggable runtime

@@ -12,20 +12,20 @@
 #include "gptps_internal.h"
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                               gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
-    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel; (void)meter;
+    (void)def; (void)payload; (void)plen; (void)caps; (void)timeout_s; (void)cancel; (void)meter;
     if (out_result) *out_result = 0;
     if (out_len) *out_len = 0;
     return GPTPS_E_IO;   /* no process model in a freestanding build */
 }
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                                   gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
-    (void)def; (void)payload; (void)plen; (void)mem_cap; (void)timeout_s; (void)cancel; (void)meter;
+    (void)def; (void)payload; (void)plen; (void)caps; (void)timeout_s; (void)cancel; (void)meter;
     if (out_result) *out_result = 0;
     if (out_len) *out_len = 0;
     return GPTPS_E_IO;

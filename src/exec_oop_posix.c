@@ -51,6 +51,9 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#  include <dirent.h>    /* /sys/block: the devices io.max is written for */
+#endif
 #if defined(__APPLE__)
 #  include <libproc.h>   /* proc_pidinfo: a running child's resident memory (samples) */
 #endif
@@ -295,24 +298,87 @@ static int cg_write_file(const char *dir, const char *file, const char *val)
     return (w < 0) ? -1 : 0;
 }
 
-/* Create a child cgroup under $GPTPS_CGROUP_PARENT with the cap applied.
- * Returns a malloc'd path (caller frees + rmdirs) or NULL if unavailable. */
-static char *cgroup_create(uint64_t mem_cap)
+static long read_small(const char *dir, const char *file, char *buf, size_t cap);
+
+/* The CPU cap as cpu.max: "<quota> <period>" in microseconds, so `millicpus` of one
+ * CPU is a quota of millicpus/1000 periods. The kernel refuses a quota under 1 ms, so a
+ * smaller cap is raised to that rather than lost. 0 if the controller took it. */
+#define GPTPS_CG_CPU_PERIOD_US 100000u
+static int cgroup_cpu_max(const char *dir, uint64_t millicpus)
+{
+    char val[64];
+    uint64_t quota;
+    if (millicpus > ((uint64_t)1 << 40)) millicpus = (uint64_t)1 << 40;   /* a billion CPUs: no overflow below */
+    quota = millicpus * (GPTPS_CG_CPU_PERIOD_US / 1000u);
+    if (quota < 1000u) quota = 1000u;
+    snprintf(val, sizeof val, "%llu %u", (unsigned long long)quota, GPTPS_CG_CPU_PERIOD_US);
+    return cg_write_file(dir, "cpu.max", val);
+}
+
+/* The I/O caps as io.max, which the kernel keys by block device: one line per whole
+ * disk in /sys/block. A cap the host gives in bytes per second therefore holds on each
+ * device separately - the documented meaning. A device the io controller does not
+ * throttle (a loop or ram disk can refuse) is skipped; the cap is in force if any
+ * device took it. Returns how many did. Parent side, before fork. */
+static unsigned cgroup_io_max(const char *dir, uint64_t rbps, uint64_t wbps)
+{
+    DIR *d = opendir("/sys/block");
+    struct dirent *de;
+    unsigned took = 0;
+    char line[128], r[24], w[24], dev[32];
+    if (!d) return 0;
+    if (rbps) snprintf(r, sizeof r, "%llu", (unsigned long long)rbps); else strcpy(r, "max");
+    if (wbps) snprintf(w, sizeof w, "%llu", (unsigned long long)wbps); else strcpy(w, "max");
+    while ((de = readdir(d)) != NULL) {
+        char sub[300];
+        long len;
+        if (de->d_name[0] == '.') continue;
+        if (snprintf(sub, sizeof sub, "/sys/block/%s", de->d_name) >= (int)sizeof sub) continue;
+        len = read_small(sub, "dev", dev, sizeof dev);      /* "MAJ:MIN\n" */
+        if (len <= 0) continue;
+        dev[strcspn(dev, "\n")] = 0;
+        if (!strchr(dev, ':')) continue;
+        snprintf(line, sizeof line, "%s rbps=%s wbps=%s", dev, r, w);
+        if (cg_write_file(dir, "io.max", line) == 0) ++took;
+    }
+    closedir(d);
+    return took;
+}
+
+/* Create a child cgroup under $GPTPS_CGROUP_PARENT holding the job's caps, and record
+ * in caps->applied which ones it holds. Returns a malloc'd path (caller frees +
+ * rmdirs) or NULL when there is nothing for a cgroup to do.
+ *
+ * Each cap stands on its own: a parent that delegates cpu but not memory still gets
+ * its CPU cap, and the memory cap then falls back to RLIMIT_AS in the child, exactly
+ * as it does with no cgroup (GPTPS_CAP_MEM_CG tells the child which). Before ABI 2.6
+ * the memory cap was the only thing a cgroup was made for, so a parent without the
+ * memory controller meant no cgroup at all - and that is still the outcome when
+ * memory is the only cap asked for. */
+static char *cgroup_create(gptps_exec_caps *caps)
 {
     const char *parent = getenv("GPTPS_CGROUP_PARENT");
     char val[32]; char *dir; size_t n;
+    int want_mem = caps->mem >= GPTPS_OOP_MEMCAP_FLOOR;
+    int want_cpu = caps->cpu_millicpus != 0;
+    int want_io  = caps->io_rbps != 0 || caps->io_wbps != 0;
     if (!parent || !*parent) return NULL;
-    if (mem_cap < GPTPS_OOP_MEMCAP_FLOOR) return NULL;
+    if (!want_mem && !want_cpu && !want_io) return NULL;
     n = strlen(parent) + 48;
     dir = (char *)gptps_malloc(n);
     if (!dir) return NULL;
     snprintf(dir, n, "%s/gptps.%ld.%u", parent, (long)getpid(), cgroup_seq());
     if (mkdir(dir, 0700) != 0) { gptps_free(dir); return NULL; }
-    snprintf(val, sizeof val, "%llu", (unsigned long long)mem_cap);
-    if (cg_write_file(dir, "memory.max", val) != 0) { /* controller not delegated here */
-        rmdir(dir); gptps_free(dir); return NULL;
+    if (want_mem) {
+        snprintf(val, sizeof val, "%llu", (unsigned long long)caps->mem);
+        if (cg_write_file(dir, "memory.max", val) == 0) {   /* else: controller not delegated here */
+            cg_write_file(dir, "memory.swap.max", "0");      /* make the cap a hard ceiling, not swap */
+            caps->applied |= GPTPS_CAP_MEM_CG;
+        }
     }
-    cg_write_file(dir, "memory.swap.max", "0"); /* make the cap a hard ceiling, not swap */
+    if (want_cpu && cgroup_cpu_max(dir, caps->cpu_millicpus) == 0) caps->applied |= GPTPS_CAP_CPU;
+    if (want_io && cgroup_io_max(dir, caps->io_rbps, caps->io_wbps) > 0) caps->applied |= GPTPS_CAP_IO;
+    if (!caps->applied) { rmdir(dir); gptps_free(dir); return NULL; }   /* holds nothing */
     return dir;
 }
 
@@ -387,6 +453,7 @@ static void report_send(int fd, uint32_t stage, int joined, uint64_t hwm_kb)
 typedef struct {
     pid_t        pid;
     const char  *cgdir;      /* the job's cgroup in cgroup mode, else NULL */
+    int          cpu_capped; /* the cgroup holds the job's CPU cap: report its throttling */
     int          host_fork;  /* an OOP job: a copy of the host that never execs */
     int          fd;         /* the report pipe's read end, non-blocking; -1 after EOF */
     int          failed;     /* reading it failed: the attempt fails with GPTPS_E_IO */
@@ -478,7 +545,7 @@ static int kv_find(const char *text, const char *key, uint64_t *out)
  * its names to the fallback. memory.events' `max` counts every time the job reached
  * its cap, page cache filling up to it included; `oom_kill` the times the kernel
  * killed for it. */
-static void cgroup_measure(gptps_exec_meter *mt, const char *dir)
+static void cgroup_measure(gptps_exec_meter *mt, const char *dir, int cpu_capped)
 {
     char buf[4096];
     uint64_t v, w;
@@ -494,6 +561,11 @@ static void cgroup_measure(gptps_exec_meter *mt, const char *dir)
         kv_find(buf, "user_usec", &v) && kv_find(buf, "system_usec", &w)) {
         gptps_meter_put(mt, GPTPS_M_CPU_USER_MS, v / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
         gptps_meter_put(mt, GPTPS_M_CPU_SYS_MS,  w / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
+        /* Only under a CPU cap of the job's own: with the controller on and no cap the
+         * figure is a 0 that says nothing, and its presence is documented as the proof
+         * that the cap was in force. */
+        if (cpu_capped && kv_find(buf, "throttled_usec", &v))
+            gptps_meter_put(mt, GPTPS_M_CPU_THROTTLED_MS, v / 1000u, GPTPS_UNIT_MS, GPTPS_MEASURE_TOTAL, "cgroup.job");
     }
 }
 
@@ -621,7 +693,7 @@ static void meter_finish(gptps_exec_meter *mt, const job_watch *jw, const struct
 {
     if (!mt) return;
 #if defined(__linux__)
-    if (jw_cgroup(jw)) cgroup_measure(mt, jw->cgdir);
+    if (jw_cgroup(jw)) cgroup_measure(mt, jw->cgdir, jw->cpu_capped);
 #endif
 #if GPTPS_HAVE_WAIT4
     if (have_ru) rusage_measure(mt, ru, jw);
@@ -741,13 +813,14 @@ static int read_all(int fd, void *buf, size_t n)
 }
 
 gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                               uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                               gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
+    const uint64_t mem_cap = caps->mem;
     int p[2], rp[2];
     pid_t pid;
 #if defined(__linux__)
-    char *cgdir = cgroup_create(mem_cap);
+    char *cgdir = cgroup_create(caps);
 #endif
 
     *out_result = NULL; *out_len = 0;
@@ -795,7 +868,8 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #if defined(__linux__)
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap */
 #endif
-        if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
+        if (!joined || !(caps->applied & GPTPS_CAP_MEM_CG))
+            apply_as_cap(mem_cap);                             /* coarse fallback */
         report_send(rp[1], REPORT_STARTED, joined, GPTPS_HWM_UNKNOWN);
         close(rp[1]);                                          /* nothing more to report */
         if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook */
@@ -841,6 +915,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         jw.pid = pid; jw.host_fork = 1; jw.fd = rp[0];
 #if defined(__linux__)
         jw.cgdir = cgdir;
+        jw.cpu_capped = (caps->applied & GPTPS_CAP_CPU) != 0;
 #endif
         memset(&ru, 0, sizeof ru);
         sampler_init(&sm, meter);
@@ -919,6 +994,10 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             gptps_free(res); res = NULL; len64 = 0; eff = GPTPS_E_IO;
         }
         meter_finish(meter, &jw, &ru, have_ru);   /* before the cgroup goes */
+        /* A child that said it could not join its cgroup ran under none of its caps. One
+         * that never said (killed before it could) keeps what the cgroup held: the
+         * caps were not refused, so there is nothing to warn about. */
+        if (jw.started && !jw.joined) caps->applied = 0;
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -930,14 +1009,15 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 #define GPTPS_PROG_RESULT_CAP GPTPS_EXEC_RESULT_CAP /* max captured stdout */
 
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
-                                   uint64_t mem_cap, uint32_t timeout_s, const uint32_t *cancel,
+                                   gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
+    const uint64_t mem_cap = caps->mem;
     const char *const *argv = def ? def->argv : NULL;
     int inp[2], outp[2], rp[2];
     pid_t pid;
 #if defined(__linux__)
-    char *cgdir = cgroup_create(mem_cap);
+    char *cgdir = cgroup_create(caps);
 #endif
 
     *out_result = NULL; *out_len = 0;
@@ -1014,7 +1094,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 #if defined(__linux__)
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap before exec */
 #endif
-        if (!joined) apply_as_cap(mem_cap);                    /* coarse fallback */
+        if (!joined || !(caps->applied & GPTPS_CAP_MEM_CG))
+            apply_as_cap(mem_cap);                             /* coarse fallback */
         report_send(rp[1], REPORT_STARTED, joined, GPTPS_HWM_UNKNOWN);
         if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook (chdir/seccomp/drop-privs/...) */
 #if defined(__linux__)
@@ -1051,6 +1132,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         jw.pid = pid; jw.fd = rp[0];
 #if defined(__linux__)
         jw.cgdir = cgdir;
+        jw.cpu_capped = (caps->applied & GPTPS_CAP_CPU) != 0;
 #endif
         memset(&ru, 0, sizeof ru);
         sampler_init(&sm, meter);
@@ -1184,6 +1266,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (jw.fd >= 0) exec_close(jw.fd);         /* a write end lives on elsewhere */
         if (jw.failed && eff == GPTPS_OK) eff = GPTPS_E_IO;   /* our own pipe failed us */
         meter_finish(meter, &jw, &ru, have_ru);   /* before the cgroup goes */
+        /* A child that said it could not join its cgroup ran under none of its caps. One
+         * that never said (killed before it could) keeps what the cgroup held: the
+         * caps were not refused, so there is nothing to warn about. */
+        if (jw.started && !jw.joined) caps->applied = 0;
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif

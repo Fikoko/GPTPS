@@ -94,6 +94,12 @@ typedef struct gptps_item {
                                       * `outcome` (never-ran vs cancelled-while-running is this
                                       * flag's half of that question). */
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
+    uint64_t              cpu_cap;   /* gptps_task_def.cpu_max_millicpus, read at submit as `cost` is */
+    uint64_t              io_rcap, io_wcap; /* io_max_read_bps / io_max_write_bps, likewise */
+    uint64_t              due_ms;    /* GPTPS_SUBMIT_DEADLINE: when it is due, monotonic; 0 = none. An
+                                      * ordering INPUT for the scheduler / constraint seams, never acted
+                                      * on here - `deadline_ms` above is the attempt's timeout, a
+                                      * different thing that the watchdog does enforce */
     uint64_t             *res_reserved; /* named-resource amounts reserved at admit (length res_n); freed+NULLed at release (done-drain), else at item_free */
     size_t                res_n;
     struct gptps_item    *next;
@@ -126,6 +132,7 @@ typedef struct gptps_reg {
     bool               service;    /* true => GPTPS_TASK_SERVICE: supervised long-running instances (restart-on-exit) */
     bool               retire_on_ok;/* service only: a clean GPTPS_OK return retires the instance instead of restarting it */
     const void        *load_tag;   /* the add-on load whose setup registered it (e->setup_tag), else NULL */
+    unsigned           cap_warned; /* GPTPS_CAP_* already reported as not in force (one WARN each) */
     uint64_t           settling_tid;/* while settling: the thread registering it, which does see it */
     gptps_task_local  *locals;     /* owned generic per-task setting cells */
     uint64_t          *res_cost;   /* per-item cost per named resource (length engine->nres; NULL if nres==0) */
@@ -1073,6 +1080,37 @@ static void emit_sample(gptps_exec_meter *mt, const gptps_measure *cur, size_t n
  * gptps_set_event_cb cannot pair a new callback with a stale user_data. */
 /* `slot` is the executing thread's: a worker's index, or nworkers for gptps_step. It
  * picks the thread's result buffer on a bounded engine. */
+/* A cap the host asked for and the executor could not put in force is said once per
+ * task type, never silently dropped, and never fatal (see cpu_max_millicpus). Runs on
+ * the executing thread with e->m released; takes it only to mark what was said. */
+static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
+{
+    unsigned want = 0, fresh;
+    char msg[400];
+    if (it->cpu_cap)                 want |= GPTPS_CAP_CPU;
+    if (it->io_rcap || it->io_wcap)  want |= GPTPS_CAP_IO;
+    want &= ~caps->applied;
+    if (!want || !it->reg) return;
+    gptps_mutex_lock(e->m);
+    fresh = want & ~it->reg->cap_warned;
+    it->reg->cap_warned |= want;
+    gptps_mutex_unlock(e->m);
+    if (fresh & GPTPS_CAP_CPU) {
+        snprintf(msg, sizeof msg, "task '%s': cpu_max_millicpus=%llu is not enforced here - it needs "
+                 "GPTPS_CGROUP_PARENT naming a cgroup v2 parent with the cpu controller delegated "
+                 "(Linux), or a Windows job object; the job runs without a CPU cap",
+                 item_name(it), (unsigned long long)it->cpu_cap);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    if (fresh & GPTPS_CAP_IO) {
+        snprintf(msg, sizeof msg, "task '%s': io_max_read_bps=%llu / io_max_write_bps=%llu are not enforced "
+                 "here - they need GPTPS_CGROUP_PARENT naming a cgroup v2 parent with the io controller "
+                 "delegated (Linux); the job runs without an I/O cap",
+                 item_name(it), (unsigned long long)it->io_rcap, (unsigned long long)it->io_wcap);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+}
+
 static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *ud, unsigned slot)
 {
     gptps_pending_ev p;
@@ -1083,6 +1121,7 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     bool inproc = (it->def->exec == GPTPS_EXEC_INPROC);
     bool raised = false;           /* the cancel flag, read ONCE after the attempt */
     exec_sampler sp;               /* a process job's measurements (docs/MEASUREMENTS.md) */
+    gptps_exec_caps caps;          /* what a process job may use; the executor says what held */
 
     p.handle = it->handle; ev_set_name(p.name, item_name(it)); p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
     p.result = NULL; p.result_len = 0; p.flags = 0;
@@ -1092,6 +1131,9 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     sp.e = e; sp.cb = cb; sp.ud = ud; sp.p = &p;
     sp.meter.sample_ms = gptps_hal_load_acquire_u32(&e->sample_ms);
     sp.meter.sample = emit_sample;
+    memset(&caps, 0, sizeof caps);
+    caps.mem = it->cost.mem_bytes;
+    caps.cpu_millicpus = it->cpu_cap; caps.io_rbps = it->io_rcap; caps.io_wbps = it->io_wcap;
 
     if (inproc) {
         /* in-process path: cooperative cancel via the deadline flag */
@@ -1120,13 +1162,15 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed.
          * it->cancel lets gptps_cancel / shutdown / removal hard-kill the child. */
         st = gptps_oop_execute(it->def, it->payload, it->payload_len,
-                               it->cost.mem_bytes, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len,
+                               &caps, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len,
                                &sp.meter);
+        caps_report(e, it, &caps);
     } else if (it->def->exec == GPTPS_EXEC_PROGRAM) {
         /* enforced path: fork+exec an external program; payload->stdin, stdout->result */
         st = gptps_program_execute(it->def, it->payload, it->payload_len,
-                                   it->cost.mem_bytes, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len,
+                                   &caps, it->policy.timeout_seconds, &it->cancel, &oop_res, &oop_len,
                                    &sp.meter);
+        caps_report(e, it, &caps);
     } else {
         /* Unreachable: gptps_register_task rejects an out-of-range exec kind. This is a
          * hard stop rather than the fallthrough it replaces, and the difference matters
@@ -1426,6 +1470,8 @@ static gptps_admit_decision run_constraints(gptps *e, gptps_item *it, uint32_t *
     in.handle      = it->handle;
     in.payload     = it->payload;
     in.payload_len = it->payload_len;
+    in.deadline_ms = it->due_ms;
+    in.now_ms      = gptps_hal_monotonic_ms();
     for (c = e->constraints; c; c = c->next) {
         uint32_t ra = 0;
         gptps_admit_decision d = c->fn(&in, &ra, c->ud);
@@ -1834,6 +1880,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                 si.handle = cur->handle;         si.priority = cur->priority;
                 si.attempt = cur->attempt;       si.enqueue_ms = cur->enqueue_ms;
                 si.payload = cur->payload;       si.payload_len = cur->payload_len;
+                si.deadline_ms = cur->due_ms;
                 cur->sched_score = e->sched_fn(&si, e->sched_ud);
             }
             intake_resort(e);   /* the keys just changed, so the order has to be rebuilt */
@@ -2144,6 +2191,12 @@ static size_t       st_rd_backoff(void *t, char *b, size_t c) { gptps_reg *r = (
 static gptps_status st_wr_backoff(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.default_policy.retry_backoff_seconds = (uint32_t)strtoul(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
 static size_t       st_rd_mem(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u64(b, c, r->def.default_cost.mem_bytes); TASK_UNLOCK(r); return n; }
 static gptps_status st_wr_mem(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.default_cost.mem_bytes = (uint64_t)strtoull(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_cpu(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u64(b, c, r->def.cpu_max_millicpus); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_cpu(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.cpu_max_millicpus = (uint64_t)strtoull(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_iord(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u64(b, c, r->def.io_max_read_bps); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_iord(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.io_max_read_bps = (uint64_t)strtoull(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
+static size_t       st_rd_iowr(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_u64(b, c, r->def.io_max_write_bps); TASK_UNLOCK(r); return n; }
+static gptps_status st_wr_iowr(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->def.io_max_write_bps = (uint64_t)strtoull(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
 static size_t       st_rd_prio(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; size_t n; TASK_LOCK(r); n = rd_i32(b, c, r->priority); TASK_UNLOCK(r); return n; }
 static gptps_status st_wr_prio(void *t, const char *v) { gptps_reg *r = (gptps_reg *)t; TASK_LOCK(r); r->priority = (int32_t)strtol(v, NULL, 10); TASK_UNLOCK(r); return GPTPS_OK; }
 static size_t       st_rd_onfail(void *t, char *b, size_t c) { gptps_reg *r = (gptps_reg *)t; const char *s; TASK_LOCK(r);
@@ -2197,6 +2250,17 @@ static const task_key TASK_KEYS[] = {
     { "on_failure",            GPTPS_SETTING_ENUM, 0, 0, 0, ONFAIL_CHOICES,
       "once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it",
       st_rd_onfail, st_wr_onfail },
+    /* ABI 2.6: the process executors' CPU and I/O caps (gptps_task_def). Appended, so
+     * the table's existing order - which a saved file follows - does not move. */
+    { "cpu_max_millicpus",     GPTPS_SETTING_UINT, 0, 0, 0, NULL,
+      "CPU a process job (oop/program) may use, in thousandths of one CPU; throttled past it, never killed. "
+      "Enforced in cgroup mode and on Windows; elsewhere warned once. 0 = no cap", st_rd_cpu, st_wr_cpu },
+    { "io_max_read_bps",       GPTPS_SETTING_UINT, 0, 0, 0, NULL,
+      "block-device reads a process job may make, bytes/s on each device; enforced in cgroup mode only, "
+      "elsewhere warned once. 0 = no cap", st_rd_iord, st_wr_iord },
+    { "io_max_write_bps",      GPTPS_SETTING_UINT, 0, 0, 0, NULL,
+      "block-device writes a process job may make, bytes/s on each device; enforced in cgroup mode only, "
+      "elsewhere warned once. 0 = no cap", st_rd_iowr, st_wr_iowr },
 };
 #define N_TASK_KEYS (sizeof TASK_KEYS / sizeof TASK_KEYS[0])
 
@@ -2875,6 +2939,9 @@ static void task_key_put(const task_key *k, const char *v, gptps_task_def *def, 
     else if (!strcmp(k->leaf, "retry_backoff_seconds")) def->default_policy.retry_backoff_seconds = (uint32_t)strtoull(v, NULL, 10);
     else if (!strcmp(k->leaf, "mem_bytes"))             def->default_cost.mem_bytes = (uint64_t)strtoull(v, NULL, 10);
     else if (!strcmp(k->leaf, "priority"))              *priority = (int32_t)strtoll(v, NULL, 10);
+    else if (!strcmp(k->leaf, "cpu_max_millicpus"))     def->cpu_max_millicpus = (uint64_t)strtoull(v, NULL, 10);
+    else if (!strcmp(k->leaf, "io_max_read_bps"))       def->io_max_read_bps = (uint64_t)strtoull(v, NULL, 10);
+    else if (!strcmp(k->leaf, "io_max_write_bps"))      def->io_max_write_bps = (uint64_t)strtoull(v, NULL, 10);
     else if (!strcmp(k->leaf, "on_failure"))
         def->default_policy.on_failure = !strcmp(v, "drop")    ? GPTPS_ON_FAILURE_DROP
                                        : !strcmp(v, "requeue") ? GPTPS_ON_FAILURE_REQUEUE
@@ -4574,13 +4641,10 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
         gptps_mutex_unlock(e->m);
         if (bad) return GPTPS_E_INVAL;
     }
-    {   /* reject collisions with the six built-in per-task leaves (they are not in
-         * task_schemas, so they would otherwise pass the dup check yet fail to materialize) */
-        static const char *const BUILTIN[] = { "timeout_seconds", "max_retries", "retry_backoff_seconds",
-                                               "mem_bytes", "priority", "on_failure", 0 };
-        const char *const *b;
-        for (b = BUILTIN; *b; ++b) if (strcmp(*b, leaf) == 0) return GPTPS_E_DUP;
-    }
+    /* reject collisions with the built-in per-task leaves (they are not in task_schemas,
+     * so they would otherwise pass the dup check yet fail to materialize). TASK_KEYS is
+     * the list: a second, hand-kept copy here went stale the day a leaf was added. */
+    if (task_key_find(leaf)) return GPTPS_E_DUP;
     if (type == GPTPS_SETTING_ENUM) {
         if (!constraint || !*constraint) return GPTPS_E_CONFIG;
         choices = parse_choices(constraint);
@@ -5550,6 +5614,9 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     it->def = &r->def;
     it->reg = r;
     it->cost = cost;
+    it->cpu_cap = r->def.cpu_max_millicpus;    /* zero-filled for a pre-2.6 def at registration */
+    it->io_rcap = r->def.io_max_read_bps;
+    it->io_wcap = r->def.io_max_write_bps;
     it->policy = r->def.default_policy;
     it->priority = r->priority;
     it->skips = 0;
@@ -5561,6 +5628,15 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         if (opts->flags & GPTPS_SUBMIT_PRIORITY)   it->priority = opts->priority;
         if (opts->flags & GPTPS_SUBMIT_POLICY)     it->policy = opts->policy;
         if (opts->flags & GPTPS_SUBMIT_TIMEOUT_MS) it->timeout_ms_override = opts->timeout_ms;
+        /* An appended field: a 2.5 caller's struct does not carry it, and setting the
+         * flag cannot make it - its bytes past the end are not its. Ignored then,
+         * rather than refused, as any flag the caller's struct cannot back would be. */
+        if ((opts->flags & GPTPS_SUBMIT_DEADLINE) && GPTPS_STRUCT_HAS(gptps_submit_options, opts, deadline_in_ms)) {
+            /* saturate rather than wrap: an absurd "due in" must order last, not first */
+            uint64_t due = it->enqueue_ms + opts->deadline_in_ms;
+            if (due < it->enqueue_ms) due = UINT64_MAX;
+            it->due_ms = due ? due : 1u;   /* 0 is "none": a clock that starts at 0 must not erase it */
+        }
     }
     it->sched_score = it->priority;   /* default ordering key; a scheduler hook re-scores per pass */
     if (r->service) {

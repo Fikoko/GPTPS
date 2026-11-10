@@ -307,13 +307,16 @@ int main(void)
     CHECK(has_key(e, "stats.dead_letters_evicted"));
     CHECK(has_key(e, "scheduler.reserve_after_skips"));
 
-    /* a task adds its six knobs */
+    /* a task adds its nine knobs: six, and the three process caps of ABI 2.6 */
     reg(e, "work");
-    CHECK(gptps_settings_count(e) == core_n + 6);
+    CHECK(gptps_settings_count(e) == core_n + 9);
     CHECK(has_key(e, "tasks.work.timeout_seconds"));
     CHECK(has_key(e, "tasks.work.on_failure"));
+    CHECK(has_key(e, "tasks.work.cpu_max_millicpus"));
+    CHECK(has_key(e, "tasks.work.io_max_read_bps"));
+    CHECK(has_key(e, "tasks.work.io_max_write_bps"));
     reg(e, "bulk");
-    CHECK(gptps_settings_count(e) == core_n + 12);
+    CHECK(gptps_settings_count(e) == core_n + 18);
 
     /* get a default */
     CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", buf, sizeof buf) == GPTPS_OK);
