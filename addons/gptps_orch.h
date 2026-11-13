@@ -95,6 +95,19 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
                               const gptps_handle *deps, size_t ndeps,
                               gptps_handle *out);
 
+/* gptps_orch_after with gptps_submit_ex's per-item options (NULL: identical to it):
+ * priority, failure policy, timeout, and a due time (GPTPS_SUBMIT_DEADLINE). A held
+ * gate keeps them until it is released. The due time counts from THIS call, not from
+ * the release: it is held as an absolute time and handed over as what is left of it,
+ * so work that waited for its dependencies past its due time is submitted due now -
+ * where a deadline-first scheduler puts it first, and a shed-late constraint
+ * (addons/gptps_sched) may refuse it. GPTPS_E_INVAL for an `opts` smaller than
+ * gptps_submit_ex accepts. */
+gptps_status gptps_orch_after_ex(gptps_orch *o, const char *task,
+                                 const void *payload, size_t len,
+                                 const gptps_handle *deps, size_t ndeps,
+                                 const gptps_submit_options *opts, gptps_handle *out);
+
 /* Number of gates not yet released: still waiting on a dependency, or waiting on a
  * retry of a submission the engine transiently rejected.
  *

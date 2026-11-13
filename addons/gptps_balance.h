@@ -72,7 +72,19 @@ typedef struct {
                                 * open - after a live write, the value for the shard's
                                 * NEXT open, so pass the depth explicitly then. Set it
                                 * to exactly max_concurrent_tasks for no prefetch. */
+    /* 1.8: OR of GPTPS_BALANCE_* (0 = as before). Read only when struct_size covers it.
+     * uint64_t so that it grows the struct: a uint32_t would sit in the 64-bit tail
+     * padding after shard_depth, where an older caller's struct_size already reaches. */
+    uint64_t flags;
 } gptps_balance_config;
+
+/* Order the router's own queue by DUE TIME (gptps_balance_submit_opts with
+ * GPTPS_SUBMIT_DEADLINE), earliest first, ahead of work with none, and only then by
+ * priority - the order addons/gptps_sched's EDF gives the shards. Without it the
+ * router orders by priority alone, and under a backlog that is the order that counts:
+ * a shard holds only its shard_depth, so most work waits HERE, where an EDF scheduler
+ * on the shards cannot see it. Set it whenever the shards run deadline-first. */
+#define GPTPS_BALANCE_BY_DEADLINE 0x1u
 
 /* Open above a pool. Registers one observer on every shard and reads each shard's
  * limits.max_concurrent_tasks. Call BEFORE submitting work to the pool (observer
@@ -91,6 +103,19 @@ gptps_status gptps_balance_submit(gptps_balance *b, const char *task,
 gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
                                      const void *payload, size_t len, int32_t priority,
                                      gptps_balance_handle *out);
+
+/* With gptps_submit_ex's full per-item options (NULL: identical to
+ * gptps_balance_submit): priority (GPTPS_SUBMIT_PRIORITY orders the router's queue, as
+ * _ex's argument does), failure policy, timeout and due time, all handed to the shard
+ * the item is dispatched to. A due time counts from THIS call: it is held as an
+ * absolute time while the item waits here, and the shard gets what is left of it (0,
+ * "due now", once it has passed). To have the router order by it too, open with
+ * GPTPS_BALANCE_BY_DEADLINE. GPTPS_E_INVAL for an `opts` smaller than gptps_submit_ex
+ * accepts. */
+gptps_status gptps_balance_submit_opts(gptps_balance *b, const char *task,
+                                       const void *payload, size_t len,
+                                       const gptps_submit_options *opts,
+                                       gptps_balance_handle *out);
 
 /* Cancel. Still queued here => removed, one terminal FAILED/E_CANCELLED event.
  * Already dispatched => forwarded to the shard (gptps_cancel). */

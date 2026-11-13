@@ -72,6 +72,18 @@ gptps_status gptps_pool_submit(gptps_pool *p, const char *task,
 gptps_status gptps_pool_submit_keyed(gptps_pool *p, uint64_t key, const char *task,
                                      const void *payload, size_t len, gptps_pool_handle *out);
 
+/* The same two, with gptps_submit_ex's per-item options (NULL: identical to the plain
+ * forms): priority, failure policy, timeout, and the due time a scheduler such as
+ * addons/gptps_sched's EDF orders by (GPTPS_SUBMIT_DEADLINE). The chosen shard gets
+ * them unchanged, at once, so a due time counts from this call. Returns the shard's
+ * gptps_submit_ex status (GPTPS_E_INVAL for an undersized `opts`). */
+gptps_status gptps_pool_submit_ex(gptps_pool *p, const char *task,
+                                  const void *payload, size_t len,
+                                  const gptps_submit_options *opts, gptps_pool_handle *out);
+gptps_status gptps_pool_submit_keyed_ex(gptps_pool *p, uint64_t key, const char *task,
+                                        const void *payload, size_t len,
+                                        const gptps_submit_options *opts, gptps_pool_handle *out);
+
 /* Cancel a work item by its pool handle (routes to the owning shard). GPTPS_E_INVAL
  * on a malformed handle; otherwise the shard's gptps_cancel status. */
 gptps_status gptps_pool_cancel(gptps_pool *p, gptps_pool_handle h);

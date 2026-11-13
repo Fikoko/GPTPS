@@ -8,7 +8,9 @@
  * xport threads are none. Then one READER thread per link is started in the parent.
  *
  * Wire (native-endian, unversioned: both ends are the same forked binary):
- *   request  [u64 id][u32 tlen][task][u64 plen][payload]
+ *   request  [u64 id][u32 tlen][task][u64 plen][payload][u32 olen][options]
+ *            olen is 0, or sizeof(gptps_submit_options): the same binary's struct, as
+ *            gptps_xport_submit_opts was given it (see there).
  *   reply    [u64 id][i32 status][u64 rlen][result][u32 mlen][measurements]
  * The measurements (docs/MEASUREMENTS.md) are those of the item's last attempt, as
  * meas_encode lays them out; mlen is 0 when there are none, as in handler mode.
@@ -49,6 +51,7 @@
 #include "gptps_xport.h"
 #include "addon_compat.h"
 
+#include <stddef.h>   /* offsetof: an options struct's appended fields */
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -211,10 +214,11 @@ static int write_reply(int fd, uint64_t id, int32_t st, const void *res, uint64_
 
 /* Read one request. Returns 0 with malloc'd task and payload, -1 on EOF/error/bad
  * length (the caller drops the link: a stream cannot resynchronise mid-frame). */
-static int read_request(int fd, uint64_t *id, char **task, void **payload, uint64_t *plen)
+static int read_request(int fd, uint64_t *id, char **task, void **payload, uint64_t *plen,
+                        gptps_submit_options *opts, int *has_opts)
 {
-    uint32_t tlen = 0;
-    *task = NULL; *payload = NULL; *plen = 0;
+    uint32_t tlen = 0, olen = 0;
+    *task = NULL; *payload = NULL; *plen = 0; *has_opts = 0;
     if (sock_read_all(fd, id, sizeof *id) != 0) return -1;
     if (sock_read_all(fd, &tlen, sizeof tlen) != 0) return -1;
     if (tlen > GPTPS_XPORT_MAX_MSG) return -1;
@@ -228,6 +232,12 @@ static int read_request(int fd, uint64_t *id, char **task, void **payload, uint6
             free(*task); free(*payload); *task = NULL; *payload = NULL; return -1;
         }
     }
+    /* Any other length is a frame this binary did not write: the stream is lost. */
+    if (sock_read_all(fd, &olen, sizeof olen) != 0 || (olen != 0 && olen != sizeof *opts) ||
+        (olen && sock_read_all(fd, opts, olen) != 0)) {
+        free(*task); free(*payload); *task = NULL; *payload = NULL; return -1;
+    }
+    *has_opts = olen != 0;
     return 0;
 }
 
@@ -240,8 +250,10 @@ static void worker_handler_main(int fd, gptps_xport_run_fn run, void *ud)
         uint64_t id, plen, rl;
         char *task; void *payload, *res = NULL; size_t rlen = 0;
         int32_t st32;
+        gptps_submit_options opts;   /* handler mode has no engine to apply them: unused */
+        int has_opts;
 
-        if (read_request(fd, &id, &task, &payload, &plen) != 0) break;   /* EOF => shut down */
+        if (read_request(fd, &id, &task, &payload, &plen, &opts, &has_opts) != 0) break;   /* EOF => shut down */
         st32 = (int32_t)run(task, payload, (size_t)plen, &res, &rlen, ud);
         rl = (uint64_t)rlen;
         if (rl > GPTPS_XPORT_MAX_MSG) {
@@ -366,8 +378,10 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
         char *task; void *payload;
         gptps_handle h = 0;
         gptps_status st;
+        gptps_submit_options opts;
+        int has_opts;
 
-        if (read_request(fd, &id, &task, &payload, &plen) != 0) break;   /* EOF => drain + exit */
+        if (read_request(fd, &id, &task, &payload, &plen, &opts, &has_opts) != 0) break;   /* EOF => drain + exit */
 
         /* Hold mmu ACROSS the submit and the insert: a fast task could otherwise
          * reach its terminal event before its handle is in the table, and the
@@ -381,7 +395,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
             if (nt) { c.tab = nt; c.cap = nc; }
         }
         if (c.n < c.cap) {
-            st = gptps_submit(e, task, payload, (size_t)plen, &h);
+            st = gptps_submit_ex(e, task, payload, (size_t)plen, has_opts ? &opts : NULL, &h);
             if (st == GPTPS_OK) {
                 c.tab[c.n].h = h; c.tab[c.n].id = id; c.tab[c.n].meas = NULL; c.tab[c.n].mlen = 0;
                 c.n += 1;
@@ -703,11 +717,13 @@ size_t gptps_xport_in_flight(gptps_xport *xp)
  * could take it back, the reader completes it with E_IO instead. Either way the
  * caller gets exactly one outcome - a non-OK return here, or one completion. */
 static gptps_status send_request(gptps_xport *xp, const char *task, const void *payload,
-                                 size_t len, pending *p, xport_worker **out_w, uint64_t *out_id)
+                                 size_t len, const gptps_submit_options *opts,
+                                 pending *p, xport_worker **out_w, uint64_t *out_id)
 {
     xport_worker *w;
     size_t tl, wi;
-    uint32_t tlen;
+    uint32_t tlen, olen = 0;
+    gptps_submit_options o;
     uint64_t plen, id;
     int ok, is_async;
 
@@ -720,6 +736,17 @@ static gptps_status send_request(gptps_xport *xp, const char *task, const void *
     if ((uint64_t)len > GPTPS_XPORT_MAX_MSG) return GPTPS_E_INVAL;
     tlen = (uint32_t)tl;
     plen = (uint64_t)len;
+    if (opts) {
+        /* A caller's struct, of whatever version, sent as this binary's full one: the
+         * worker is this binary too, and reads exactly that. */
+        size_t n;
+        if (opts->struct_size < offsetof(gptps_submit_options, timeout_ms) + sizeof(uint32_t)) return GPTPS_E_INVAL;
+        memset(&o, 0, sizeof o);
+        n = opts->struct_size < sizeof o ? opts->struct_size : sizeof o;
+        memcpy(&o, opts, n);
+        o.struct_size = sizeof o;
+        olen = (uint32_t)sizeof o;
+    }
 
     wi = next_rr(xp);
     if (wi == (size_t)-1) return GPTPS_E_IO;      /* every worker has been retired */
@@ -747,7 +774,9 @@ static gptps_status send_request(gptps_xport *xp, const char *task, const void *
          sock_write_all(w->fd, &tlen, sizeof tlen) == 0 &&
          sock_write_all(w->fd, task, tlen) == 0 &&
          sock_write_all(w->fd, &plen, sizeof plen) == 0 &&
-         (len == 0 || sock_write_all(w->fd, payload, len) == 0);
+         (len == 0 || sock_write_all(w->fd, payload, len) == 0) &&
+         sock_write_all(w->fd, &olen, sizeof olen) == 0 &&
+         (olen == 0 || sock_write_all(w->fd, &o, olen) == 0);
     if (!ok) shutdown(w->fd, SHUT_RDWR);          /* half a frame is on the wire: retire the link */
     apx_mutex_unlock(&w->wmu);
 
@@ -814,7 +843,7 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     if (xp && on_reader_thread(xp)) return GPTPS_E_BUSY;
 
     memset(&p, 0, sizeof p);
-    st = send_request(xp, task, payload, len, &p, &w, &id);
+    st = send_request(xp, task, payload, len, NULL, &p, &w, &id);
     if (st != GPTPS_OK) return st;
 
     apx_mutex_lock(&w->pmu);
@@ -832,6 +861,13 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
 gptps_status gptps_xport_submit_ex(gptps_xport *xp, const char *task,
                                    const void *payload, size_t len, gptps_xport_reply *out)
 {
+    return gptps_xport_submit_opts(xp, task, payload, len, NULL, out);
+}
+
+gptps_status gptps_xport_submit_opts(gptps_xport *xp, const char *task,
+                                     const void *payload, size_t len,
+                                     const gptps_submit_options *opts, gptps_xport_reply *out)
+{
     pending p;
     xport_worker *w = NULL;
     gptps_status st;
@@ -844,7 +880,7 @@ gptps_status gptps_xport_submit_ex(gptps_xport *xp, const char *task,
     if (xp && on_reader_thread(xp)) return GPTPS_E_BUSY;   /* see gptps_xport_submit */
 
     memset(&p, 0, sizeof p);
-    st = send_request(xp, task, payload, len, &p, &w, &id);
+    st = send_request(xp, task, payload, len, opts, &p, &w, &id);
     if (st != GPTPS_OK) return st;
 
     apx_mutex_lock(&w->pmu);
@@ -886,7 +922,7 @@ gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
     p = (pending *)calloc(1, sizeof *p);
     if (!p) return GPTPS_E_NOMEM;
     p->is_async = 1; p->cb = cb; p->ud = user_data;
-    st = send_request(xp, task, payload, len, p, &w, &id);
+    st = send_request(xp, task, payload, len, NULL, p, &w, &id);
     if (st != GPTPS_OK) { free(p); return st; }
     /* Do not touch `p` from here: the reader may already have completed and freed it. */
     if (out_request_id) *out_request_id = id;
@@ -898,6 +934,15 @@ gptps_status gptps_xport_submit_async_ex(gptps_xport *xp, const char *task,
                                          gptps_xport_reply_ex_fn cb, void *user_data,
                                          uint64_t *out_request_id)
 {
+    return gptps_xport_submit_async_opts(xp, task, payload, len, NULL, cb, user_data, out_request_id);
+}
+
+gptps_status gptps_xport_submit_async_opts(gptps_xport *xp, const char *task,
+                                           const void *payload, size_t len,
+                                           const gptps_submit_options *opts,
+                                           gptps_xport_reply_ex_fn cb, void *user_data,
+                                           uint64_t *out_request_id)
+{
     pending *p;
     xport_worker *w = NULL;
     gptps_status st;
@@ -908,7 +953,7 @@ gptps_status gptps_xport_submit_async_ex(gptps_xport *xp, const char *task,
     p = (pending *)calloc(1, sizeof *p);
     if (!p) return GPTPS_E_NOMEM;
     p->is_async = 1; p->cb_ex = cb; p->ud = user_data;
-    st = send_request(xp, task, payload, len, p, &w, &id);
+    st = send_request(xp, task, payload, len, opts, p, &w, &id);
     if (st != GPTPS_OK) { free(p); return st; }
     if (out_request_id) *out_request_id = id;      /* `p` may already be gone: see above */
     return GPTPS_OK;
