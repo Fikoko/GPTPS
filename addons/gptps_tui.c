@@ -14,6 +14,7 @@
 #endif
 #include "gptps_tui.h"
 
+#include <stddef.h>   /* offsetof: the appended fields of option and dead-letter structs */
 #include <stdlib.h>
 #include <string.h>
 #include <locale.h>   /* the decimal point, for numbers shown as they are typed */
@@ -57,6 +58,8 @@ typedef struct {
     int      hotkey;
     void    *payload;
     size_t   plen;
+    int      has_opts;                 /* gptps_tui_add_task_ex: the hotkey submits with these */
+    gptps_submit_options opts;
     unsigned started, finished, failed, retried, dead, dropped;
     uint64_t lat_sum_ms, lat_max_ms;   /* queue->finish latency accumulators */
     unsigned lat_n;
@@ -894,7 +897,17 @@ typedef struct { gptps *e; size_t ok, dropped; } tui_resubmit_ctx;
 static void tui_resubmit(const gptps_dead_letter *dl, void *ud)
 {
     tui_resubmit_ctx *c = (tui_resubmit_ctx *)ud; gptps_handle h;
-    if (gptps_submit(c->e, dl->task_name, dl->payload, dl->payload_len, &h) == GPTPS_OK) c->ok++;
+    gptps_submit_options o;
+    const gptps_submit_options *op = NULL;
+    /* Re-drive it as it was submitted: its own priority, policy and timeout
+     * (gptps_dead_letter.options). Not its due time once that has passed - the operator
+     * asked for it to run, and a shed-late constraint would only refuse it again. */
+    if (dl->struct_size >= offsetof(gptps_dead_letter, options) + sizeof dl->options && dl->options.flags) {
+        o = dl->options;
+        if ((o.flags & GPTPS_SUBMIT_DEADLINE) && o.deadline_in_ms == 0) o.flags &= ~(unsigned)GPTPS_SUBMIT_DEADLINE;
+        if (o.flags) op = &o;
+    }
+    if (gptps_submit_ex(c->e, dl->task_name, dl->payload, dl->payload_len, op, &h) == GPTPS_OK) c->ok++;
     else c->dropped++;
 }
 
@@ -1072,6 +1085,8 @@ int gptps_tui_press(gptps_tui *t, int key)
     const void *pl = NULL;
     size_t pn = 0;
     int i;
+    gptps_submit_options ko;
+    int has_ko = 0;
     if (!t) return 0;
     if (t->pane == TUI_PANE_SETTINGS) return settings_press(t, key);   /* settings editor handles its own keys */
     if (t->pane == TUI_PANE_TASKS)    return tasks_press(t, key);
@@ -1088,9 +1103,18 @@ int gptps_tui_press(gptps_tui *t, int key)
     if (key == '?') { t->pane = TUI_PANE_HELP; return 4; }      /* open the help overlay */
     mu_lock(&t->mu);
     for (i = 0; i < t->ntasks; ++i)
-        if (t->tasks[i].hotkey == key) { name = t->tasks[i].name; label = t->tasks[i].label; pl = t->tasks[i].payload; pn = t->tasks[i].plen; break; }
+        if (t->tasks[i].hotkey == key) {
+            name = t->tasks[i].name; label = t->tasks[i].label; pl = t->tasks[i].payload; pn = t->tasks[i].plen;
+            if ((has_ko = t->tasks[i].has_opts) != 0) ko = t->tasks[i].opts;   /* a copy: used unlocked */
+            break;
+        }
     mu_unlock(&t->mu);                 /* submit OUTSIDE the lock: QUEUED fires our observer */
-    if (name) { gptps_handle h; gptps_submit(t->e, name, pl, pn, &h); toast(t, "submitted %s", label ? label : name); return 1; }
+    if (name) {                        /* a due time counts from this press */
+        gptps_handle h;
+        gptps_submit_ex(t->e, name, pl, pn, has_ko ? &ko : NULL, &h);
+        toast(t, "submitted %s", label ? label : name);
+        return 1;
+    }
     if (key == 'm' || key == 'M') {                 /* cycle KPI level (configure cost live) */
         int nk; mu_lock(&t->mu); nk = (t->kpi >= GPTPS_TUI_KPI_FULL) ? GPTPS_TUI_KPI_MINIMAL : t->kpi + 1; mu_unlock(&t->mu);
         gptps_tui_set_kpi(t, (gptps_tui_kpi)nk); toast(t, "kpi -> %s", kpi_str(nk)); return 3;
@@ -1110,9 +1134,25 @@ int gptps_tui_press(gptps_tui *t, int key)
 gptps_status gptps_tui_add_task(gptps_tui *t, const char *task_name, const char *label,
                                 int hotkey, const void *payload, size_t len)
 {
+    return gptps_tui_add_task_ex(t, task_name, label, hotkey, payload, len, NULL);
+}
+
+gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const char *label,
+                                   int hotkey, const void *payload, size_t len,
+                                   const gptps_submit_options *opts)
+{
     tui_task *tk;
     void *cp = NULL;
+    gptps_submit_options o;
     if (!t || !task_name) return GPTPS_E_INVAL;
+    if (opts) {                        /* an older caller's struct: copy what it has, the rest 0 */
+        size_t n;
+        if (opts->struct_size < offsetof(gptps_submit_options, timeout_ms) + sizeof(uint32_t)) return GPTPS_E_INVAL;
+        memset(&o, 0, sizeof o);
+        n = opts->struct_size < sizeof o ? opts->struct_size : sizeof o;
+        memcpy(&o, opts, n);
+        o.struct_size = sizeof o;
+    }
     if (len) { cp = malloc(len); if (!cp) return GPTPS_E_NOMEM; memcpy(cp, payload, len); }
     mu_lock(&t->mu);
     tk = task_for(t, task_name);
@@ -1120,6 +1160,8 @@ gptps_status gptps_tui_add_task(gptps_tui *t, const char *task_name, const char 
         if (label) { strncpy(tk->label, label, sizeof tk->label - 1); tk->label[sizeof tk->label - 1] = 0; }
         tk->hotkey = hotkey;
         free(tk->payload); tk->payload = cp; tk->plen = len; cp = NULL;
+        tk->has_opts = opts != NULL;
+        if (opts) tk->opts = o;
     }
     mu_unlock(&t->mu);
     if (cp) free(cp);

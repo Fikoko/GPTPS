@@ -12,8 +12,8 @@ the release version and is documented in `include/gptps.h`.
 No API changed incompatibly. The ABI is 2.6, additive over 1.7.0's 2.5:
 `gptps_task_def` appends `cpu_max_millicpus`, `io_max_read_bps` and `io_max_write_bps`;
 `gptps_submit_options` appends `deadline_in_ms` (with the `GPTPS_SUBMIT_DEADLINE` flag);
-`gptps_sched_input` appends `deadline_ms`, and `gptps_constraint_input` appends
-`deadline_ms` and `now_ms`; `GPTPS_M_CPU_THROTTLED_MS` is a new measurement name. Two
+`gptps_sched_input` appends `deadline_ms`, `gptps_constraint_input` appends
+`deadline_ms` and `now_ms`, and `gptps_dead_letter` appends `options`; `GPTPS_M_CPU_THROTTLED_MS` is a new measurement name. Two
 add-ons are new: `gptps_sched` and `gptps_adapt`; `gptps_durable_queue` adds
 `gptps_dq_submit_ex` and `gptps_dq_submit_batch_ex`; `gptps_pool`, `gptps_orch`, `gptps_balance`
 and `gptps_xport` add options-taking submits, and `gptps_balance_config` appends `flags`. Two changes can need a change in a host:
@@ -91,6 +91,17 @@ and `gptps_xport` add options-taking submits, and `gptps_balance_config` appends
 - `gptps_balance_open` accepts a config struct from before `flags` was appended: it
   used to require `struct_size >= sizeof`, which would have refused every caller
   compiled against an older header.
+
+### Added — dead letters keep their submit options
+
+- `gptps_dead_letter.options` holds the per-submit options an item was given -
+  exactly the `GPTPS_SUBMIT_*` its submit applied, with what it ran under, and its due
+  time as what is left at the drain - ready to pass to `gptps_submit_ex`. A
+  dead-letter drain used to hand back only the task and payload, so a re-drive lost
+  the item's priority, policy, timeout and due time.
+- The dashboard's dead-letter re-run uses them (except a due time that has passed:
+  the operator asked for the work to run). `gptps_tui_add_task_ex` binds a hotkey that
+  submits with options, the due time counting from each press.
 
 ### Added — a Windows CPU-cap test
 

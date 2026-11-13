@@ -1042,6 +1042,11 @@ set_tests_properties(stress_api PROPERTIES TIMEOUT 120)
 
 # real-time terminal dashboard add-on (portable; headless-tested)
 if(TARGET gptps_tui)
+add_executable(test_redrive_opts tests/test_redrive_opts.c)   # dead letters keep their options; the dashboard uses them
+target_include_directories(test_redrive_opts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_redrive_opts PRIVATE gptps_tui)
+add_test(NAME redrive_opts COMMAND test_redrive_opts)
+set_tests_properties(redrive_opts PROPERTIES TIMEOUT 30)
 add_executable(test_tui tests/test_tui.c)
 target_include_directories(test_tui
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons

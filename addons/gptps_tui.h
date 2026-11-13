@@ -103,6 +103,16 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 gptps_status gptps_tui_add_task(gptps_tui *t, const char *task_name, const char *label,
                                 int hotkey, const void *payload, size_t len);
 
+/* gptps_tui_add_task whose hotkey submits with gptps_submit_ex's options (NULL:
+ * identical to gptps_tui_add_task): a priority, a policy, a timeout, or a due time -
+ * which counts from each press, so a "due in 5 s" key is due 5 s after it is pressed.
+ * GPTPS_E_INVAL for an `opts` smaller than gptps_submit_ex accepts.
+ * Re-running dead letters from the dead-letter view re-submits each with the options
+ * it was first given (gptps_dead_letter.options), except a due time that has passed. */
+gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const char *label,
+                                   int hotkey, const void *payload, size_t len,
+                                   const gptps_submit_options *opts);
+
 /* Render one frame into `buf` (NUL-terminated, truncated to cap). Returns the
  * length written (excluding NUL). Pure read of live state - no terminal needed. */
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);

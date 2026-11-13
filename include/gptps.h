@@ -84,7 +84,8 @@ extern "C" {
  * (cpu_max_millicpus, io_max_read_bps, io_max_write_bps) with the cpu.throttled_ms
  * measurement, and a due time: GPTPS_SUBMIT_DEADLINE + deadline_in_ms on
  * gptps_submit_options, carried to the seams as deadline_ms on gptps_sched_input and
- * gptps_constraint_input (which also gains now_ms). Additive, and the loader compares
+ * gptps_constraint_input (which also gains now_ms), and the options an item was
+ * submitted with on its gptps_dead_letter (`options`), for a re-drive. Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 6u
@@ -1122,6 +1123,16 @@ typedef struct {
     uint32_t     attempts;      /* attempts made before giving up */
     const void  *payload;       /* original payload (valid only for the callback) */
     size_t       payload_len;
+    /* ABI 2.6: the per-submit options the item was given (gptps_submit_ex), ready to
+     * pass back to gptps_submit_ex to re-drive it as it was submitted. `flags` holds
+     * only the GPTPS_SUBMIT_* the submit applied - 0 for a plain gptps_submit, whose
+     * item took the type's defaults then and takes its defaults as they are now - and
+     * the fields they name hold what the item ran under. A due time
+     * (GPTPS_SUBMIT_DEADLINE) is given as what is left of it at this drain:
+     * deadline_in_ms 0 once it has passed, which re-submitted means "due now". Drop
+     * the flag to re-drive late work without one - a shed-late constraint would
+     * otherwise refuse it again. Read only if struct_size covers it. */
+    gptps_submit_options options;
 } gptps_dead_letter;
 
 /* Current number of retained dead-lettered tasks (does not drain). */

@@ -96,6 +96,8 @@ typedef struct gptps_item {
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
     uint64_t              cpu_cap;   /* gptps_task_def.cpu_max_millicpus, read at submit as `cost` is */
     uint64_t              io_rcap, io_wcap; /* io_max_read_bps / io_max_write_bps, likewise */
+    unsigned              submit_flags; /* GPTPS_SUBMIT_* gptps_submit_ex applied: what a dead
+                                      * letter hands back for a re-drive (gptps_dead_letter.options) */
     uint64_t              due_ms;    /* GPTPS_SUBMIT_DEADLINE: when it is due, monotonic; 0 = none. An
                                       * ordering INPUT for the scheduler / constraint seams, never acted
                                       * on here - `deadline_ms` above is the attempt's timeout, a
@@ -5625,6 +5627,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
 
     /* per-submit overrides (gptps_submit_ex): only flagged fields apply */
     if (opts) {
+        it->submit_flags = opts->flags & (GPTPS_SUBMIT_PRIORITY | GPTPS_SUBMIT_POLICY | GPTPS_SUBMIT_TIMEOUT_MS);
         if (opts->flags & GPTPS_SUBMIT_PRIORITY)   it->priority = opts->priority;
         if (opts->flags & GPTPS_SUBMIT_POLICY)     it->policy = opts->policy;
         if (opts->flags & GPTPS_SUBMIT_TIMEOUT_MS) it->timeout_ms_override = opts->timeout_ms;
@@ -5636,6 +5639,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
             uint64_t due = it->enqueue_ms + opts->deadline_in_ms;
             if (due < it->enqueue_ms) due = UINT64_MAX;
             it->due_ms = due ? due : 1u;   /* 0 is "none": a clock that starts at 0 must not erase it */
+            it->submit_flags |= GPTPS_SUBMIT_DEADLINE;
         }
     }
     it->sched_score = it->priority;   /* default ordering key; a scheduler hook re-scores per pass */
@@ -5647,6 +5651,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         it->policy.max_retries     = 0;
         it->policy.timeout_seconds = 0;
         it->timeout_ms_override    = 0;
+        it->submit_flags &= ~(unsigned)(GPTPS_SUBMIT_POLICY | GPTPS_SUBMIT_TIMEOUT_MS);   /* not what it runs under */
     }
 
     intake_insert(e, it);   /* by admission order, so the dispatcher need not search */
@@ -5971,6 +5976,17 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
             dl.attempts = it->attempt;
             dl.payload = it->payload;
             dl.payload_len = it->payload_len;
+            /* what to re-drive it with: the overrides its submit applied, as it ran */
+            dl.options.struct_size = sizeof dl.options;
+            dl.options.flags       = it->submit_flags;
+            dl.options.priority    = it->priority;
+            dl.options.policy      = it->policy;
+            dl.options.policy.struct_size = sizeof dl.options.policy;
+            dl.options.timeout_ms  = it->timeout_ms_override;
+            if (it->due_ms) {
+                uint64_t now = gptps_hal_monotonic_ms();
+                dl.options.deadline_in_ms = it->due_ms > now ? it->due_ms - now : 0u;
+            }
             cb(&dl, user_data);
         }
         item_free(e, it);
