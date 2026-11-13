@@ -555,6 +555,8 @@ gptps_stats_task(st, "resize", &c);                 // one task type
 engine, built on the observer seam — ANSI/VT escapes only (no ncurses; Windows VT
 enabled automatically). Panes/metrics:
 
+**Submit options (1.8).** `gptps_tui_add_task_ex` binds a hotkey that submits with `gptps_submit_options` — a due time counting from each press. Re-running the dead-letter view (`r`) re-submits each item with the options it was first given (`gptps_dead_letter.options`), except a due time that has passed.
+
 - header: uptime + **throughput** (done/s);
 - counts (queued/started/finished/failed/retried/dead/dropped) + an **in-flight gauge
   bar**;
