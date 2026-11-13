@@ -700,6 +700,11 @@ if(UNIX)
     target_link_libraries(test_xport_engine PRIVATE gptps_xport)
     add_test(NAME xport_engine COMMAND test_xport_engine)
     set_tests_properties(xport_engine PROPERTIES TIMEOUT 60)
+    add_executable(test_xport_opts tests/test_xport_opts.c)   # submit options cross the link to the worker's engine
+    target_include_directories(test_xport_opts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(test_xport_opts PRIVATE gptps_xport)
+    add_test(NAME xport_opts COMMAND test_xport_opts)
+    set_tests_properties(xport_opts PROPERTIES TIMEOUT 30)
     if(TARGET gptps_stats)
     add_executable(test_xport_measure tests/test_xport_measure.c) # measurements carried back from worker processes
     target_include_directories(test_xport_measure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
@@ -857,6 +862,14 @@ add_executable(test_retry_order tests/test_retry_order.c)
 target_link_libraries(test_retry_order PRIVATE gptps_stats)
 add_test(NAME retry_order COMMAND test_retry_order)
 set_tests_properties(retry_order PROPERTIES TIMEOUT 30)
+endif()
+
+if(TARGET gptps_balance AND TARGET gptps_orch)
+add_executable(test_route_opts tests/test_route_opts.c) # submit options through pool, orch and balance
+target_include_directories(test_route_opts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_route_opts PRIVATE gptps_balance gptps_orch)
+add_test(NAME route_opts COMMAND test_route_opts)
+set_tests_properties(route_opts PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_balance AND TARGET gptps_stats)

@@ -15,7 +15,8 @@ No API changed incompatibly. The ABI is 2.6, additive over 1.7.0's 2.5:
 `gptps_sched_input` appends `deadline_ms`, and `gptps_constraint_input` appends
 `deadline_ms` and `now_ms`; `GPTPS_M_CPU_THROTTLED_MS` is a new measurement name. Two
 add-ons are new: `gptps_sched` and `gptps_adapt`; `gptps_durable_queue` adds
-`gptps_dq_submit_ex` and `gptps_dq_submit_batch_ex`. Two changes can need a change in a host:
+`gptps_dq_submit_ex` and `gptps_dq_submit_batch_ex`; `gptps_pool`, `gptps_orch`, `gptps_balance`
+and `gptps_xport` add options-taking submits, and `gptps_balance_config` appends `flags`. Two changes can need a change in a host:
 
 - **Every task type has three more settings**: `tasks.<name>.cpu_max_millicpus`,
   `.io_max_read_bps` and `.io_max_write_bps`. A host that counts a task's settings, or
@@ -75,6 +76,21 @@ add-ons are new: `gptps_sched` and `gptps_adapt`; `gptps_durable_queue` adds
   the host was down comes back due now. The options travel as a new marker record type
   written in the same fsync as the work: a journal without them recovers as before, and
   an older build skips them and recovers the work without its options.
+
+### Added — submit options through pool, orch, balance and xport
+
+- Work routed through the composition add-ons can now carry `gptps_submit_options`, so
+  a due time reaches whichever engine runs it: `gptps_pool_submit_ex` /
+  `gptps_pool_submit_keyed_ex`, `gptps_orch_after_ex`, `gptps_balance_submit_opts` and
+  `gptps_xport_submit_opts` / `gptps_xport_submit_async_opts`. Where work waits inside
+  the add-on before an engine gets it - a gate in `orch`, the router queue in
+  `balance` - the due time counts from the add-on's call and the engine is told what
+  is left of it. `GPTPS_BALANCE_BY_DEADLINE` (a new `flags` field appended to
+  `gptps_balance_config`) orders the router's own queue by due time. xport's request
+  frame grows by the options; both ends are the same binary, as before.
+- `gptps_balance_open` accepts a config struct from before `flags` was appended: it
+  used to require `struct_size >= sizeof`, which would have refused every caller
+  compiled against an older header.
 
 ### Added — a Windows CPU-cap test
 

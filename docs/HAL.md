@@ -142,7 +142,7 @@ CI's two commands, for each seed in turn:
 for s in $(seq 1 500); do
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$s GPTPS_STRESS_MS=1500 \
     ctest --test-dir build-sim -j4 --no-tests=error \
-    -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|xport|xport_engine|xport_measure|gptps_bench_pool|gptps_bench_balance)$' \
+    -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance)$' \
     > sim-$s.log 2>&1 || echo "seed $s failed: see sim-$s.log"
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 \
     ctest --test-dir build-sim --no-tests=error \
@@ -162,7 +162,7 @@ The tests the first command leaves out, and why:
 | `example_edge_ai` | Its jobs are child processes as well: `fake_infer`, which takes its memory and holds it for real milliseconds, under the cap the executor sets. So it runs with the tests above, once, paced. It also passed unpaced, on seeds 1-40, but a run that forks does not replay. |
 | `measure` | Its jobs are child processes too, measured as they end and sampled while they run on the executor's clock, so it runs paced, with the tests above. |
 | `caps`, `adapt` | Their jobs are child processes (`GPTPS_EXEC_OOP`): the CPU / I/O caps are a process executor's, and adapt learns from what process jobs measure. Paced, with the tests above. |
-| `xport`, `xport_engine`, `xport_measure` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
+| `xport`, `xport_engine`, `xport_opts`, `xport_measure` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
 
 `stress_api` runs in the first command, shortened to one round of 1.5 s by
 `GPTPS_STRESS_MS=1500`. Its rounds last 1.5 s of the clock. Once a round runs one of

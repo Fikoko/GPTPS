@@ -24,6 +24,7 @@
 #include "gptps_balance.h"
 #include "addon_compat.h"   /* portable mutex */
 
+#include <stddef.h>   /* offsetof: the appended fields of caller structs */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,7 +37,12 @@ typedef struct bitem {
     size_t       shard;
     gptps_handle eh;
     int32_t      prio;
+    uint64_t     kdue;        /* router order: the due time under BY_DEADLINE (UINT64_MAX for
+                               * none), else 0 for every item, so it never decides */
     uint64_t     seq;
+    int          has_o;       /* gptps_balance_submit_opts: options for the shard */
+    gptps_submit_options o;   /* ... as given, except a due time, held in `due` */
+    uint64_t     due;         /* GPTPS_SUBMIT_DEADLINE: absolute, gptps_now_ms clock */
     char        *task;
     void        *payload;
     size_t       len;
@@ -94,10 +100,13 @@ static void hm_del(hmap *m, uint64_t k)
     m->tab[i].key = 0; m->tab[i].val = NULL; m->n -= 1;
 }
 
-/* ---- the router queue: binary heap by (prio desc, seq asc) ---- */
+/* ---- the router queue: binary heap by (kdue asc, prio desc, seq asc) ---- */
 typedef struct { bitem **a; size_t n, cap; } heap;
 static int before(const bitem *x, const bitem *y)
-{ return x->prio != y->prio ? x->prio > y->prio : x->seq < y->seq; }
+{
+    if (x->kdue != y->kdue) return x->kdue < y->kdue;   /* all 0 unless BY_DEADLINE */
+    return x->prio != y->prio ? x->prio > y->prio : x->seq < y->seq;
+}
 static int heap_push(heap *h, bitem *it)
 {
     size_t i;
@@ -151,6 +160,7 @@ struct gptps_balance {
     hmap           by_bh;
     uint64_t       next_bh, next_seq;
     gptps_event_cb cb; void *cb_ud;
+    int            by_deadline;  /* GPTPS_BALANCE_BY_DEADLINE */
 };
 
 static void item_free(bitem *it)
@@ -208,7 +218,14 @@ static bitem *dispatch_locked(gptps_balance *b)
         it->state = IT_DISPATCHED; it->shard = best;
         b->sh[best].load += 1;
         memset(&o, 0, sizeof o); o.struct_size = sizeof o;
-        o.flags = GPTPS_SUBMIT_PRIORITY; o.priority = it->prio;
+        if (it->has_o) {                                /* the caller's, due time as what is left */
+            o = it->o;
+            if (o.flags & GPTPS_SUBMIT_DEADLINE) {
+                uint64_t now = gptps_now_ms(NULL);
+                o.deadline_in_ms = it->due > now ? it->due - now : 0u;
+            }
+        }
+        o.flags |= GPTPS_SUBMIT_PRIORITY; o.priority = it->prio;
         /* Emits the engine's QUEUED on THIS thread; the observer ignores QUEUED. */
         st = gptps_submit_ex(b->sh[best].e, it->task, it->payload, it->len, &o, &it->eh);
         if (st == GPTPS_OK && hm_put(&b->sh[best].by_eh, it->eh, it) == 0) {
@@ -282,11 +299,16 @@ gptps_balance *gptps_balance_open(gptps_pool *p, const gptps_balance_config *cfg
     gptps_balance *b;
     size_t i, n;
     uint32_t depth = 0;
+    int by_deadline = 0;
 
     if (!p) return NULL;
     if (cfg) {
-        if (cfg->struct_size < sizeof(gptps_balance_config)) return NULL;
+        /* The floor is the 1.0 layout, which ends at shard_depth: `< sizeof` would
+         * refuse every caller compiled before `flags` was appended. */
+        if (cfg->struct_size < offsetof(gptps_balance_config, shard_depth) + sizeof cfg->shard_depth) return NULL;
         depth = cfg->shard_depth;
+        if (cfg->struct_size >= offsetof(gptps_balance_config, flags) + sizeof cfg->flags)
+            by_deadline = (cfg->flags & GPTPS_BALANCE_BY_DEADLINE) != 0;
     }
     n = gptps_pool_count(p);
     if (!n) return NULL;
@@ -294,7 +316,7 @@ gptps_balance *gptps_balance_open(gptps_pool *p, const gptps_balance_config *cfg
     if (!b) return NULL;
     b->sh = (bshard *)calloc(n, sizeof *b->sh);
     if (!b->sh) { free(b); return NULL; }
-    b->pool = p; b->nsh = n;
+    b->pool = p; b->nsh = n; b->by_deadline = by_deadline;
     apx_mutex_init(&b->mu);
 
     for (i = 0; i < n; ++i) {
@@ -364,10 +386,25 @@ gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
                                      const void *payload, size_t len, int32_t priority,
                                      gptps_balance_handle *out)
 {
+    gptps_submit_options o;
+    memset(&o, 0, sizeof o);
+    o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_PRIORITY; o.priority = priority;
+    return gptps_balance_submit_opts(b, task, payload, len, &o, out);
+}
+
+#define BAL_OPTS_MIN_SIZE (offsetof(gptps_submit_options, timeout_ms) + sizeof(uint32_t))
+
+gptps_status gptps_balance_submit_opts(gptps_balance *b, const char *task,
+                                       const void *payload, size_t len,
+                                       const gptps_submit_options *opts,
+                                       gptps_balance_handle *out)
+{
     bitem *it, *fails;
     gptps_balance_handle bh;
+    int32_t priority = 0;
     if (out) *out = 0;
     if (!b || !task || !*task) return GPTPS_E_INVAL;
+    if (opts && opts->struct_size < BAL_OPTS_MIN_SIZE) return GPTPS_E_INVAL;
     if (len && !payload) return GPTPS_E_INVAL;
     if (!gptps_task_exists(b->sh[0].e, task)) return GPTPS_E_NOTFOUND;
     if (task_is_service(b->sh[0].e, task)) return GPTPS_E_INVAL;
@@ -382,6 +419,25 @@ gptps_status gptps_balance_submit_ex(gptps_balance *b, const char *task,
         if (!it->payload) { item_free(it); return GPTPS_E_NOMEM; }
         memcpy(it->payload, payload, len);
     }
+    if (opts) {
+        /* Copy only what the caller's struct holds; an older one is shorter. A due
+         * time is held absolute, so the wait in this queue counts against it. */
+        size_t n = opts->struct_size < sizeof it->o ? opts->struct_size : sizeof it->o;
+        memcpy(&it->o, opts, n);
+        it->o.struct_size = sizeof it->o;
+        it->has_o = 1;
+        if (it->o.flags & GPTPS_SUBMIT_PRIORITY) priority = it->o.priority;
+        if ((it->o.flags & GPTPS_SUBMIT_DEADLINE) &&
+            opts->struct_size >= offsetof(gptps_submit_options, deadline_in_ms) + sizeof opts->deadline_in_ms) {
+            uint64_t now = gptps_now_ms(NULL);
+            it->due = (it->o.deadline_in_ms > UINT64_MAX - 1u - now) ? UINT64_MAX - 1u : now + it->o.deadline_in_ms;
+        } else {
+            it->o.flags &= ~(unsigned)GPTPS_SUBMIT_DEADLINE;
+        }
+    }
+    /* UINT64_MAX - 1 at most for a due item, so it still sorts ahead of the
+     * UINT64_MAX that marks "no due time" */
+    it->kdue = !b->by_deadline ? 0u : (it->o.flags & GPTPS_SUBMIT_DEADLINE) ? it->due : UINT64_MAX;
     it->len = len; it->prio = priority; it->state = IT_QUEUED;
 
     apx_mutex_lock(&b->mu);

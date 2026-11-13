@@ -139,6 +139,8 @@ work-stealing in effect, since idle shards pull — and it adapts to any task si
 without knowing sizes in advance: a shard running one long item simply stops being the
 shortest queue.
 
+**Submit options (1.8).** `gptps_balance_submit_opts` takes `gptps_submit_options` — priority, policy, timeout and due time — and hands them to the shard at dispatch, the due time as what is left after waiting in the router. Open with `GPTPS_BALANCE_BY_DEADLINE` to have the router's own queue order by due time too: under a backlog most work waits there, where an EDF scheduler on the shards cannot see it.
+
 ```c
 p = gptps_pool_open(4, &cfg); gptps_pool_register_task(p, &def);
 b = gptps_balance_open(p, NULL);              // BEFORE submitting; NULL cfg => depth 2x workers
@@ -350,6 +352,8 @@ once they have all reached a terminal state. Built entirely on the observer seam
 `gptps_submit`, which is the proof that task dependencies belong on top of GPTPS rather
 than in the dispatcher.
 
+**Submit options (1.8).** `gptps_orch_after_ex` takes `gptps_submit_options`. A held gate keeps them, and its due time counts from the call, not the release, so work that waited past its due time behind its dependencies is submitted due now.
+
 - **What counts as terminal:** `FINISHED`, `DROPPED`, `DEAD_LETTERED`, or `FAILED`
   carrying `GPTPS_E_CANCELLED`. A plain `FAILED` is **not** terminal — it is emitted
   after every failed *attempt*, and a dependency that merely retries must not release
@@ -407,6 +411,8 @@ than complicate the core, this runs **N independent engine shards** (each its ow
 dispatcher and worker pool) and routes each submit to one. It needs **no engine change
 at all**, which is the whole point: that file is the proof that scale-by-composition
 works.
+
+**Submit options (1.8).** `gptps_pool_submit_ex` and `gptps_pool_submit_keyed_ex` take `gptps_submit_options` and hand them to the chosen shard unchanged — a due time included, since every shard shares the process's clock.
 
 - **Sizing:** with N shards you get N independent budgets, so set `cfg->limits` so the
   shards *sum* to what the machine can bear. A NULL cfg auto-tunes each shard to the
@@ -625,6 +631,8 @@ gptps_wasm_close(w);
 out: it forks N persistent worker **processes** and ships each request to one over a
 socketpair, marshalling the result back. Work runs in a separate address space —
 crash-isolated and independently capped. Two modes:
+
+**Submit options (1.8).** `gptps_xport_submit_opts` and `gptps_xport_submit_async_opts` send `gptps_submit_options` with the request, and the worker's engine applies them (engine mode; handler mode has no engine and ignores them). Install a deadline-first scheduler from `child_init` and the due time orders work inside each worker.
 
 - **Engine mode** (`gptps_xport_open_ex` with a task table): **every worker runs its own
   GPTPS engine.** The worker pool, memory and named-resource budgets, retries, timeouts,

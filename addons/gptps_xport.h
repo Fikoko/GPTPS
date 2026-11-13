@@ -200,6 +200,17 @@ gptps_status gptps_xport_submit_async(gptps_xport *xp, const char *task,
  * The same returns as gptps_xport_submit otherwise, and *out is then left empty. */
 gptps_status gptps_xport_submit_ex(gptps_xport *xp, const char *task,
                                    const void *payload, size_t len, gptps_xport_reply *out);
+/* gptps_xport_submit_ex with gptps_submit_ex's per-item options (NULL: identical to
+ * it), applied by the worker's own engine (ENGINE MODE): priority, failure policy,
+ * timeout, and a due time (GPTPS_SUBMIT_DEADLINE) for the worker's scheduler - an EDF
+ * installed from child_init, for instance. They cross the link with the request and
+ * the worker submits at once on reading it, so a due time counts from about this
+ * call; parent and worker share the machine's monotonic clock. HANDLER MODE has no
+ * engine to apply them to and ignores them. GPTPS_E_INVAL for an `opts` smaller than
+ * gptps_submit_ex accepts; the rest as gptps_xport_submit_ex. */
+gptps_status gptps_xport_submit_opts(gptps_xport *xp, const char *task,
+                                     const void *payload, size_t len,
+                                     const gptps_submit_options *opts, gptps_xport_reply *out);
 /* Free what gptps_xport_submit_ex put in *r (the result and the measurements), and
  * empty it. Safe on an empty or already freed reply. */
 void gptps_xport_result_free(gptps_xport_reply *r);
@@ -210,6 +221,13 @@ gptps_status gptps_xport_submit_async_ex(gptps_xport *xp, const char *task,
                                          const void *payload, size_t len,
                                          gptps_xport_reply_ex_fn cb, void *user_data,
                                          uint64_t *out_request_id);
+
+/* gptps_xport_submit_async_ex with per-item options, as gptps_xport_submit_opts. */
+gptps_status gptps_xport_submit_async_opts(gptps_xport *xp, const char *task,
+                                           const void *payload, size_t len,
+                                           const gptps_submit_options *opts,
+                                           gptps_xport_reply_ex_fn cb, void *user_data,
+                                           uint64_t *out_request_id);
 
 /* Graceful drain (see header), then reap and free. Not from a reply callback. */
 void gptps_xport_close(gptps_xport *xp);

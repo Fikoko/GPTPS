@@ -100,32 +100,47 @@ static size_t next_rr(gptps_pool *p)
     return idx;
 }
 
+/* One submit to shard `idx`. The options go through gptps_submit_ex unchanged: a
+ * shard is an engine of this process, on the same clock, so even a due time needs no
+ * translation. gptps_submit_ex with NULL options is gptps_submit. */
+static gptps_status shard_submit(gptps_pool *p, size_t idx, const char *task, const void *payload,
+                                 size_t len, const gptps_submit_options *opts, gptps_pool_handle *out)
+{
+    gptps_handle h = 0;
+    gptps_status st = gptps_submit_ex(p->shards[idx], task, payload, len, opts, &h);
+    if (st == GPTPS_OK && out) *out = pool_pack(idx, h);
+    return st;
+}
+
 gptps_status gptps_pool_submit(gptps_pool *p, const char *task,
                                const void *payload, size_t len, gptps_pool_handle *out)
 {
-    size_t idx;
-    gptps_handle h = 0;
-    gptps_status st;
-    if (out) *out = 0;
-    if (!p || !task) return GPTPS_E_INVAL;
-    idx = next_rr(p);
-    st = gptps_submit(p->shards[idx], task, payload, len, &h);
-    if (st == GPTPS_OK && out) *out = pool_pack(idx, h);
-    return st;
+    return gptps_pool_submit_ex(p, task, payload, len, NULL, out);
 }
 
 gptps_status gptps_pool_submit_keyed(gptps_pool *p, uint64_t key, const char *task,
                                      const void *payload, size_t len, gptps_pool_handle *out)
 {
-    size_t idx;
-    gptps_handle h = 0;
-    gptps_status st;
+    return gptps_pool_submit_keyed_ex(p, key, task, payload, len, NULL, out);
+}
+
+gptps_status gptps_pool_submit_ex(gptps_pool *p, const char *task,
+                                  const void *payload, size_t len,
+                                  const gptps_submit_options *opts, gptps_pool_handle *out)
+{
     if (out) *out = 0;
     if (!p || !task) return GPTPS_E_INVAL;
-    idx = (size_t)(key % (uint64_t)p->n);   /* lock-free: same key -> same shard */
-    st = gptps_submit(p->shards[idx], task, payload, len, &h);
-    if (st == GPTPS_OK && out) *out = pool_pack(idx, h);
-    return st;
+    return shard_submit(p, next_rr(p), task, payload, len, opts, out);
+}
+
+gptps_status gptps_pool_submit_keyed_ex(gptps_pool *p, uint64_t key, const char *task,
+                                        const void *payload, size_t len,
+                                        const gptps_submit_options *opts, gptps_pool_handle *out)
+{
+    if (out) *out = 0;
+    if (!p || !task) return GPTPS_E_INVAL;
+    /* lock-free: same key -> same shard */
+    return shard_submit(p, (size_t)(key % (uint64_t)p->n), task, payload, len, opts, out);
 }
 
 gptps_status gptps_pool_cancel(gptps_pool *p, gptps_pool_handle h)

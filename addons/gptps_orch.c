@@ -16,8 +16,56 @@
 #include "gptps_orch.h"
 #include "addon_compat.h"   /* portable mutex */
 
+#include <stddef.h>   /* offsetof: an options struct's appended fields */
 #include <stdlib.h>
 #include <string.h>
+
+/* ---- submit options held while a gate waits (gptps_orch_after_ex) ----
+ * A gate is submitted later than the call that made it, so a due time
+ * (GPTPS_SUBMIT_DEADLINE) given as "due in N ms" must not start counting again at
+ * release. It is held as an absolute time on the engine's clock (gptps_now_ms) and
+ * handed over as what is left of it - 0, "due now", once it has passed - so an item
+ * that waited behind its dependencies keeps the due time it was given. */
+typedef struct {
+    int                  has;
+    gptps_submit_options o;
+    uint64_t             due;     /* GPTPS_SUBMIT_DEADLINE: when it is due, gptps_now_ms clock */
+} held_opts;
+
+#define ORCH_OPTS_MIN_SIZE (offsetof(gptps_submit_options, timeout_ms) + sizeof(uint32_t))
+
+/* 0, or GPTPS_E_INVAL for an options struct smaller than gptps_submit_ex accepts. */
+static gptps_status hold_opts(held_opts *h, const gptps_submit_options *in)
+{
+    size_t n;
+    memset(h, 0, sizeof *h);
+    if (!in) return GPTPS_OK;
+    if (in->struct_size < ORCH_OPTS_MIN_SIZE) return GPTPS_E_INVAL;
+    n = in->struct_size < sizeof h->o ? in->struct_size : sizeof h->o;
+    memcpy(&h->o, in, n);                     /* an older caller's struct: the rest stays 0 */
+    h->o.struct_size = sizeof h->o;
+    h->has = 1;
+    if ((h->o.flags & GPTPS_SUBMIT_DEADLINE) &&
+        in->struct_size >= offsetof(gptps_submit_options, deadline_in_ms) + sizeof in->deadline_in_ms) {
+        uint64_t now = gptps_now_ms(NULL);
+        h->due = (h->o.deadline_in_ms > UINT64_MAX - now) ? UINT64_MAX : now + h->o.deadline_in_ms;
+    } else {
+        h->o.flags &= ~(unsigned)GPTPS_SUBMIT_DEADLINE;   /* nothing the caller's struct can back */
+    }
+    return GPTPS_OK;
+}
+
+/* The options to submit with now, in *tmp; NULL when there are none. */
+static const gptps_submit_options *give_opts(const held_opts *h, gptps_submit_options *tmp)
+{
+    if (!h->has) return NULL;
+    *tmp = h->o;
+    if (tmp->flags & GPTPS_SUBMIT_DEADLINE) {
+        uint64_t now = gptps_now_ms(NULL);
+        tmp->deadline_in_ms = h->due > now ? h->due - now : 0u;
+    }
+    return tmp;
+}
 
 typedef struct {
     char         *task;
@@ -30,6 +78,7 @@ typedef struct {
     unsigned      attempts;    /* rejected release_gate submits so far (see the cap) */
     int           abandoned;   /* released WITHOUT ever being submitted */
     gptps_status  last_status; /* the engine's last verdict on this gate's submit */
+    held_opts     opts;        /* gptps_orch_after_ex's options, due time held absolute */
 } gate;
 
 /* How many times a gate whose dependencies are all satisfied may be re-submitted
@@ -196,7 +245,8 @@ static int mark_done(gptps_orch *o, gptps_handle h)
 static void release_gate(gptps_orch *o, gate *g)
 {
     gptps_handle h = 0;
-    gptps_status st = gptps_submit(o->e, g->task, g->payload, g->len, &h);
+    gptps_submit_options tmp;
+    gptps_status st = gptps_submit_ex(o->e, g->task, g->payload, g->len, give_opts(&g->opts, &tmp), &h);
 
     g->last_status = st;
     if (st == GPTPS_OK) { g->released = 1; g->abandoned = 0; return; }
@@ -344,10 +394,20 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
                               const gptps_handle *deps, size_t ndeps,
                               gptps_handle *out)
 {
+    return gptps_orch_after_ex(o, task, payload, len, deps, ndeps, NULL, out);
+}
+
+gptps_status gptps_orch_after_ex(gptps_orch *o, const char *task,
+                                 const void *payload, size_t len,
+                                 const gptps_handle *deps, size_t ndeps,
+                                 const gptps_submit_options *opts, gptps_handle *out)
+{
     gate *g;
     size_t i, remaining;
+    held_opts ho;
     if (out) *out = 0;
     if (!o || !task || (ndeps && !deps)) return GPTPS_E_INVAL;
+    if (hold_opts(&ho, opts) != GPTPS_OK) return GPTPS_E_INVAL;
     /* 0 is no handle: the engine never issues it, so it never terminates, and a
      * gate on it was held forever - pending() never reached 0. It is exactly what a
      * held gate's *out holds, which makes it an easy value to pass on by mistake. */
@@ -360,7 +420,7 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
     for (i = 0; i < ndeps; ++i) if (!is_done(o, deps[i])) ++remaining;
     if (remaining == 0) {
         gptps_handle h = 0;
-        gptps_status st = gptps_submit(o->e, task, payload, len, &h);
+        gptps_status st = gptps_submit_ex(o->e, task, payload, len, opts, &h);   /* now: as given */
         apx_mutex_unlock(&o->mu);
         if (st == GPTPS_OK && out) *out = h;
         return st;
@@ -378,6 +438,7 @@ gptps_status gptps_orch_after(gptps_orch *o, const char *task,
     g->task = dup_str(task);
     g->payload = dup_mem(payload, len);
     g->len = len;
+    g->opts = ho;
     g->ndeps = ndeps;
     g->remaining = remaining;
     g->deps = (gptps_handle *)malloc(ndeps * sizeof *g->deps);
