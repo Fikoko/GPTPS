@@ -204,6 +204,14 @@ and quarantines it when the task is dead-lettered; `gptps_dq_recover()` re-submi
 anything a prior run left pending.
 
 - **Guarantee:** at-least-once — task bodies must be idempotent.
+- **Options survive a restart.** `gptps_dq_submit_ex` (and `gptps_dq_submit_batch_ex`,
+  one set for the whole batch) take `gptps_submit_options` and journal them with the
+  record: priority, failure policy, timeout and due time (`GPTPS_SUBMIT_DEADLINE`). The
+  due time is journaled on the **wall clock**, since the engine's clock does not outlive
+  the process, and recovery turns it back into "due in N ms" — an item whose due time
+  passed while the host was down comes back due now, where `gptps_sched_shed_late` can
+  refuse it. Journals stay readable both ways: one written without options recovers as
+  before, and an older build skips the options and recovers the work.
 - **Journaling does not stall the engine.** Only the submitting thread waits for the
   disk: no lock the engine's threads need is held across the fsync, and submits made at
   the same time share one fsync (group commit). To journal many items from one thread,

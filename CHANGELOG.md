@@ -14,7 +14,8 @@ No API changed incompatibly. The ABI is 2.6, additive over 1.7.0's 2.5:
 `gptps_submit_options` appends `deadline_in_ms` (with the `GPTPS_SUBMIT_DEADLINE` flag);
 `gptps_sched_input` appends `deadline_ms`, and `gptps_constraint_input` appends
 `deadline_ms` and `now_ms`; `GPTPS_M_CPU_THROTTLED_MS` is a new measurement name. Two
-add-ons are new: `gptps_sched` and `gptps_adapt`. Two changes can need a change in a host:
+add-ons are new: `gptps_sched` and `gptps_adapt`; `gptps_durable_queue` adds
+`gptps_dq_submit_ex` and `gptps_dq_submit_batch_ex`. Two changes can need a change in a host:
 
 - **Every task type has three more settings**: `tasks.<name>.cpu_max_millicpus`,
   `.io_max_read_bps` and `.io_max_write_bps`. A host that counts a task's settings, or
@@ -63,6 +64,22 @@ add-ons are new: `gptps_sched` and `gptps_adapt`. Two changes can need a change 
   samples, or growth from a declaration that was hit, at once. `gptps_adapt_apply`
   writes it to the task's setting; `auto_apply` does so as it changes. The core still
   never acts on a measurement.
+
+### Added — submit options in the durable queue
+
+- `gptps_dq_submit_ex` and `gptps_dq_submit_batch_ex` journal the submit options with
+  each record, so work recovered after a restart keeps its priority, failure policy,
+  timeout and due time. Before this a journaled item could carry none of them, so
+  durable work dropped out of deadline ordering altogether. The due time is journaled on
+  the wall clock and turned back into time remaining at recovery; one that passed while
+  the host was down comes back due now. The options travel as a new marker record type
+  written in the same fsync as the work: a journal without them recovers as before, and
+  an older build skips them and recovers the work without its options.
+
+### Added — a Windows CPU-cap test
+
+- `cpu_cap_win` runs the same CPU-bound program uncapped and capped at 100 millicpus,
+  and checks that the job object actually throttled it.
 
 ### Changed
 
