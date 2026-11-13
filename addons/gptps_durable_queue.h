@@ -173,6 +173,24 @@ gptps_dq *gptps_dq_open(gptps *e, const char *journal_path);
 gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
                              const void *payload, size_t len, gptps_handle *out_handle);
 
+/* gptps_dq_submit with gptps_submit_ex's per-item options (NULL: identical to
+ * gptps_dq_submit). The options the engine applies are journaled with the record -
+ * GPTPS_SUBMIT_PRIORITY, _POLICY, _TIMEOUT_MS and _DEADLINE - so a record that
+ * gptps_dq_recover brings back after a restart keeps them. The due time
+ * (GPTPS_SUBMIT_DEADLINE) is journaled on the WALL clock, since the engine's own clock
+ * does not outlive the process: recovery turns it back into "due in N ms" from that
+ * moment, and an item whose due time passed while the host was down comes back due at
+ * once - which a shed-late constraint (addons/gptps_sched) may then refuse, and this
+ * queue then quarantines as it does any dead letter. Moving the system clock between
+ * the runs moves the due time with it.
+ * This run's engine gets `opts` exactly as given. GPTPS_E_INVAL, before anything is
+ * written, for an `opts` smaller than gptps_submit_ex accepts. A journal with options
+ * still opens in a build without this call: it skips them and recovers the work as
+ * gptps_dq_submit journaled it. */
+gptps_status gptps_dq_submit_ex(gptps_dq *dq, const char *task_name, const void *payload,
+                                size_t len, const gptps_submit_options *opts,
+                                gptps_handle *out_handle);
+
 /* One item of gptps_dq_submit_batch: fill task_name, payload and len; the call fills
  * handle and status. */
 typedef struct {
@@ -196,6 +214,13 @@ typedef struct {
  * is journaled whole or not at all. n == 0 is GPTPS_OK. The QUEUED events arrive on
  * this thread with the queue's lock held, as gptps_dq_submit's do. */
 gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n);
+
+/* gptps_dq_submit_batch with one set of options for EVERY item of the batch (NULL:
+ * identical to gptps_dq_submit_batch), journaled and recovered as gptps_dq_submit_ex
+ * describes. Items that need different options - different due times, say - go in
+ * separate batches, or through gptps_dq_submit_ex. */
+gptps_status gptps_dq_submit_batch_ex(gptps_dq *dq, gptps_dq_item *items, size_t n,
+                                      const gptps_submit_options *opts);
 
 /* Re-submit every record that survived from a previous run/crash (persisted but
  * never completed). Quarantined (dead-lettered) records are terminal-but-retained,

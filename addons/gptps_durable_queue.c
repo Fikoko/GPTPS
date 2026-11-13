@@ -12,7 +12,9 @@
  *   'D'(one), 'Q'(uarantined) - its verdict;
  *   'S'(tarted), 'F'(ailed)   - an attempt began, and ended without a verdict (see
  *                               "crash loops");
- *   'K' [u32 count]           - its crash count, carried across a compaction.
+ *   'K' [u32 count]           - its crash count, carried across a compaction;
+ *   'O' [options, 40+ bytes]  - the submit options it was journaled with
+ *                               (gptps_dq_submit_ex), see "submit options".
  * A reader skips a type it does not know, so this journal still opens in an older
  * version of this file (which only loses the crash counts), and an older one opens
  * here. A 'P' record is fsync'd before it is enqueued (durability); the markers are
@@ -41,6 +43,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <errno.h>
+#include <time.h>       /* clock_gettime / time: the wall clock a due time is journaled on */
 
 #define DQ_FILE_MAGIC 0x47445131u /* "GDQ1" */
 #define DQ_REC_MAGIC  0x44515231u /* "DQR1" */
@@ -89,9 +92,43 @@
 #define DQ_SUSPECT_AT    2u
 #define DQ_QUARANTINE_AT 3u
 
+/* ---- submit options ----
+ *
+ * gptps_dq_submit_ex journals the options a record was submitted with, so a recovered
+ * record keeps its priority, failure policy, timeout and due time. They travel as an
+ * 'O' marker written right after the record's 'P', before the one fsync that makes
+ * both durable, so a 'P' acknowledged with options is never recovered without them.
+ * (A crash that tears the write in between can leave the 'P' and lose the 'O' - but
+ * then the submit was never acknowledged, and recovering it at all is the
+ * at-least-once contract's choice, not a promise broken.) An older build skips the
+ * unknown type and recovers the work without its options; a journal with no 'O'
+ * recovers exactly as it always has.
+ *
+ * The due time cannot be journaled as the engine holds it: that is the engine's
+ * monotonic clock, which starts again with the process. It is written as WALL-CLOCK
+ * milliseconds since the epoch, and recovery turns it back into "due in N ms" against
+ * the wall clock of the run that recovers it - an item already late comes back due
+ * now, and a shed-late constraint (addons/gptps_sched) can then refuse it. Moving the
+ * wall clock between the two runs moves the due time with it.
+ *
+ * Body, little-endian, 40 bytes; a reader takes the first 40 of a longer one, so a
+ * later version may append:
+ *   [u32 flags][i32 priority][u32 timeout_s][u32 max_retries][u32 backoff_s]
+ *   [u32 on_failure][u32 timeout_ms][u32 reserved = 0][u64 due, wall-clock ms] */
+#define DQ_OPTS_LEN   40u
+#define DQ_OPTS_KNOWN (GPTPS_SUBMIT_PRIORITY | GPTPS_SUBMIT_POLICY | GPTPS_SUBMIT_TIMEOUT_MS | GPTPS_SUBMIT_DEADLINE)
+typedef struct {
+    uint32_t flags;           /* GPTPS_SUBMIT_* this record applies; 0 = no options */
+    int32_t  priority;
+    uint32_t timeout_s, max_retries, backoff_s, on_failure;
+    uint32_t timeout_ms;
+    uint64_t due_wall_ms;     /* GPTPS_SUBMIT_DEADLINE: when it is due, wall clock */
+} dq_opts;
+
 typedef struct {
     uint64_t     seq;
     gptps_handle handle;      /* 0 until submitted/recovered this run */
+    dq_opts      opts;        /* journaled submit options; flags == 0 for none */
     char        *name;
     void        *payload;
     size_t       len;
@@ -171,6 +208,79 @@ static uint32_t fnv(const void *d, size_t n, uint32_t h)
 
 static char *dup_str(const char *s) { size_t n = strlen(s) + 1; char *o = (char *)malloc(n); if (o) memcpy(o, s, n); return o; }
 static void *dup_mem(const void *s, size_t n) { void *o; if (!n) return NULL; o = malloc(n); if (o) memcpy(o, s, n); return o; }
+
+/* Wall-clock milliseconds since the epoch: the clock a due time is journaled on (see
+ * "submit options"), since the engine's monotonic one does not outlive the process. */
+static uint64_t dq_wall_ms(void)
+{
+#if defined(_WIN32)
+    FILETIME ft;
+    uint64_t t;
+    GetSystemTimeAsFileTime(&ft);                       /* 100 ns ticks since 1601 */
+    t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return t / 10000u - 11644473600000ull;
+#elif defined(CLOCK_REALTIME)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return (uint64_t)time(NULL) * 1000u;
+#else
+    return (uint64_t)time(NULL) * 1000u;
+#endif
+}
+
+/* The options worth journaling from a caller's struct: only the GPTPS_SUBMIT_* this
+ * build knows, and the due time only when the caller's struct actually carries it (an
+ * older caller's flag cannot vouch for bytes past its end). 0 flags: nothing to keep. */
+static void opts_take(dq_opts *o, const gptps_submit_options *in, uint64_t now_wall)
+{
+    memset(o, 0, sizeof *o);
+    if (!in) return;
+    o->flags = in->flags & DQ_OPTS_KNOWN;
+    if (in->struct_size < offsetof(gptps_submit_options, deadline_in_ms) + sizeof in->deadline_in_ms)
+        o->flags &= ~(uint32_t)GPTPS_SUBMIT_DEADLINE;
+    o->priority    = in->priority;
+    o->timeout_s   = in->policy.timeout_seconds;
+    o->max_retries = in->policy.max_retries;
+    o->backoff_s   = in->policy.retry_backoff_seconds;
+    o->on_failure  = (uint32_t)in->policy.on_failure;
+    o->timeout_ms  = in->timeout_ms;
+    if (o->flags & GPTPS_SUBMIT_DEADLINE)   /* saturate: a huge "due in" stays latest */
+        o->due_wall_ms = (in->deadline_in_ms > UINT64_MAX - now_wall) ? UINT64_MAX : now_wall + in->deadline_in_ms;
+}
+
+/* Back into the engine's form, against the wall clock of THIS run. */
+static void opts_give(const dq_opts *o, gptps_submit_options *out, uint64_t now_wall)
+{
+    memset(out, 0, sizeof *out);
+    out->struct_size = sizeof *out;
+    out->flags       = o->flags;
+    out->priority    = o->priority;
+    out->policy.struct_size            = sizeof out->policy;
+    out->policy.timeout_seconds        = o->timeout_s;
+    out->policy.max_retries            = o->max_retries;
+    out->policy.retry_backoff_seconds  = o->backoff_s;
+    out->policy.on_failure             = (gptps_on_failure)o->on_failure;
+    out->timeout_ms  = o->timeout_ms;
+    out->deadline_in_ms = (o->due_wall_ms > now_wall) ? o->due_wall_ms - now_wall : 0u;   /* late: due now */
+}
+
+static void opts_encode(unsigned char *b, const dq_opts *o)
+{
+    put32(b, o->flags); put32(b + 4, (uint32_t)o->priority);
+    put32(b + 8, o->timeout_s); put32(b + 12, o->max_retries); put32(b + 16, o->backoff_s);
+    put32(b + 20, o->on_failure); put32(b + 24, o->timeout_ms); put32(b + 28, 0);
+    put64(b + 32, o->due_wall_ms);
+}
+
+static void opts_decode(dq_opts *o, const unsigned char *b)
+{
+    o->flags = get32(b) & DQ_OPTS_KNOWN;   /* a later version's flags: not ours to apply */
+    o->priority = (int32_t)get32(b + 4);
+    o->timeout_s = get32(b + 8); o->max_retries = get32(b + 12); o->backoff_s = get32(b + 16);
+    o->on_failure = get32(b + 20); o->timeout_ms = get32(b + 24);
+    o->due_wall_ms = get64(b + 32);
+}
 
 /* fsync the directory holding `path` so a rename of a file in it is durable. */
 static int fsync_parent_dir(const char *path)
@@ -398,9 +508,10 @@ static int cut_back(gptps_dq *dq, dq_waiter *w, long start, uint64_t seq, uint64
  * `w` (sync_until) and then unregisters it, and the call succeeded only if it returned
  * 0 and `w` became durable. */
 static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
-                         const char *name, const void *payload, size_t plen)
+                         const char *name, const void *payload, size_t plen, const dq_opts *o)
 {
     long start;
+    unsigned char ob[DQ_OPTS_LEN];
     if (!dq->fp || dq->broken) return -2;   /* see "a broken queue" */
     /* Seek to EOF before sampling the rollback point. C99 leaves an append
      * stream's initial position implementation-defined and the Windows CRT
@@ -409,7 +520,11 @@ static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
      * truncate every recovered record away on a transient ENOSPC. */
     fseek(dq->fp, 0, SEEK_END);
     start = ftell(dq->fp);
-    if (write_record(dq->fp, type, seq, name, payload, plen) != 0 || fflush(dq->fp) != 0)
+    if (o && o->flags) opts_encode(ob, o);
+    /* the 'O' rides in the same write and the same fsync as its 'P' (see "submit options") */
+    if (write_record(dq->fp, type, seq, name, payload, plen) != 0 ||
+        (o && o->flags && write_record(dq->fp, 'O', seq, "", ob, sizeof ob) != 0) ||
+        fflush(dq->fp) != 0)
         return cut_back(dq, w, start, seq, seq);
     register_waiter(dq, w, type, seq, seq, ftell(dq->fp));
     return 0;
@@ -419,15 +534,18 @@ static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
  * all of them, so one fsync settles the batch. All of it, or - cut back - none.
  * Caller holds jmu. */
 static int write_durable_batch(gptps_dq *dq, dq_waiter *w, const gptps_dq_item *items,
-                               size_t n, uint64_t first)
+                               size_t n, uint64_t first, const dq_opts *o)
 {
     long start;
     size_t i;
+    unsigned char ob[DQ_OPTS_LEN];
+    if (o && o->flags) opts_encode(ob, o);
     if (!dq->fp || dq->broken) return -2;
     fseek(dq->fp, 0, SEEK_END);       /* see write_durable */
     start = ftell(dq->fp);
     for (i = 0; i < n; ++i)
-        if (write_record(dq->fp, 'P', first + i, items[i].task_name, items[i].payload, items[i].len) != 0)
+        if (write_record(dq->fp, 'P', first + i, items[i].task_name, items[i].payload, items[i].len) != 0 ||
+            (o && o->flags && write_record(dq->fp, 'O', first + i, "", ob, sizeof ob) != 0))
             return cut_back(dq, w, start, first, first + n - 1);
     if (fflush(dq->fp) != 0) return cut_back(dq, w, start, first, first + n - 1);
     register_waiter(dq, w, 'P', first, first + n - 1, ftell(dq->fp));
@@ -800,6 +918,7 @@ static int apply_rec(gptps_dq *dq, const dq_raw *r)
     case 'S': rc->inflight = 1; break;
     case 'F': rc->inflight = 0; rc->crashes = 0; break;
     case 'K': if (r->plen == 4 && r->nlen == 0) rc->crashes = get32(r->body); break;
+    case 'O': if (r->plen >= DQ_OPTS_LEN && r->nlen == 0) opts_decode(&rc->opts, r->body); break;
     default: break;                          /* a later version's type: skip it */
     }
     return 0;
@@ -1036,7 +1155,7 @@ static gptps_status do_rewrite(gptps_dq *dq, int *replaced)
     apx_mutex_lock(&dq->smu);         /* waiter_state below; nothing can change it now */
     for (i = 0; i < dq->n; ++i) {
         const dq_rec *rc = &dq->recs[i];
-        unsigned char kb[4];
+        unsigned char kb[4], ob[DQ_OPTS_LEN];
         if (rc->done) continue;
         /* A submit still finishing up is written only if its 'P' became durable, and a
          * record whose retraction did is gone already: the file agrees with what those
@@ -1049,7 +1168,9 @@ static gptps_status do_rewrite(gptps_dq *dq, int *replaced)
          * travels as a K marker, and an attempt running right now as its S: a crash
          * just after a mid-run compaction must still count. */
         put32(kb, rc->crashes);
+        opts_encode(ob, &rc->opts);
         if (write_record(t, 'P', rc->seq, rc->name, rc->payload, rc->len) != 0 ||
+            (rc->opts.flags  && write_record(t, 'O', rc->seq, "", ob, sizeof ob) != 0) ||
             (rc->crashes     && write_record(t, 'K', rc->seq, "", kb, sizeof kb) != 0) ||
             (rc->inflight    && write_record(t, 'S', rc->seq, "", NULL, 0) != 0) ||
             (rc->quarantined && write_record(t, 'Q', rc->seq, "", NULL, 0) != 0)) {
@@ -1127,7 +1248,13 @@ static gptps_status resubmit(gptps_dq *dq, dq_rec *rc)
     gptps_handle h = 0;
     gptps_status st;
     if (map_reserve(dq, 1) != 0) return GPTPS_E_NOMEM;
-    st = gptps_submit(dq->e, rc->name, rc->payload, rc->len, &h);
+    if (rc->opts.flags) {             /* journaled with options: they come back with it */
+        gptps_submit_options so;
+        opts_give(&rc->opts, &so, dq_wall_ms());
+        st = gptps_submit_ex(dq->e, rc->name, rc->payload, rc->len, &so, &h);
+    } else {
+        st = gptps_submit(dq->e, rc->name, rc->payload, rc->len, &h);
+    }
     if (st == GPTPS_OK) {
         rc->handle = h;
         map_put(dq, h, rc->seq);
@@ -1347,18 +1474,32 @@ fail:
     return NULL;
 }
 
+/* The smallest gptps_submit_options gptps_submit_ex accepts: a struct that ends at
+ * timeout_ms, as before ABI 2.6. Checked here too, before anything is journaled. */
+#define DQ_OPTS_MIN_SIZE (offsetof(gptps_submit_options, timeout_ms) + sizeof(uint32_t))
+
 gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
                              const void *payload, size_t len, gptps_handle *out_handle)
+{
+    return gptps_dq_submit_ex(dq, task_name, payload, len, NULL, out_handle);
+}
+
+gptps_status gptps_dq_submit_ex(gptps_dq *dq, const char *task_name, const void *payload,
+                                size_t len, const gptps_submit_options *opts,
+                                gptps_handle *out_handle)
 {
     gptps_status st;
     gptps_handle h = 0;
     dq_rec *rc;
     dq_waiter w;
+    dq_opts jo;
     uint64_t seq;
     char *nm;
     void *pl;
     int wrote;
     if (!dq || !task_name) return GPTPS_E_INVAL;
+    if (opts && opts->struct_size < DQ_OPTS_MIN_SIZE) return GPTPS_E_INVAL;   /* as gptps_submit_ex */
+    opts_take(&jo, opts, dq_wall_ms());
     /* Refuse anything the replayer would reject rather than writing it: a record
      * past these bounds is classified as damage on the next open, and at the end of
      * the file it is dropped with every record appended after it - while this call
@@ -1395,10 +1536,11 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
     }
     seq = dq->next_seq++;
     rc->seq = seq; rc->name = nm; rc->payload = pl; rc->len = len;
+    rc->opts = jo;
     rc->committing = 1;               /* not a record, and not pending, until it is durable */
     apx_mutex_lock(&dq->jmu);         /* before letting go of mu: see "group commit" */
     apx_mutex_unlock(&dq->mu);
-    wrote = write_durable(dq, &w, 'P', seq, task_name, payload, len);
+    wrote = write_durable(dq, &w, 'P', seq, task_name, payload, len, &jo);
     apx_mutex_unlock(&dq->jmu);
     /* Durable before we enqueue: a swallowed fsync error would be a false durability
      * claim. The wait holds no lock the engine's threads need, and it shares its fsync
@@ -1420,7 +1562,10 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
         return GPTPS_E_IO;
     }
     dq->pending += 1;
-    st = gptps_submit(dq->e, task_name, payload, len, &h);
+    /* The caller's own options, as given: this run's engine clock is the one they were
+     * written against. Only a recovery needs the journaled, wall-clock form. */
+    st = opts ? gptps_submit_ex(dq->e, task_name, payload, len, opts, &h)
+              : gptps_submit(dq->e, task_name, payload, len, &h);
     if (st == GPTPS_OK) {
         rc->handle = h;
         map_put(dq, h, seq);
@@ -1437,15 +1582,24 @@ gptps_status gptps_dq_submit(gptps_dq *dq, const char *task_name,
 
 gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
 {
+    return gptps_dq_submit_batch_ex(dq, items, n, NULL);
+}
+
+gptps_status gptps_dq_submit_batch_ex(gptps_dq *dq, gptps_dq_item *items, size_t n,
+                                      const gptps_submit_options *opts)
+{
     char **nm = NULL;
     void **pl = NULL;
     dq_waiter w;
+    dq_opts jo;
     uint64_t first;
     size_t i, pushed;
     int wrote, durable;
     gptps_status bad = GPTPS_OK;
     if (!dq || (n && !items)) return GPTPS_E_INVAL;
     if (n == 0) return GPTPS_OK;
+    opts_take(&jo, opts, dq_wall_ms());
+    if (opts && opts->struct_size < DQ_OPTS_MIN_SIZE) bad = GPTPS_E_INVAL;
     /* gptps_dq_submit's bounds, for every item, before anything is written: a batch is
      * journaled whole or not at all. */
     for (i = 0; i < n && bad == GPTPS_OK; ++i)
@@ -1485,12 +1639,13 @@ gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
     for (i = 0; i < n; ++i) {
         dq_rec *rc = &dq->recs[dq->n - n + i];
         rc->seq = first + i; rc->name = nm[i]; rc->payload = pl[i]; rc->len = items[i].len;
+        rc->opts = jo;
         rc->committing = 1;
         nm[i] = NULL; pl[i] = NULL;                   /* the table owns them now */
     }
     apx_mutex_lock(&dq->jmu);                         /* before letting go of mu: see "group commit" */
     apx_mutex_unlock(&dq->mu);
-    wrote = write_durable_batch(dq, &w, items, n, first);
+    wrote = write_durable_batch(dq, &w, items, n, first, &jo);
     apx_mutex_unlock(&dq->jmu);
     if (wrote != -2) sync_until(dq, &w);              /* one fsync for the lot */
     durable = (wrote == 0 && w.state == DQ_W_DURABLE);
@@ -1509,7 +1664,8 @@ gptps_status gptps_dq_submit_batch(gptps_dq *dq, gptps_dq_item *items, size_t n)
             continue;
         }
         dq->pending += 1;
-        items[i].status = gptps_submit(dq->e, rc->name, rc->payload, rc->len, &h);
+        items[i].status = opts ? gptps_submit_ex(dq->e, rc->name, rc->payload, rc->len, opts, &h)
+                               : gptps_submit(dq->e, rc->name, rc->payload, rc->len, &h);
         if (items[i].status == GPTPS_OK) {
             rc->handle = h;
             map_put(dq, h, rc->seq);
@@ -1586,7 +1742,7 @@ gptps_status gptps_dq_cancel(gptps_dq *dq, gptps_handle h)
     rc->retracting += 1;
     apx_mutex_lock(&dq->jmu);         /* before letting go of mu: see "group commit" */
     apx_mutex_unlock(&dq->mu);
-    wrote = write_durable(dq, &w, 'D', seq, "", NULL, 0);
+    wrote = write_durable(dq, &w, 'D', seq, "", NULL, 0, NULL);
     apx_mutex_unlock(&dq->jmu);
     if (wrote != -2) sync_until(dq, &w);
     durable = (wrote == 0 && w.state == DQ_W_DURABLE);

@@ -750,6 +750,11 @@ target_include_directories(test_durable PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(test_durable PRIVATE gptps_durable_queue)
 add_test(NAME durable COMMAND test_durable)
 set_tests_properties(durable PROPERTIES TIMEOUT 30)
+add_executable(test_durable_opts tests/test_durable_opts.c) # submit options survive a restart (no fork: portable)
+target_include_directories(test_durable_opts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable_opts PRIVATE gptps_durable_queue)
+add_test(NAME durable_opts COMMAND test_durable_opts)
+set_tests_properties(durable_opts PROPERTIES TIMEOUT 30)
 # compiles the add-on in with realloc redirected, so it links the core only
 add_executable(test_durable_oom tests/test_durable_oom.c)
 target_include_directories(test_durable_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
@@ -906,6 +911,18 @@ target_compile_definitions(test_program_helper PRIVATE HELPER_PATH="$<TARGET_FIL
 add_dependencies(test_program_helper prog_helper)
 add_test(NAME program_helper COMMAND test_program_helper)
 set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
+
+# The CPU cap on Windows: a job object throttles a capped PROGRAM job (ABI 2.6). Linux's
+# is a cgroup's and is tested in test_cgroup; nothing else could vouch for this one.
+if(WIN32)
+add_executable(test_cpu_cap_win tests/test_cpu_cap_win.c)
+target_include_directories(test_cpu_cap_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_cpu_cap_win PRIVATE gptps)
+target_compile_definitions(test_cpu_cap_win PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_cpu_cap_win prog_helper)
+add_test(NAME cpu_cap_win COMMAND test_cpu_cap_win)
+set_tests_properties(cpu_cap_win PROPERTIES TIMEOUT 120)
+endif()
 
 # --- what a process job actually used (docs/MEASUREMENTS.md) ----------------
 # prog_helper jobs of known size, on every platform; in cgroup mode too, where CI's
