@@ -85,7 +85,8 @@ extern "C" {
  * measurement, and a due time: GPTPS_SUBMIT_DEADLINE + deadline_in_ms on
  * gptps_submit_options, carried to the seams as deadline_ms on gptps_sched_input and
  * gptps_constraint_input (which also gains now_ms), and the options an item was
- * submitted with on its gptps_dead_letter (`options`), for a re-drive. Additive, and the loader compares
+ * submitted with on its gptps_dead_letter (`options`), for a re-drive, and the
+ * scheduler seam's GPTPS_SCHED_STABLE flag. Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 6u
@@ -1739,6 +1740,18 @@ GPTPS_API gptps_status gptps_set_scheduler(gptps *e, gptps_sched_fn fn, void *us
 
 /* Take the seam regardless of who holds it (the pre-2.1 behaviour). */
 #define GPTPS_SCHED_REPLACE 0x1u
+/* ABI 2.6: the hook's score for an item never changes while the item waits - it
+ * depends only on the item (its priority, due time, enqueue time, payload ...), not on
+ * the time of the pass or on other items. The engine then asks the hook ONCE per wait:
+ * as the item enters the queue (gptps_submit, or a retry / requeue coming back), and
+ * once for everything already queued when the hook is installed. Without the flag it
+ * rescores and re-sorts every pending item on every admission pass, under the engine
+ * lock: O(n log n) per pass, so a backlog drains in O(n^2 log n). Keys like
+ * -deadline, or priority * k - enqueue_ms (aging by a fixed rate), are stable; a score
+ * that reads the clock is not. With the flag the hook also runs on the SUBMITTING
+ * thread, under the engine lock, with the same must-not-block rules. addons/gptps_sched
+ * sets it for all three of its orderings. */
+#define GPTPS_SCHED_STABLE  0x2u
 
 /* Install the scheduler, declaring an OWNER (ABI 2.1).
  *

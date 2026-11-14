@@ -804,6 +804,11 @@ set_tests_properties(remote_codec PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_sched)
+add_executable(test_sched_perf tests/test_sched_perf.c)     # complexity gate: linear drain with a scheduler installed
+target_include_directories(test_sched_perf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_sched_perf PRIVATE gptps_sched)
+add_test(NAME sched_perf COMMAND test_sched_perf)
+set_tests_properties(sched_perf PROPERTIES TIMEOUT 300)
 add_executable(test_sched_addon tests/test_sched_addon.c)   # EDF / aging / fair share / shed late
 target_include_directories(test_sched_addon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_sched_addon PRIVATE gptps_sched)
@@ -935,6 +940,18 @@ target_compile_definitions(test_cpu_cap_win PRIVATE HELPER_PATH="$<TARGET_FILE:p
 add_dependencies(test_cpu_cap_win prog_helper)
 add_test(NAME cpu_cap_win COMMAND test_cpu_cap_win)
 set_tests_properties(cpu_cap_win PROPERTIES TIMEOUT 120)
+endif()
+
+# gptps_adapt with PROGRAM jobs - every platform, Windows included. It includes the
+# add-on's source to reach its observer, so it links the core only.
+if(TARGET gptps_adapt)
+add_executable(test_adapt_program tests/test_adapt_program.c)
+target_include_directories(test_adapt_program PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_adapt_program PRIVATE gptps)
+target_compile_definitions(test_adapt_program PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_adapt_program prog_helper)
+add_test(NAME adapt_program COMMAND test_adapt_program)
+set_tests_properties(adapt_program PROPERTIES TIMEOUT 60)
 endif()
 
 # --- what a process job actually used (docs/MEASUREMENTS.md) ----------------

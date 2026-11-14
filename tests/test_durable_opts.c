@@ -158,7 +158,14 @@ int main(void)
         CHECK(gptps_dq_submit_ex(dq, "ok", &t, 1, &small, NULL) == GPTPS_E_INVAL);
         CHECK(gptps_dq_pending(dq) == before);
     }
-    CHECK(gptps_dq_pending(dq) == 6);
+    {   /* a 1.7 caller's struct, ending before deadline_in_ms, with the flag set: the
+         * priority is journaled, and no due time is read from bytes it does not have */
+        gptps_submit_options old = due_in(1000, 2);
+        old.struct_size = offsetof(gptps_submit_options, deadline_in_ms);
+        t = 'o';
+        CHECK(gptps_dq_submit_ex(dq, "ok", &t, 1, &old, NULL) == GPTPS_OK);
+    }
+    CHECK(gptps_dq_pending(dq) == 7);
     CHECK(gptps_shutdown(e) == GPTPS_OK);               /* unstepped: stays pending */
     gptps_dq_close(dq);
 
@@ -166,7 +173,7 @@ int main(void)
      * the compaction for run 3 to see them */
     e = open_engine();
     dq = gptps_dq_open(e, JOURNAL); CHECK(dq != NULL);
-    CHECK(gptps_dq_pending(dq) == 6);
+    CHECK(gptps_dq_pending(dq) == 7);
     CHECK(gptps_shutdown(e) == GPTPS_OK);
     gptps_dq_close(dq);
 
@@ -174,7 +181,7 @@ int main(void)
     reset_seen();
     e = open_engine();
     dq = gptps_dq_open(e, JOURNAL); CHECK(dq != NULL);
-    CHECK(gptps_dq_recover(dq) == 6);
+    CHECK(gptps_dq_recover(dq) == 7);
     drain(e);
 
     /* 1) and 3): priority and what is left of the due time */
@@ -189,6 +196,7 @@ int main(void)
     /* 5) the batch */
     CHECK(g_prio['x'] == -3 && g_prio['y'] == -3);
     CHECK(left_about('x', 300000) && left_about('y', 300000));
+    CHECK(g_seen['o'] && g_prio['o'] == 2 && g_dl['o'] == 0);
     CHECK(g_runs['a'] == 1 && g_runs['l'] == 1 && g_runs['n'] == 1 && g_runs['x'] == 1 && g_runs['y'] == 1);
     CHECK(gptps_dq_pending(dq) == 0);
     CHECK(gptps_shutdown(e) == GPTPS_OK);

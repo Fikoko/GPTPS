@@ -11,6 +11,12 @@
  *     once gives one to each tenant.
  *  4) shed_late: an item past due by more than the grace is refused (dead-lettered,
  *     GPTPS_E_DENIED); one without a due time, or not yet due, runs.
+ *  5) Fair share at depth: 300 items from 3 tenants - enough to grow its item table
+ *     several times and delete from it constantly - still share admissions equally;
+ *     more tenants than max_tenants share a slot, and every item still runs.
+ *  6) Every ordering on a THREADED engine, with real worker threads: all work
+ *     completes, and ThreadSanitizer (CI's tsan job runs this) sees the add-on's
+ *     lock protect the scheduler hook and the observer from each other.
  *
  * MANUAL mode, so the queue is exactly what each case lines up.
  */
@@ -18,11 +24,12 @@
 #include "gptps_sched.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-#define MAXO 64
+#define MAXO 512
 static char g_order[MAXO + 1];       /* first payload byte of each STARTED, in order */
 static int  g_n, g_denied;
 static gptps_handle g_tag[MAXO];     /* handle -> payload byte, for STARTED lookup */
@@ -40,6 +47,8 @@ static void on_ev(const gptps_event *ev, void *ud)
 }
 
 static gptps_status ok_task(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_OK; }
+static int g_ran;
+static gptps_status count_body(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; __atomic_add_fetch(&g_ran, 1, __ATOMIC_SEQ_CST); return GPTPS_OK; }
 
 static gptps *open_manual(uint32_t slots)
 {
@@ -92,6 +101,8 @@ int main(void)
     e = open_manual(1);
     CHECK(gptps_sched_edf(e, &s) == GPTPS_OK);
     CHECK(gptps_sched_aging(e, 10, &s2) == GPTPS_E_BUSY && s2 == NULL);   /* not taken from its owner */
+    CHECK(gptps_sched_fair(e, NULL, NULL, 0, &s2) == GPTPS_E_BUSY && s2 == NULL);   /* nor by fair share, */
+    /* whose observer, registered first, was taken back off: nothing it left behind can fire */
     CHECK(strcmp(gptps_scheduler_owner(e), "sched.edf") == 0);
     sub(e, 'x', 5, 0, 0);          /* no due time, high priority */
     sub(e, 'c', 0, 1, 30000);
@@ -194,6 +205,75 @@ int main(void)
     gptps_sched_close(s);
     gptps_sched_close(s2);
     gptps_sched_close(NULL);
+
+    /* 5a) depth: 3 tenants x 100, one slot; the STARTED order, by tenant */
+    {
+        static char deep[301];
+        int nd = 0, i, cnt[3] = { 0, 0, 0 };
+        e = open_manual(1);
+        CHECK(gptps_sched_fair(e, by_payload, NULL, 0, &s) == GPTPS_OK);
+        for (i = 0; i < 300; ++i) sub(e, (char)('a' + i / 100), 0, 0, 0);   /* all of a, then b, then c */
+        {   size_t n; while (gptps_step(e, &n) == GPTPS_OK && n) { } }
+        CHECK(g_n == 300);
+        for (i = 0; i < 300 && i < g_n; ++i) cnt[g_order[i] - 'a']++;
+        CHECK(cnt[0] == 100 && cnt[1] == 100 && cnt[2] == 100);
+        /* equal weights, ties FIFO: strictly round robin, a b c a b c ..., all the way */
+        for (i = 0; i < 300 && i < g_n; ++i) if (g_order[i] != "abc"[i % 3]) { ++nd; }
+        CHECK(nd == 0);
+        CHECK(gptps_dead_letter_count(e) == 0);
+        CHECK(gptps_shutdown(e) == GPTPS_OK);
+        gptps_sched_close(s);
+        (void)deep;
+    }
+
+    /* 5b) more tenants than the table: they share, and everything runs */
+    {
+        int done = 0;
+        size_t n;
+        e = open_manual(1);
+        CHECK(gptps_sched_fair(e, by_payload, NULL, 2, &s) == GPTPS_OK);
+        sub(e, 'x', 0, 0, 0); sub(e, 'y', 0, 0, 0); sub(e, 'z', 0, 0, 0);
+        sub(e, 'x', 0, 0, 0); sub(e, 'y', 0, 0, 0); sub(e, 'z', 0, 0, 0);
+        while (gptps_step(e, &n) == GPTPS_OK && n) done += (int)n;
+        CHECK(g_n == 6);
+        CHECK(gptps_shutdown(e) == GPTPS_OK);
+        gptps_sched_close(s);
+        (void)done;
+    }
+
+    /* 6) threaded: each ordering, four workers, 2 000 tiny items */
+    {
+        int k;
+        for (k = 0; k < 3; ++k) {
+            gptps_config cfg; gptps *te = NULL; gptps_task_def d; int i;
+            memset(&cfg, 0, sizeof cfg);
+            cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+            cfg.limits.max_concurrent_tasks = 4; cfg.limits.max_memory_bytes = 1u << 20;
+            CHECK(gptps_open_ex(&cfg, &te) == GPTPS_OK);
+            if (!te) break;
+            memset(&d, 0, sizeof d);
+            d.struct_size = sizeof d; d.name = "t"; d.run = count_body;
+            d.default_cost.struct_size = sizeof d.default_cost;
+            d.default_policy.struct_size = sizeof d.default_policy;
+            CHECK(gptps_register_task(te, &d) == GPTPS_OK);
+            s = NULL;
+            if (k == 0) CHECK(gptps_sched_fair(te, by_payload, NULL, 0, &s) == GPTPS_OK);
+            if (k == 1) CHECK(gptps_sched_edf(te, &s) == GPTPS_OK);
+            if (k == 2) CHECK(gptps_sched_aging(te, 5, &s) == GPTPS_OK);
+            __atomic_store_n(&g_ran, 0, __ATOMIC_SEQ_CST);
+            for (i = 0; i < 2000; ++i) {
+                gptps_submit_options o;
+                char c = (char)('a' + i % 4);
+                memset(&o, 0, sizeof o);
+                o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_DEADLINE | GPTPS_SUBMIT_PRIORITY;
+                o.deadline_in_ms = (uint64_t)(i * 37 % 1000); o.priority = i % 3;
+                CHECK(gptps_submit_ex(te, "t", &c, 1, &o, NULL) == GPTPS_OK);
+            }
+            CHECK(gptps_shutdown(te) == GPTPS_OK);         /* drains (bounded) and joins */
+            CHECK(__atomic_load_n(&g_ran, __ATOMIC_SEQ_CST) == 2000);
+            gptps_sched_close(s);
+        }
+    }
 
     if (fails) { printf("%d sched add-on check(s) FAILED\n", fails); return 1; }
     printf("sched add-on: all checks passed\n");

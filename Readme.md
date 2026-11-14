@@ -578,7 +578,10 @@ dropped for being late. The constraint seam sees it too (with `now_ms`), which i
 [`gptps_sched`](addons/README.md#sched--edf-aging-and-fair-share-orderings-shed-late-work)
 ships **EDF**, **priority with aging**, **weighted fair share** between tenants, and a
 **shed-late** constraint, each installed with one call and each refusing to take a
-scheduler seam someone else owns.
+scheduler seam someone else owns. A hook of your own whose score for an item never
+changes while it waits should pass `GPTPS_SCHED_STABLE` to `gptps_set_scheduler_ex`:
+the engine then asks it once per item instead of on every admission pass, and
+admission stays linear in queue depth (`tests/test_sched_perf.c`).
 
 **Faster locks (`-DGPTPS_HAL_FAST`).** An opt-in build knob swaps in adaptive
 (spin-then-block) mutexes on glibc — a latency knob for the engine's contended critical
@@ -923,7 +926,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **59** public functions · **ABI 2.6** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **13** add-on modules + 1 example binary
-plug-in · **97** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **99** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

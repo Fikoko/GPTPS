@@ -106,6 +106,8 @@ typedef struct gptps_item {
     size_t                res_n;
     struct gptps_item    *next;
     struct gptps_item    *prev;      /* every queue is doubly linked: see "finding an item" */
+    struct gptps_item    *tl, *tr, *tp; /* in intake: its node in the order tree ("intake ordering") */
+    uint32_t              tprio;     /* that tree's heap key, from intake_seq */
     unsigned char         where;     /* GPTPS_Q_*: the engine queue holding it, NONE in a local list */
     unsigned char         indexed;   /* in the handle index: gptps_cancel can still reach it */
     unsigned char         pooled;    /* a bounded engine's: freeing returns it to the pool */
@@ -235,9 +237,6 @@ static size_t cb_bucket(uint64_t tid)
     return (size_t)(tid & (GPTPS_CB_BUCKETS - 1));
 }
 
-/* Equal-score runs cached to keep an ordered intake insert O(1); see "intake
- * ordering". Advisory, so this bounds memory, never correctness. */
-#define GPTPS_INTAKE_RUNS 32
 
 /* pending event emitted after the lock is released. `name` is an OWNED inline copy
  * (not a borrowed pointer): a task type can be unregistered and freed during the
@@ -288,11 +287,10 @@ struct gptps {
     gptps_cond    *cv_work;
     gptps_cond    *cv_drain;        /* signalled after each pass; a blocked unregister re-checks drain */
 
-    /* intake is held in ADMISSION order, not submission order, and intake_runs
-     * indexes it - see "intake ordering" below for both invariants. */
+    /* intake is held in ADMISSION order, not submission order, and a search tree
+     * threaded through its items indexes it - see "intake ordering" below. */
     gptps_fifo     intake;
-    struct { int64_t score; gptps_item *tail; } intake_runs[GPTPS_INTAKE_RUNS];
-    size_t         n_intake_runs;
+    gptps_item    *intake_root;     /* the tree's root; NULL when intake is empty */
     gptps_fifo     ready;
     gptps_fifo     done;
     gptps_fifo     delayed;        /* retries waiting for backoff */
@@ -378,6 +376,7 @@ struct gptps {
     void          *ev_ud;
     gptps_sched_fn sched_fn;      /* swappable admission ordering (NULL => built-in priority) */
     void          *sched_ud;
+    int            sched_stable;  /* GPTPS_SCHED_STABLE: scored once as it enters intake, never per pass */
     /* Who installed it. COPIED, not borrowed: an add-on passes its namespace token,
      * which lives in the .so and outlives the engine - but a host can perfectly
      * reasonably pass a stack buffer, and gptps_scheduler_owner would then hand back
@@ -390,6 +389,7 @@ struct gptps {
     const void    *sched_tag;
     gptps_sched_fn sched_undo_fn;
     void          *sched_undo_ud;
+    int            sched_undo_stable;
     char           sched_undo_owner[32];
 
     /* Namespace enforcement window (ABI 2.1). Set under e->m immediately before an
@@ -650,73 +650,98 @@ static void hidx_trim(gptps *e)
  * holds ~250k/s flat across the same range (tests/test_admission_perf.c).
  *
  * Sorting moves the cost to insertion, and an ordered insert that walks the list is
- * the same quadratic in a different place - so intake_runs caches the TAIL of each
- * equal-score run. Real workloads use a handful of distinct priorities, so the cache
- * answers virtually every insert and the splice is O(1).
+ * the same quadratic in a different place. Until 1.8 a cache of the tails of the 32
+ * highest equal-score runs answered that, on the grounds that real workloads use a
+ * handful of distinct priorities. A deadline-first scheduler breaks that ground: every
+ * item has its own due time, so its own score, the cache missed on every insert, and
+ * each miss walked the list - a backlog of 40 000 took 15-22 s to drain where 20 000
+ * took 1.4 s (tests/test_sched_perf.c). So the list is indexed by a TREAP threaded
+ * through its items: ordered by the same key, (sched_score descending, intake_seq
+ * ascending), which is unique, and balanced in expectation by a heap key hashed from
+ * intake_seq. An insert descends it to the item's predecessor and splices the list
+ * there; a removal rotates the item down to a leaf and cuts it off: O(log n) each, for
+ * any mix of scores. It lives in fields of the items themselves, so a bounded engine
+ * allocates nothing for it, and the list stays what the dispatcher walks.
  *
- * THE CACHE IS ADVISORY. A miss just walks for the insertion point, and
- * intake_forget() may be called at any time. The single hard rule is that no cached
- * tail may dangle, so every removal from intake either goes through intake_unlink()
- * - which repairs the affected run - or is followed by intake_forget().
+ * THE RULE: the tree holds exactly the items in intake. Every single removal goes
+ * through intake_unlink() or intake_pop(); a bulk change of the list - a re-sort, a
+ * detach of many items - is followed by intake_reindex(), which rebuilds the tree from
+ * the list in O(n).
  *
  * ORDER IS NOT A NEW POLICY. It is the order the old double scan already picked,
  * made explicit: highest score first, and within one score the oldest item, so FIFO
  * still holds inside a priority. tests/test_admission_order.c pins that. */
 
-static void intake_forget(gptps *e) { e->n_intake_runs = 0; }
-
-/* Index of the cached run for `score`, or where a new one belongs (runs are sorted
- * by score DESCENDING). *found says which of the two it is. */
-static size_t intake_run_slot(gptps *e, int64_t score, int *found)
+/* `a` is admitted before `b`. Unique: no two items share an intake_seq. */
+static int intake_before(const gptps_item *a, const gptps_item *b)
 {
-    size_t lo = 0, hi = e->n_intake_runs;
-    *found = 0;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (e->intake_runs[mid].score == score) { *found = 1; return mid; }
-        if (e->intake_runs[mid].score > score) lo = mid + 1; else hi = mid;
+    return a->sched_score > b->sched_score ||
+           (a->sched_score == b->sched_score && a->intake_seq < b->intake_seq);
+}
+
+/* The treap's heap key: a mix of intake_seq, deterministic, so runs are repeatable. */
+static uint32_t intake_tprio(uint64_t seq)
+{
+    uint64_t x = seq * 0x9E3779B97F4A7C15ull;
+    x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
+    return (uint32_t)x;
+}
+
+/* Rotate `x` above its parent; the in-order sequence is unchanged. */
+static void intake_rot_up(gptps *e, gptps_item *x)
+{
+    gptps_item *p = x->tp, *g = p->tp;
+    if (p->tl == x) { p->tl = x->tr; if (x->tr) x->tr->tp = p; x->tr = p; }
+    else            { p->tr = x->tl; if (x->tl) x->tl->tp = p; x->tl = p; }
+    p->tp = x; x->tp = g;
+    if (!g) e->intake_root = x; else if (g->tl == p) g->tl = x; else g->tr = x;
+}
+
+/* Rebuild the tree from the list, which is in admission order: a Cartesian tree on
+ * the heap keys, built left to right along the rightmost spine - O(n) amortized, and
+ * no stack, since the parent links are the stack. */
+static void intake_reindex(gptps *e)
+{
+    gptps_item *it, *last = NULL;
+    e->intake_root = NULL;
+    for (it = e->intake.head; it; it = it->next) {
+        it->tprio = intake_tprio(it->intake_seq);
+        it->tl = it->tr = NULL;
+        while (last && last->tprio > it->tprio) last = last->tp;
+        if (last) {
+            it->tl = last->tr;
+            last->tr = it;
+        } else {
+            it->tl = e->intake_root;
+            e->intake_root = it;
+        }
+        if (it->tl) it->tl->tp = it;
+        it->tp = last;
+        last = it;
     }
-    return lo;
 }
 
-static void intake_run_cache(gptps *e, size_t at, int64_t score, gptps_item *tail)
-{
-    size_t i;
-    if (e->n_intake_runs == GPTPS_INTAKE_RUNS) {
-        if (at == e->n_intake_runs) return;     /* lower than everything cached: skip it */
-        e->n_intake_runs -= 1;                  /* evict the lowest-scoring run */
-    }
-    for (i = e->n_intake_runs; i > at; --i) e->intake_runs[i] = e->intake_runs[i - 1];
-    e->intake_runs[at].score = score;
-    e->intake_runs[at].tail  = tail;
-    e->n_intake_runs += 1;
-}
-
-static void intake_run_drop(gptps *e, size_t at)
-{
-    size_t i;
-    for (i = at + 1; i < e->n_intake_runs; ++i) e->intake_runs[i - 1] = e->intake_runs[i];
-    e->n_intake_runs -= 1;
-}
-
-/* Splice `it` in after the last item scoring >= it, i.e. onto the tail of its own
- * score's run - which is what keeps equal scores in submission order. */
+/* Put `it` into intake at its place in admission order: after every item that goes
+ * before it, which keeps equal scores in submission order. O(log n). */
 static void intake_insert(gptps *e, gptps_item *it)
 {
     gptps_fifo *q = &e->intake;
-    gptps_item *prev;
-    size_t at;
-    int found;
+    gptps_item *cur = e->intake_root, *par = NULL, *prev;
+    int left = 0;
 
-    it->intake_seq = ++e->intake_seq;                    /* the tie-break intake_sort uses */
-    at = intake_run_slot(e, it->sched_score, &found);
-    if (found) {
-        prev = e->intake_runs[at].tail;                  /* cache hit: O(1) */
-    } else {
-        gptps_item *cur;                                 /* miss: walk for the point */
-        for (prev = NULL, cur = q->head;
-             cur && cur->sched_score >= it->sched_score;
-             prev = cur, cur = cur->next) { }
+    it->intake_seq = ++e->intake_seq;                    /* the tie-break; also the heap key's seed */
+    it->tprio = intake_tprio(it->intake_seq);
+    it->tl = it->tr = NULL;
+    while (cur) { par = cur; left = intake_before(it, cur); cur = left ? cur->tl : cur->tr; }
+    it->tp = par;
+    if (!par) e->intake_root = it; else if (left) par->tl = it; else par->tr = it;
+    while (it->tp && it->tprio < it->tp->tprio) intake_rot_up(e, it);
+
+    /* its predecessor in order: the list node to splice after */
+    if (it->tl) { for (prev = it->tl; prev->tr; prev = prev->tr) { } }
+    else {
+        gptps_item *c = it;
+        for (prev = it->tp; prev && prev->tl == c; c = prev, prev = prev->tp) { }
     }
 
     it->next = prev ? prev->next : q->head;
@@ -725,31 +750,38 @@ static void intake_insert(gptps *e, gptps_item *it)
     if (prev) prev->next = it; else q->head = it;
     q->count += 1;
     it->where = GPTPS_Q_INTAKE;
-
-    if (found) e->intake_runs[at].tail = it;             /* it is the run's new tail */
-    else       intake_run_cache(e, at, it->sched_score, it);
 }
 
-/* Unlink `it` from intake, in O(1), and repair the run cache if it was pointing at
- * `it` as a run tail - so a removal never costs the next insert a walk. */
+/* Take `it` out of intake: rotate it down to a leaf, cut it from the tree, unlink it
+ * from the list. O(log n). */
 static void intake_unlink(gptps *e, gptps_item *it)
 {
     gptps_fifo *q = &e->intake;
     gptps_item *prev = it->prev;
-    size_t at;
-    int found;
+
+    while (it->tl || it->tr) {
+        gptps_item *c = !it->tl ? it->tr : !it->tr ? it->tl
+                      : (it->tl->tprio < it->tr->tprio ? it->tl : it->tr);
+        intake_rot_up(e, c);
+    }
+    if (!it->tp) e->intake_root = NULL;
+    else if (it->tp->tl == it) it->tp->tl = NULL;
+    else it->tp->tr = NULL;
+    it->tp = NULL;
 
     if (prev) prev->next = it->next; else q->head = it->next;
     if (it->next) it->next->prev = prev; else q->tail = prev;
     q->count -= 1;
-
-    at = intake_run_slot(e, it->sched_score, &found);
-    if (found && e->intake_runs[at].tail == it) {
-        if (prev && prev->sched_score == it->sched_score) e->intake_runs[at].tail = prev;
-        else intake_run_drop(e, at);                     /* that run is empty now */
-    }
     it->next = it->prev = NULL;
     it->where = GPTPS_Q_NONE;
+}
+
+/* The head of intake, taken out, or NULL. */
+static gptps_item *intake_pop(gptps *e)
+{
+    gptps_item *it = e->intake.head;
+    if (it) intake_unlink(e, it);
+    return it;
 }
 
 /* Bottom-up merge sort of an item list by sched_score DESCENDING, equal scores
@@ -799,7 +831,46 @@ static void intake_resort(gptps *e)
     e->intake.head = intake_sort(e->intake.head);
     for (it = e->intake.head; it; prev = it, it = it->next) it->prev = prev;
     e->intake.tail = prev;
-    intake_forget(e);                 /* every cached tail is now meaningless */
+    intake_reindex(e);                /* a new order: the tree is rebuilt from it */
+}
+
+static const char *item_name(const gptps_item *it);   /* below, with the item helpers */
+
+/* An item's ordering key under the current seam: the hook's score, or its priority
+ * when none is installed. Caller holds e->m. */
+static int64_t sched_key(gptps *e, const gptps_item *it)
+{
+    gptps_sched_input si;
+    if (!e->sched_fn) return it->priority;
+    memset(&si, 0, sizeof si);
+    si.struct_size = sizeof si;
+    si.task_name = item_name(it);   si.cost = &it->cost;
+    si.handle = it->handle;         si.priority = it->priority;
+    si.attempt = it->attempt;       si.enqueue_ms = it->enqueue_ms;
+    si.payload = it->payload;       si.payload_len = it->payload_len;
+    si.deadline_ms = it->due_ms;
+    return e->sched_fn(&si, e->sched_ud);
+}
+
+/* The key an item takes as it ENTERS intake (a submit, or a re-admission from
+ * `delayed`). A stable hook is asked here and only here. Otherwise the default
+ * ordering's key, priority, which the per-pass rescoring replaces when a hook that is
+ * not stable is installed. Caller holds e->m. */
+static int64_t entry_key(gptps *e, const gptps_item *it)
+{
+    return (e->sched_fn && e->sched_stable) ? sched_key(e, it) : (int64_t)it->priority;
+}
+
+/* The seam changed (installed, replaced, released, or put back by a failed add-on
+ * setup): every waiting item is keyed by the new ordering now, once, and the queue
+ * re-sorted. Without this a released hook's scores stayed on the items queued under
+ * it, and a stable hook - asked only on entry - would never see the items that were
+ * already waiting. Caller holds e->m. */
+static void intake_rekey(gptps *e)
+{
+    gptps_item *it;
+    for (it = e->intake.head; it; it = it->next) it->sched_score = sched_key(e, it);
+    intake_resort(e);
 }
 
 /* An engine created before a fork() must not be used in the child: its mutex may be
@@ -1758,6 +1829,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                      * is the one place that has to clear it. */
                     cur->started = 0;
                     fifo_remove(&e->delayed, cur);
+                    cur->sched_score = entry_key(e, cur);   /* a new wait: the stable hook's key for it */
                     intake_insert(e, cur);   /* back into ADMISSION order, not at the tail */
                 } else {
                     next_wake = min_nonzero(next_wake, cur->not_before_ms);
@@ -1826,7 +1898,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                  * the deadline (`past_grace`). */
                 while (npend < GPTPS_PENDING_CAP &&
                        ((it = fifo_pop(&e->delayed)) != NULL ||
-                        (it = fifo_pop(&e->intake)) != NULL)) {
+                        (it = intake_pop(e)) != NULL)) {
                     int drop = (it->policy.on_failure == GPTPS_ON_FAILURE_DROP);
                     it->outcome = GPTPS_E_SHUTDOWN;
                     pend[npend].kind = drop ? GPTPS_EV_DROPPED : GPTPS_EV_DEAD_LETTERED;
@@ -1838,7 +1910,6 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].flags = GPTPS_EV_FLAG_SHUTDOWN; ++npend;
                     if (drop) item_drop(e, it); else dead_letter_push(e, it);
                 }
-                intake_forget(e);                /* popped from the head: every cached tail may be gone */
                 if (e->delayed.head || e->intake.head) more = 1;
                 past_grace = 1;
                 for (it = e->running_items.head; it; it = it->next) {
@@ -1872,19 +1943,12 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
         /* scheduler seam: with a custom ordering installed, (re)score every pending
          * item for this pass (scores may depend on time). The default ordering left
          * sched_score == priority, stamped at submit, so it needs no rescoring. */
-        if (!past_grace && e->sched_fn && e->intake.head && e->running < e->limits.max_concurrent_tasks) {
+        /* A STABLE hook was asked once, as each item entered intake: rescoring it every
+         * pass, and re-sorting, made each pass O(n log n) under the lock - a drain of n
+         * items O(n^2 log n) - for keys that cannot have changed. */
+        if (!past_grace && e->sched_fn && !e->sched_stable && e->intake.head && e->running < e->limits.max_concurrent_tasks) {
             gptps_item *cur;
-            for (cur = e->intake.head; cur; cur = cur->next) {
-                gptps_sched_input si;
-                memset(&si, 0, sizeof si);
-                si.struct_size = sizeof si;
-                si.task_name = item_name(cur);   si.cost = &cur->cost;
-                si.handle = cur->handle;         si.priority = cur->priority;
-                si.attempt = cur->attempt;       si.enqueue_ms = cur->enqueue_ms;
-                si.payload = cur->payload;       si.payload_len = cur->payload_len;
-                si.deadline_ms = cur->due_ms;
-                cur->sched_score = e->sched_fn(&si, e->sched_ud);
-            }
+            for (cur = e->intake.head; cur; cur = cur->next) cur->sched_score = sched_key(e, cur);
             intake_resort(e);   /* the keys just changed, so the order has to be rebuilt */
         }
         while (!past_grace && e->intake.head && e->running < e->limits.max_concurrent_tasks) {
@@ -4410,7 +4474,7 @@ static gptps_status unregister_task(gptps *e, const char *task_name, unsigned fl
             }
             r->removed = true; r->cancelling = true;
             fifo_detach_reg(&e->intake, r, &dropped);
-            intake_forget(e);
+            intake_reindex(e);
             fifo_detach_reg(&e->delayed, r, &dropped);
             /* admitted but not yet run (or run and awaiting accounting): these hold
              * admission budget, so detaching them must release the ledger too */
@@ -4456,7 +4520,7 @@ static gptps_status unregister_task(gptps *e, const char *task_name, unsigned fl
             gptps_item *it;
             r->cancelling = true;             /* in-flight items are discarded, not dead-lettered */
             fifo_detach_reg(&e->intake, r, &dropped);   /* queued backlog (no budget reserved yet) */
-            intake_forget(e);
+            intake_reindex(e);
             fifo_detach_reg(&e->delayed, r, &dropped);
             index_drop_list(e, &dropped);   /* drained below, without the lock */
             for (it = e->running_items.head; it; it = it->next)
@@ -5128,8 +5192,10 @@ static void addon_unwind(gptps *e, const void *tag)
      * since is theirs, and stays. */
     if (e->sched_tag == tag) {
         e->sched_fn = e->sched_undo_fn; e->sched_ud = e->sched_undo_ud;
+        e->sched_stable = e->sched_undo_stable;
         memcpy(e->sched_owner, e->sched_undo_owner, sizeof e->sched_owner);
         e->sched_tag = NULL;
+        intake_rekey(e);
         gptps_cond_signal(e->cv_disp);   /* re-evaluate ordering on the next pass */
     }
     gptps_mutex_unlock(e->m);
@@ -5642,7 +5708,9 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
             it->submit_flags |= GPTPS_SUBMIT_DEADLINE;
         }
     }
-    it->sched_score = it->priority;   /* default ordering key; a scheduler hook re-scores per pass */
+    /* default ordering key - or a stable hook's, asked now and only now; a hook that is
+     * not stable re-scores every pass */
+    it->sched_score = entry_key(e, it);
     if (r->service) {
         /* a service instance is supervised: restart-on-exit, never a wall-clock kill.
          * Re-assert here so a submit_ex override (or a live tasks.<name>.* edit that
@@ -5743,7 +5811,7 @@ gptps_status gptps_cancel(gptps *e, gptps_handle h)
         it->cancelled = 1; cancel_raise(it);
         gptps_mutex_unlock(e->m); return GPTPS_OK;
     case GPTPS_Q_INTAKE:
-        intake_unlink(e, it);   /* repairs the run cache: the next submit stays O(1) */
+        intake_unlink(e, it);   /* keeps the order tree whole: the next submit stays O(log n) */
         break;
     case GPTPS_Q_DELAYED:
         fifo_remove(&e->delayed, it);
@@ -5809,11 +5877,14 @@ gptps_status gptps_set_scheduler_ex(gptps *e, gptps_sched_fn fn, void *user_data
         const void *tag = setup_tag_here(e);
         if (tag && e->sched_tag != tag) {
             e->sched_undo_fn = e->sched_fn; e->sched_undo_ud = e->sched_ud;
+            e->sched_undo_stable = e->sched_stable;
             memcpy(e->sched_undo_owner, e->sched_owner, sizeof e->sched_undo_owner);
         }
         e->sched_tag = tag;
     }
     e->sched_fn = fn; e->sched_ud = user_data;
+    e->sched_stable = (fn && (flags & GPTPS_SCHED_STABLE)) ? 1 : 0;
+    intake_rekey(e);   /* what is already waiting is ordered by the new key from now on */
     /* Copy, do not borrow - see the field's declaration. */
     if (fn && owner) {
         size_t n = strlen(owner);
@@ -6124,7 +6195,7 @@ static void stop_services(gptps *e, gptps_fifo *out)
     for (it = e->done.head; it; it = it->next)
         if (it->reg && it->reg->service) { it->cancelled = 1; cancel_raise(it); }
     fifo_detach_services(&e->intake, out);
-    intake_forget(e);
+    intake_reindex(e);
     fifo_detach_services(&e->delayed, out);
     index_drop_list(e, out);          /* the caller drains `out` without the lock */
 }
@@ -6200,7 +6271,7 @@ gptps_status gptps_shutdown(gptps *e)
      * is dropped. */
     gptps_mutex_lock(e->m);
     while ((it = fifo_pop(&e->intake))        != NULL) fifo_push(&dropped, it);
-    intake_forget(e);
+    e->intake_root = NULL;                    /* intake is empty: so is its tree */
     while ((it = fifo_pop(&e->delayed))       != NULL) fifo_push(&dropped, it);
     while ((it = fifo_pop(&e->ready))         != NULL) fifo_push(&dropped, it);
     while ((it = fifo_pop(&e->done))          != NULL) fifo_push(&dropped, it);

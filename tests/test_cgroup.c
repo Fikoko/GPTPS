@@ -28,6 +28,15 @@ static int inc(int *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static int get(int *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
 static int c_hog_nomem, c_small_ok, c_hog_cap_hit, c_small_measured;
 static int c_spin_ok, c_spin_throttled, c_spin_unthrottled;
+static int c_io_ok, c_io_capped;
+
+/* `needle` in the first `n` bytes of `hay` (no memmem in C99) */
+static int memmem_s(const char *hay, size_t n, const char *needle)
+{
+    size_t k = strlen(needle), i;
+    for (i = 0; i + k <= n; ++i) if (memcmp(hay + i, needle, k) == 0) return 1;
+    return 0;
+}
 
 static void on_ev(const gptps_event *ev, void *ud)
 {
@@ -48,6 +57,13 @@ static void on_ev(const gptps_event *ev, void *ud)
     }
     if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "small") == 0 &&
         gptps_event_measure(ev, GPTPS_M_CPU_THROTTLED_MS) == NULL) inc(&c_spin_unthrottled);
+    /* the I/O cap (ABI 2.6): the job's own cgroup holds io.max for its devices */
+    if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "ioread") == 0) {
+        inc(&c_io_ok);
+        if (ev->result && ev->result_len &&
+            memmem_s((const char *)ev->result, ev->result_len, "wbps=1048576") &&
+            memmem_s((const char *)ev->result, ev->result_len, "rbps=2097152")) inc(&c_io_capped);
+    }
     if (ev->kind == GPTPS_EV_FINISHED && strcmp(ev->task_name, "small") == 0) {
         inc(&c_small_ok);
         m = gptps_event_measure(ev, GPTPS_M_MEM_CAP_HIT);
@@ -83,6 +99,32 @@ static gptps_status task_spin(gptps_ctx *ctx, void *ud)
     (void)ctx; (void)ud;
     while ((double)(clock() - start) / CLOCKS_PER_SEC < 0.1) x += 1;
     return GPTPS_OK;
+}
+
+/* In the job: read the io.max of the cgroup this process is in, and return it. That
+ * is the kernel's own record of what holds the job - the proof, from inside, that the
+ * cap is the job's and not just written somewhere. */
+static gptps_status task_ioread(gptps_ctx *ctx, void *ud)
+{
+    char line[1024], path[1200], buf[4096];
+    size_t n = 0;
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    (void)ud;
+    if (!f) return GPTPS_E_IO;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "0::", 3) == 0) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = 0;
+            snprintf(path, sizeof path, "/sys/fs/cgroup%s/io.max", line + 3);
+            break;
+        }
+    }
+    fclose(f);
+    f = fopen(path, "r");
+    if (!f) return GPTPS_E_IO;
+    n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    return gptps_result_set(ctx, buf, n);
 }
 
 static int cg_write(const char *dir, const char *file, const char *val)
@@ -139,6 +181,7 @@ static int setup_parent(char *parent, size_t pn)
     if (mkdir(parent, 0700) != 0) return 0;      /* no delegation here -> skip */
     if (cg_write(parent, "cgroup.subtree_control", "+memory") != 0) { rmdir(parent); return 0; }
     (void)cg_write(parent, "cgroup.subtree_control", "+cpu");   /* best effort: see cpu_delegated */
+    (void)cg_write(parent, "cgroup.subtree_control", "+io");    /* best effort: see io_delegated */
     /* verify a child can actually take a memory cap */
     if ((size_t)snprintf(probe, sizeof probe, "%s/_probe", parent) >= sizeof probe) { rmdir(parent); return 0; }
     if (mkdir(probe, 0700) != 0) { rmdir(parent); return 0; }
@@ -159,6 +202,34 @@ static int cpu_delegated(const char *parent)
     if ((size_t)snprintf(probe, sizeof probe, "%s/_cpuprobe", parent) >= sizeof probe) return 0;
     if (mkdir(probe, 0700) != 0) return 0;
     ok = cg_write(probe, "cpu.max", "5000 100000") == 0;
+    rmdir(probe);
+    return ok;
+}
+
+/* Can a job's cgroup under the parent take an I/O cap on some block device? The I/O
+ * part of this test needs it and skips without it. */
+static int io_delegated(const char *parent)
+{
+    char probe[1088], dev[64], line[160], p[300];
+    FILE *ls = popen("ls /sys/block 2>/dev/null", "r");
+    int ok = 0;
+    if (!ls) return 0;
+    if ((size_t)snprintf(probe, sizeof probe, "%s/_ioprobe", parent) >= sizeof probe || mkdir(probe, 0700) != 0) { pclose(ls); return 0; }
+    while (!ok && fgets(line, sizeof line, ls)) {
+        FILE *f;
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        snprintf(p, sizeof p, "/sys/block/%s/dev", line);
+        if (!(f = fopen(p, "r"))) continue;
+        if (fgets(dev, sizeof dev, f)) {
+            char val[128];
+            if ((nl = strchr(dev, '\n')) != NULL) *nl = 0;
+            snprintf(val, sizeof val, "%s wbps=1048576", dev);
+            ok = cg_write(probe, "io.max", val) == 0;
+        }
+        fclose(f);
+    }
+    pclose(ls);
     rmdir(probe);
     return ok;
 }
@@ -220,6 +291,25 @@ int main(void)
             gptps_shutdown(e);
             CHECK(get(&c_spin_ok) == 1);
             CHECK(get(&c_spin_throttled) == 1);      /* held back by cpu.max, and measured */
+        }
+    }
+
+    if (!io_delegated(parent)) {
+        printf("cgroup I/O-cap check skipped (io controller not delegated)\n");
+    } else {
+        e = NULL;
+        CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+        if (e) {
+            gptps_set_event_cb(e, on_ev, NULL);
+            def_oop(&d, "ioread", task_ioread);
+            d.default_cost.mem_bytes = 0;            /* an I/O cap alone still makes a cgroup */
+            d.io_max_read_bps  = 2u << 20;           /* 2 MiB/s */
+            d.io_max_write_bps = 1u << 20;           /* 1 MiB/s */
+            CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+            CHECK(gptps_submit(e, "ioread", NULL, 0, &h) == GPTPS_OK);
+            gptps_shutdown(e);
+            CHECK(get(&c_io_ok) == 1);
+            CHECK(get(&c_io_capped) == 1);           /* the job's own cgroup holds both limits */
         }
     }
 

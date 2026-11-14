@@ -154,6 +154,13 @@ int main(void)
         CHECK(due_from('g', t0) >= 10000 && due_from('g', t0) <= 10000 + 20);
         CHECK(g_enq['g'] >= t0 + 60);                       /* ...though released 60 ms later */
         CHECK(g_seen['l'] && g_dl['l'] - g_enq['l'] == 0);  /* late by the release: due now */
+        /* a 1.7 caller's struct, ending before deadline_in_ms, with the flag set: its
+         * priority holds, and no due time is read from bytes it does not have */
+        tag = 'o'; o = due(10000, 6);
+        o.struct_size = offsetof(gptps_submit_options, deadline_in_ms);
+        CHECK(gptps_orch_after_ex(orch, "t", &tag, 1, &dep, 1, &o, &h) == GPTPS_OK);
+        drain(e);
+        CHECK(g_seen['o'] && g_prio['o'] == 6 && g_dl['o'] == 0);
         /* fast path: the dependency is terminal now, so the options apply at once */
         tag = 'f'; o = due(3000, 1);
         CHECK(gptps_orch_after_ex(orch, "t", &tag, 1, &dep, 1, &o, &h) == GPTPS_OK && h != 0);
