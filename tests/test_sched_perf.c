@@ -83,7 +83,7 @@ static double drain(int kind, int n, int reps)
             memset(&o, 0, sizeof o);
             o.struct_size = sizeof o;
             o.flags = GPTPS_SUBMIT_DEADLINE | GPTPS_SUBMIT_PRIORITY;
-            o.deadline_in_ms = (uint64_t)((i * 7919) % 50000);
+            o.deadline_in_ms = ((uint64_t)i * 7919u) % 50000u;   /* 64-bit: i * 7919 overflows an int past ~271k items */
             o.priority = (int32_t)(i % 5);
             if (gptps_submit_ex(e, "n", &b, 1, &o, NULL) != GPTPS_OK) { ++fails; break; }
         }
