@@ -905,7 +905,10 @@ static void test_journaling_does_not_stall(void)
     t0 = time(NULL);
     while (get(&g_plain_done) < 1000 && time(NULL) - t0 < 10) nap();
     CHECK(get(&g_plain_done) == 1000);                  /* was minutes */
-    CHECK(get(&g_pump_submits) > before);               /* and the pump ran all along */
+    /* and the pump is still running: wait for its next journaled submit rather than
+     * expect one already - a thousand no-op tasks can finish inside a single fsync on
+     * a busy runner. A stalled pump would still fail this, after 10 s. */
+    CHECK(wait_for(&g_pump_submits, before + 1));
     __atomic_store_n(&g_pump_stop, 1, __ATOMIC_SEQ_CST);
     gptps_shutdown(e);
     gptps_dq_close(dq);
