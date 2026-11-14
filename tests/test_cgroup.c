@@ -129,8 +129,9 @@ static gptps_status task_ioread(gptps_ctx *ctx, void *ud)
 
 static int cg_write(const char *dir, const char *file, const char *val)
 {
-    char path[1024]; FILE *f;
-    snprintf(path, sizeof path, "%s/%s", dir, file);
+    char path[2048]; FILE *f;
+    /* refuse, never truncate: a cut path could name another cgroup's file */
+    if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, file) >= sizeof path) return -1;
     f = fopen(path, "w");
     if (!f) return -1;
     fputs(val, f);
