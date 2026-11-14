@@ -5,7 +5,7 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.8.0] - 2026-11-14
 
 ### Upgrading from 1.7
 

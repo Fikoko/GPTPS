@@ -101,6 +101,13 @@ max_retries     = 1
 on_failure      = "drop"
 mem_bytes       = 268435456          # advertise this task's per-run memory cost (256 MiB)
 priority        = 10                 # run resizes ahead of lower-priority work
+# For a task that runs as a separate process (exec OOP or PROGRAM), 1.8 can also cap
+# what one run may use while it runs - throttled, never killed. Enforced in cgroup
+# mode (GPTPS_CGROUP_PARENT) and, for the CPU cap, on Windows; elsewhere the first
+# run logs one warning per cap. 0 = no cap. In-process tasks ignore them.
+# cpu_max_millicpus = 2000           # at most two CPUs' worth (1000 = one CPU)
+# io_max_read_bps   = 104857600      # 100 MiB/s of block-device reads, per device
+# io_max_write_bps  = 52428800       # 50 MiB/s of writes, per device
 
 [tasks.resize.resources]
 gpu = 1                              # each resize holds one of the two GPUs while it runs
