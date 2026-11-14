@@ -491,7 +491,10 @@ gptps_submit_ex(e, "frame", buf, len, &o, &h);
 - **Shed late** — a constraint: an item more than `grace_ms` past due when it comes up
   for admission is refused (dead-lettered, `GPTPS_E_DENIED`); items without a due time
   never are. `gptps_sched_shed_count` counts them.
-- **Owning the seam.** The three orderings install with `flags == 0` and return
+- **Linear at depth.** All three keep an item's score fixed while it waits, so they
+  install with `GPTPS_SCHED_STABLE`: the engine asks for a score once per item, not on
+  every admission pass. `sched_perf` gates it.
+- **Owning the seam.** The three orderings install without `GPTPS_SCHED_REPLACE` and return
   `GPTPS_E_BUSY` if the scheduler seam is taken — the rule `gptps_set_scheduler_ex` sets
   for add-ons. None of them changes the mechanism: skip-to-fit, budgets and the
   starvation guard apply as before.

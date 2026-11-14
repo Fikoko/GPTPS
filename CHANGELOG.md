@@ -103,6 +103,35 @@ and `gptps_xport` add options-taking submits, and `gptps_balance_config` appends
   the operator asked for the work to run). `gptps_tui_add_task_ex` binds a hotkey that
   submits with options, the due time counting from each press.
 
+### Fixed — admission with a scheduler installed was super-linear
+
+- With any scheduler hook installed, the engine rescored and re-sorted every waiting
+  item on every admission pass, under its lock, and found an item's place in the queue
+  by walking it whenever many items had different scores - which a deadline-first
+  ordering always produces. Draining a backlog cost O(n^2): measured with EDF, 20 000
+  items took 1.4-6 s and 40 000 took 15-22 s. Two changes make it linear:
+  - **`GPTPS_SCHED_STABLE`**, a new `gptps_set_scheduler_ex` flag: a hook whose score
+    for an item never changes while it waits is asked once - when the item enters the
+    queue, and for what is already queued when it is installed - never per pass. EDF,
+    aging and fair share in `gptps_sched` all set it.
+  - **The queue is indexed by a balanced search tree** threaded through its items,
+    replacing a 32-entry cache of equal-score runs: an insert or removal is O(log n)
+    for any mix of scores, and a bounded engine still allocates nothing for it.
+
+  Now EDF drains 160 000 items in about a third of a second. `sched_perf`, a complexity
+  gate like `admission_perf`, keeps all three orderings linear.
+- Installing, replacing or releasing a scheduler now re-keys the work already waiting.
+  Before, a released hook's scores stayed on the queued items until they ran.
+
+### Added — tests for what had none
+
+- The I/O cap: `cgroup` now checks, from inside a capped job, that its own cgroup holds
+  the `io.max` limits it was given. Nothing tested the I/O cap before.
+- `gptps_adapt` with external-program jobs (`adapt_program`), so on Windows too, and its
+  "never mix methods" and cap-hit branches.
+- Fair share at depth (300 items, strict round robin), with more tenants than its table
+  holds, and every `gptps_sched` ordering on a threaded engine (for ThreadSanitizer).
+
 ### Added — a Windows CPU-cap test
 
 - `cpu_cap_win` runs the same CPU-bound program uncapped and capped at 100 millicpus,

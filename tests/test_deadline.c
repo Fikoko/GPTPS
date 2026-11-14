@@ -33,10 +33,12 @@ static int      g_order[MAXH], g_order_n;
 static int      g_fail_first;         /* "flaky" fails its first attempt */
 static int      g_flaky_runs;
 
+static int g_calls;   /* how often the hook was asked */
 static int64_t edf(const gptps_sched_input *in, void *ud)
 {
     uint64_t d = 0;
     (void)ud;
+    ++g_calls;
     if (in->struct_size >= offsetof(gptps_sched_input, deadline_ms) + sizeof in->deadline_ms)
         d = in->deadline_ms;
     if (in->handle < MAXH) { g_sched_dl[in->handle] = d; g_sched_enq[in->handle] = in->enqueue_ms; }
@@ -175,6 +177,45 @@ int main(void)
         drain(e);
         CHECK(g_sched_dl[h] == UINT64_MAX);
         CHECK(gptps_shutdown(e) == GPTPS_OK);
+    }
+
+    /* 6) GPTPS_SCHED_STABLE: the hook is asked once per wait - at submit, and for
+     * what is already queued when it is installed, never again per pass - and a seam
+     * change re-keys what is waiting: installing orders it by the hook, releasing
+     * puts it back in priority order (a released hook's scores used to stay on it) */
+    {
+        int pass;
+        for (pass = 0; pass < 2; ++pass) {
+            gptps *e = open_manual();
+            gptps_handle h1, h2, h3;
+            gptps_submit_options o;
+            reg(e, "t", ok_task, 0);
+            CHECK(gptps_set_event_cb(e, on_ev, NULL) == GPTPS_OK);
+            g_calls = 0; g_order_n = 0;
+            if (pass == 1) CHECK(gptps_set_scheduler_ex(e, edf, NULL, "test", GPTPS_SCHED_STABLE) == GPTPS_OK);
+            memset(&o, 0, sizeof o);
+            o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_DEADLINE | GPTPS_SUBMIT_PRIORITY;
+            o.priority = 9; o.deadline_in_ms = 50000; CHECK(gptps_submit_ex(e, "t", NULL, 0, &o, &h1) == GPTPS_OK);
+            o.priority = 1; o.deadline_in_ms = 1000;  CHECK(gptps_submit_ex(e, "t", NULL, 0, &o, &h2) == GPTPS_OK);
+            o.priority = 5; o.deadline_in_ms = 20000; CHECK(gptps_submit_ex(e, "t", NULL, 0, &o, &h3) == GPTPS_OK);
+            if (pass == 0) {
+                /* installed after the three were queued: each keyed once, at install */
+                CHECK(g_calls == 0);
+                CHECK(gptps_set_scheduler_ex(e, edf, NULL, "test", GPTPS_SCHED_STABLE) == GPTPS_OK);
+                CHECK(g_calls == 3);
+                drain(e);
+                CHECK(g_calls == 3);                       /* no admission pass asked again */
+                CHECK(g_order_n == 3 && g_order[0] == (int)h2 && g_order[1] == (int)h3 && g_order[2] == (int)h1);
+            } else {
+                /* installed first: each asked once, at its submit; then released */
+                CHECK(g_calls == 3);
+                CHECK(gptps_set_scheduler_ex(e, NULL, NULL, "test", 0) == GPTPS_OK);
+                drain(e);
+                CHECK(g_calls == 3);
+                CHECK(g_order_n == 3 && g_order[0] == (int)h1 && g_order[1] == (int)h3 && g_order[2] == (int)h2);
+            }
+            CHECK(gptps_shutdown(e) == GPTPS_OK);
+        }
     }
 
     if (fails) { printf("%d deadline check(s) FAILED\n", fails); return 1; }

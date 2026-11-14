@@ -250,7 +250,7 @@ static gptps_status install_order(gptps *e, int kind, gptps_sched_fn fn, const c
     *out = NULL;
     s = new_sched(kind);
     if (!s) return GPTPS_E_NOMEM;
-    st = gptps_set_scheduler_ex(e, fn, s, owner, 0);   /* never take a seam someone holds */
+    st = gptps_set_scheduler_ex(e, fn, s, owner, GPTPS_SCHED_STABLE);   /* never take a seam someone holds; scores never move */
     if (st != GPTPS_OK) { gptps_sched_close(s); return st; }
     *out = s;
     return GPTPS_OK;
@@ -270,7 +270,7 @@ gptps_status gptps_sched_aging(gptps *e, uint32_t ms_per_level, gptps_sched **ou
     s = new_sched(K_AGING);
     if (!s) return GPTPS_E_NOMEM;
     s->ms_per_level = ms_per_level;                     /* set before the engine can call */
-    st = gptps_set_scheduler_ex(e, aging_score, s, "sched.aging", 0);
+    st = gptps_set_scheduler_ex(e, aging_score, s, "sched.aging", GPTPS_SCHED_STABLE);
     if (st != GPTPS_OK) { gptps_sched_close(s); return st; }
     *out = s;
     return GPTPS_OK;
@@ -299,7 +299,7 @@ gptps_status gptps_sched_fair(gptps *e, gptps_sched_tenant_fn tenant_fn, void *u
      * would leave an ordering in place that could not advance. */
     st = gptps_register_observer(e, fair_obs, s);
     if (st != GPTPS_OK) { gptps_sched_close(s); return st; }
-    st = gptps_set_scheduler_ex(e, fair_score, s, "sched.fair", 0);
+    st = gptps_set_scheduler_ex(e, fair_score, s, "sched.fair", GPTPS_SCHED_STABLE);
     if (st != GPTPS_OK) {
         gptps_unregister_observer(e, fair_obs, s);
         gptps_sched_close(s);
