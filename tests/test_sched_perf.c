@@ -14,8 +14,16 @@
  * queue - which all three of these orderings are.
  *
  * MANUAL mode: every item is queued before the first admission decision, so each
- * drain starts from full depth. Doubling n must roughly double the time (~2); the
- * quadratic path shows up far above the bar.
+ * drain starts from full depth.
+ *
+ * THE BAR. The queue is a balanced search tree, so a drain is O(n log n), not O(n):
+ * with deadlines arriving in random order each insert lands somewhere new in a tree
+ * that outgrows the CPU cache, and EDF's doubling ratio measured 2.05-2.73 on Linux
+ * and 3.03 on a macOS runner - over the 3.0 that test_admission_perf uses for a
+ * strictly linear structure, which this gate first copied. So it compares n with 4n
+ * instead of 2n, which widens the gap between the two cases it must tell apart:
+ * linear ~4, O(n log n) with cache effects ~5-6, quadratic ~16 (and the bug this
+ * gate exists for measured 9-15 on a mere doubling). The bar sits at 8.
  */
 #include "gptps.h"
 #include "gptps_hal.h"
@@ -26,7 +34,14 @@
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-#define MAX_RATIO 3.0   /* linear ~2.0; see test_admission_perf.c for the reasoning */
+#define SCALE     4     /* compare n with SCALE * n */
+#define MAX_RATIO 8.0   /* linear ~4, n log n ~5-6, quadratic ~16: see THE BAR above */
+
+/* No drain here takes a second when admission is linear. One that runs past this is
+ * itself the verdict - the quadratic path took minutes for a single drain - so it is
+ * stopped and failed at once rather than left to reach ctest's timeout. */
+#define BUDGET_MS 30000u
+static int g_overtime;
 
 enum { K_EDF, K_FAIR, K_AGING, K_N };
 static const char *const NAMES[K_N] = { "EDF", "fair share", "aging" };
@@ -72,7 +87,12 @@ static double drain(int kind, int n, int reps)
             o.priority = (int32_t)(i % 5);
             if (gptps_submit_ex(e, "n", &b, 1, &o, NULL) != GPTPS_OK) { ++fails; break; }
         }
-        while (gptps_step(e, &ran) == GPTPS_OK && ran) { }
+        {
+            unsigned steps = 0;
+            while (gptps_step(e, &ran) == GPTPS_OK && ran)
+                if ((++steps & 255u) == 0 && gptps_hal_monotonic_ms() - t0 > BUDGET_MS) { g_overtime = 1; break; }
+        }
+        if (g_overtime) break;
     }
     { double dt = (double)(gptps_hal_monotonic_ms() - t0); gptps_shutdown(e); gptps_sched_close(s); return dt; }
 }
@@ -90,16 +110,25 @@ int main(void)
             if (n < 160000) n *= 2; else if (reps < 32) reps *= 2; else break;
         }
         if (fails) break;
-        b = drain(k, 2 * n, reps);
-        for (i = 0; i < 2 && !fails; ++i) {        /* best of three, as admission_perf */
-            double a2 = drain(k, n, reps), b2 = drain(k, 2 * n, reps);
+        b = drain(k, SCALE * n, reps);
+        if (g_overtime) {
+            printf("%-10s a drain of %d items ran past %u ms: admission is super-linear\n",
+                   NAMES[k], SCALE * n, BUDGET_MS);
+            ++fails;
+            break;
+        }
+        /* Best of three - unless the first is already far past the bar: the repeats
+         * only filter out a noisy HIGH reading, and a quadratic path would spend
+         * minutes on them before failing (it reached ctest's timeout instead). */
+        for (i = 0; i < 2 && !fails && a > 0.0 && b / a < 2.0 * MAX_RATIO; ++i) {
+            double a2 = drain(k, n, reps), b2 = drain(k, SCALE * n, reps);
             if (a2 < a) a = a2;
             if (b2 < b) b = b2;
         }
         if (fails) break;
         ratio = (a > 0.0) ? b / a : 0.0;
-        printf("%-10s drain %d x%d: %.0fms | drain %d x%d: %.0fms | ratio %.2f (linear ~2.0)\n",
-               NAMES[k], n, reps, a, 2 * n, reps, b, ratio);
+        printf("%-10s drain %d x%d: %.0fms | drain %d x%d: %.0fms | ratio %.2f (linear ~4, quadratic ~16)\n",
+               NAMES[k], n, reps, a, SCALE * n, reps, b, ratio);
         CHECK(ratio < MAX_RATIO);
     }
     printf("test_sched_perf: %s\n", fails ? "FAILED" : "OK");
