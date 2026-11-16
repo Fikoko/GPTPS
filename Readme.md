@@ -654,7 +654,7 @@ Run it live in a terminal: `./build/example_dashboard` (source:
 |---|---|---|---|---|
 | `GPTPS_EXEC_INPROC` | your C function, in-process | cooperative cancel (advisory) | **kills your whole process** — the engine, the dispatcher, and every other in-flight item | all |
 | `GPTPS_EXEC_OOP` | the same C function in a forked child | memory cap + hard-kill on timeout **or cancel** | kills only the child; reported as `GPTPS_E_TASK` (`E_NOMEM` if it blew the memory cap) | POSIX only (needs `fork`) |
-| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout **or cancel** | kills only the child; reported as `GPTPS_E_TASK` (`E_NOMEM` if it blew the memory cap) | all (POSIX `fork`+exec; Windows `CreateProcess` + Job Object) |
+| `GPTPS_EXEC_PROGRAM` | an external program (`def.argv`); payload→stdin, stdout→result | memory cap + hard-kill on timeout **or cancel** | kills only the child; reported as `GPTPS_E_TASK` (`E_NOMEM` if it blew the memory cap) | all (POSIX `fork`+exec; Windows `CreateProcessW` + Job Object) |
 
 **Read the blast-radius column before you pick.** `GPTPS_EXEC_INPROC` is `0`, so it is
 what a `memset`-zeroed `gptps_task_def` gives you — the fast path, and the right default
@@ -685,6 +685,17 @@ and the CPU cap through the job object's hard CPU-rate limit on Windows. Where n
 hold one, the job still runs and the log sink gets **one** `WARN` per cap per task type —
 never silence. A CPU cap held by a cgroup reports `cpu.throttled_ms` on the job's
 `FINISHED` / `FAILED`: the evidence that the cap is why it was slow.
+
+**Starting, stopping and failing a program (ABI 2.7).** A `PROGRAM` job can be given
+`def.work_dir` (where it starts) and `def.env` (`"NAME=value"` laid over the host's
+environment; a bare `"NAME"` removes one), on POSIX and Windows alike; strings are UTF-8,
+so a Turkish path works on any Windows code page. `def.stop_grace_ms` lets a job GPTPS has
+to stop clean up first: SIGTERM, up to that long, then SIGKILL (POSIX; Windows still stops
+at once and says so). `def.stderr_tail_bytes` captures the job's stderr and hands its last
+bytes back on the `FAILED` event and the dead letter, so forty jobs' errors stay apart.
+Every `FINISHED` / `FAILED` also carries `exit.code` (or `exit.signal`) when the program
+ended on its own. What happens to running jobs if the host itself dies is in
+[docs/SECURITY.md](docs/SECURITY.md).
 
 **What a job actually used.** Admission counts what a task *declares*; the
 out-of-process executors also report what each attempt *used*, because they collect its
@@ -924,9 +935,9 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **59** public functions · **ABI 2.6** (append-only; 2.0 was the first
+At a glance: **59** public functions · **ABI 2.7** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **13** add-on modules + 1 example binary
-plug-in · **99** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **100** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
