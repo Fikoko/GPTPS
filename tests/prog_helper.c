@@ -34,6 +34,8 @@
  *             "term"  : POSIX: on SIGTERM write "cleaned" to the file argv[2] and
  *                       exit 0; until then, sleep - a program that cleans up.
  *             "termignore": ignore SIGTERM and sleep - one that never does.
+ *             "brk"   : Windows: on Ctrl+Break write "cleaned" to the file argv[2]
+ *                       and exit 0; until then, sleep - "term", the Windows way.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
@@ -112,6 +114,18 @@ static void on_term(int sig)
 #endif
 
 #if defined(_WIN32)
+static const char *g_brk_file;
+static BOOL WINAPI on_brk(DWORD kind)
+{
+    if (kind != CTRL_BREAK_EVENT) return FALSE;
+    if (g_brk_file) {
+        FILE *f = fopen(g_brk_file, "wb");
+        if (f) { fputs("cleaned", f); fclose(f); }
+    }
+    ExitProcess(0);
+    return TRUE;
+}
+
 /* a wide string, written to stdout as UTF-8 */
 static void put_w(const wchar_t *w)
 {
@@ -191,6 +205,13 @@ int main(int argc, char **argv)
     }
     if (strcmp(mode, "termignore") == 0) {
         signal(SIGTERM, SIG_IGN);
+        for (;;) sleep_ms(10);
+    }
+#endif
+#if defined(_WIN32)
+    if (strcmp(mode, "brk") == 0) {
+        g_brk_file = (argc > 2) ? argv[2] : NULL;
+        SetConsoleCtrlHandler(on_brk, TRUE);
         for (;;) sleep_ms(10);
     }
 #endif

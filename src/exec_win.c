@@ -494,6 +494,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t *wcmd = NULL, *wdir = NULL, *wenv = NULL;   /* ABI 2.7: CreateProcessW's */
+    int ctrl_break = 0;                                 /* ABI 2.7: stop with Ctrl+Break first */
     writer_ctx wc;
     reader_ctx rc;
     char *cmd;
@@ -558,8 +559,17 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     si.hStdError  = errW ? errW : GetStdHandle(STD_ERROR_HANDLE);
     memset(&pi, 0, sizeof pi);
 
+    /* ABI 2.7 stop_grace_ms: Windows' SIGTERM is Ctrl+Break, and a console sends it
+     * only to programs sharing that console. So with a grace and a host that has a
+     * console, the program shares it (no CREATE_NO_WINDOW) in a process group of its
+     * own, which Ctrl+Break can address without reaching the host. A host with no
+     * console - a service - cannot: the program is stopped at once, and the engine
+     * says so once. GPTPS does not give the host a console; that is the host's call
+     * (AllocConsole before starting work). */
+    ctrl_break = caps->stop_grace_ms != 0 && GetConsoleCP() != 0;
     if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
-                        CREATE_SUSPENDED | CREATE_NO_WINDOW | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
+                        CREATE_SUSPENDED | (ctrl_break ? CREATE_NEW_PROCESS_GROUP : CREATE_NO_WINDOW)
+                        | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
                         wenv, wdir, &si, &pi)) {
         gptps_free(wcmd); gptps_free(wdir); gptps_free(wenv);
         if (errR) { CloseHandle(errR); CloseHandle(errW); }
@@ -575,6 +585,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     /* A cap on a job the program is not in holds nothing. The I/O caps are never set
      * here (see win_cpu_rate), so the engine reports them as not in force. */
     caps->applied = (assigned && cpu_set) ? GPTPS_CAP_CPU : 0u;
+    if (ctrl_break) caps->applied |= GPTPS_CAP_GRACE;
     ResumeThread(pi.hThread);
 
     wc.h = inW; wc.data = (const char *)payload; wc.len = plen; wc.ioerr = 0;
@@ -617,6 +628,11 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             if (waited == WAIT_FAILED) { killed = 1; kill_st = GPTPS_E_IO; break; } /* defensive: never spin */
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }
+        /* A grace to give (timeout or cancel, not our own I/O failure): Ctrl+Break to
+         * the program's group, then up to the grace for it to exit before the kill. */
+        if (killed && ctrl_break && kill_st != GPTPS_E_IO &&
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi.dwProcessId))
+            WaitForSingleObject(pi.hProcess, caps->stop_grace_ms);
         /* Tear the job down on EVERY path, not just the kill path, and do it BEFORE
          * the joins. "child gone => its stdout closes => reader ends" is false: an
          * anonymous pipe reports EOF only when the LAST write handle closes, so a

@@ -204,6 +204,8 @@ jobs:
             dist/gptps_orch.h
             dist/gptps_pool.c
             dist/gptps_pool.h
+            dist/gptps_retry.c
+            dist/gptps_retry.h
             dist/gptps_sched.c
             dist/gptps_sched.h
             dist/gptps_tui.c

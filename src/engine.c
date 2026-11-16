@@ -1168,7 +1168,7 @@ static void emit_sample(gptps_exec_meter *mt, const gptps_measure *cur, size_t n
 static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
 {
     unsigned want = 0, fresh;
-    char msg[400];
+    char msg[640];
     if (it->cpu_cap)                 want |= GPTPS_CAP_CPU;
     if (it->io_rcap || it->io_wcap)  want |= GPTPS_CAP_IO;
     if (caps->stop_grace_ms)         want |= GPTPS_CAP_GRACE;
@@ -1193,8 +1193,10 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_GRACE) {
-        snprintf(msg, sizeof msg, "task '%s': stop_grace_ms=%lu is not in force here - Windows has no "
-                 "SIGTERM; a program this engine has to stop is stopped at once",
+        snprintf(msg, sizeof msg, "task '%s': stop_grace_ms=%lu is not in force here - Windows can send "
+                 "Ctrl+Break only to a program that shares the host's console, and this host has none "
+                 "(a service, say); a program this engine has to stop is stopped at once. A host that "
+                 "wants the grace can call AllocConsole() before it starts work",
                  item_name(it), (unsigned long)caps->stop_grace_ms);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }

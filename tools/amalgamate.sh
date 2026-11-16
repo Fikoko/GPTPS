@@ -46,6 +46,7 @@ durable_queue|gptps_durable_queue.c|gptps_durable_queue.h|crash-durable submissi
 gpu_quota|gptps_gpu_quota.c|gptps_gpu_quota.h|named-resource admission quota
 orch|gptps_orch.c|gptps_orch.h|run-after / fan-in orchestration
 pool|gptps_pool.c|gptps_pool.h|N-shard engine router (scale-up)
+retry|gptps_retry.c|gptps_retry.h|retry rules by exit code: never, or after a wait
 sched|gptps_sched.c|gptps_sched.h|EDF, aging and fair-share orderings; shed late work
 stats|gptps_stats.c|gptps_stats.h|counters, gauges and latency on the observer seam
 tui|gptps_tui.c|gptps_tui.h|real-time terminal dashboard
