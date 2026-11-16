@@ -566,7 +566,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
      * console - a service - cannot: the program is stopped at once, and the engine
      * says so once. GPTPS does not give the host a console; that is the host's call
      * (AllocConsole before starting work). */
-    ctrl_break = caps->stop_grace_ms != 0 && GetConsoleCP() != 0;
+    if (caps->stop_grace_ms) {
+        DWORD one;
+        ctrl_break = GetConsoleProcessList(&one, 1) != 0;   /* 0: attached to no console */
+    }
     if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
                         CREATE_SUSPENDED | (ctrl_break ? CREATE_NEW_PROCESS_GROUP : CREATE_NO_WINDOW)
                         | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
