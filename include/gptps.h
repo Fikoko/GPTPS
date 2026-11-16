@@ -86,9 +86,10 @@ extern "C" {
  * gptps_submit_options, carried to the seams as deadline_ms on gptps_sched_input and
  * gptps_constraint_input (which also gains now_ms), and the options an item was
  * submitted with on its gptps_dead_letter (`options`), for a re-drive, and the
- * scheduler seam's GPTPS_SCHED_STABLE flag; 2.7 appends `work_dir` and `env` to
- * gptps_task_def for GPTPS_EXEC_PROGRAM, adds the exit.code / exit.signal
- * measurements and their unit, GPTPS_UNIT_CODE. Additive, and the loader compares
+ * scheduler seam's GPTPS_SCHED_STABLE flag; 2.7 appends `work_dir`, `env`,
+ * `stop_grace_ms` and `stderr_tail_bytes` to gptps_task_def for GPTPS_EXEC_PROGRAM,
+ * `stderr_tail` / `stderr_tail_len` to gptps_event and gptps_dead_letter, and adds
+ * the exit.code / exit.signal measurements and their unit, GPTPS_UNIT_CODE. Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 7u
@@ -401,6 +402,30 @@ typedef struct {
      * working. Pointers, so on a 32-bit ABI the two together still GROW sizeof. */
     const char         *work_dir;
     const char *const  *env;
+    /* ABI 2.7 - GPTPS_EXEC_PROGRAM only, both 0 by default.
+     *
+     *   stop_grace_ms      how GPTPS stops a program it has to stop (timeout, cancel,
+     *                      removal, shutdown). 0 = SIGKILL at once, as before. Above 0
+     *                      (POSIX): SIGTERM to the program's process group, up to this
+     *                      long for it to exit - finish a transaction, close a file -
+     *                      then SIGKILL to the group, whatever is left. The attempt's
+     *                      status is the same either way (GPTPS_E_TIMEOUT /
+     *                      GPTPS_E_CANCELLED), and so is the bound: the stop takes at
+     *                      most this much longer. Capped at 300000 (5 min). Output the
+     *                      program writes to stdout after the SIGTERM is not read.
+     *                      Windows has no SIGTERM: there the program is still stopped
+     *                      at once, and the first attempt of the type logs a WARN that
+     *                      the grace period is not in force.
+     *   stderr_tail_bytes  0 = the program's stderr is the host's, as before. Above 0:
+     *                      its stderr is captured instead, and the LAST this-many bytes
+     *                      are handed back on the attempt's FAILED event and, when the
+     *                      item is dead-lettered, on its gptps_dead_letter - the
+     *                      failure's own evidence, kept apart from every other job's.
+     *                      Earlier output is read and dropped, so a chatty program
+     *                      never blocks on it. Capped at 65536. Not on FINISHED: a job
+     *                      that succeeded needs no evidence. */
+    uint32_t            stop_grace_ms;
+    uint32_t            stderr_tail_bytes;
 } gptps_task_def;
 
 /* ============================================================================
@@ -1117,6 +1142,12 @@ typedef struct {
      * use gptps_event_measure(), which checks. */
     const gptps_measure *measures;
     size_t               n_measures;
+    /* ABI 2.7: on FAILED of a GPTPS_EXEC_PROGRAM job whose type sets
+     * stderr_tail_bytes, the last bytes it wrote to stderr (not NUL-terminated, may be
+     * cut mid-character); NULL / 0 everywhere else, and when it wrote nothing. Valid
+     * only for the duration of the callback. Read only if struct_size covers it. */
+    const char          *stderr_tail;
+    size_t               stderr_tail_len;
 } gptps_event;
 
 /* On a GPTPS_EV_DEAD_LETTERED or GPTPS_EV_DROPPED: teardown imposed this disposition
@@ -1175,6 +1206,11 @@ typedef struct {
      * the flag to re-drive late work without one - a shed-late constraint would
      * otherwise refuse it again. Read only if struct_size covers it. */
     gptps_submit_options options;
+    /* ABI 2.7: the stderr tail of the attempt that failed last (see
+     * gptps_task_def.stderr_tail_bytes); NULL / 0 when there is none. Valid only for
+     * the callback. Read only if struct_size covers it. */
+    const char          *stderr_tail;
+    size_t               stderr_tail_len;
 } gptps_dead_letter;
 
 /* Current number of retained dead-lettered tasks (does not drain). */

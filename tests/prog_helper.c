@@ -29,6 +29,11 @@
  *                       read from the wide command line, which the ANSI argv of
  *                       main() would make lossy).
  *             "sig"   : end by a signal (POSIX: SIGTERM, raised on itself).
+ *             "errout": write argv[2] bytes of '.' to stderr, then the line argv[3],
+ *                       then exit argv[4] (default 3) - a chatty program that fails.
+ *             "term"  : POSIX: on SIGTERM write "cleaned" to the file argv[2] and
+ *                       exit 0; until then, sleep - a program that cleans up.
+ *             "termignore": ignore SIGTERM and sleep - one that never does.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
@@ -87,6 +92,24 @@ static void sleep_ms(unsigned long ms)
     while (nanosleep(&ts, &ts) != 0) { }
 #endif
 }
+
+#if !defined(_WIN32)
+/* "term": what a program that cleans up does on SIGTERM (open/write/_exit are
+ * async-signal-safe) */
+#  include <fcntl.h>
+static const char *g_term_file;
+static void on_term(int sig)
+{
+    int fd;
+    (void)sig;
+    if (g_term_file && (fd = open(g_term_file, O_WRONLY | O_CREAT | O_TRUNC, 0600)) >= 0) {
+        ssize_t w = write(fd, "cleaned", 7);
+        (void)w;
+        close(fd);
+    }
+    _exit(0);
+}
+#endif
 
 #if defined(_WIN32)
 /* a wide string, written to stdout as UTF-8 */
@@ -147,6 +170,30 @@ int main(int argc, char **argv)
         fflush(stdout);
         return 0;
     }
+    if (strcmp(mode, "errout") == 0) {
+        static char dots[65536];
+        unsigned long left = (argc > 2) ? strtoul(argv[2], NULL, 10) : 0;
+        memset(dots, '.', sizeof dots);
+        while (left) {
+            size_t n = (left < sizeof dots) ? (size_t)left : sizeof dots;
+            if (fwrite(dots, 1, n, stderr) != n) return 1;
+            left -= (unsigned long)n;
+        }
+        if (argc > 3) { fputs(argv[3], stderr); fputc('\n', stderr); }
+        fflush(stderr);
+        return (argc > 4) ? atoi(argv[4]) : 3;
+    }
+#if !defined(_WIN32)
+    if (strcmp(mode, "term") == 0) {
+        g_term_file = (argc > 2) ? argv[2] : NULL;
+        signal(SIGTERM, on_term);
+        for (;;) sleep_ms(10);
+    }
+    if (strcmp(mode, "termignore") == 0) {
+        signal(SIGTERM, SIG_IGN);
+        for (;;) sleep_ms(10);
+    }
+#endif
     if (strcmp(mode, "sig") == 0) {
 #if !defined(_WIN32)
         raise(SIGTERM);

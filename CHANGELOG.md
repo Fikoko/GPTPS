@@ -10,7 +10,8 @@ the release version and is documented in `include/gptps.h`.
 ### Upgrading from 1.8
 
 No API changed incompatibly. The ABI is 2.7, additive over 2.6: `gptps_task_def`
-appends `work_dir` and `env`, and `GPTPS_M_EXIT_CODE` / `GPTPS_M_EXIT_SIGNAL` are new
+appends `work_dir`, `env`, `stop_grace_ms` and `stderr_tail_bytes`; `gptps_event` and
+`gptps_dead_letter` append `stderr_tail` and `stderr_tail_len`; and `GPTPS_M_EXIT_CODE` / `GPTPS_M_EXIT_SIGNAL` are new
 measurement names with a new unit, `GPTPS_UNIT_CODE`. A consumer that checks a
 measurement's unit against a fixed list should allow 5. On Windows, PROGRAM jobs are
 now started with `CreateProcessW`: argv strings are read as UTF-8, and a string that
@@ -28,8 +29,21 @@ working.
 - `exit.code` and `exit.signal` measurements on a PROGRAM job's FINISHED / FAILED: the
   exit status, or the POSIX signal that ended it, whenever the program ended on its
   own. Reported, not acted on: any non-zero exit is still `GPTPS_E_TASK`.
-- `test_program_launch`: working directory, environment, UTF-8 arguments and exit
-  reporting, run on Linux, macOS and Windows.
+- `gptps_task_def.stderr_tail_bytes` (PROGRAM, POSIX and Windows): capture the
+  program's stderr and hand back its last bytes (up to 64 KiB) on the attempt's FAILED
+  event and on its dead letter, so each failure carries its own evidence instead of
+  forty jobs' output interleaved on the host's stderr. All of it is read, so a chatty
+  program never blocks. 0, the default, leaves stderr as the host's.
+- `gptps_task_def.stop_grace_ms` (PROGRAM, POSIX): a job GPTPS has to stop (timeout,
+  cancel, removal, shutdown) gets SIGTERM, up to this long to exit, then SIGKILL to
+  its process group. Same status, still bounded. 0, the default, is the old instant
+  SIGKILL. On Windows the job is still stopped at once, and the first attempt of the
+  type logs a WARN saying so.
+- docs/SECURITY.md: what happens to running jobs when the host dies, and a
+  `child_setup` example with `PR_SET_PDEATHSIG` for Linux (with the `getppid()` check
+  and the per-thread caveat).
+- `test_program_launch`: working directory, environment, UTF-8 arguments, exit
+  reporting, stderr tails and the grace period, run on Linux, macOS and Windows.
 
 ### Fixed
 

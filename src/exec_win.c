@@ -375,6 +375,28 @@ static void reader_stop_child(reader_ctx *r)
     else             TerminateProcess(r->proc, 1);
 }
 
+/* ABI 2.7: the program's stderr, when its tail is kept - everything is read, only
+ * the last `cap` bytes stay, so a chatty program never blocks on a full pipe. */
+typedef struct { HANDLE h; char *buf; size_t len, cap; } err_ctx;
+static DWORD WINAPI err_proc(LPVOID p)
+{
+    err_ctx *t = (err_ctx *)p;
+    char chunk[4096];
+    DWORD got;
+    while (ReadFile(t->h, chunk, (DWORD)sizeof chunk, &got, NULL) && got > 0) {
+        size_t n = got;
+        if (n >= t->cap) { memcpy(t->buf, chunk + (n - t->cap), t->cap); t->len = t->cap; continue; }
+        if (t->len + n > t->cap) {
+            size_t drop = t->len + n - t->cap;
+            memmove(t->buf, t->buf + drop, t->len - drop);
+            t->len -= drop;
+        }
+        memcpy(t->buf + t->len, chunk, n);
+        t->len += n;
+    }
+    return 0;
+}
+
 static DWORD WINAPI reader_proc(LPVOID p)
 {
     reader_ctx *r = (reader_ctx *)p;
@@ -467,6 +489,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
     HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
+    HANDLE errR = NULL, errW = NULL, et = NULL;   /* ABI 2.7: stderr, when its tail is kept */
+    err_ctx ec;
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t *wcmd = NULL, *wdir = NULL, *wenv = NULL;   /* ABI 2.7: CreateProcessW's */
@@ -489,6 +513,18 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     /* parent-side ends must NOT be inherited by the child */
     SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
+    memset(&ec, 0, sizeof ec);
+    if (meter && meter->err_cap) {
+        ec.cap = meter->err_cap;
+        ec.buf = (char *)gptps_malloc(ec.cap);
+        if (!ec.buf || !CreatePipe(&errR, &errW, &sa, 0)) {
+            gptps_status why = ec.buf ? GPTPS_E_IO : GPTPS_E_NOMEM;
+            gptps_free(ec.buf);
+            CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
+            return why;
+        }
+        SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
+    }
 
     job = CreateJobObjectA(NULL, NULL);
     if (job) {
@@ -509,6 +545,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     if (wcmd && def->work_dir && !(wdir = win_wide(def->work_dir))) { gptps_free(wcmd); wcmd = NULL; }
     if (wcmd && def->env && !(wenv = win_env_block(def->env))) { gptps_free(wcmd); wcmd = NULL; }
     if (!wcmd) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
+                 if (errR) { CloseHandle(errR); CloseHandle(errW); }
+                 gptps_free(ec.buf);
                  if (job) CloseHandle(job);
                  gptps_free(wdir); gptps_free(wenv);
                  return GPTPS_E_NOMEM; }
@@ -517,13 +555,15 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdInput  = inR;
     si.hStdOutput = outW;
-    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    si.hStdError  = errW ? errW : GetStdHandle(STD_ERROR_HANDLE);
     memset(&pi, 0, sizeof pi);
 
     if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
                         CREATE_SUSPENDED | CREATE_NO_WINDOW | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
                         wenv, wdir, &si, &pi)) {
         gptps_free(wcmd); gptps_free(wdir); gptps_free(wenv);
+        if (errR) { CloseHandle(errR); CloseHandle(errW); }
+        gptps_free(ec.buf);
         CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
         if (job) CloseHandle(job);
         return GPTPS_E_TASK; /* program could not be started (or work_dir entered) */
@@ -544,6 +584,12 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     wt = CreateThread(NULL, 0, writer_proc, &wc, 0, NULL);
     if (!wt) CloseHandle(inW);                 /* no writer => close stdin so the child sees EOF */
     rt = CreateThread(NULL, 0, reader_proc, &rc, 0, NULL);
+    if (errW) {
+        CloseHandle(errW); errW = NULL;        /* the child owns its end */
+        ec.h = errR;
+        et = CreateThread(NULL, 0, err_proc, &ec, 0, NULL);
+        if (!et) { CloseHandle(errR); errR = NULL; }   /* nothing would read it: fail its writes, not block them */
+    }
 
     /* Wait for the child in bounded slices so a raised cancel flag (gptps_cancel /
      * shutdown / task removal) OR the deadline hard-kills it - including when
@@ -614,6 +660,15 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         outR = NULL;
         WaitForSingleObject(rt, INFINITE); CloseHandle(rt);
     }
+    if (et) {                                  /* the same bounded join, for stderr */
+        if (WaitForSingleObject(et, GPTPS_WIN_JOIN_GRACE_MS) == WAIT_TIMEOUT) GPTPS_WIN_CANCEL_SYNC_IO(et);
+        CloseHandle(errR);
+        errR = NULL;
+        WaitForSingleObject(et, INFINITE); CloseHandle(et);
+    }
+    if (errR) CloseHandle(errR);               /* no stderr thread was started */
+    if (meter && ec.len) { meter->err = ec.buf; meter->err_len = ec.len; }
+    else gptps_free(ec.buf);
     GetExitCodeProcess(pi.hProcess, &code);
     /* Every process of the job has ended (TerminateJobObject above), so its totals are
      * final; the handles are still open, which is all the queries need. */
