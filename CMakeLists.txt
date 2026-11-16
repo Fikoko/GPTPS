@@ -922,6 +922,9 @@ endif()
 
 # --- cross-platform external-program executor test (POSIX + Windows) -------
 add_executable(prog_helper tests/prog_helper.c)         # tiny portable test binary
+if(WIN32)
+    target_link_libraries(prog_helper PRIVATE shell32)   # CommandLineToArgvW ("arg" mode)
+endif()
 add_executable(test_program_helper tests/test_program_helper.c)
 target_include_directories(test_program_helper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_program_helper PRIVATE gptps)
@@ -929,6 +932,15 @@ target_compile_definitions(test_program_helper PRIVATE HELPER_PATH="$<TARGET_FIL
 add_dependencies(test_program_helper prog_helper)
 add_test(NAME program_helper COMMAND test_program_helper)
 set_tests_properties(program_helper PROPERTIES TIMEOUT 30)
+# How a program is started and how it ended (ABI 2.7): work_dir, env, UTF-8 argv,
+# exit.code / exit.signal - on POSIX and on Windows (CreateProcessW).
+add_executable(test_program_launch tests/test_program_launch.c)
+target_include_directories(test_program_launch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_program_launch PRIVATE gptps)
+target_compile_definitions(test_program_launch PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_program_launch prog_helper)
+add_test(NAME program_launch COMMAND test_program_launch)
+set_tests_properties(program_launch PROPERTIES TIMEOUT 30)
 
 # The CPU cap on Windows: a job object throttles a capped PROGRAM job (ABI 2.6). Linux's
 # is a cgroup's and is tested in test_cgroup; nothing else could vouch for this one.

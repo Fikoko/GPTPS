@@ -253,6 +253,78 @@ static char *build_cmdline(const char *const *argv)
     return out;
 }
 
+/* UTF-8 to UTF-16 for CreateProcessW (ABI 2.7). A string that is not valid UTF-8 is
+ * read in the ANSI code page instead - what CreateProcessA made of every string - so a
+ * host that passed ANSI text before 2.7 is started as it was. NULL when out of memory
+ * or unconvertible. */
+static wchar_t *win_wide(const char *s)
+{
+    UINT cp = CP_UTF8;
+    DWORD fl = MB_ERR_INVALID_CHARS;
+    int n = MultiByteToWideChar(cp, fl, s, -1, NULL, 0);
+    wchar_t *w;
+    if (n <= 0) { cp = CP_ACP; fl = 0; n = MultiByteToWideChar(cp, fl, s, -1, NULL, 0); }
+    if (n <= 0) return NULL;
+    w = (wchar_t *)gptps_malloc((size_t)n * sizeof *w);
+    if (!w) return NULL;
+    if (MultiByteToWideChar(cp, fl, s, -1, w, n) <= 0) { gptps_free(w); return NULL; }
+    return w;
+}
+
+/* the name's length in "NAME=value" or a bare "NAME"; Windows' own per-drive entries
+ * ("=C:=C:\\x") begin with '=', which is part of their name */
+static size_t wenv_name_len(const wchar_t *s)
+{
+    const wchar_t *q = s[0] ? wcschr(s + 1, L'=') : NULL;
+    return q ? (size_t)(q - s) : wcslen(s);
+}
+static int wenv_same(const wchar_t *a, size_t la, const wchar_t *b, size_t lb)
+{
+    return la == lb && _wcsnicmp(a, b, la) == 0;   /* Windows names ignore case */
+}
+
+/* The program's environment block (ABI 2.7 gptps_task_def.env): the host's, with each
+ * "NAME=value" replacing or adding NAME and each bare "NAME" removing it. NULL when out
+ * of memory. */
+static wchar_t *win_env_block(const char *const *over)
+{
+    wchar_t *host, *p, *blk = NULL, *w, **ov;
+    size_t no = 0, i, j, total = 2;
+    while (over[no]) ++no;
+    ov = (wchar_t **)gptps_calloc(no + 1, sizeof *ov);
+    if (!ov) return NULL;
+    for (j = 0; j < no; ++j) {
+        if (!(ov[j] = win_wide(over[j]))) goto out;
+        total += wcslen(ov[j]) + 1;
+    }
+    host = GetEnvironmentStringsW();
+    for (p = host; p && *p; p += wcslen(p) + 1) total += wcslen(p) + 1;
+    blk = (wchar_t *)gptps_malloc(total * sizeof *blk);
+    if (blk) {
+        w = blk;
+        for (p = host; p && *p; p += wcslen(p) + 1) {
+            size_t L = wenv_name_len(p), n = wcslen(p) + 1;
+            int replaced = 0;
+            for (j = 0; j < no && !replaced; ++j) replaced = wenv_same(ov[j], wenv_name_len(ov[j]), p, L);
+            if (!replaced) { memcpy(w, p, n * sizeof *w); w += n; }
+        }
+        for (j = 0; j < no; ++j) {
+            size_t L = wenv_name_len(ov[j]), n = wcslen(ov[j]) + 1, k;
+            int later = 0;          /* the last entry for a name wins */
+            if (!wcschr(ov[j] + 1, L'=')) continue;            /* a removal */
+            for (k = j + 1; k < no && !later; ++k) later = wenv_same(ov[k], wenv_name_len(ov[k]), ov[j], L);
+            if (!later) { memcpy(w, ov[j], n * sizeof *w); w += n; }
+        }
+        if (w == blk) *w++ = 0;   /* an empty block is still two NULs */
+        *w = 0;
+    }
+    if (host) FreeEnvironmentStringsW(host);
+out:
+    for (i = 0; i < no; ++i) gptps_free(ov[i]);
+    gptps_free(ov);
+    return blk;
+}
+
 typedef struct { HANDLE h; const char *data; size_t len; int ioerr;
                  HANDLE proc, job; int assigned; } writer_ctx;
 static DWORD WINAPI writer_proc(LPVOID p)
@@ -395,8 +467,9 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
     HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
+    wchar_t *wcmd = NULL, *wdir = NULL, *wenv = NULL;   /* ABI 2.7: CreateProcessW's */
     writer_ctx wc;
     reader_ctx rc;
     char *cmd;
@@ -431,9 +504,14 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     }
 
     cmd = build_cmdline(argv);
-    if (!cmd) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
-                if (job) CloseHandle(job);
-return GPTPS_E_NOMEM; }
+    if (cmd) wcmd = win_wide(cmd);
+    gptps_free(cmd);
+    if (wcmd && def->work_dir && !(wdir = win_wide(def->work_dir))) { gptps_free(wcmd); wcmd = NULL; }
+    if (wcmd && def->env && !(wenv = win_env_block(def->env))) { gptps_free(wcmd); wcmd = NULL; }
+    if (!wcmd) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
+                 if (job) CloseHandle(job);
+                 gptps_free(wdir); gptps_free(wenv);
+                 return GPTPS_E_NOMEM; }
 
     memset(&si, 0, sizeof si); si.cb = sizeof si;
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -442,14 +520,15 @@ return GPTPS_E_NOMEM; }
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
     memset(&pi, 0, sizeof pi);
 
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
-        gptps_free(cmd);
+    if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
+                        CREATE_SUSPENDED | CREATE_NO_WINDOW | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
+                        wenv, wdir, &si, &pi)) {
+        gptps_free(wcmd); gptps_free(wdir); gptps_free(wenv);
         CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
         if (job) CloseHandle(job);
-        return GPTPS_E_TASK; /* program could not be started */
+        return GPTPS_E_TASK; /* program could not be started (or work_dir entered) */
     }
-    gptps_free(cmd);
+    gptps_free(wcmd); gptps_free(wdir); gptps_free(wenv);
     CloseHandle(inR); CloseHandle(outW); /* child owns these; parent keeps inW + outR */
 
     if (job && AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
@@ -550,6 +629,11 @@ return GPTPS_E_NOMEM; }
     else if (rc.ioerr)      eff = GPTPS_E_IO;   /* the output could not be read */
     else if (rc.nomem)      eff = GPTPS_E_NOMEM;
     else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
+    /* ABI 2.7: how it ended, when it ended on its own - every branch above but the last
+     * may have terminated it, and then its code is ours, not the program's */
+    if (!killed && !rc.oversize && !wc.ioerr && !rc.ioerr && !rc.nomem)
+        gptps_meter_put(meter, GPTPS_M_EXIT_CODE, (uint64_t)code, GPTPS_UNIT_CODE,
+                        GPTPS_MEASURE_CURRENT, "win.exitcode");
 
     if (eff == GPTPS_OK) { *out_result = rc.buf; *out_len = rc.len; }
     else gptps_free(rc.buf);

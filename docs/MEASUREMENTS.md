@@ -52,7 +52,7 @@ now and every one added later, by the core, an add-on or a plug-in.
 typedef struct {
     const char *name;     /* "mem.peak", "cpu.user_ms", ... or "<addon>.<name>" */
     uint64_t    value;
-    uint16_t    unit;     /* gptps_measure_unit: GPTPS_UNIT_BYTES, _MS, _COUNT, _FLAG */
+    uint16_t    unit;     /* gptps_measure_unit: GPTPS_UNIT_BYTES, _MS, _COUNT, _FLAG, _CODE */
     uint16_t    kind;     /* gptps_measure_kind: how values combine - see below */
     uint32_t    flags;    /* 0 today; ignore bits you do not know */
     const char *method;   /* how it was measured, e.g. "cgroup.job.resident" */
@@ -108,6 +108,13 @@ if (m) printf("%s: peak %llu bytes (%s)\n", ev->task_name,
 | `io.read_bytes` | bytes | total | bytes the job read |
 | `io.write_bytes` | bytes | total | bytes the job wrote |
 | `cpu.throttled_ms` | ms | total | time the job was held back by its CPU cap (`cpu_max_millicpus`, ABI 2.6). Present only where a cgroup held that cap - `cgroup.job`, from `cpu.stat`'s `throttled_usec` - so its presence is also the proof the cap was in force; 0 means it never bit |
+| `exit.code` | code | current | how a `GPTPS_EXEC_PROGRAM` job exited (ABI 2.7): 0-255 on POSIX (`posix.wait`), the full 32-bit exit code on Windows (`win.exitcode`), where a crash shows as an NTSTATUS such as `0xC0000005`. Reported on FINISHED and FAILED, only when the program ended on its own |
+| `exit.signal` | code | current | POSIX: the signal that ended a `GPTPS_EXEC_PROGRAM` job (`posix.wait`) - 9 when the OOM killer or anything else outside GPTPS killed it. Never with `exit.code` |
+
+Neither `exit.*` is reported when GPTPS ended the job itself - timeout, cancel, output
+over the cap - because the attempt's status already says why. Both are reports, never
+policy: any non-zero exit is still `GPTPS_E_TASK`. A `code` unit (`GPTPS_UNIT_CODE`) is
+an identifier: compare it, never add or average it.
 
 CPU time divided by run time (`STARTED` to `FINISHED`) is the average number of cores
 the attempt kept busy - the check on a declared CPU-seat resource.

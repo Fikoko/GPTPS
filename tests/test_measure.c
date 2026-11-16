@@ -208,7 +208,7 @@ static void check_shape(void)
     size_t i, j;
     for (i = 0; i < g_at.n; ++i) {
         CHECK(g_at.m[i].flags == 0);
-        CHECK(g_at.m[i].unit >= GPTPS_UNIT_BYTES && g_at.m[i].unit <= GPTPS_UNIT_FLAG);
+        CHECK(g_at.m[i].unit >= GPTPS_UNIT_BYTES && g_at.m[i].unit <= GPTPS_UNIT_CODE);
         CHECK(g_at.m[i].kind >= GPTPS_MEASURE_PEAK && g_at.m[i].kind <= GPTPS_MEASURE_CURRENT);
         for (j = i + 1; j < g_at.n; ++j) CHECK(strcmp(g_at.m[i].name, g_at.m[j].name) != 0);
     }

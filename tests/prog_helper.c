@@ -21,6 +21,14 @@
  *                       argv[3] MiB, every later run takes argv[4] MiB; then exit
  *                       argv[5] (default 0) - attempts told apart, for test_xport_measure.
  *             "spin"  : burn argv[2] ms of CPU time, then exit 0.
+ *             "cwdfile": print the file argv[2], opened relative to the current
+ *                       directory - where the program was started (work_dir).
+ *             "env"   : for each name in argv[2..], print "NAME=value\n", or
+ *                       "NAME unset\n" - the environment the program was given.
+ *             "arg"   : print argv[2] exactly as received, as UTF-8 (on Windows
+ *                       read from the wide command line, which the ANSI argv of
+ *                       main() would make lossy).
+ *             "sig"   : end by a signal (POSIX: SIGTERM, raised on itself).
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
@@ -33,7 +41,9 @@
 #  include <io.h>
 #  include <fcntl.h>
 #  include <windows.h>
+#  include <shellapi.h>   /* CommandLineToArgvW */
 #else
+#  include <signal.h>
 #  include <unistd.h>
 #endif
 
@@ -78,6 +88,16 @@ static void sleep_ms(unsigned long ms)
 #endif
 }
 
+#if defined(_WIN32)
+/* a wide string, written to stdout as UTF-8 */
+static void put_w(const wchar_t *w)
+{
+    char buf[4096];
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)sizeof buf, NULL, NULL);
+    if (n > 1) fwrite(buf, 1, (size_t)n - 1, stdout);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     const char *mode = (argc > 1) ? argv[1] : "cat";
@@ -85,6 +105,54 @@ int main(int argc, char **argv)
     _setmode(_fileno(stdin), _O_BINARY);   /* exact byte round-trip (no CRLF translation) */
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
+    if (strcmp(mode, "cwdfile") == 0) {
+        FILE *f = (argc > 2) ? fopen(argv[2], "rb") : NULL;
+        int c;
+        if (!f) return 4;
+        while ((c = fgetc(f)) != EOF) putchar(c);
+        fclose(f);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(mode, "env") == 0) {
+        int i;
+        for (i = 2; i < argc; ++i) {
+#if defined(_WIN32)
+            wchar_t name[256], val[4096];
+            DWORD n;
+            MultiByteToWideChar(CP_UTF8, 0, argv[i], -1, name, 256);
+            n = GetEnvironmentVariableW(name, val, 4096);
+            fputs(argv[i], stdout);
+            if (n == 0 || n >= 4096) fputs(" unset\n", stdout);
+            else { putchar('='); put_w(val); putchar('\n'); }
+#else
+            const char *v = getenv(argv[i]);
+            if (v) printf("%s=%s\n", argv[i], v); else printf("%s unset\n", argv[i]);
+#endif
+        }
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(mode, "arg") == 0) {
+#if defined(_WIN32)
+        int wn = 0;
+        wchar_t **wv = CommandLineToArgvW(GetCommandLineW(), &wn);
+        if (!wv || wn < 3) return 5;
+        put_w(wv[2]);
+        LocalFree(wv);
+#else
+        if (argc < 3) return 5;
+        fputs(argv[2], stdout);
+#endif
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(mode, "sig") == 0) {
+#if !defined(_WIN32)
+        raise(SIGTERM);
+#endif
+        return 6;
+    }
     if (strcmp(mode, "exit") == 0) return (argc > 2) ? atoi(argv[2]) : 0;
     if (strcmp(mode, "hang") == 0) { for (;;) { /* killed by the deadline */ } }
     if (strcmp(mode, "eofhang") == 0) {

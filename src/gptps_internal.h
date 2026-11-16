@@ -124,7 +124,7 @@ gptps_status gptps_run_capture(const gptps_task_def *def, const void *payload, s
  * and nothing is allocated). While the job runs, and only if sample_ms is non-zero, it
  * calls sample() about every sample_ms with the job's current values. `meter` may be
  * NULL: then nothing is measured. */
-#define GPTPS_EXEC_MEASURES_MAX 8
+#define GPTPS_EXEC_MEASURES_MAX 12
 typedef struct gptps_exec_meter {
     gptps_measure m[GPTPS_EXEC_MEASURES_MAX];
     size_t        n;
