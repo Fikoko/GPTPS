@@ -320,31 +320,48 @@ int main(void)
         CHECK(gptps_now_ms(NULL) - t0 >= 1300 && gptps_now_ms(NULL) - t0 < 4000);
     }
 #else
-    {   /* Windows: Ctrl+Break when this process has a console to share; otherwise the
-         * stop is immediate and the engine says so, once per task type */
+    {   /* Windows, both cases every run, whatever console ctest gave us. This process
+         * is the host here, so it does what the WARN tells a host to do. */
         static const char *const a_brk[] = { HELPER_PATH, "brk", "gptps_launch_cleaned.txt", NULL };
-        int console = GetConsoleCP() != 0;
+        /* Wine cannot deliver Ctrl+Break to a process group; there only the
+         * no-console case is checked in full */
+        int wine = GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != NULL;
         FILE *f;
-        printf("(this process %s console)\n", console ? "has a" : "has no");
-        remove("gptps_launch_cleaned.txt");
         gptps_set_log_sink(on_log, NULL);
-        def_prog(&d, "grace", a_brk); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
+
+        /* a) no console (a service): stopped at once, said once per task type */
+        FreeConsole();
+        remove("gptps_launch_cleaned.txt");
+        def_prog(&d, "grace_nc", a_brk); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
         CHECK(gptps_register_task(e, &d) == GPTPS_OK);
-        CHECK(run1(e, "grace") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(run1(e, "grace_nc") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(run1(e, "grace_nc") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(g_grace_warns == 1);
         f = fopen("gptps_launch_cleaned.txt", "rb");
-        if (console) {
+        CHECK(f == NULL);                                     /* no chance to clean up */
+        if (f) fclose(f);
+
+        /* b) a host that gave itself a (hidden) console: Ctrl+Break, then the grace */
+        CHECK(AllocConsole());
+        if (GetConsoleWindow()) ShowWindow(GetConsoleWindow(), SW_HIDE);
+        remove("gptps_launch_cleaned.txt");
+        g_grace_warns = 0;
+        def_prog(&d, "grace_c", a_brk); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "grace_c") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(g_grace_warns == 0);                            /* the grace was in force */
+        f = fopen("gptps_launch_cleaned.txt", "rb");
+        if (wine) {
+            printf("(Wine: Ctrl+Break delivery not checked)\n");
+        } else {
             char got[16] = { 0 };
             CHECK(f != NULL);                                 /* it got its Ctrl+Break, and used it */
             if (f) { CHECK(fread(got, 1, sizeof got - 1, f) == 7); }
             CHECK(strcmp(got, "cleaned") == 0);
-            CHECK(g_grace_warns == 0);
-        } else {
-            CHECK(f == NULL);                                 /* stopped at once */
-            CHECK(run1(e, "grace") && !g_ok);
-            CHECK(g_grace_warns == 1);                        /* said once per task type */
         }
         if (f) fclose(f);
         remove("gptps_launch_cleaned.txt");
+        FreeConsole();
         gptps_set_log_sink(NULL, NULL);
     }
 #endif
