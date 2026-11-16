@@ -413,9 +413,14 @@ typedef struct {
      *                      GPTPS_E_CANCELLED), and so is the bound: the stop takes at
      *                      most this much longer. Capped at 300000 (5 min). Output the
      *                      program writes to stdout after the SIGTERM is not read.
-     *                      Windows has no SIGTERM: there the program is still stopped
-     *                      at once, and the first attempt of the type logs a WARN that
-     *                      the grace period is not in force.
+     *                      Windows (1.10): Ctrl+Break to the program's own process
+     *                      group in place of SIGTERM, then TerminateJobObject. Windows
+     *                      delivers Ctrl+Break only to a program sharing the sender's
+     *                      console, so this needs a HOST WITH A CONSOLE; the program
+     *                      then shares it. A host without one (a service) gets the
+     *                      immediate stop, and the first attempt of the type logs a
+     *                      WARN saying so - GPTPS does not give the host a console;
+     *                      one that wants the grace calls AllocConsole() itself.
      *   stderr_tail_bytes  0 = the program's stderr is the host's, as before. Above 0:
      *                      its stderr is captured instead, and the LAST this-many bytes
      *                      are handed back on the attempt's FAILED event and, when the

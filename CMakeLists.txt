@@ -803,6 +803,16 @@ add_test(NAME remote_codec COMMAND test_remote_codec)
 set_tests_properties(remote_codec PROPERTIES TIMEOUT 30)
 endif()
 
+if(TARGET gptps_retry)
+add_executable(test_retry_addon tests/test_retry_addon.c)   # retry rules by exit code (POSIX + Windows)
+target_include_directories(test_retry_addon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_retry_addon PRIVATE gptps_retry)
+target_compile_definitions(test_retry_addon PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_retry_addon prog_helper)
+add_test(NAME retry_addon COMMAND test_retry_addon)
+set_tests_properties(retry_addon PROPERTIES TIMEOUT 60)
+endif()
+
 if(TARGET gptps_sched)
 add_executable(test_sched_perf tests/test_sched_perf.c)     # complexity gate: linear drain with a scheduler installed
 target_include_directories(test_sched_perf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)

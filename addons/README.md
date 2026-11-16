@@ -462,6 +462,32 @@ peer. On a listening socket that is remote code *selection* by whoever can conne
 There is no authentication and no encryption here by design — run it inside a trusted
 boundary (loopback, WireGuard, a TLS terminator, an SSH tunnel), never on an open port.
 
+## retry — retry rules by exit code
+
+`gptps_retry.c` / `gptps_retry.h`. The core retries every failure the same way;
+which failures are worth retrying is policy. A program's exit code usually says:
+a vendor's convention might be 1 retry, 2 bad input (never), 3 licence server (retry,
+much later). This add-on maps exit codes to that, per task type or for every type:
+
+```c
+gptps_retry *r;
+gptps_retry_install(e, &r);                          /* setup time */
+gptps_retry_on_exit(r, NULL, 2, GPTPS_RETRY_NEVER);  /* any task: 2 is final */
+gptps_retry_on_exit(r, "mrp", 3, 3600000);           /* "mrp": 3 waits an hour */
+/* ... */
+gptps_shutdown(e);
+gptps_retry_close(r);                                /* after shutdown */
+```
+
+It reads `exit.code` on each `PROGRAM` attempt's `FAILED` (observer seam) and decides
+the item's next attempt at admission (constraint seam): `GPTPS_RETRY_NEVER` refuses it,
+dead-lettering the item at once with `GPTPS_E_DENIED` (the dead letter keeps its
+stderr tail); a wait holds it that much longer; `0` is an explicit "as the policy
+says", so one task can opt out of an all-tasks rule. It never adds a retry the policy
+does not allow, so "retry much later" needs `max_retries` of at least 1. Failures with
+no exit code (timeouts, cancels, in-process tasks) are untouched. No core change.
+Tested on POSIX and Windows by `test_retry_addon`.
+
 ## sched — EDF, aging and fair-share orderings; shed late work
 
 `gptps_sched.c` / `gptps_sched.h`. The scheduler seam has always promised that

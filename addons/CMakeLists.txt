@@ -13,7 +13,7 @@
 # two engines in one process. The dlopen tier is the supported way to get a binary
 # boundary, and it works precisely BECAUSE a plug-in links no core symbols at all.
 
-set(GPTPS_ADDON_ALL adapt await balance durable_queue gpu_quota orch pool remote sched stats tui wasm_exec xport)
+set(GPTPS_ADDON_ALL adapt await balance durable_queue gpu_quota orch pool remote retry sched stats tui wasm_exec xport)
 
 # GPTPS_ADDONS is the human knob; the per-add-on GPTPS_ADDON_<NAME> booleans are what
 # a distro packager scripts against. The list only sets their DEFAULTS.
@@ -127,6 +127,7 @@ gptps_addon(remote        SOURCE gptps_remote.c        HEADER gptps_remote.h    
 # tui is TTY-dependent at RUNTIME only - gptps_tui_run self-skips without a TTY, and
 # render/press are headless and unit-tested. It compiles everywhere (POSIX termios and
 # the Windows console are both handled inside the add-on), so there is nothing to gate.
+gptps_addon(retry         SOURCE gptps_retry.c         HEADER gptps_retry.h         DESC "retry rules by exit code: never, or after a wait")
 gptps_addon(sched         SOURCE gptps_sched.c         HEADER gptps_sched.h         DESC "EDF, aging and fair-share orderings; shed late work")
 gptps_addon(stats         SOURCE gptps_stats.c         HEADER gptps_stats.h         DESC "counters, gauges and latency on the observer seam")
 gptps_addon(tui           SOURCE gptps_tui.c           HEADER gptps_tui.h           DESC "real-time terminal dashboard")

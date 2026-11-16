@@ -5,6 +5,23 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+No ABI change: 2.7, as in 1.9.0.
+
+### Added
+
+- `gptps_retry`, a new add-on: retry rules by exit code, per task type or for every
+  type. `GPTPS_RETRY_NEVER` dead-letters an item at once (`GPTPS_E_DENIED`) instead of
+  spending its retries on a failure that cannot succeed; a wait holds the retry back
+  (a licence server, say); `0` opts one task out of an all-tasks rule. Built on the
+  observer and constraint seams, with no core change.
+- Windows: `stop_grace_ms` is now honoured when the host has a console. The program
+  shares it in its own process group, gets Ctrl+Break, and up to the grace to exit
+  before the job object is terminated. A host without a console (a service) still
+  stops at once, and the WARN now says why and that `AllocConsole()` in the host
+  enables it; GPTPS does not change the host process itself.
+
 ## [1.9.0] - 2026-11-16
 
 ### Upgrading from 1.8
