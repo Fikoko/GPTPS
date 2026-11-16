@@ -5,6 +5,43 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+### Upgrading from 1.8
+
+No API changed incompatibly. The ABI is 2.7, additive over 2.6: `gptps_task_def`
+appends `work_dir` and `env`, and `GPTPS_M_EXIT_CODE` / `GPTPS_M_EXIT_SIGNAL` are new
+measurement names with a new unit, `GPTPS_UNIT_CODE`. A consumer that checks a
+measurement's unit against a fixed list should allow 5. On Windows, PROGRAM jobs are
+now started with `CreateProcessW`: argv strings are read as UTF-8, and a string that
+is not valid UTF-8 is read in the ANSI code page as before, so an ANSI argv keeps
+working.
+
+### Added
+
+- `gptps_task_def.work_dir` and `env` for `GPTPS_EXEC_PROGRAM`, on POSIX and Windows:
+  the directory a program starts in, and variables laid over the host's environment
+  (`"NAME=value"` replaces or adds, a bare `"NAME"` removes). Both are copied at
+  registration and kept by `gptps_clone_task`; an `env` entry with an empty name is
+  refused with `GPTPS_E_INVAL`. A `work_dir` that cannot be entered fails the attempt
+  as a program that cannot be started does.
+- `exit.code` and `exit.signal` measurements on a PROGRAM job's FINISHED / FAILED: the
+  exit status, or the POSIX signal that ended it, whenever the program ended on its
+  own. Reported, not acted on: any non-zero exit is still `GPTPS_E_TASK`.
+- `test_program_launch`: working directory, environment, UTF-8 arguments and exit
+  reporting, run on Linux, macOS and Windows.
+
+### Fixed
+
+- Windows: PROGRAM jobs could not be given a working directory or environment, and
+  a non-ASCII argv (a Turkish path, say) was mangled on any system whose ANSI code
+  page could not represent it, because jobs were started with `CreateProcessA`.
+- The header told hosts to call `setenv` from `child_setup`, which runs between
+  `fork` and `exec` and must be async-signal-safe; `setenv` is not, and can deadlock
+  the child of a threaded host. The docs now point to `work_dir` and `env`.
+- `test_durable` no longer expects the journaling pump to have finished another
+  submit while a thousand no-op tasks drain; it waits (up to 10 s) for one.
+
 ## [1.8.0] - 2026-11-14
 
 ### Upgrading from 1.7

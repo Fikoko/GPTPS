@@ -51,6 +51,13 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#  include <crt_externs.h>            /* a shared library cannot link `environ` directly */
+#  define gptps_environ (*_NSGetEnviron())
+#else
+extern char **environ;
+#  define gptps_environ environ
+#endif
 #if defined(__linux__)
 #  include <dirent.h>    /* /sys/block: the devices io.max is written for */
 #endif
@@ -1008,12 +1015,58 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
 
 #define GPTPS_PROG_RESULT_CAP GPTPS_EXEC_RESULT_CAP /* max captured stdout */
 
+/* length of the name in "NAME=value" (or of a bare "NAME") */
+static size_t env_name_len(const char *s) { const char *q = strchr(s, '='); return q ? (size_t)(q - s) : strlen(s); }
+
+/* The program's environment (ABI 2.7 gptps_task_def.env): the host's, with each
+ * "NAME=value" replacing or adding NAME and each bare "NAME" removing it. Built in the
+ * PARENT - the child may not allocate - as an array of pointers into the host's
+ * environment and def->env, both of which outlive the fork; NULL when out of memory. */
+static char **env_merge(const char *const *over)
+{
+    char **host = gptps_environ, **out;
+    size_t nh = 0, no = 0, n = 0, i, j;
+    while (host && host[nh]) ++nh;
+    while (over[no]) ++no;
+    out = (char **)gptps_calloc(nh + no + 1, sizeof *out);
+    if (!out) return NULL;
+    for (i = 0; i < nh; ++i) {
+        size_t L = env_name_len(host[i]);
+        int replaced = 0;
+        for (j = 0; j < no && !replaced; ++j)
+            replaced = env_name_len(over[j]) == L && strncmp(over[j], host[i], L) == 0;
+        if (!replaced) out[n++] = host[i];
+    }
+    for (j = 0; j < no; ++j) {
+        size_t k, L = env_name_len(over[j]);
+        int later = 0;          /* the last entry for a name wins, as setenv twice would */
+        if (!strchr(over[j], '=')) continue;               /* a removal */
+        for (k = j + 1; k < no && !later; ++k)
+            later = env_name_len(over[k]) == L && strncmp(over[k], over[j], L) == 0;
+        if (!later) out[n++] = (char *)over[j];
+    }
+    out[n] = NULL;
+    return out;
+}
+
+/* async-signal-safe: a line on the child's stderr before it gives up */
+static void child_say(const char *what, const char *arg)
+{
+    ssize_t w;
+    w = write(STDERR_FILENO, "gptps: ", 7);
+    w = write(STDERR_FILENO, what, strlen(what));
+    if (arg) w = write(STDERR_FILENO, arg, strlen(arg));
+    w = write(STDERR_FILENO, "\n", 1);
+    (void)w;
+}
+
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     const uint64_t mem_cap = caps->mem;
     const char *const *argv = def ? def->argv : NULL;
+    char **envm = NULL;          /* ABI 2.7: the merged environment, when def->env is set */
     int inp[2], outp[2], rp[2];
     pid_t pid;
 #if defined(__linux__)
@@ -1050,12 +1103,22 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         return GPTPS_E_IO;
     }
 
+    if (def->env && !(envm = env_merge(def->env))) {
+        exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
+        exec_close(rp[0]); exec_close(rp[1]);
+#if defined(__linux__)
+        cgroup_destroy(cgdir);
+#endif
+        return GPTPS_E_NOMEM;
+    }
+
     {
         int keep[6];
         keep[0] = inp[0]; keep[1] = inp[1]; keep[2] = outp[0]; keep[3] = outp[1];
         keep[4] = rp[0]; keep[5] = rp[1];
         pid = exec_fork_sweep(keep, 6);
     }
+    if (pid != 0) gptps_free(envm);   /* the parent's copy; the child has its own */
     if (pid < 0) {
         exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
         exec_close(rp[0]); exec_close(rp[1]);
@@ -1097,7 +1160,11 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (!joined || !(caps->applied & GPTPS_CAP_MEM_CG))
             apply_as_cap(mem_cap);                             /* coarse fallback */
         report_send(rp[1], REPORT_STARTED, joined, GPTPS_HWM_UNKNOWN);
-        if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook (chdir/seccomp/drop-privs/...) */
+        /* ABI 2.7: where it starts and what it sees - before the host's hook, so the
+         * hook can still change either */
+        if (def->work_dir && chdir(def->work_dir) != 0) { child_say("cannot enter work_dir ", def->work_dir); _exit(127); }
+        if (envm) gptps_environ = envm;   /* execvp passes, and PATH-resolves from, environ */
+        if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook (seccomp/drop-privs/...) */
 #if defined(__linux__)
         report_send(rp[1], REPORT_EXEC, joined, self_hwm_kb()); /* the last thing before exec */
 #else
@@ -1265,6 +1332,16 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         report_poll(&jw);                          /* the child is gone: all of it */
         if (jw.fd >= 0) exec_close(jw.fd);         /* a write end lives on elsewhere */
         if (jw.failed && eff == GPTPS_OK) eff = GPTPS_E_IO;   /* our own pipe failed us */
+        /* ABI 2.7: how it ended, when it ended on its own (GPTPS killed it otherwise,
+         * and the status says why) */
+        if (reaped && !killed && !oversize && !nomem) {
+            if (WIFEXITED(wstatus))
+                gptps_meter_put(meter, GPTPS_M_EXIT_CODE, (uint64_t)WEXITSTATUS(wstatus),
+                                GPTPS_UNIT_CODE, GPTPS_MEASURE_CURRENT, "posix.wait");
+            else if (WIFSIGNALED(wstatus))
+                gptps_meter_put(meter, GPTPS_M_EXIT_SIGNAL, (uint64_t)WTERMSIG(wstatus),
+                                GPTPS_UNIT_CODE, GPTPS_MEASURE_CURRENT, "posix.wait");
+        }
         meter_finish(meter, &jw, &ru, have_ru);   /* before the cgroup goes */
         /* A child that said it could not join its cgroup ran under none of its caps. One
          * that never said (killed before it could) keeps what the cgroup held: the

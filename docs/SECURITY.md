@@ -52,9 +52,13 @@ They do **not** give you privilege isolation, and this is the part that matters:
 - Neither drops privileges. A child of a root process is a root process.
 
 **`child_setup` is the seam where you fix that.** It runs in the child after `fork`
-and before the work (or the `exec`), so it is where `chdir`, `setuid`/`setgid`,
-`setrlimit`, `unsetenv`, closing inherited descriptors, and installing a seccomp
-filter belong. It must be async-signal-safe. If you are running code you actually
+and before the work (or the `exec`), so it is where `setuid`/`setgid`, `setrlimit`,
+closing inherited descriptors, and installing a seccomp filter belong. It must be
+async-signal-safe: no `setenv`, `unsetenv`, `malloc` or stdio, which can deadlock a
+child forked from a threaded host. For a program's working directory and environment,
+including removing inherited variables, use `gptps_task_def.work_dir` and `env`
+(ABI 2.7) instead: the engine prepares them before the `fork`, and they work on Windows
+too, where `child_setup` does not run. If you are running code you actually
 distrust, `child_setup` is not optional — and you should still put the whole process
 inside a container or VM, because a seccomp filter you wrote is not a security
 boundary a determined attacker respects.

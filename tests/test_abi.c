@@ -165,7 +165,7 @@ int main(void)
         (void)sizeof(count_inside);
         (void)sizeof(measure_order);
         CHECK(GPTPS_EV_SAMPLE == GPTPS_EV_DROPPED + 1);
-        CHECK(GPTPS_UNIT_BYTES == 1 && GPTPS_UNIT_FLAG == 4);
+        CHECK(GPTPS_UNIT_BYTES == 1 && GPTPS_UNIT_FLAG == 4 && GPTPS_UNIT_CODE == 5);
         CHECK(GPTPS_MEASURE_PEAK == 1 && GPTPS_MEASURE_CURRENT == 4);
     }
 

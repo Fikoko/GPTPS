@@ -86,10 +86,12 @@ extern "C" {
  * gptps_submit_options, carried to the seams as deadline_ms on gptps_sched_input and
  * gptps_constraint_input (which also gains now_ms), and the options an item was
  * submitted with on its gptps_dead_letter (`options`), for a re-drive, and the
- * scheduler seam's GPTPS_SCHED_STABLE flag. Additive, and the loader compares
+ * scheduler seam's GPTPS_SCHED_STABLE flag; 2.7 appends `work_dir` and `env` to
+ * gptps_task_def for GPTPS_EXEC_PROGRAM, adds the exit.code / exit.signal
+ * measurements and their unit, GPTPS_UNIT_CODE. Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 6u
+#define GPTPS_ABI_VERSION_MINOR 7u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -325,9 +327,13 @@ typedef struct {
     const char *const    *argv;
     /* GPTPS_EXEC_OOP / GPTPS_EXEC_PROGRAM only (v1.9): optional hook run IN THE
      * CHILD after fork - before exec (PROGRAM) or before the run fn (OOP). Harden
-     * the child here: chdir, setenv, setrlimit, drop privileges, install seccomp,
-     * close inherited fds. MUST be async-signal-safe (it runs between fork and
-     * exec). Receives `user_data`. Ignored for INPROC and on Windows (no fork). */
+     * the child here: setrlimit, drop privileges, install seccomp, close inherited
+     * fds. MUST be async-signal-safe (it runs between fork and exec in a process
+     * that may have other threads' locks held), so NOT setenv/putenv/malloc/stdio:
+     * for a program's working directory and environment use `work_dir` and `env`
+     * below (ABI 2.7), which also work on Windows. Receives `user_data`. Ignored for
+     * INPROC and on Windows (no fork). On PROGRAM it runs after `work_dir` and `env`
+     * are applied. */
     void (*child_setup)(void *user_data);
     /* v1.11: OR of GPTPS_TASK_* flags (0 = a normal one-shot task). GPTPS_TASK_SERVICE
      * marks a supervised long-running instance (see the flag's doc above). Appended
@@ -372,6 +378,29 @@ typedef struct {
     uint64_t cpu_max_millicpus;
     uint64_t io_max_read_bps;
     uint64_t io_max_write_bps;
+    /* ABI 2.7 - GPTPS_EXEC_PROGRAM only (ignored for INPROC and OOP); both copied at
+     * registration, both NULL by default, and on every platform.
+     *
+     *   work_dir  the directory the program starts in; NULL or "" = the host's. A
+     *             directory that cannot be entered fails the attempt as a program that
+     *             cannot be started does (GPTPS_E_TASK; POSIX: exit.code 127 and a
+     *             line on the program's stderr). argv[0] is resolved as before - a
+     *             bare name through PATH, a path relative to the HOST's directory on
+     *             Windows but to work_dir on POSIX - so give an absolute path when
+     *             setting both.
+     *   env       NULL-terminated "NAME=value" strings laid OVER the host's
+     *             environment: a name already there is replaced, a new one added. A
+     *             bare "NAME" (no '=') removes that variable. Names compare as the OS
+     *             does: exactly on POSIX, case-insensitively on Windows. A bare name
+     *             in argv[0] is looked up through the PATH the program will see. An
+     *             entry with an empty name ("=x", "") is refused at registration.
+     *
+     * Strings are UTF-8 (so are argv's, on Windows since 2.7: the program is started
+     * with CreateProcessW). A string that is not valid UTF-8 is taken as the ANSI code
+     * page, which is what 2.6 and older passed to CreateProcessA, so an ANSI argv keeps
+     * working. Pointers, so on a 32-bit ABI the two together still GROW sizeof. */
+    const char         *work_dir;
+    const char *const  *env;
 } gptps_task_def;
 
 /* ============================================================================
@@ -1001,7 +1030,7 @@ typedef enum {
  *   - Every value carries its method ("cgroup.job.resident", ...), because one name
  *     can mean different things on different platforms; never mix methods.
  *   - One unit per name, everywhere. Names are dotted like settings keys; the core
- *     owns mem., cpu. and io., an add-on uses its own namespace. Ignore a name you
+ *     owns mem., cpu., io. and exit., an add-on uses its own namespace. Ignore a name you
  *     do not know.
  * gptps_measure is the element of an array, so it is FROZEN: it never grows. New
  * information arrives as new names, units, kinds or flag bits.
@@ -1010,7 +1039,9 @@ typedef enum {
     GPTPS_UNIT_BYTES = 1,
     GPTPS_UNIT_MS    = 2,
     GPTPS_UNIT_COUNT = 3,
-    GPTPS_UNIT_FLAG  = 4       /* 0 or 1 */
+    GPTPS_UNIT_FLAG  = 4,      /* 0 or 1 */
+    GPTPS_UNIT_CODE  = 5       /* ABI 2.7: an identifier (an exit code, a signal number):
+                                * compare it, never add or average it */
 } gptps_measure_unit;
 
 typedef enum {
@@ -1041,6 +1072,16 @@ typedef struct {
  * only where that cap was enforced through the job's cgroup, so its presence is also
  * the proof the cap was in force; 0 is a real value - the cap never bit. */
 #define GPTPS_M_CPU_THROTTLED_MS "cpu.throttled_ms" /* ms, total */
+/* ABI 2.7: how a GPTPS_EXEC_PROGRAM job ended, on its FINISHED / FAILED - reported, never
+ * acted on: the attempt's status is still 0 => OK, anything else => GPTPS_E_TASK. One
+ * of the two, and only when the program ended ON ITS OWN: neither when GPTPS stopped
+ * it (timeout, cancel, oversized output), since that status already says why.
+ *   exit.code    the exit status: 0-255 on POSIX; the full 32-bit code on Windows,
+ *                where a crash shows as an NTSTATUS such as 0xC0000005.
+ *   exit.signal  POSIX: the signal that ended it (9 when the kernel's OOM killer, or
+ *                anything else outside GPTPS, killed it). */
+#define GPTPS_M_EXIT_CODE      "exit.code"       /* code, current */
+#define GPTPS_M_EXIT_SIGNAL    "exit.signal"     /* code, current */
 
 typedef struct {
     size_t           struct_size;   /* = sizeof(gptps_event) */

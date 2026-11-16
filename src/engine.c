@@ -127,6 +127,8 @@ typedef struct gptps_reg {
     gptps_task_def     def;
     char              *name;
     char             **argv_copy;  /* owned NULL-terminated copy for EXEC_PROGRAM */
+    char              *wd_copy;    /* owned def.work_dir (ABI 2.7), or NULL */
+    char             **env_copy;   /* owned def.env (ABI 2.7), or NULL */
     int32_t            priority;   /* scheduling priority for this task type (default 0) */
     bool               enabled;    /* false => reject new submits (paused, reversible) */
     bool               settling;   /* true => gptps_register_task is still adding its settings: hidden from other threads */
@@ -3697,6 +3699,37 @@ static char **argv_dup(const char *const *argv)
     return out;
 }
 
+static void strv_free(char **v) { char **a = v; if (!v) return; while (*a) gptps_free(*a++); gptps_free(v); }
+
+/* A PROGRAM's owned launch strings (argv, ABI 2.7 work_dir and env), copied together so
+ * one call frees what was copied. */
+typedef struct { char **argv; char *wd; char **env; } prog_strs;
+static void prog_strs_free(prog_strs *p) { strv_free(p->argv); gptps_free(p->wd); strv_free(p->env); }
+
+/* Copy what `def` names; GPTPS_E_INVAL for an env entry with an empty name. Fields the
+ * caller's struct does not reach are NULL. An empty work_dir or env is none. */
+static gptps_status prog_strs_dup(const gptps_task_def *def, prog_strs *out)
+{
+    const char *wd = GPTPS_STRUCT_HAS(gptps_task_def, def, work_dir) ? def->work_dir : NULL;
+    const char *const *env = GPTPS_STRUCT_HAS(gptps_task_def, def, env) ? def->env : NULL;
+    size_t i;
+    memset(out, 0, sizeof *out);
+    if (env) for (i = 0; env[i]; ++i) if (!env[i][0] || env[i][0] == '=') return GPTPS_E_INVAL;
+    out->argv = argv_dup(def->argv);
+    if (!out->argv) return GPTPS_E_NOMEM;
+    if (wd && wd[0]) {
+        size_t L = strlen(wd) + 1;
+        out->wd = (char *)gptps_malloc(L);
+        if (!out->wd) { prog_strs_free(out); return GPTPS_E_NOMEM; }
+        memcpy(out->wd, wd, L);
+    }
+    if (env && env[0]) {
+        out->env = argv_dup(env);
+        if (!out->env) { prog_strs_free(out); return GPTPS_E_NOMEM; }
+    }
+    return GPTPS_OK;
+}
+
 /* ------------------------------------------------------------------------- */
 /* add-on namespaces (ABI 2.1)                                               */
 /*                                                                            */
@@ -3747,7 +3780,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
 {
     gptps_reg *r;
     char *name;
-    char **argv_copy = NULL;
+    prog_strs ps;
     uint64_t svc_flags;
     const gptps_task_schema *sc0;
     size_t nres0;
@@ -3790,9 +3823,10 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
         if (def->default_policy.timeout_seconds != 0) return GPTPS_E_INVAL;
     }
 
+    memset(&ps, 0, sizeof ps);
     if (def->exec == GPTPS_EXEC_PROGRAM) {
-        argv_copy = argv_dup(def->argv);
-        if (!argv_copy) return GPTPS_E_NOMEM;
+        gptps_status pst = prog_strs_dup(def, &ps);
+        if (pst != GPTPS_OK) return pst;
     }
 
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
@@ -3809,12 +3843,12 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     if (!ns_ok(e, def->name)) {                    /* namespaced add-on, unprefixed name */
         ns_reject(e, "task", def->name);
         gptps_mutex_unlock(e->m);
-        if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
+        prog_strs_free(&ps);
         return GPTPS_E_INVAL;
     }
     if (registry_holder(e, def->name)) {     /* taken, by a type registered or still registering */
         gptps_mutex_unlock(e->m);
-        if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
+        prog_strs_free(&ps);
         return GPTPS_E_DUP;
     }
 
@@ -3822,7 +3856,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     name = (char *)gptps_malloc(strlen(def->name) + 1);
     if (!r || !name) {
         gptps_free(r); gptps_free(name);
-        if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
+        prog_strs_free(&ps);
         gptps_mutex_unlock(e->m);
         return GPTPS_E_NOMEM;
     }
@@ -3831,7 +3865,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
         r->res_cost = (uint64_t *)gptps_calloc(e->nres, sizeof(uint64_t));
         if (!r->res_cost) {
             gptps_free(r); gptps_free(name);
-            if (argv_copy) { char **a = argv_copy; while (*a) gptps_free(*a++); gptps_free(argv_copy); }
+            prog_strs_free(&ps);
             gptps_mutex_unlock(e->m);
             return GPTPS_E_NOMEM;
         }
@@ -3847,8 +3881,10 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     }
     r->name = name;
     r->def.name = name;
-    r->argv_copy = argv_copy;
-    r->def.argv = (const char *const *)argv_copy; /* point at our owned copy (NULL for non-PROGRAM) */
+    r->argv_copy = ps.argv; r->wd_copy = ps.wd; r->env_copy = ps.env;
+    r->def.argv = (const char *const *)ps.argv;   /* point at our owned copies (NULL for non-PROGRAM) */
+    r->def.work_dir = ps.wd;
+    r->def.env = (const char *const *)ps.env;
     if (r->def.default_cost.struct_size == 0) r->def.default_cost.struct_size = sizeof(gptps_cost);
     r->priority = 0;
     r->enabled = true;
@@ -4275,7 +4311,7 @@ static void reg_destroy(gptps_reg *r)
     gptps_res_cell *x = r->res_cells;
     while (L) { gptps_task_local *n = L->next; gptps_free(L); L = n; }
     while (x) { gptps_res_cell *n = x->next; gptps_free(x); x = n; }
-    if (r->argv_copy) { char **a = r->argv_copy; while (*a) gptps_free(*a++); gptps_free(r->argv_copy); }
+    strv_free(r->argv_copy); gptps_free(r->wd_copy); strv_free(r->env_copy);
     gptps_free(r->res_cost);
     gptps_free(r->name);
     gptps_free(r);
@@ -4387,7 +4423,7 @@ gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_na
     gptps_task_def def;
     gptps_reg *r;
     int32_t prio;
-    char **argv_snapshot = NULL;
+    prog_strs snap;
     gptps_status st;
 
     if (!e || !src_name || !dst_name) return GPTPS_E_INVAL;
@@ -4404,16 +4440,19 @@ gptps_status gptps_clone_task(gptps *e, const char *src_name, const char *dst_na
      * service runs with. */
     if (r->service) def.default_policy.timeout_seconds = 0;
     prio = r->priority;
+    memset(&snap, 0, sizeof snap);
     if (def.exec == GPTPS_EXEC_PROGRAM && r->argv_copy) {
-        argv_snapshot = argv_dup((const char *const *)r->argv_copy);   /* own a copy across the unlock */
-        if (!argv_snapshot) { gptps_mutex_unlock(e->m); return GPTPS_E_NOMEM; }
+        st = prog_strs_dup(&r->def, &snap);                /* own copies across the unlock */
+        if (st != GPTPS_OK) { gptps_mutex_unlock(e->m); return st; }
     }
     gptps_mutex_unlock(e->m);
 
     def.name = dst_name;
-    def.argv = (const char *const *)argv_snapshot;   /* register_task deep-copies this */
+    def.argv = (const char *const *)snap.argv;       /* register_task deep-copies these */
+    def.work_dir = snap.wd;
+    def.env = (const char *const *)snap.env;
     st = gptps_register_task(e, &def);               /* re-applies [tasks.<dst>] config too */
-    if (argv_snapshot) { char **a = argv_snapshot; while (*a) gptps_free(*a++); gptps_free(argv_snapshot); }
+    prog_strs_free(&snap);
     if (st != GPTPS_OK) return st;
     gptps_set_task_priority(e, dst_name, prio);   /* carry the source priority (incl. 0) over config */
     return GPTPS_OK;
