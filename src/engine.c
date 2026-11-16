@@ -96,6 +96,8 @@ typedef struct gptps_item {
     uint32_t              timeout_ms_override; /* per-submit sub-second deadline (0 = use policy.timeout_seconds) */
     uint64_t              cpu_cap;   /* gptps_task_def.cpu_max_millicpus, read at submit as `cost` is */
     uint64_t              io_rcap, io_wcap; /* io_max_read_bps / io_max_write_bps, likewise */
+    char                 *err_tail;   /* ABI 2.7: the last failed attempt's stderr tail, owned; for the dead letter */
+    size_t                err_len;
     unsigned              submit_flags; /* GPTPS_SUBMIT_* gptps_submit_ex applied: what a dead
                                       * letter hands back for a re-drive (gptps_dead_letter.options) */
     uint64_t              due_ms;    /* GPTPS_SUBMIT_DEADLINE: when it is due, monotonic; 0 = none. An
@@ -255,6 +257,8 @@ typedef struct {
     const void      *result;
     size_t           result_len;
     uint32_t         flags;         /* GPTPS_EV_FLAG_* */
+    const char      *err;           /* ABI 2.7: stderr tail on FAILED (borrowed for the emit) */
+    size_t           err_len;
 } gptps_pending_ev;
 
 static void ev_set_name(char *dst, const char *src)
@@ -946,6 +950,8 @@ static int  cancel_raised(const gptps_item *it) { return gptps_hal_load_acquire_
 static void item_free(gptps *e, gptps_item *it)
 {
     if (!it) return;
+    gptps_free(it->err_tail);
+    it->err_tail = NULL; it->err_len = 0;
     if (it->pooled) {                       /* bounded: its storage is the pool's */
         gptps_free(it->name_owned);         /* never made once sealed; never leaked either */
         it->name_owned = NULL;
@@ -992,6 +998,7 @@ static void emit_with(gptps *e, gptps_event_cb cb, void *ud, const gptps_pending
     ev.result = p->result; ev.result_len = p->result_len;
     ev.flags = p->flags;
     ev.measures = nm ? m : NULL; ev.n_measures = nm;
+    ev.stderr_tail = p->err_len ? p->err : NULL; ev.stderr_tail_len = p->err_len;
     if (cb) cb(&ev, ud);
     for (o = e->observers; o; o = o->next) o->fn(&ev, o->ud); /* extra sinks */
 }
@@ -1147,7 +1154,7 @@ static void emit_sample(gptps_exec_meter *mt, const gptps_measure *cur, size_t n
     gptps_pending_ev q = *sp->p;
     if (!n) return;
     q.kind = GPTPS_EV_SAMPLE; q.status = GPTPS_OK;
-    q.result = NULL; q.result_len = 0; q.flags = 0;
+    q.result = NULL; q.result_len = 0; q.err = NULL; q.err_len = 0; q.flags = 0;
     emit_with(sp->e, sp->cb, sp->ud, &q, cur, n);
 }
 
@@ -1164,6 +1171,7 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
     char msg[400];
     if (it->cpu_cap)                 want |= GPTPS_CAP_CPU;
     if (it->io_rcap || it->io_wcap)  want |= GPTPS_CAP_IO;
+    if (caps->stop_grace_ms)         want |= GPTPS_CAP_GRACE;
     want &= ~caps->applied;
     if (!want || !it->reg) return;
     gptps_mutex_lock(e->m);
@@ -1184,6 +1192,12 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
                  item_name(it), (unsigned long long)it->io_rcap, (unsigned long long)it->io_wcap);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
+    if (fresh & GPTPS_CAP_GRACE) {
+        snprintf(msg, sizeof msg, "task '%s': stop_grace_ms=%lu is not in force here - Windows has no "
+                 "SIGTERM; a program this engine has to stop is stopped at once",
+                 item_name(it), (unsigned long)caps->stop_grace_ms);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
 }
 
 static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *ud, unsigned slot)
@@ -1199,7 +1213,7 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     gptps_exec_caps caps;          /* what a process job may use; the executor says what held */
 
     p.handle = it->handle; ev_set_name(p.name, item_name(it)); p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-    p.result = NULL; p.result_len = 0; p.flags = 0;
+    p.result = NULL; p.result_len = 0; p.err = NULL; p.err_len = 0; p.flags = 0;
     p.kind = GPTPS_EV_STARTED; p.status = GPTPS_OK; emit_now(e, cb, ud, &p);
 
     memset(&sp, 0, sizeof sp);
@@ -1209,6 +1223,10 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     memset(&caps, 0, sizeof caps);
     caps.mem = it->cost.mem_bytes;
     caps.cpu_millicpus = it->cpu_cap; caps.io_rbps = it->io_rcap; caps.io_wbps = it->io_wcap;
+    if (it->def->exec == GPTPS_EXEC_PROGRAM) {   /* ABI 2.7; the def is the registry's full copy */
+        caps.stop_grace_ms = it->def->stop_grace_ms > 300000u ? 300000u : it->def->stop_grace_ms;
+        sp.meter.err_cap = it->def->stderr_tail_bytes > 65536u ? 65536u : it->def->stderr_tail_bytes;
+    }
 
     if (inproc) {
         /* in-process path: cooperative cancel via the deadline flag */
@@ -1277,7 +1295,16 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         if (inproc) { if (ctx.result_set) { p.result = ctx.result; p.result_len = ctx.result_len; } }
         else        { p.result = oop_res; p.result_len = oop_len; }
     }
+    if (st != GPTPS_OK && sp.meter.err_len) { p.err = sp.meter.err; p.err_len = sp.meter.err_len; }
     emit_with(e, cb, ud, &p, sp.meter.m, sp.meter.n);   /* an in-process attempt has none */
+    /* The item keeps the last failed attempt's tail, for its dead letter. Only this
+     * worker touches a running item's fields; a drain reads them once it is parked. */
+    if (st != GPTPS_OK && sp.meter.err_len) {
+        gptps_free(it->err_tail);
+        it->err_tail = sp.meter.err; it->err_len = sp.meter.err_len;
+    } else {
+        gptps_free(sp.meter.err);
+    }
 
     if (inproc) ctx_clear_result(&ctx);
     else        gptps_free(oop_res);
@@ -1655,7 +1682,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
                         ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                     }
                     item_drop(e, it);
                 }
@@ -1674,7 +1701,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_FAILED; pend[npend].handle = it->handle;
                     ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_CANCELLED;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                 }
                 item_drop(e, it);
                 continue;
@@ -1715,7 +1742,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         ev_set_name(pend[npend].name, item_name(it));
                         pend[npend].status = it->reg->cancelling ? GPTPS_E_CANCELLED : it->outcome;
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                     }
                     item_drop(e, it);
                 } else {
@@ -1723,7 +1750,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                         ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                         pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                        pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                     }
                     dead_letter_push(e, it);
                 }
@@ -1737,7 +1764,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_RETRIED; pend[npend].handle = it->handle;
                     ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                 }
                 fifo_push(&announced, it);   /* joins `delayed` after step 2's scan */
             } else {
@@ -1773,7 +1800,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                                 pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                                 ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = GPTPS_E_SHUTDOWN;
                                 pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                                pend[npend].result = NULL; pend[npend].result_len = 0;
+                                pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0;
                                 pend[npend].flags = GPTPS_EV_FLAG_SHUTDOWN; ++npend;
                             }
                             dead_letter_push(e, it);
@@ -1793,7 +1820,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                             pend[npend].kind = GPTPS_EV_DROPPED; pend[npend].handle = it->handle;
                             ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                            pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                            pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                         }
                         item_drop(e, it);
                         break;
@@ -1803,7 +1830,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                             pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = it->handle;
                             ev_set_name(pend[npend].name, item_name(it)); pend[npend].status = it->outcome;
                             pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                         }
                         dead_letter_push(e, it);
                         break;
@@ -1908,7 +1935,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     ev_set_name(pend[npend].name, item_name(it));
                     pend[npend].status = GPTPS_E_SHUTDOWN;
                     pend[npend].attempt = it->attempt; pend[npend].mem = it->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0;
                     pend[npend].flags = GPTPS_EV_FLAG_SHUTDOWN; ++npend;
                     if (drop) item_drop(e, it); else dead_letter_push(e, it);
                 }
@@ -1983,7 +2010,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = stranded->handle;
                     ev_set_name(pend[npend].name, item_name(stranded)); pend[npend].status = GPTPS_E_BUDGET;
                     pend[npend].attempt = stranded->attempt; pend[npend].mem = stranded->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                     dead_letter_push(e, stranded);
                     continue;                            /* rescan: the head may have changed */
                 }
@@ -2041,7 +2068,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     pend[npend].kind = GPTPS_EV_DEAD_LETTERED; pend[npend].handle = best->handle;
                     ev_set_name(pend[npend].name, item_name(best)); pend[npend].status = GPTPS_E_DENIED;
                     pend[npend].attempt = best->attempt; pend[npend].mem = best->cost.mem_bytes;
-                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].flags = 0; ++npend;
+                    pend[npend].result = NULL; pend[npend].result_len = 0; pend[npend].err = NULL; pend[npend].err_len = 0; pend[npend].flags = 0; ++npend;
                 }
                 dead_letter_push(e, best);               /* denied -> retained */
                 continue;
@@ -4238,7 +4265,7 @@ static void drain_cancelled(gptps *e, gptps_fifo *q, gptps_event_cb cb, void *ud
         p.kind = GPTPS_EV_FAILED; p.handle = it->handle;
         ev_set_name(p.name, item_name(it));
         p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-        p.result = NULL; p.result_len = 0; p.flags = 0;
+        p.result = NULL; p.result_len = 0; p.err = NULL; p.err_len = 0; p.flags = 0;
         emit_now(e, cb, ud, &p);
         item_free(e, it);
     }
@@ -5778,7 +5805,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
         gptps_cb_thread *in = NULL;
         p.kind = GPTPS_EV_QUEUED; p.handle = h; ev_set_name(p.name, r->def.name);
         p.status = GPTPS_OK; p.attempt = 0; p.mem = mem;
-        p.result = NULL; p.result_len = 0; p.flags = 0;
+        p.result = NULL; p.result_len = 0; p.err = NULL; p.err_len = 0; p.flags = 0;
         /* Once: see "the config file" - and not while the open is still reading it, as
          * when an add-on submits as it loads, since its keys are not claimed yet. The
          * report itself is made elsewhere: it consults the settings registry, and this
@@ -5864,7 +5891,7 @@ gptps_status gptps_cancel(gptps *e, gptps_handle h)
      * removed above; free it and emit a terminal cancelled event with the lock released. */
     p.kind = GPTPS_EV_FAILED; p.handle = h; ev_set_name(p.name, item_name(it));
     p.status = GPTPS_E_CANCELLED; p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
-    p.result = NULL; p.result_len = 0; p.flags = 0;
+    p.result = NULL; p.result_len = 0; p.err = NULL; p.err_len = 0; p.flags = 0;
     cb = e->ev_cb; ud = e->ev_ud;
     item_drop(e, it);
     /* This can be the last live reference to a draining task type, and
@@ -6097,6 +6124,8 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
                 uint64_t now = gptps_hal_monotonic_ms();
                 dl.options.deadline_in_ms = it->due_ms > now ? it->due_ms - now : 0u;
             }
+            dl.stderr_tail = it->err_len ? it->err_tail : NULL;
+            dl.stderr_tail_len = it->err_len;
             cb(&dl, user_data);
         }
         item_free(e, it);

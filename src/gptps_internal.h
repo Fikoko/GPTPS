@@ -131,6 +131,12 @@ typedef struct gptps_exec_meter {
     uint32_t      sample_ms;                  /* 0 = no samples */
     void        (*sample)(struct gptps_exec_meter *mt, const gptps_measure *cur, size_t n);
     void         *sample_ud;                  /* the engine's, for sample() */
+    /* ABI 2.7, PROGRAM only: when err_cap > 0 the executor captures the program's
+     * stderr and leaves its last err_cap bytes in err / err_len (gptps_malloc'd, the
+     * engine frees or keeps it; NULL when nothing was written). */
+    size_t        err_cap;
+    char         *err;
+    size_t        err_len;
 } gptps_exec_meter;
 
 /* Append one measurement to `mt` (no-op when mt is NULL or full). */
@@ -145,10 +151,12 @@ void gptps_meter_put(gptps_exec_meter *mt, const char *name, uint64_t value,
 #define GPTPS_CAP_CPU    0x1u   /* cpu_max_millicpus is in force */
 #define GPTPS_CAP_IO     0x2u   /* io_max_*_bps is in force on at least one device */
 #define GPTPS_CAP_MEM_CG 0x4u   /* the memory cap is the cgroup's, not RLIMIT_AS (POSIX) */
+#define GPTPS_CAP_GRACE  0x8u   /* stop_grace_ms is in force (POSIX) */
 typedef struct {
     uint64_t mem;              /* bytes; 0 or below the executor's floor = no cap */
     uint64_t cpu_millicpus;    /* 0 = no cap */
     uint64_t io_rbps, io_wbps; /* 0 = no cap, per direction */
+    uint32_t stop_grace_ms;    /* ABI 2.7: SIGTERM first, this long, then SIGKILL; 0 = none */
     unsigned applied;          /* OUT: GPTPS_CAP_*; the engine sets it 0 */
 } gptps_exec_caps;
 

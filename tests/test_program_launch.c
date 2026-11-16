@@ -14,6 +14,12 @@
  *     (POSIX), and neither when GPTPS stopped it (timeout).
  *  5) Registration: an env entry with an empty name is refused; a clone keeps
  *     work_dir and env; a 2.6-sized def leaves both unread.
+ *  6) stderr_tail_bytes: a failing program's last stderr bytes arrive on FAILED and
+ *     on its dead letter - and a program that writes far more than a pipe holds
+ *     does not block; nothing on FINISHED; nothing when the type does not ask.
+ *  7) stop_grace_ms (POSIX): a stopped program gets SIGTERM and time to clean up;
+ *     one that ignores it is SIGKILLed when the grace runs out. Windows: stopped at
+ *     once, and the first attempt logs that the grace is not in force.
  *
  * MANUAL mode: gptps_step runs each job to completion on this thread.
  */
@@ -48,6 +54,9 @@ static gptps_status g_st;
 static char     g_res[512];
 static int      g_have_code, g_have_sig;
 static uint64_t g_code, g_sig;
+static char     g_tail[128];
+static size_t   g_tail_len;
+static int      g_has_tail;
 
 static void on_ev(const gptps_event *ev, void *ud)
 {
@@ -62,7 +71,31 @@ static void on_ev(const gptps_event *ev, void *ud)
     if (m) CHECK(m->unit == GPTPS_UNIT_CODE);
     m = gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL);
     g_have_sig = m != NULL; g_sig = m ? m->value : 0;
+    g_has_tail = ev->stderr_tail != NULL; g_tail_len = ev->stderr_tail_len; g_tail[0] = 0;
+    if (ev->stderr_tail && ev->stderr_tail_len < sizeof g_tail) {
+        memcpy(g_tail, ev->stderr_tail, ev->stderr_tail_len); g_tail[ev->stderr_tail_len] = 0;
+    }
 }
+
+static char   g_dl_tail[128];
+static size_t g_dl_len;
+static void on_dl(const gptps_dead_letter *dl, void *ud)
+{
+    (void)ud;
+    g_dl_len = dl->stderr_tail_len;
+    if (dl->stderr_tail && dl->stderr_tail_len < sizeof g_dl_tail) {
+        memcpy(g_dl_tail, dl->stderr_tail, dl->stderr_tail_len); g_dl_tail[dl->stderr_tail_len] = 0;
+    }
+}
+
+#if defined(_WIN32)
+static int g_grace_warns;
+static void on_log(gptps_log_level lvl, const char *msg, void *ud)
+{
+    (void)ud;
+    if (lvl == GPTPS_LOG_WARN && strstr(msg, "stop_grace_ms")) ++g_grace_warns;
+}
+#endif
 
 static gptps *open_manual(void)
 {
@@ -222,6 +255,82 @@ int main(void)
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
     CHECK(run1(e, "hang") && !g_ok && g_st == GPTPS_E_TIMEOUT);
     CHECK(!g_have_code && !g_have_sig);                   /* GPTPS ended it: the status says why */
+
+    /* 6) the stderr tail: 200 000 bytes - three times what a pipe holds - then the
+     * line that says why; only the last 32 bytes come back */
+    {
+        static const char *const a_err[] = { HELPER_PATH, "errout", "200000", "FATAL: bad input", "3", NULL };
+        static const char *const a_errok[] = { HELPER_PATH, "errout", "100", "fine", "0", NULL };
+        static const char *const a_errhost[] = { HELPER_PATH, "errout", "0",
+                                                 "(test_program_launch: this line on stderr is expected)", "3", NULL };
+#if defined(_WIN32)
+        const char *want = "..............FATAL: bad input\r\n"; /* the last 32 bytes, raw: */
+#else                                                             /* the CRT's text-mode stderr */
+        const char *want = "...............FATAL: bad input\n";   /* the last 32 bytes */
+#endif
+        gptps_dead_letter_drain(e, NULL, NULL);               /* the earlier failures' */
+        def_prog(&d, "err", a_err); d.stderr_tail_bytes = 32;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "err") && !g_ok && g_st == GPTPS_E_TASK && g_code == 3);
+        CHECK(g_has_tail && g_tail_len == 32);
+        CHECK(strcmp(g_tail, want) == 0);
+        g_dl_len = 0; g_dl_tail[0] = 0;
+        CHECK(gptps_dead_letter_drain(e, on_dl, NULL) == 1);
+        CHECK(g_dl_len == 32 && strcmp(g_dl_tail, g_tail) == 0);
+        /* succeeded: no evidence needed */
+        def_prog(&d, "errok", a_errok); d.stderr_tail_bytes = 32;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "errok") && g_ok && !g_has_tail);
+        /* not asked: stderr is the host's, as before */
+        def_prog(&d, "errhost", a_errhost);
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "errhost") && !g_ok && !g_has_tail);
+        CHECK(gptps_dead_letter_drain(e, on_dl, NULL) == 1);
+    }
+
+    /* 7) stop_grace_ms */
+#if !defined(_WIN32)
+    {
+        static const char *const a_term[] = { HELPER_PATH, "term", "gptps_launch_cleaned.txt", NULL };
+        static const char *const a_tign[] = { HELPER_PATH, "termignore", NULL };
+        FILE *f;
+        char got[16] = { 0 };
+        uint64_t t0;
+        remove("gptps_launch_cleaned.txt");
+        def_prog(&d, "term", a_term); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "term") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        f = fopen("gptps_launch_cleaned.txt", "rb");
+        CHECK(f != NULL);
+        if (f) { CHECK(fread(got, 1, sizeof got - 1, f) == 7); fclose(f); }
+        CHECK(strcmp(got, "cleaned") == 0);                   /* it got its SIGTERM, and used it */
+        remove("gptps_launch_cleaned.txt");
+        /* no grace: SIGKILL, no chance to clean up */
+        def_prog(&d, "termnow", a_term); d.default_policy.timeout_seconds = 1;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "termnow") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        f = fopen("gptps_launch_cleaned.txt", "rb");
+        CHECK(f == NULL);
+        if (f) fclose(f);
+        /* ignores SIGTERM: killed when the grace runs out - bounded */
+        def_prog(&d, "tign", a_tign); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 400;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        t0 = gptps_now_ms(NULL);
+        CHECK(run1(e, "tign") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(gptps_now_ms(NULL) - t0 >= 1300 && gptps_now_ms(NULL) - t0 < 4000);
+    }
+#else
+    {
+        static const char *const a_hang2[] = { HELPER_PATH, "hang", NULL };
+        gptps_set_log_sink(on_log, NULL);
+        def_prog(&d, "grace", a_hang2); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "grace") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(run1(e, "grace") && !g_ok);
+        CHECK(g_grace_warns == 1);                            /* once per task type */
+        gptps_set_log_sink(NULL, NULL);
+    }
+#endif
 
     CHECK(gptps_shutdown(e) == GPTPS_OK);
     remove_dir();

@@ -63,6 +63,52 @@ distrust, `child_setup` is not optional — and you should still put the whole p
 inside a container or VM, because a seccomp filter you wrote is not a security
 boundary a determined attacker respects.
 
+## When the host dies: jobs left running
+
+If the host process crashes or is killed, what happens to the jobs it started?
+
+- **Windows:** every job is in a job object created with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the jobs die with the host. Nothing to do.
+- **Linux, macOS:** they keep running. A restarted host can then start a second copy
+  next to the first - two MRP runs against one database. GPTPS does not change this
+  on its own, because a host may *want* a job to outlive it, and it has to be decided
+  in the child.
+
+On **Linux**, ask the kernel to kill the job when its parent goes, from `child_setup`:
+
+```c
+#include <stdint.h>
+#include <sys/prctl.h>
+#include <signal.h>
+#include <unistd.h>
+
+static void die_with_host(void *ud)        /* runs in the child, before exec */
+{
+    pid_t host = (pid_t)(intptr_t)ud;
+    prctl(PR_SET_PDEATHSIG, SIGKILL);       /* or SIGTERM, to let it clean up */
+    if (getppid() != host) _exit(1);        /* the host died before prctl: too late */
+}
+
+/* at registration */
+def.child_setup = die_with_host;
+def.user_data   = (void *)(intptr_t)getpid();
+```
+
+Two things to know:
+
+- The `getppid()` check is not optional. If the host dies between `fork` and the
+  `prctl`, no signal is ever sent, and the job is already an orphan.
+- `PR_SET_PDEATHSIG` fires when the **thread** that forked the job ends, not the
+  whole process. That is safe with GPTPS: the worker thread that starts a job waits
+  for it, so it outlives it. It would not be safe from a thread of your own that
+  exits while its child runs.
+
+`prctl` and `getppid` are system calls, so this is async-signal-safe. Under systemd
+the service's `KillMode=control-group` (the default) also kills every job when the
+service stops, crash or not. On **macOS** there is no `PR_SET_PDEATHSIG`; run the
+host under `launchd` with `AbandonProcessGroup` left false, or have each program
+watch its parent.
+
 ## Fork safety
 
 An engine created **before** a `fork()` must not be used in the child: its mutex may

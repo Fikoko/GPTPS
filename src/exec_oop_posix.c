@@ -102,6 +102,64 @@ static pid_t wait_child(pid_t pid, int *wstatus, int options, struct rusage *ru,
 #endif
 }
 
+/* ABI 2.7: a PROGRAM's captured stderr - only its last `cap` bytes are kept, and
+ * everything is read, so a chatty program never blocks on a full pipe. fd < 0 = none. */
+typedef struct { int fd; char *buf; size_t len, cap; } err_tail;
+
+static void err_keep(err_tail *t, const char *p, size_t n)
+{
+    if (!t->buf) return;
+    if (n >= t->cap) { memcpy(t->buf, p + (n - t->cap), t->cap); t->len = t->cap; return; }
+    if (t->len + n > t->cap) {                     /* drop the oldest */
+        size_t drop = t->len + n - t->cap;
+        memmove(t->buf, t->buf + drop, t->len - drop);
+        t->len -= drop;
+    }
+    memcpy(t->buf + t->len, p, n);
+    t->len += n;
+}
+
+/* Read what is there now (the fd is non-blocking); close it at EOF or on an error. */
+static void err_drain(err_tail *t)
+{
+    char chunk[4096];
+    if (!t || t->fd < 0) return;
+    for (;;) {
+        ssize_t r = read(t->fd, chunk, sizeof chunk);
+        if (r > 0) { err_keep(t, chunk, (size_t)r); continue; }
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0 && errno == EAGAIN) return;
+        close(t->fd); t->fd = -1;                  /* EOF, or nothing more to be had */
+        return;
+    }
+}
+
+static void nap_ms(long ms) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = ms * 1000000L; nanosleep(&ts, NULL); }
+
+/* ABI 2.7 stop_grace_ms: SIGTERM to the group, up to `grace_ms` for the leader to
+ * exit (seen without reaping it - the caller reaps), then SIGKILL to the group,
+ * whatever is left of it. Bounded either way. With no grace, just the SIGKILL. */
+static void stop_group(pid_t pid, uint32_t grace_ms, err_tail *et)
+{
+    if (grace_ms) {
+        uint32_t waited = 0;
+        kill(-pid, SIGTERM);
+        while (waited < grace_ms) {
+            siginfo_t si;
+            memset(&si, 0, sizeof si);
+            if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) != 0) {
+                if (errno == EINTR) continue;
+                break;                             /* reaped elsewhere (SIGCHLD ignored): gone */
+            }
+            if (si.si_pid == pid) break;           /* it has exited */
+            err_drain(et);
+            nap_ms(5);
+            waited += 5;
+        }
+    }
+    kill(-pid, SIGKILL);
+}
+
 /* Reap `pid` WITHOUT blocking forever. A child that closes its stdout but keeps
  * running - or ignores every signal short of SIGKILL - would otherwise pin this
  * worker inside waitpid(), which is exactly the hang these executors promise never
@@ -116,7 +174,8 @@ static pid_t wait_child(pid_t pid, int *wstatus, int options, struct rusage *ru,
  * Returns GPTPS_OK if the child exited on its own, else why it had to be killed. */
 static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group,
                                  uint64_t deadline, const uint32_t *cancel,
-                                 struct rusage *ru, int *have_ru)
+                                 struct rusage *ru, int *have_ru,
+                                 uint32_t grace_ms, err_tail *et)
 {
     gptps_status why = GPTPS_OK;
     int waited = 0;
@@ -134,8 +193,9 @@ static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group
             if (deadline && now >= deadline)              why = GPTPS_E_TIMEOUT;
             else if (cancel && gptps_hal_load_acquire_u32(cancel))    why = GPTPS_E_CANCELLED;
             else if (waited >= GPTPS_EXEC_EXIT_GRACE_MS)  why = GPTPS_E_TIMEOUT;
-            if (why != GPTPS_OK) { if (group) kill(-pid, SIGKILL); else kill(pid, SIGKILL); }
+            if (why != GPTPS_OK) { if (group) stop_group(pid, grace_ms, et); else kill(pid, SIGKILL); }
         }
+        err_drain(et);                                 /* a program past its stdout may still log */
         ts.tv_sec = 0; ts.tv_nsec = 5L * 1000000L;   /* 5ms */
         nanosleep(&ts, NULL);
         waited += 5;
@@ -977,7 +1037,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             while (wait_child(pid, &wstatus, 0, &ru, &have_ru) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
         } else {
             /* The child owes us nothing more, but it has not necessarily exited. */
-            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel, &ru, &have_ru);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel, &ru, &have_ru, 0, NULL);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
@@ -1068,6 +1128,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     const char *const *argv = def ? def->argv : NULL;
     char **envm = NULL;          /* ABI 2.7: the merged environment, when def->env is set */
     int inp[2], outp[2], rp[2];
+    int errp[2] = { -1, -1 };    /* ABI 2.7: the program's stderr, when its tail is kept */
+    err_tail et;
     pid_t pid;
 #if defined(__linux__)
     char *cgdir = cgroup_create(caps);
@@ -1103,7 +1165,24 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         return GPTPS_E_IO;
     }
 
+    memset(&et, 0, sizeof et); et.fd = -1;
+    if (meter && meter->err_cap) {
+        et.cap = meter->err_cap;
+        et.buf = (char *)gptps_malloc(et.cap);
+        if (!et.buf || exec_pipe(errp, 0) != 0) {
+            gptps_status why = et.buf ? GPTPS_E_IO : GPTPS_E_NOMEM;
+            gptps_free(et.buf);
+            exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
+            exec_close(rp[0]); exec_close(rp[1]);
+#if defined(__linux__)
+            cgroup_destroy(cgdir);
+#endif
+            return why;
+        }
+    }
     if (def->env && !(envm = env_merge(def->env))) {
+        gptps_free(et.buf);
+        if (errp[0] >= 0) { exec_close(errp[0]); exec_close(errp[1]); }
         exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
         exec_close(rp[0]); exec_close(rp[1]);
 #if defined(__linux__)
@@ -1113,13 +1192,16 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     }
 
     {
-        int keep[6];
+        int keep[8], nk = 6;
         keep[0] = inp[0]; keep[1] = inp[1]; keep[2] = outp[0]; keep[3] = outp[1];
         keep[4] = rp[0]; keep[5] = rp[1];
-        pid = exec_fork_sweep(keep, 6);
+        if (errp[0] >= 0) { keep[6] = errp[0]; keep[7] = errp[1]; nk = 8; }
+        pid = exec_fork_sweep(keep, nk);
     }
     if (pid != 0) gptps_free(envm);   /* the parent's copy; the child has its own */
     if (pid < 0) {
+        gptps_free(et.buf);
+        if (errp[0] >= 0) { exec_close(errp[0]); exec_close(errp[1]); }
         exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
         exec_close(rp[0]); exec_close(rp[1]);
 #if defined(__linux__)
@@ -1131,7 +1213,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     if (pid == 0) {
         /* ---- CHILD: wire stdin/stdout to the pipes, cap memory, exec ---- */
         int joined = 0;
-        int i, *ends[4];
+        int i, nends = 4, *ends[6];
         /* Hoist EVERY pipe end above fd 2 first. A host that daemonised (closed its
          * stdin, a standard step) leaves fd 0 free, so pipe() hands back inp[0]==0:
          * dup2(inp[0], 0) is then a no-op that does not even clear FD_CLOEXEC, and
@@ -1141,7 +1223,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
          * Any of the four ends can alias, hence all four; closing the low original
          * keeps it from aliasing a dup2 target below. */
         ends[0] = &inp[0]; ends[1] = &inp[1]; ends[2] = &outp[0]; ends[3] = &outp[1];
-        for (i = 0; i < 4; ++i) {
+        if (errp[0] >= 0) { ends[4] = &errp[0]; ends[5] = &errp[1]; nends = 6; }
+        for (i = 0; i < nends; ++i) {
             if (*ends[i] < 3) {
                 int n = fcntl(*ends[i], F_DUPFD, 3);  /* the copy is closed below, so
                                                        * plain F_DUPFD is enough and
@@ -1152,6 +1235,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             }
         }
         if (dup2(inp[0], STDIN_FILENO) < 0 || dup2(outp[1], STDOUT_FILENO) < 0) _exit(127);
+        if (errp[0] >= 0) {
+            if (dup2(errp[1], STDERR_FILENO) < 0) _exit(127);
+            close(errp[0]); close(errp[1]);
+        }
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]); close(rp[0]);
         setpgid(0, 0); /* own process group: a timeout kill takes down the program AND its children */
 #if defined(__linux__)
@@ -1206,6 +1293,11 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
 
         exec_close(inp[0]); exec_close(outp[1]); exec_close(rp[1]);
         (void)fcntl(rp[0], F_SETFL, fcntl(rp[0], F_GETFL) | O_NONBLOCK);
+        if (errp[0] >= 0) {
+            exec_close(errp[1]);
+            et.fd = errp[0];
+            (void)fcntl(et.fd, F_SETFL, fcntl(et.fd, F_GETFL) | O_NONBLOCK);
+        }
         setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
         /* A write to the child's closed stdin must EPIPE, not kill us - but suppress
          * SIGPIPE WITHOUT mutating the host's process-wide disposition: per-fd on
@@ -1224,29 +1316,31 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (!wleft) { exec_close(inp[1]); in_open = 0; } /* no payload: EOF the child's stdin now */
 
         for (;;) {
-            struct pollfd pfd[2]; int nfd = 0, oidx, iidx = -1, pr; int slice = 200;
+            struct pollfd pfd[3]; int nfd = 0, oidx, iidx = -1, eidx = -1, pr; int slice = 200;
 
             oidx = nfd; pfd[nfd].fd = outp[0]; pfd[nfd].events = POLLIN;  pfd[nfd].revents = 0; nfd++;
             if (in_open) { iidx = nfd; pfd[nfd].fd = inp[1]; pfd[nfd].events = POLLOUT; pfd[nfd].revents = 0; nfd++; }
+            if (et.fd >= 0) { eidx = nfd; pfd[nfd].fd = et.fd; pfd[nfd].events = POLLIN; pfd[nfd].revents = 0; nfd++; }
 
             /* Every pass, not only on an idle slice: a program that writes all the
              * time would otherwise never be sampled. */
             sampler_tick(&sm, &jw);
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
-                if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; kill(-pid, SIGKILL); break; }
+                if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; stop_group(pid, caps->stop_grace_ms, &et); break; }
                 if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
             slice = sampler_slice(&sm, slice);
             pr = poll(pfd, (nfds_t)nfd, slice);
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
-            if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; kill(-pid, SIGKILL); break; }
+            if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; stop_group(pid, caps->stop_grace_ms, &et); break; }
             /* a genuine poll error (e.g. ENOMEM) must still kill the child, or the
              * blocking waitpid below would hang this worker on a still-live child -
              * the very thing this executor promises never to do. */
             if (pr < 0) { if (errno == EINTR) continue; killed = 1; kill_st = GPTPS_E_IO; kill(-pid, SIGKILL); break; }
             if (pr == 0) continue;                 /* slice elapsed: re-check deadline/cancel */
+            if (eidx >= 0 && (pfd[eidx].revents & (POLLIN | POLLHUP | POLLERR))) err_drain(&et);
 
             /* drain stdout */
             if (pfd[oidx].revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -1310,7 +1404,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
              * that it exited. A program that keeps running (or ignores signals) would
              * otherwise pin this worker in waitpid() forever, orphaning the child at
              * shutdown. Give it a bounded grace period, then SIGKILL. */
-            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel, &ru, &have_ru);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel, &ru, &have_ru,
+                                            caps->stop_grace_ms, &et);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
@@ -1329,6 +1424,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (cgdir && eff != GPTPS_OK && eff != GPTPS_E_TIMEOUT && cgroup_oom_killed(cgdir))
             eff = GPTPS_E_NOMEM;     /* exceeded the memory cap */
 #endif
+        err_drain(&et);                            /* what it wrote last; a grandchild may hold the pipe */
+        if (et.fd >= 0) { exec_close(et.fd); et.fd = -1; }
+        if (meter && et.len) { meter->err = et.buf; meter->err_len = et.len; }
+        else gptps_free(et.buf);
         report_poll(&jw);                          /* the child is gone: all of it */
         if (jw.fd >= 0) exec_close(jw.fd);         /* a write end lives on elsewhere */
         if (jw.failed && eff == GPTPS_OK) eff = GPTPS_E_IO;   /* our own pipe failed us */
@@ -1347,6 +1446,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
          * that never said (killed before it could) keeps what the cgroup held: the
          * caps were not refused, so there is nothing to warn about. */
         if (jw.started && !jw.joined) caps->applied = 0;
+        if (caps->stop_grace_ms) caps->applied |= GPTPS_CAP_GRACE;   /* POSIX always has SIGTERM */
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
