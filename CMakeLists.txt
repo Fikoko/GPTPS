@@ -21,6 +21,11 @@ if(MSVC)
     # Quiet the C4996 deprecation noise MSVC emits for ISO C (fopen, ...) and POSIX
     # (_isatty, ...) names; the code uses them portably and correctly.
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+    # Sources are UTF-8. Without /utf-8 MSVC reads a file with no byte order mark in
+    # the build machine's ANSI code page, so a non-ASCII letter in a string literal
+    # (or a comment) would mean something else on each runner. The sources spell such
+    # letters with escapes anyway; this keeps a slip from changing a test's meaning.
+    add_compile_options(/utf-8)
     # The test/example suite uses GCC __atomic_* builtins for cross-thread counters;
     # force-include a shim mapping them to Win32 Interlocked* under MSVC. Inert for
     # the library itself (it routes atomics through the HAL, not these builtins).

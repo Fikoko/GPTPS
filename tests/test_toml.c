@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>               /* MultiByteToWideChar: the rule gptps_path_wide keeps */
+#endif
 
 #ifndef ADDON_DEMO_PATH
 #define ADDON_DEMO_PATH "./addon_demo.so"
@@ -507,11 +510,15 @@ static void test_bom(void)
 /* Paths are UTF-8 on Windows too, as a program's argv and work_dir are: a config file
  * under a directory with a Turkish name used to fail with "cannot open the file" on
  * any ANSI code page without the letter (fopen read the UTF-8 bytes as ANSI). */
-#define UTF8_NAME "gptps_toml_\xC5\x9Eirket.toml"            /* "...Şirket.toml" */
+#define UTF8_NAME "gptps_toml_\xC5\x9Eirket.toml"            /* "...\u015Eirket.toml" */
+/* The same name as UTF-16, spelled with an escape: a raw letter in a wide literal is
+ * read in the compiler's source code page, which for MSVC without /utf-8 is the
+ * build machine's ANSI one (C5 9E became L"\u00C5\u017E" on cp1252). */
+#define WIDE_NAME L"gptps_toml_\x015E" L"irket.toml"
 static FILE *native_open(const char *mode)
 {
 #if defined(_WIN32)
-    return _wfopen(L"gptps_toml_Şirket.toml", mode[0] == 'w' ? L"wb" : L"rb");
+    return _wfopen(WIDE_NAME, mode[0] == 'w' ? L"wb" : L"rb");
 #else
     return fopen(UTF8_NAME, mode);
 #endif
@@ -568,6 +575,33 @@ static void test_utf8_path(void)
     CHECK(gptps_path_wide("\xED\xA0\x80", &w) == 0 && w == NULL);          /* a surrogate */
     CHECK(gptps_path_wide("\xF4\x90\x80\x80", &w) == 0 && w == NULL);      /* past U+10FFFF */
     CHECK(gptps_path_wide("\xC5", &w) == 0 && w == NULL);                  /* cut short */
+    /* The same rule as the converters beside the Win32 calls (exec_win.c's win_wide,
+     * the HAL's for LoadLibraryW / MoveFileExW): wide exactly when the system's own
+     * strict UTF-8 reading accepts the bytes, with the same UTF-16 - so a path opens
+     * the same file whichever call it reaches. */
+    {
+        static const char *const corpus[] = {
+            "a\xC5\x9E\xF0\x9F\x98\x80", "\xC5\x9F\xC4\xB1rket", "\xE2\x82\xAC.toml",
+            "\xEF\xBF\xBF", "\xF4\x8F\xBF\xBF", "\xF0\x90\x80\x80", "\xC2\x80",
+            "\xC0\x80", "\xC1\xBF", "\xE0\x80\x80", "\xE0\x9F\xBF", "\xF0\x80\x80\x80",
+            "\xF0\x8F\xBF\xBF", "\xF4\x90\x80\x80", "\xF5\x80\x80\x80", "\xF8\x88\x80\x80\x80",
+            "\xFE", "\xFF", "\x80", "a\xBF", "\xC5", "\xE2\x82", "\xF0\x9F\x98", "\xC5\x41",
+            "\xE2\x28\xA1", "ANSI \xE7.toml", "\xE7\xE8\xE9", "C:\\Users\\\xC5\x9E\\x.toml"
+        };
+        size_t k;
+        for (k = 0; k < sizeof corpus / sizeof *corpus; ++k) {
+            wchar_t sys[64];
+            int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, corpus[k], -1, sys, 64);
+            int rc = gptps_path_wide(corpus[k], &w);
+            if (n > 0) {
+                CHECK(rc == 1 && w && memcmp(w, sys, (size_t)n * sizeof *w) == 0);
+            } else {
+                CHECK(rc == 0 && w == NULL);
+            }
+            if (!(n > 0 ? rc == 1 : rc == 0)) printf("  path_wide disagrees with the system on corpus[%u]\n", (unsigned)k);
+            gptps_free(w); w = NULL;
+        }
+    }
 #else
     CHECK(gptps_path_wide("a\xC5\x9E", &w) == 0 && w == NULL);             /* no *W calls here */
 #endif
