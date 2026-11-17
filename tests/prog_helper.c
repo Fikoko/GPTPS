@@ -11,6 +11,13 @@
  *                       tells the parent "the child is done" while the process is
  *                       very much alive - the shape that used to leave the executor
  *                       blocked in waitpid() with no deadline to rescue it.
+ *             "eofsleep": write "x", then point stdout elsewhere (`exec >/dev/null`, as a
+ *                       wrapper that logs to a file does), sleep argv[2] ms, write
+ *                       "late" to stderr and exit argv[3] (default 0) - a program
+ *                       that is NOT done when its stdout reaches EOF.
+ *             "sigstate": POSIX: print "term=<1 if SIGTERM is blocked> pipe=<1 if
+ *                       SIGPIPE is ignored>" - the signal state it was started with.
+ *                       Elsewhere "term=0 pipe=0".
  *             "zeros" : write exactly argv[2] zero bytes, then exit 0 - a result of
  *                       a chosen size, for the 16 MiB result cap.
  *             "mem"   : take argv[2] MiB, writing every page so it is resident and
@@ -346,6 +353,35 @@ int main(int argc, char **argv)
     }
     if (strcmp(mode, "exit") == 0) return (argc > 2) ? atoi(argv[2]) : 0;
     if (strcmp(mode, "hang") == 0) { for (;;) { /* killed by the deadline */ } }
+    if (strcmp(mode, "eofsleep") == 0) {
+        unsigned long ms = (argc > 2) ? strtoul(argv[2], NULL, 10) : 0;
+        putchar('x'); fflush(stdout);
+#if defined(_WIN32)
+        _close(_fileno(stdout));
+#else
+        {
+            int nul = open("/dev/null", O_WRONLY);
+            if (nul < 0 || dup2(nul, STDOUT_FILENO) < 0) return 9;
+            close(nul);
+        }
+#endif
+        sleep_ms(ms);
+        fputs("late\n", stderr); fflush(stderr);
+        return (argc > 3) ? atoi(argv[3]) : 0;
+    }
+    if (strcmp(mode, "sigstate") == 0) {
+        int term = 0, pipe_ign = 0;
+#if !defined(_WIN32)
+        sigset_t cur;
+        struct sigaction sa;
+        sigemptyset(&cur);
+        if (sigprocmask(SIG_BLOCK, NULL, &cur) == 0) term = sigismember(&cur, SIGTERM) == 1;
+        if (sigaction(SIGPIPE, NULL, &sa) == 0) pipe_ign = sa.sa_handler == SIG_IGN;
+#endif
+        printf("term=%d pipe=%d", term, pipe_ign);
+        fflush(stdout);
+        return 0;
+    }
     if (strcmp(mode, "eofhang") == 0) {
         putchar('x'); fflush(stdout);
 #if defined(_WIN32)

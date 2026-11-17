@@ -309,6 +309,14 @@ add_dependencies(test_hal_conformance addon_demo)
 add_test(NAME hal_conformance COMMAND test_hal_conformance)
 add_test(NAME hal_conformance_dl COMMAND test_hal_conformance --dl-only $<TARGET_FILE:addon_demo>)
 set_tests_properties(hal_conformance hal_conformance_dl PROPERTIES TIMEOUT 120)
+# What the bundled POSIX HAL does beyond the contract: the cgroup clamp auto-tune
+# sizes by, and a settings save's replace (permissions with no window, durable).
+if(NOT WIN32 AND NOT GPTPS_HAL_SOURCE)
+    add_executable(test_hal_posix tests/test_hal_posix.c)
+    target_include_directories(test_hal_posix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_hal_posix PRIVATE gptps)
+    add_test(NAME hal_posix COMMAND test_hal_posix)
+endif()
 
 add_executable(test_engine tests/test_engine.c)
 target_include_directories(test_engine

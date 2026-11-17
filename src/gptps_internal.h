@@ -326,8 +326,9 @@ int             gptps_settings_publish_locked(gptps_settings *r, gptps_setting_p
  * the item's cooperative cancel flag - the pump kills the child when it is raised,
  * so a no-timeout program can still be cancelled / shut down (reported as
  * GPTPS_E_CANCELLED, distinct from a deadline's GPTPS_E_TIMEOUT). Stdout EOF means the
- * child closed its output, NOT that it exited, so the reap is bounded: a program that
- * goes silent and keeps running is SIGKILLed after a grace period. */
+ * child closed its output, NOT that it exited: a program that goes on running after it
+ * runs until it exits, its deadline or a cancel, and is waited for in bounded slices,
+ * never in a blocking waitpid(). */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter);

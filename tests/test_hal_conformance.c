@@ -319,6 +319,26 @@ static void check_replace(int freestanding)
     remove(fin); remove(tmp);
 }
 
+static void check_open_private(int freestanding)
+{
+    const char *p = "hal_conformance_private.tmp";
+    FILE *f;
+    int ok;
+    if (freestanding) { skip("open_private", "--freestanding: no filesystem; settings save is unavailable there"); return; }
+    remove(p);
+    f = gptps_hal_open_private(p);
+    ok = f && fputs("one", f) >= 0;
+    if (f && fclose(f) != 0) ok = 0;
+    snprintf(why, sizeof why, "it returned %s, or the file does not hold what was written", f ? "a FILE" : "NULL");
+    expect(ok && file_is(p, "one"), "open_private: creates the file, open for writing");
+    f = gptps_hal_open_private(p);      /* one already there: replaced, not appended to */
+    ok = f && fputs("two", f) >= 0;
+    if (f && fclose(f) != 0) ok = 0;
+    snprintf(why, sizeof why, "it returned %s, or the old contents are still there", f ? "a FILE" : "NULL");
+    expect(ok && file_is(p, "two"), "open_private: a file already there is replaced");
+    remove(p);
+}
+
 /* ===== THREADED-mode checks ===================================================== */
 
 static void *noop(void *arg) { (void)arg; return NULL; }
@@ -744,6 +764,7 @@ int main(int argc, char **argv)
     if (module) check_dl(freestanding, module);
     else skip("dl: open, sym, close", "run with --dl-only <module> (CTest: hal_conformance_dl)");
     check_replace(freestanding);
+    check_open_private(freestanding);
 
     /* Can it run THREADED mode at all? A HAL that cannot start a thread runs the
      * engine in MANUAL mode only - legitimately, as the freestanding stub does. */

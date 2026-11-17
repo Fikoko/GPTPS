@@ -1059,7 +1059,10 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
     if (!tmp) { st = GPTPS_E_NOMEM; goto out; }
     snprintf(tmp, tn, "%s.tmp", path);
 
-    f = fopen(tmp, "wb");
+    /* private from the start: nobody else can read the settings while they are
+     * written, nor write into the file before it becomes the config (which can name
+     * add-ons to load) */
+    f = gptps_hal_open_private(tmp);
     if (!f) st = GPTPS_E_IO;
     else {
         made = 1;

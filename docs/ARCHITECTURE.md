@@ -367,7 +367,8 @@ so the core never includes an `_Atomic` type.
 Surface: hardware detection (CPU/RAM/GPU hint), monotonic clock, an acquire/release
 `u32` pair (each item's cancel flag is a word in the item, read and written through
 it), mutex / condvar / thread, dynamic loading, and atomic
-file replace (`gptps_hal_atomic_replace`, for the settings save). Its contract —
+file replace (`gptps_hal_atomic_replace`, with `gptps_hal_open_private` for its
+private temp file, for the settings save). Its contract —
 clause by clause, with what the core needs each clause for — is in
 [`docs/HAL.md`](HAL.md), and `tests/test_hal_conformance.c` holds every backend to
 it. Two full backends implement it: `hal_posix.c` (pthreads, `clock_gettime`,
@@ -392,7 +393,7 @@ wait and starts no thread: mutex and condvar create/destroy/lock/unlock/signal/
 broadcast (no-ops will do), the monotonic clock, the thread id and the
 acquire/release `u32` pair (a constant and plain accesses will do), the
 fork-guard pair (a constant), and hardware detection (return `cpu_count = 1`).
-`dlopen` and `atomic_replace` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use
+`dlopen`, `atomic_replace` and `open_private` can be stubbed (`NULL` / `GPTPS_E_IO`) if you don't use
 dynamic add-ons or settings persistence. `freestanding/hal_stub.c` is exactly that,
 and CI runs the conformance test against it in that profile. Combined with
 `gptps_set_allocator` (§3.2) for a static memory pool, that is the whole bare-metal
@@ -525,7 +526,8 @@ in the add-on. Validation (range / enum / parseable) runs in the generic layer
   write is kept for reads and `gptps_settings_save` (a saved file carries it to the next
   open), and admission never sees it.
 - **Persistence:** `gptps_settings_save` updates the file in place, through
-  `gptps_hal_atomic_replace` (temp + rename/MoveFileEx). Each entry records whether a
+  `gptps_hal_atomic_replace` (a temp file only its owner can open, from
+  `gptps_hal_open_private`, then rename/MoveFileEx). Each entry records whether a
   live set or a file last wrote it; save rewrites the lines of the live-set ones (the
   parser's line numbers say which line holds which key), adds those the file lacks next
   to their siblings, and copies every other line byte for byte. A file the parser
