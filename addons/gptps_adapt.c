@@ -111,6 +111,10 @@ static void obs(const gptps_event *ev, void *ud)
     if (!gptps_event_measure(ev, GPTPS_M_CPU_USER_MS) && !gptps_event_measure(ev, GPTPS_M_MEM_PEAK)) return;
     if (ev->kind == GPTPS_EV_FAILED &&
         (ev->status == GPTPS_E_CANCELLED || ev->status == GPTPS_E_TIMEOUT || ev->status == GPTPS_E_SHUTDOWN)) return;
+    /* nor does an attempt whose program never started (ABI 2.8): what was measured is
+     * the forked child before its exec - on Linux in a cgroup a few hundred KiB, which
+     * as a sample would shrink the declaration to about 1 MiB */
+    if (gptps_event_measure(ev, GPTPS_M_START_ERROR)) return;
     peak = gptps_event_measure(ev, GPTPS_M_MEM_PEAK);
     hit  = gptps_event_measure(ev, GPTPS_M_MEM_CAP_HIT);
     was_hit = (hit && hit->value) || (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_NOMEM);

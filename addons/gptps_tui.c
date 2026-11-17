@@ -20,6 +20,8 @@
 #include <locale.h>   /* the decimal point, for numbers shown as they are typed */
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
 
 /* ---- portable mutex + tty + terminal control ---- */
 #if defined(_WIN32)
@@ -73,52 +75,194 @@ typedef struct {
 typedef struct { uint64_t ts; int kind; char name[64]; uint64_t handle; gptps_status status;
                  char why[96]; } tui_event;   /* why a FAILED failed: its exit and its stderr's last line */
 
+/* ---- text that is not ours: a job's stderr, a value typed or configured ----------
+ *
+ * Everything the dashboard prints that it did not write itself goes through
+ * tui_clean, because the operator's terminal executes what it is sent: an ESC starts a
+ * control sequence (clear the screen, retitle the window, recolour, worse), and so do
+ * BEL, the other C0 bytes, DEL and the C1 controls - U+0080..U+009F, which a terminal
+ * also honours when they arrive UTF-8 encoded (\xc2\x9b is CSI). So the text is
+ * decoded as strict UTF-8 and only printable characters survive:
+ *   - every continuation byte is checked to be 10xxxxxx: the old filter checked only a
+ *     lead byte and then copied the next 1-3 bytes blind, so "\xc3\x1b[2J" carried
+ *     a raw ESC through;
+ *   - overlong forms (C0, C1, E0 80..9F, F0 80..8F), surrogates (ED A0..BF), code
+ *     points past U+10FFFF and leads F5..FF are invalid;
+ *   - C0 controls and DEL become a space (a tab is still a gap); an invalid byte, a
+ *     C1 control, and the invisible formatting characters that reorder or hide text
+ *     (zero-width, bidi embeddings and isolates, line/paragraph separators, BOM)
+ *     become '?'. An invalid sequence costs its first byte only, so the bytes after it
+ *     are judged on their own - an ESC after a stray lead byte is a space too.
+ * The result is valid UTF-8, never cut inside a character, and also measured in
+ * terminal columns (u8_width, an approximation of wcwidth good for the common wide
+ * and combining ranges), so a line can be fitted to the screen. */
+
+/* Display columns of code point cp: 0 for a combining mark, 2 for East Asian wide and
+ * full-width forms and emoji, else 1. */
+static int u8_width(uint32_t cp)
+{
+    if ((cp >= 0x0300 && cp <= 0x036f) || (cp >= 0x1ab0 && cp <= 0x1aff) || (cp >= 0x1dc0 && cp <= 0x1dff) ||
+        (cp >= 0x20d0 && cp <= 0x20ff) || (cp >= 0xfe20 && cp <= 0xfe2f)) return 0;
+    if ((cp >= 0x1100 && cp <= 0x115f) || (cp >= 0x2e80 && cp <= 0xa4cf && cp != 0x303f) ||
+        (cp >= 0xac00 && cp <= 0xd7a3) || (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) ||
+        (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || (cp >= 0x1f300 && cp <= 0x1f64f) ||
+        (cp >= 0x1f900 && cp <= 0x1f9ff) || (cp >= 0x20000 && cp <= 0x3fffd)) return 2;
+    return 1;
+}
+
+/* The well-formed UTF-8 character at s (n bytes available): its length, with its code
+ * point in *cp; 0 if no well-formed character starts there. */
+static size_t u8_decode(const unsigned char *s, size_t n, uint32_t *cp)
+{
+    unsigned c = s[0];
+    size_t len, k;
+    uint32_t v;
+    unsigned char lo = 0x80, hi = 0xbf;                /* the second byte's range */
+    if (c < 0x80) { *cp = c; return 1; }
+    if      (c >= 0xc2 && c <= 0xdf) { len = 2; v = c & 0x1f; }
+    else if (c >= 0xe0 && c <= 0xef) { len = 3; v = c & 0x0f; if (c == 0xe0) lo = 0xa0; if (c == 0xed) hi = 0x9f; }
+    else if (c >= 0xf0 && c <= 0xf4) { len = 4; v = c & 0x07; if (c == 0xf0) lo = 0x90; if (c == 0xf4) hi = 0x8f; }
+    else return 0;                                     /* a continuation byte, C0/C1, F5..FF */
+    if (n < len || s[1] < lo || s[1] > hi) return 0;
+    v = (v << 6) | (s[1] & 0x3fu);
+    for (k = 2; k < len; ++k) {
+        if ((s[k] & 0xc0u) != 0x80u) return 0;
+        v = (v << 6) | (s[k] & 0x3fu);
+    }
+    *cp = v;
+    return len;
+}
+
+/* Whether code point cp may be shown as it is. */
+static int u8_printable(uint32_t cp)
+{
+    if (cp < 0x20 || cp == 0x7f || (cp >= 0x80 && cp <= 0x9f)) return 0;       /* C0, DEL, C1 */
+    if ((cp >= 0x200b && cp <= 0x200f) || (cp >= 0x2028 && cp <= 0x202e) ||
+        (cp >= 0x2060 && cp <= 0x206f) || cp == 0xfeff) return 0;               /* invisible / bidi */
+    return 1;
+}
+
+/* Copy the printable text of s[0..n) into out (cap bytes; NUL-terminated), at most
+ * maxcols terminal columns (< 0: no limit). Returns the bytes written; *cols (may be
+ * NULL) gets the columns used. See above for what is kept. */
+static size_t tui_clean(const char *s, size_t n, char *out, size_t cap, int maxcols, int *cols)
+{
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0, pos = 0;
+    int used = 0, measure = (out == NULL);   /* NULL: only count the columns */
+    if (!cap && !measure) return 0;
+    while (i < n) {
+        uint32_t cp = 0;
+        size_t len = u8_decode(u + i, n - i, &cp);
+        const char *rep = NULL;
+        int w;
+        if (len == 0)                rep = "?", len = 1;      /* not UTF-8: this byte only */
+        else if (cp < 0x20 || cp == 0x7f) rep = " ";          /* C0 / DEL: a gap */
+        else if (!u8_printable(cp))  rep = "?";
+        w = rep ? 1 : u8_width(cp);
+        if (maxcols >= 0 && used + w > maxcols) break;
+        if (measure) {
+            pos += rep ? 1 : len;
+        } else if (rep) {
+            if (pos + 2 > cap) break;
+            out[pos++] = rep[0];
+        } else {
+            if (pos + len + 1 > cap) break;                    /* never half a character */
+            memcpy(out + pos, u + i, len); pos += len;
+        }
+        used += w; i += len;
+    }
+    if (!measure) out[pos] = 0;
+    if (cols) *cols = used;
+    return pos;
+}
+
+/* The number of bytes of s (already clean) that fit in `cols` columns. */
+static size_t u8_fit(const char *s, int cols)
+{
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0, n = strlen(s);
+    int used = 0;
+    while (i < n) {
+        uint32_t cp = 0;
+        size_t len = u8_decode(u + i, n - i, &cp);
+        int w;
+        if (len == 0) len = 1, cp = '?';
+        w = u8_width(cp);
+        if (used + w > cols) break;
+        used += w; i += len;
+    }
+    return i;
+}
+
+/* Columns that s takes on a terminal. */
+static int u8_cols(const char *s)
+{
+    int c = 0;
+    tui_clean(s, strlen(s), NULL, 0, -1, &c);
+    return c;
+}
+
 /* Why an attempt failed, in one short line: "exit 3", "signal 9", "not started (error
  * 2)" or the status, then the last line of its stderr tail when it kept one (ABI 2.7 /
- * 2.8). The tail is the job's own output: only printable bytes are kept - an escape
- * sequence in it must not reach the operator's terminal - and a cut never splits a
- * UTF-8 character. */
-static void tui_why(const gptps_event *ev, char *out, size_t n)
+ * 2.8), cleaned (tui_clean). From an event or a dead letter alike. */
+static void why_line(const gptps_measure *start_err, const gptps_measure *exit_code,
+                     const gptps_measure *exit_sig, gptps_status status,
+                     const char *tail, size_t tail_len, char *out, size_t n)
 {
-    const gptps_measure *m;
-    size_t pos = 0;
+    size_t pos;
     out[0] = 0;
-    if (ev->kind != GPTPS_EV_FAILED || n < 8) return;
-    if ((m = gptps_event_measure(ev, GPTPS_M_START_ERROR)) != NULL)
-        pos = (size_t)snprintf(out, n, "not started (error %llu)", (unsigned long long)m->value);
-    else if ((m = gptps_event_measure(ev, GPTPS_M_EXIT_CODE)) != NULL)
-        pos = (size_t)snprintf(out, n, "exit %llu", (unsigned long long)m->value);
-    else if ((m = gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL)) != NULL)
-        pos = (size_t)snprintf(out, n, "signal %llu", (unsigned long long)m->value);
-    else
-        pos = (size_t)snprintf(out, n, "%s", gptps_strerror(ev->status));
+    if (n < 8) return;
+    if (start_err)      pos = (size_t)snprintf(out, n, "not started (error %llu)", (unsigned long long)start_err->value);
+    else if (exit_code) pos = (size_t)snprintf(out, n, "exit %llu", (unsigned long long)exit_code->value);
+    else if (exit_sig)  pos = (size_t)snprintf(out, n, "signal %llu", (unsigned long long)exit_sig->value);
+    else                pos = (size_t)snprintf(out, n, "%s", gptps_strerror(status));
     if (pos >= n) pos = n - 1;
-    if (ev->struct_size >= offsetof(gptps_event, stderr_tail_len) + sizeof ev->stderr_tail_len &&
-        ev->stderr_tail && ev->stderr_tail_len) {
-        const char *t = ev->stderr_tail;
-        size_t end = ev->stderr_tail_len, start, i;
-        while (end && (t[end - 1] == '\n' || t[end - 1] == '\r' || t[end - 1] == ' ')) --end;
+    if (tail && tail_len) {
+        size_t end = tail_len, start;
+        while (end && (tail[end - 1] == '\n' || tail[end - 1] == '\r' || tail[end - 1] == ' ')) --end;
         start = end;
-        while (start && t[start - 1] != '\n') --start;               /* its last line */
-        if (end > start && pos + 4 < n) {
+        while (start && tail[start - 1] != '\n') --start;            /* its last line */
+        if (end > start && pos + 6 < n) {
             pos += (size_t)snprintf(out + pos, n - pos, " \xc2\xb7 ");
             if (pos >= n) pos = n - 1;
-            for (i = start; i < end && pos + 1 < n; ++i) {
-                unsigned char c = (unsigned char)t[i];
-                if (c < 0x20 || c == 0x7f) c = ' ';                    /* no control bytes */
-                if (c >= 0xc0) {                                        /* a whole UTF-8 sequence, or none */
-                    size_t len = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : 2;
-                    if (pos + len + 1 > n || i + len > end) break;
-                    memcpy(out + pos, t + i, len); pos += len; i += len - 1;
-                    continue;
-                }
-                if (c >= 0x80) continue;                                /* a stray continuation byte */
-                out[pos++] = (char)c;
-            }
-            out[pos] = 0;
+            tui_clean(tail + start, end - start, out + pos, n - pos, -1, NULL);
         }
     }
 }
+
+static void tui_why(const gptps_event *ev, char *out, size_t n)
+{
+    int has_tail = ev->struct_size >= offsetof(gptps_event, stderr_tail_len) + sizeof ev->stderr_tail_len;
+    out[0] = 0;
+    if (ev->kind != GPTPS_EV_FAILED) return;
+    why_line(gptps_event_measure(ev, GPTPS_M_START_ERROR), gptps_event_measure(ev, GPTPS_M_EXIT_CODE),
+             gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL), ev->status,
+             has_tail ? ev->stderr_tail : NULL, has_tail ? ev->stderr_tail_len : 0, out, n);
+}
+
+/* A dead letter's measurement by name (ABI 2.8), NULL when it has none. */
+static const gptps_measure *dl_measure(const gptps_dead_letter *dl, const char *name)
+{
+    size_t i;
+    if (dl->struct_size < offsetof(gptps_dead_letter, n_measures) + sizeof dl->n_measures || !dl->measures) return NULL;
+    for (i = 0; i < dl->n_measures; ++i)
+        if (dl->measures[i].name && strcmp(dl->measures[i].name, name) == 0) return &dl->measures[i];
+    return NULL;
+}
+
+/* ---- dead letters the dashboard holds (see "dead-letter pane") ---- */
+#define TUI_HELD_MAX 4096
+typedef struct {
+    char                *task;
+    void                *payload;
+    size_t               plen;
+    gptps_submit_options opts;     /* as it was submitted; flags 0: the type's defaults */
+    gptps_handle         handle;   /* its original handle */
+    gptps_status         status;   /* why it was dead-lettered */
+    gptps_status         refused;  /* GPTPS_OK, or what the last re-submit was refused with */
+    char                 why[96];
+} tui_held;
 
 struct gptps_tui {
     gptps           *e;
@@ -168,7 +312,14 @@ struct gptps_tui {
     char             detail_task[128];  /* task whose settings the detail pane shows */
     int              prompt_kind;   /* TUI_PK_*: active text prompt / confirm */
     char             prompt_name[128];  /* stash carried across prompt steps (clone/new/delete target) */
-    char             edit_key[320]; /* settings key being edited in the detail pane */
+    char             edit_key[320]; /* settings key being edited (settings or detail pane) */
+    int              edit_skip;     /* continuation bytes of a character that did not fit */
+    /* Dead letters drained into the dashboard's keeping (dead-letter pane) - run-
+     * thread-local like the rest of the pane state. */
+    tui_held        *held;
+    size_t           nheld, held_cap;
+    int              dl_sel;
+    unsigned long    held_lost;     /* could not be kept (no memory, or past TUI_HELD_MAX) */
     char             status[320];   /* last save/validation message + dashboard action toast */
     uint64_t         status_ms;     /* when the toast was set (it fades after a few seconds) */
     int              cols, rows;    /* terminal size: run() refreshes it; 80x24 headless default */
@@ -473,6 +624,8 @@ static int list_rows(const gptps_tui *t)
     return r < 3 ? 3 : r;
 }
 
+static size_t edit_line(gptps_tui *t, char *buf, size_t cap, size_t pos, const char *B, const char *D, const char *X);
+
 /* Settings pane (no t->mu: reads only run-thread-local pane state + the registry,
  * whose get_info takes its own locks - holding t->mu here would deadlock the tui
  * read_fns). The list scrolls to keep the selection in view; the selected
@@ -509,7 +662,7 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
                       kw, info.key, info.value, hint, X, info.hot ? "" : "(restart)", X);
     }
     if (have_sel) pos = setting_details(t, buf, cap, pos, &sel);
-    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_  %s(Enter applies, Esc cancels)%s\n", B, X, t->editbuf, D, X);
+    if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
@@ -614,6 +767,10 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "\n%sTask manager%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s inspect a task's settings\n", "Enter");
     pos = appendf(buf, cap, pos, "  %-9s pause/resume \xc2\xb7 clone \xc2\xb7 new \xc2\xb7 delete\n", "a/c/n/d");
+    pos = appendf(buf, cap, pos, "\n%sDead letters%s\n", B, X);
+    pos = appendf(buf, cap, pos, "  %-9s load the engine's here (takes them), to see each one and why\n", "g");
+    pos = appendf(buf, cap, pos, "  %-9s re-submit all \xc2\xb7 this one \xc2\xb7 discard this one \xc2\xb7 all\n", "r/e/x/D");
+    pos = appendf(buf, cap, pos, "  %-9s %s(a re-submit the engine refuses stays here, with the reason)%s\n", "", D, X);
     pos = appendf(buf, cap, pos, "\n%spress any key to return%s\n", D, X);
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
@@ -697,12 +854,15 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
                           R, t->prompt_name, X, info.queued, info.running, B, X, B, X, B, X);
         else
             pos = appendf(buf, cap, pos, "\n%s'%s' is gone.%s  any key to dismiss\n", R, t->prompt_name, X);
-    } else if (t->prompt_kind == TUI_PK_CLONE_NAME) {
-        pos = appendf(buf, cap, pos, "\n%sclone '%s' as:%s %s_  %s(enter ok, esc cancel)%s\n", B, t->prompt_name, X, t->editbuf, D, X);
-    } else if (t->prompt_kind == TUI_PK_NEW_NAME) {
-        pos = appendf(buf, cap, pos, "\n%snew program task \xc2\xb7 name:%s %s_  %s(enter next, esc cancel)%s\n", B, X, t->editbuf, D, X);
-    } else if (t->prompt_kind == TUI_PK_NEW_ARGV) {
-        pos = appendf(buf, cap, pos, "\n%snew task '%s' \xc2\xb7 argv:%s %s_  %s(space-separated; enter ok, esc cancel)%s\n", B, t->prompt_name, X, t->editbuf, D, X);
+    } else if (t->prompt_kind == TUI_PK_CLONE_NAME || t->prompt_kind == TUI_PK_NEW_NAME || t->prompt_kind == TUI_PK_NEW_ARGV) {
+        char shown[GPTPS_SETTINGS_VALUE_MAX * 2];
+        tui_clean(t->editbuf, (size_t)t->editlen, shown, sizeof shown, -1, NULL);
+        if (t->prompt_kind == TUI_PK_CLONE_NAME)
+            pos = appendf(buf, cap, pos, "\n%sclone '%s' as:%s %s_  %s(enter ok, esc cancel)%s\n", B, t->prompt_name, X, shown, D, X);
+        else if (t->prompt_kind == TUI_PK_NEW_NAME)
+            pos = appendf(buf, cap, pos, "\n%snew program task \xc2\xb7 name:%s %s_  %s(enter next, esc cancel)%s\n", B, X, shown, D, X);
+        else
+            pos = appendf(buf, cap, pos, "\n%snew task '%s' \xc2\xb7 argv:%s %s_  %s(space-separated; enter ok, esc cancel)%s\n", B, t->prompt_name, X, shown, D, X);
     }
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s inspect  %s back  a pause  c clone  n new  d delete  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
@@ -753,7 +913,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
         ++c;
     }
     if (have_sel) pos = setting_details(t, buf, cap, pos, &sel);
-    if (t->editing) pos = appendf(buf, cap, pos, "\n%sedit:%s %s_  %s(Enter applies, Esc cancels)%s\n", B, X, t->editbuf, D, X);
+    if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     if (t->status[0]) pos = appendf(buf, cap, pos, "%s%s%s\n", D, t->status, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
@@ -761,28 +921,103 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
     return pos;
 }
 
-/* Dead-letter pane: retained terminal failures; re-submit or discard in bulk. */
+/* Dead-letter pane. The engine keeps its dead letters where only a DRAIN can read
+ * them, and a drain takes them (gptps.h: destructive, exactly once), so this pane
+ * does not read them behind the host's back: it shows how many the engine retains
+ * and, once the operator loads them (g, or any action - which takes them), each one
+ * with its task, its status and why it failed (exit code or start error, and its
+ * stderr's last line; ABI 2.8). Loaded dead letters are HELD here: re-submitted or
+ * discarded one at a time or all at once, and a re-submit the engine refuses (the
+ * task is paused or gone, the queue is full, a constraint says no, shutdown) keeps the
+ * item here, with the reason, instead of losing it - "re-submit all" used to drop
+ * every such item for good and blame a removed task. */
 static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
 {
-    size_t pos = 0, dn = gptps_dead_letter_count(t->e);
-    int color = t->cfg.color;
-    const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *R = color ? "\x1b[31m" : "", *X = color ? "\x1b[0m" : "";
+    size_t pos = 0, dn = gptps_dead_letter_count(t->e), i;
+    int color = t->cfg.color, rows = list_rows(t), first, W = draw_width(t);
+    const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *R = color ? "\x1b[31m" : "",
+               *INV = color ? "\x1b[7m" : "", *X = color ? "\x1b[0m" : "";
     pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 dead letter%s\n\n", B, t->cfg.title, X);
-    pos = appendf(buf, cap, pos, "  %s%lu%s retained terminal failure%s\n", dn ? R : "", (unsigned long)dn, X, dn == 1 ? "" : "s");
-    pos = appendf(buf, cap, pos, "  %sthese exhausted retries (or were denied); re-submit to retry, or discard.%s\n", D, X);
+    pos = appendf(buf, cap, pos, "  %s%lu%s retained by the engine \xc2\xb7 %s%lu%s held here\n",
+                  dn ? R : "", (unsigned long)dn, X, t->nheld ? R : "", (unsigned long)t->nheld, X);
+    pos = appendf(buf, cap, pos, "  %sthese exhausted retries (or were denied). g loads the engine's here (it takes them\n"
+                  "  from the engine); re-submit them, or discard them.%s\n", D, X);
+    if (t->held_lost)
+        pos = appendf(buf, cap, pos, "  %s%lu could not be kept here (no memory, or more than %d) and are gone%s\n",
+                      R, t->held_lost, TUI_HELD_MAX, X);
+    if (t->nheld) {
+        if (t->dl_sel < 0) t->dl_sel = 0;
+        if ((size_t)t->dl_sel >= t->nheld) t->dl_sel = (int)t->nheld - 1;
+        first = t->dl_sel - rows / 2;
+        if (first > (int)t->nheld - rows) first = (int)t->nheld - rows;
+        if (first < 0) first = 0;
+        pos = appendf(buf, cap, pos, "\n%s  %-16s %-10s %-22s %s%s\n", D, "task", "handle", "status", "why", X);
+        for (i = (size_t)first; i < t->nheld && (int)(i - (size_t)first) < rows; ++i) {
+            const tui_held *h = &t->held[i];
+            char pre[128], why[160];
+            int pl, room, wl;
+            if (h->refused != GPTPS_OK)
+                snprintf(why, sizeof why, "[re-submit refused: %s] %s", gptps_strerror(h->refused), h->why);
+            else
+                snprintf(why, sizeof why, "%s", h->why);
+            pl = snprintf(pre, sizeof pre, "%s%-16.16s #%-9llu %-22.22s ", (i == (size_t)t->dl_sel) ? "> " : "  ",
+                          h->task, (unsigned long long)h->handle, gptps_strerror(h->status));
+            room = W - 1 - (pl < 0 ? 0 : pl);
+            wl = room > 0 ? (int)u8_fit(why, room) : 0;
+            pos = appendf(buf, cap, pos, "%s%s%.*s%s\n", (i == (size_t)t->dl_sel) ? INV : "",
+                          pre, wl, why, X);
+        }
+    }
     if (t->status[0]) pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, t->status, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s r re-submit all  D discard all  %s back  q quit\n", D, X, a_lt(t));
+    pos = appendf(buf, cap, pos, "\n%skeys:%s g load  r re-submit all  e re-submit this one  x discard this one  D discard all\n"
+                  "      %s move  %s back  q quit\n", D, X, a_ud(t), a_lt(t));
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
 }
 
+/* The dashboard's key legend, wrapped to W columns: one line was over 80 columns with
+ * no hotkeys bound, so it wrapped and the frame was a row taller than counted. Plain
+ * text, lines joined by '\n', no trailing one; returns the rows. Caller holds mu. */
+static int legend_text(gptps_tui *t, int W, char *out, size_t cap)
+{
+    char items[TUI_MAX_TASKS + 8][96];
+    int n = 0, i, rows = 1, col;
+    size_t pos = 0;
+    int any = 0;
+    for (i = 0; i < t->ntasks && n < TUI_MAX_TASKS; ++i)
+        if (t->tasks[i].hotkey) { snprintf(items[n++], sizeof items[0], "[%c] %s", t->tasks[i].hotkey, t->tasks[i].label); any = 1; }
+    if (any) snprintf(items[n++], sizeof items[0], "\xc2\xb7");
+    snprintf(items[n++], sizeof items[0], "%s scroll", a_ud(t));
+    snprintf(items[n++], sizeof items[0], "s settings");
+    snprintf(items[n++], sizeof items[0], "t tasks");
+    snprintf(items[n++], sizeof items[0], "l dead-letter");
+    snprintf(items[n++], sizeof items[0], "m kpi");
+    snprintf(items[n++], sizeof items[0], "p pause");
+    snprintf(items[n++], sizeof items[0], "? help");
+    snprintf(items[n++], sizeof items[0], "q quit");
+    pos = (size_t)snprintf(out, cap, "keys:");
+    col = 5;
+    for (i = 0; i < n; ++i) {
+        int w = u8_cols(items[i]);
+        if (col > 6 && col + 2 + w > W - 1) {         /* the next row, indented */
+            pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "\n     ");
+            col = 5; ++rows;
+        }
+        pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "%s%s", col > 5 ? "  " : " ", items[i]);
+        col += (col > 5 ? 2 : 1) + w;
+        if (pos >= cap) { out[cap - 1] = 0; break; }
+    }
+    return rows;
+}
+
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0;
-    int i, color, uni, W;
+    int i, color, uni, W, toast_on, legrows;
     const char *B, *D, *R, *G, *X;
     double up, rate;
+    char legend[2048];
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
     if (t->pane == TUI_PANE_SETTINGS) return render_settings(t, buf, cap);
     if (t->pane == TUI_PANE_HELP)     return render_help(t, buf, cap);
@@ -794,6 +1029,8 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     G = color ? "\x1b[32m" : ""; X = color ? "\x1b[0m" : "";
 
     mu_lock(&t->mu);
+    toast_on = t->status[0] && t->status_ms && (gptps_now_ms(NULL) - t->status_ms) < 3000u;
+    legrows = legend_text(t, W, legend, sizeof legend);
     up = (double)(gptps_now_ms(NULL) - t->start_ms) / 1000.0;
     rate = (up > 0.05) ? (double)t->fin / up : 0.0;
 
@@ -861,7 +1098,10 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         size_t z;
         if (shown > t->cfg.max_recent) shown = t->cfg.max_recent;
         for (z = 0; z < pos; ++z) if (buf[z] == '\n') ++used;     /* vertical fit: stay within rows */
-        avail = (t->rows > 0 ? t->rows : 24) - used - 3;
+        /* every line below is one row (each is fitted to W): the RECENT heading and
+         * its blank line, the toast and its blank line, the legend and its blank line;
+         * and the frame's last newline must not scroll the screen */
+        avail = (t->rows > 0 ? t->rows : 24) - 1 - used - 2 - (toast_on ? 2 : 0) - 1 - legrows;
         if (avail < 1) avail = 1;
         if (shown > avail) shown = avail;
         maxoff = t->rn - shown; if (maxoff < 0) maxoff = 0;
@@ -876,28 +1116,71 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
                               re->kind == GPTPS_EV_DROPPED) ? R
                            : (re->kind == GPTPS_EV_FINISHED) ? G : D;
             double rel = (double)(re->ts - t->start_ms) / 1000.0; /* seconds since install */
-            pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %-14.14s #%llu%s%s%s%s\n",
+            /* One terminal row each: the vertical fit above counts rows by '\n', so a
+             * line that wrapped took two and pushed the frame past the screen. The fixed
+             * fields are measured as printed; the why text gets what is left. */
+            char pre[128];
+            int pl = snprintf(pre, sizeof pre, "  %6.1f %-8s %-14.14s #%llu", rel, kind_str(re->kind), re->name,
+                              (unsigned long long)re->handle);
+            int room = W - 1 - (pl < 0 ? 0 : pl) - 2;
+            int wl = (re->why[0] && room >= 4) ? (int)u8_fit(re->why, room) : 0;
+            pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %-14.14s #%llu%s%s%.*s%s\n",
                           D, rel, X, kc, kind_str(re->kind), X, re->name, (unsigned long long)re->handle,
-                          re->why[0] ? "  " : "", D, re->why, X);
+                          wl ? "  " : "", D, wl, re->why, X);
         }
     }
 
-    /* transient action toast (fades after a few seconds) */
-    if (t->status[0] && t->status_ms && (gptps_now_ms(NULL) - t->status_ms) < 3000u)
-        pos = appendf(buf, cap, pos, "\n%s%s%s\n", (color ? "\x1b[36m" : ""), t->status, X);
+    /* transient action toast (fades after a few seconds), one row */
+    if (toast_on) {
+        char shown[sizeof t->status * 2];
+        tui_clean(t->status, strlen(t->status), shown, sizeof shown, W - 1, NULL);
+        pos = appendf(buf, cap, pos, "\n%s%s%s\n", (color ? "\x1b[36m" : ""), shown, X);
+    }
 
-    /* key legend: task hotkeys first, then the global keys */
-    pos = appendf(buf, cap, pos, "\n%skeys:%s ", D, X);
-    for (i = 0; i < t->ntasks; ++i)
-        if (t->tasks[i].hotkey)
-            pos = appendf(buf, cap, pos, "[%c] %s  ", t->tasks[i].hotkey, t->tasks[i].label);
-    pos = appendf(buf, cap, pos, "%s%s%s scroll  s settings  t tasks  l dead-letter  m kpi  p pause  ? help  q quit%s\n",
-                  (t->ntasks ? " \xc2\xb7  " : ""), D, a_ud(t), X);
+    /* key legend: task hotkeys first, then the global keys, wrapped to the width */
+    pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, legend, X);
     mu_unlock(&t->mu);
 
     if (pos >= cap) pos = cap - 1;
     buf[pos] = 0;
     return pos;
+}
+
+/* One key into the line editor shared by every pane (settings, detail, the task
+ * prompts). Text is UTF-8: the live loop hands over a character's bytes one key at a
+ * time (POSIX reads them as they come; on Windows term_poll_key encodes the console's
+ * UTF-16), and they are kept - only ASCII used to be, so a value with a non-ASCII
+ * path could not be typed. Backspace removes a whole character, not its last byte,
+ * and a character that does not fit is left out whole. */
+static void edit_input(gptps_tui *t, int key)
+{
+    int cap = (int)sizeof t->editbuf - 1;
+    if (key == 8 || key == 127) {                                   /* backspace: one character */
+        while (t->editlen > 0 && ((unsigned char)t->editbuf[t->editlen - 1] & 0xc0u) == 0x80u) --t->editlen;
+        if (t->editlen > 0) --t->editlen;
+        t->editbuf[t->editlen] = 0;
+        t->edit_skip = 0;
+        return;
+    }
+    if (key < 32 || key > 255 || key == 127) return;
+    if (key >= 0x80 && key < 0xc0) {                                /* a continuation byte */
+        if (t->edit_skip > 0) { --t->edit_skip; return; }           /* of a lead left out */
+        if (t->editlen == 0 || ((unsigned char)t->editbuf[t->editlen - 1] < 0x80)) return;   /* stray */
+    } else {
+        int need = key < 0x80 ? 1 : key >= 0xf0 ? 4 : key >= 0xe0 ? 3 : 2;
+        t->edit_skip = 0;
+        if (key >= 0xf8 || (key >= 0x80 && key < 0xc2)) return;     /* never a lead byte */
+        if (t->editlen + need > cap) { t->edit_skip = need - 1; return; }
+    }
+    if (t->editlen < cap) { t->editbuf[t->editlen++] = (char)key; t->editbuf[t->editlen] = 0; }
+}
+
+/* the edit line, cleaned: a value set elsewhere is shown, never executed */
+static size_t edit_line(gptps_tui *t, char *buf, size_t cap, size_t pos, const char *B, const char *D, const char *X)
+{
+    char shown[GPTPS_SETTINGS_VALUE_MAX * 2];
+    tui_clean(t->editbuf, (size_t)t->editlen, shown, sizeof shown, -1, NULL);
+    return appendf(buf, cap, pos, "\n%sedit:%s %s_  %s(Enter applies, Esc cancels)%s\n", B, X, shown, D, X);
 }
 
 /* Settings-pane key handling. Returns 4 (settings interaction) or -1 (quit). */
@@ -907,20 +1190,17 @@ static int settings_press(gptps_tui *t, int key)
     if (t->editing) {
         if (key == 27) { t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; return 4; }   /* cancel */
         if (key == '\r' || key == '\n') {                                                 /* commit */
-            memset(&info, 0, sizeof info); info.struct_size = sizeof info;
-            if (gptps_settings_get_info(t->e, (size_t)t->sel, &info) == GPTPS_OK) {
-                char why[256], key[320];
-                gptps_status st;
-                /* info.key lives as long as the setting: another thread may remove it */
-                snprintf(key, sizeof key, "%s", info.key);
-                st = gptps_settings_set_ex(t->e, key, t->editbuf, why, sizeof why);
-                set_status(t, key, t->editbuf, st, why);
-            }
+            /* To the key the edit STARTED on (edit_key), not to whatever setting is at
+             * the selected index now: a task unregistered meanwhile removes its
+             * settings and shifts every index after them, and the value used to land
+             * on a neighbour - "set <wrong key> = 600000". */
+            char why[256];
+            gptps_status st = gptps_settings_set_ex(t->e, t->edit_key, t->editbuf, why, sizeof why);
+            set_status(t, t->edit_key, t->editbuf, st, why);
             t->editing = 0; t->editbuf[0] = 0; t->editlen = 0;
             return 4;
         }
-        if (key == 8 || key == 127) { if (t->editlen > 0) t->editbuf[--t->editlen] = 0; return 4; } /* backspace */
-        if (key >= 32 && key < 127 && t->editlen < (int)sizeof t->editbuf - 1) { t->editbuf[t->editlen++] = (char)key; t->editbuf[t->editlen] = 0; }
+        edit_input(t, key);
         return 4;
     }
     switch (key) {
@@ -931,8 +1211,9 @@ static int settings_press(gptps_tui *t, int key)
         case '\r': case '\n':                                                              /* start editing */
             memset(&info, 0, sizeof info); info.struct_size = sizeof info;
             if (gptps_settings_get_info(t->e, (size_t)t->sel, &info) == GPTPS_OK) {
+                snprintf(t->edit_key, sizeof t->edit_key, "%s", info.key);   /* the key, now */
                 snprintf(t->editbuf, sizeof t->editbuf, "%s", info.value);
-                t->editlen = (int)strlen(t->editbuf); t->editing = 1;
+                t->editlen = (int)strlen(t->editbuf); t->editing = 1; t->edit_skip = 0;
             }
             return 4;
         case 'w': case 'W': save_status(t, gptps_settings_save(t->e, t->cfg.settings_path)); return 4;
@@ -940,25 +1221,75 @@ static int settings_press(gptps_tui *t, int key)
     }
 }
 
-/* re-submit a drained dead-letter item (drain runs us with the engine lock released).
- * Items whose task type was removed can no longer be submitted (GPTPS_E_NOTFOUND) -
- * count those so the operator is told rather than silently losing them. */
-typedef struct { gptps *e; size_t ok, dropped; } tui_resubmit_ctx;
-static void tui_resubmit(const gptps_dead_letter *dl, void *ud)
+/* Take one drained dead letter into the dashboard's keeping (drain runs this with the
+ * engine lock released). A copy of everything a re-submit needs, and of why it failed. */
+static void tui_take(const gptps_dead_letter *dl, void *ud)
 {
-    tui_resubmit_ctx *c = (tui_resubmit_ctx *)ud; gptps_handle h;
-    gptps_submit_options o;
-    const gptps_submit_options *op = NULL;
-    /* Re-drive it as it was submitted: its own priority, policy and timeout
-     * (gptps_dead_letter.options). Not its due time once that has passed - the operator
-     * asked for it to run, and a shed-late constraint would only refuse it again. */
-    if (dl->struct_size >= offsetof(gptps_dead_letter, options) + sizeof dl->options && dl->options.flags) {
-        o = dl->options;
-        if ((o.flags & GPTPS_SUBMIT_DEADLINE) && o.deadline_in_ms == 0) o.flags &= ~(unsigned)GPTPS_SUBMIT_DEADLINE;
-        if (o.flags) op = &o;
+    gptps_tui *t = (gptps_tui *)ud;
+    tui_held *h;
+    int has_tail;
+    if (t->nheld == t->held_cap) {
+        size_t nc = t->held_cap ? t->held_cap * 2 : 16;
+        tui_held *nh = nc <= TUI_HELD_MAX ? (tui_held *)realloc(t->held, nc * sizeof *nh) : NULL;
+        if (!nh) { t->held_lost += 1; return; }
+        t->held = nh; t->held_cap = nc;
     }
-    if (gptps_submit_ex(c->e, dl->task_name, dl->payload, dl->payload_len, op, &h) == GPTPS_OK) c->ok++;
-    else c->dropped++;
+    h = &t->held[t->nheld];
+    memset(h, 0, sizeof *h);
+    h->task = (char *)malloc(strlen(dl->task_name) + 1);
+    h->payload = dl->payload_len ? malloc(dl->payload_len) : NULL;
+    if (!h->task || (dl->payload_len && !h->payload)) { free(h->task); free(h->payload); t->held_lost += 1; return; }
+    strcpy(h->task, dl->task_name);
+    if (dl->payload_len) memcpy(h->payload, dl->payload, dl->payload_len);
+    h->plen = dl->payload_len; h->handle = dl->handle; h->status = dl->status; h->refused = GPTPS_OK;
+    if (dl->struct_size >= offsetof(gptps_dead_letter, options) + sizeof dl->options) h->opts = dl->options;
+    has_tail = dl->struct_size >= offsetof(gptps_dead_letter, stderr_tail_len) + sizeof dl->stderr_tail_len;
+    why_line(dl_measure(dl, GPTPS_M_START_ERROR), dl_measure(dl, GPTPS_M_EXIT_CODE),
+             dl_measure(dl, GPTPS_M_EXIT_SIGNAL), dl->status,
+             has_tail ? dl->stderr_tail : NULL, has_tail ? dl->stderr_tail_len : 0, h->why, sizeof h->why);
+    t->nheld += 1;
+}
+
+/* Drain the engine's dead letters into the dashboard's keeping; how many arrived. */
+static size_t tui_load(gptps_tui *t)
+{
+    size_t before = t->nheld;
+    unsigned long lost = t->held_lost;
+    gptps_dead_letter_drain(t->e, tui_take, t);
+    if (t->held_lost != lost) {                     /* never silent */
+        char msg[200];
+        snprintf(msg, sizeof msg, "gptps_tui: %lu dead letter(s) drained from the engine could not be kept by the "
+                 "dashboard (no memory, or more than %d held) and are gone", t->held_lost - lost, TUI_HELD_MAX);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    return t->nheld - before;
+}
+
+static void held_free(tui_held *h) { free(h->task); free(h->payload); }
+
+static void held_remove(gptps_tui *t, size_t i)
+{
+    held_free(&t->held[i]);
+    memmove(&t->held[i], &t->held[i + 1], (t->nheld - i - 1) * sizeof *t->held);
+    t->nheld -= 1;
+    if (t->dl_sel > 0 && (size_t)t->dl_sel >= t->nheld) t->dl_sel = (int)t->nheld - 1;
+}
+
+/* Re-submit held item i as it was submitted - its own priority, policy and timeout
+ * (gptps_dead_letter.options), but not a due time that has passed: the operator asked
+ * for it to run, and a shed-late constraint would only refuse it again. On success it
+ * leaves the dashboard; refused, it stays, with the reason. */
+static gptps_status held_resubmit(gptps_tui *t, size_t i)
+{
+    tui_held *h = &t->held[i];
+    gptps_submit_options o = h->opts;
+    gptps_handle hd;
+    gptps_status st;
+    if ((o.flags & GPTPS_SUBMIT_DEADLINE) && o.deadline_in_ms == 0) o.flags &= ~(unsigned)GPTPS_SUBMIT_DEADLINE;
+    st = gptps_submit_ex(t->e, h->task, h->payload, h->plen, o.flags ? &o : NULL, &hd);
+    if (st == GPTPS_OK) held_remove(t, i);
+    else h->refused = st;
+    return st;
 }
 
 /* register a GPTPS_EXEC_PROGRAM task from a name + a space-separated argv string
@@ -1032,8 +1363,7 @@ static int tasks_press(gptps_tui *t, int key)
             t->editbuf[0] = 0; t->editlen = 0;
             return 4;
         }
-        if (key == 8 || key == 127) { if (t->editlen > 0) t->editbuf[--t->editlen] = 0; return 4; }
-        if (key >= 32 && key < 127 && t->editlen < (int)sizeof t->editbuf - 1) { t->editbuf[t->editlen++] = (char)key; t->editbuf[t->editlen] = 0; }
+        edit_input(t, key);
         return 4;
     }
     switch (key) {
@@ -1090,8 +1420,7 @@ static int detail_press(gptps_tui *t, int key)
             set_status(t, t->edit_key, t->editbuf, st, why);
             t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; return 4;
         }
-        if (key == 8 || key == 127) { if (t->editlen > 0) t->editbuf[--t->editlen] = 0; return 4; }
-        if (key >= 32 && key < 127 && t->editlen < (int)sizeof t->editbuf - 1) { t->editbuf[t->editlen++] = (char)key; t->editbuf[t->editlen] = 0; }
+        edit_input(t, key);
         return 4;
     }
     switch (key) {
@@ -1103,7 +1432,7 @@ static int detail_press(gptps_tui *t, int key)
             if (nth_prefixed(t, prefix, t->detail_sel, &info)) {
                 snprintf(t->edit_key, sizeof t->edit_key, "%s", info.key);
                 snprintf(t->editbuf, sizeof t->editbuf, "%s", info.value);
-                t->editlen = (int)strlen(t->editbuf); t->editing = 1;
+                t->editlen = (int)strlen(t->editbuf); t->editing = 1; t->edit_skip = 0;
             }
             return 4;
         case 'w': case 'W': save_status(t, gptps_settings_save(t->e, t->cfg.settings_path)); return 4;
@@ -1111,20 +1440,60 @@ static int detail_press(gptps_tui *t, int key)
     }
 }
 
-/* Dead-letter pane key handling: bulk re-submit / discard (returns 4 / -1). */
+/* Dead-letter pane key handling (returns 4 / -1). See render_deadletter. */
 static int deadletter_press(gptps_tui *t, int key)
 {
+    if (t->dl_sel < 0 || (size_t)t->dl_sel >= t->nheld) t->dl_sel = t->nheld ? (int)t->nheld - 1 : 0;
     switch (key) {
         case 'q': case 'Q': mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1;
         case 27: case 'l': case 'L': case 's': case 'S': case '\t': t->pane = TUI_PANE_DASH; t->status[0] = 0; return 4;
-        case 'r': case 'R': {
-            tui_resubmit_ctx c; c.e = t->e; c.ok = 0; c.dropped = 0;
-            gptps_dead_letter_drain(t->e, tui_resubmit, &c);
-            if (c.dropped) toast(t, "re-submitted %lu, %lu dropped (task removed)", (unsigned long)c.ok, (unsigned long)c.dropped);
-            else           toast(t, "re-submitted %lu", (unsigned long)c.ok);
+        case 'j': case 'J': if (t->nheld && (size_t)t->dl_sel + 1 < t->nheld) t->dl_sel++; return 4;
+        case 'k': case 'K': if (t->dl_sel > 0) t->dl_sel--; return 4;
+        case 'g': case 'G': { size_t k = tui_load(t); toast(t, "loaded %lu from the engine", (unsigned long)k); return 4; }
+        case 'r': case 'R': {                          /* re-submit all: the engine's and those held */
+            size_t ok = 0, kept = 0, i = 0;
+            gptps_status first = GPTPS_OK;
+            tui_load(t);
+            while (i < t->nheld) {
+                gptps_status st = held_resubmit(t, i);
+                if (st == GPTPS_OK) { ++ok; continue; }    /* removed: i is the next one */
+                if (first == GPTPS_OK) first = st;
+                ++kept; ++i;
+            }
+            if (kept) {
+                char msg[256];
+                toast(t, "re-submitted %lu; %lu refused and kept here (%s)", (unsigned long)ok, (unsigned long)kept,
+                      gptps_strerror(first));
+                snprintf(msg, sizeof msg, "gptps_tui: %lu dead letter(s) could not be re-submitted (first: %s); "
+                         "the dashboard keeps them", (unsigned long)kept, gptps_strerror(first));
+                gptps_log(NULL, GPTPS_LOG_WARN, msg);
+            } else {
+                toast(t, "re-submitted %lu", (unsigned long)ok);
+            }
             return 4;
         }
-        case 'D':           { size_t k = gptps_dead_letter_drain(t->e, NULL, NULL);          toast(t, "discarded %lu",    (unsigned long)k); return 4; }
+        case 'e': case 'E': {                          /* re-submit the selected one */
+            gptps_status st;
+            char task[64];
+            if (!t->nheld) { toast(t, "nothing held here (g loads the engine's)"); return 4; }
+            copy_name(task, sizeof task, t->held[t->dl_sel].task);
+            st = held_resubmit(t, (size_t)t->dl_sel);
+            if (st == GPTPS_OK) toast(t, "re-submitted one %s", task);
+            else                toast(t, "%s not re-submitted: %s (kept here)", task, gptps_strerror(st));
+            return 4;
+        }
+        case 'x': case 'X':                            /* discard the selected one */
+            if (!t->nheld) { toast(t, "nothing held here (g loads the engine's)"); return 4; }
+            held_remove(t, (size_t)t->dl_sel);
+            toast(t, "discarded one");
+            return 4;
+        case 'D': {                                    /* discard all: the engine's and those held */
+            size_t k = gptps_dead_letter_drain(t->e, NULL, NULL) + t->nheld, i;
+            for (i = 0; i < t->nheld; ++i) held_free(&t->held[i]);
+            t->nheld = 0; t->dl_sel = 0;
+            toast(t, "discarded %lu", (unsigned long)k);
+            return 4;
+        }
         default: return 4;
     }
 }
@@ -1161,7 +1530,11 @@ int gptps_tui_press(gptps_tui *t, int key)
     mu_unlock(&t->mu);                 /* submit OUTSIDE the lock: QUEUED fires our observer */
     if (name) {                        /* a due time counts from this press */
         gptps_handle h;
-        gptps_submit_ex(t->e, name, pl, pn, has_ko ? &ko : NULL, &h);
+        gptps_status st = gptps_submit_ex(t->e, name, pl, pn, has_ko ? &ko : NULL, &h);
+        if (st != GPTPS_OK) {          /* paused, unknown, full, denied, shutting down: say so */
+            toast(t, "NOT submitted %s: %s", label ? label : name, gptps_strerror(st));
+            return 0;
+        }
         toast(t, "submitted %s", label ? label : name);
         return 1;
     }
@@ -1237,7 +1610,17 @@ static int term_read_byte(int ms)
     fd_set fds; struct timeval tv; unsigned char c;
     FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
     tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0 && read(STDIN_FILENO, &c, 1) == 1) return c;
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+        ssize_t r = read(STDIN_FILENO, &c, 1);
+        if (r == 1) return c;
+        if (r == 0 || (errno != EINTR && errno != EAGAIN)) {
+            /* readable but nothing to read: end of input (the terminal went away, or
+             * stdin was never one). select() would report that at once forever, and
+             * the loop spun repainting with no wait: wait the interval anyway. */
+            tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+            select(0, NULL, NULL, NULL, &tv);
+        }
+    }
     return -1;
 }
 /* After an ESC, decode an arrow / Home / End sequence (CSI "ESC [ X" or SS3
@@ -1291,14 +1674,35 @@ static void term_restore(gptps_tui *t)
 { if (t->modes_saved) { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), t->saved_out_mode); t->modes_saved = 0; }
   if (t->saved_cp) { SetConsoleOutputCP(t->saved_cp); t->saved_cp = 0; }
   t->raw_active = 0; }
+/* The console gives UTF-16; the editors take UTF-8, one byte per key, so a
+ * character's later bytes wait here for the next calls. */
+static unsigned char tui_kq[4];
+static int tui_kq_n, tui_kq_i;
 static int term_poll_key(int ms)
 {
     int waited = 0;
+    if (tui_kq_i < tui_kq_n) return tui_kq[tui_kq_i++];
     while (waited <= ms) {
         if (_kbhit()) {
-            int c = _getch();
+            wint_t w = _getwch();
+            int c = (int)w;
+            if (w >= 0x80 && w != 0xE0) {           /* a character past ASCII: as UTF-8 */
+                uint32_t cp = (uint32_t)w;
+                if (w >= 0xD800 && w <= 0xDBFF) {   /* a surrogate pair */
+                    wint_t lo = _getwch();
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) cp = 0x10000u + (((uint32_t)w - 0xD800u) << 10) + ((uint32_t)lo - 0xDC00u);
+                    else return 0;
+                } else if (w >= 0xDC00 && w <= 0xDFFF) return 0;
+                tui_kq_i = 0;
+                if (cp < 0x800) { tui_kq[0] = (unsigned char)(0xC0 | (cp >> 6)); tui_kq[1] = (unsigned char)(0x80 | (cp & 0x3F)); tui_kq_n = 2; }
+                else if (cp < 0x10000) { tui_kq[0] = (unsigned char)(0xE0 | (cp >> 12)); tui_kq[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+                                         tui_kq[2] = (unsigned char)(0x80 | (cp & 0x3F)); tui_kq_n = 3; }
+                else { tui_kq[0] = (unsigned char)(0xF0 | (cp >> 18)); tui_kq[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+                       tui_kq[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F)); tui_kq[3] = (unsigned char)(0x80 | (cp & 0x3F)); tui_kq_n = 4; }
+                return tui_kq[tui_kq_i++];
+            }
             if (c == 0 || c == 0xE0) {              /* extended key: a scan code follows */
-                switch (_getch()) {
+                switch (_getwch()) {
                     case 72: case 71: return 'k';   /* Up    / Home */
                     case 80: case 79: return 'j';   /* Down  / End  */
                     case 77:          return '\r';  /* Right => select */
@@ -1340,7 +1744,15 @@ void gptps_tui_run(gptps_tui *t)
 {
     char *buf; size_t cap = 16384;
     int first = 1, kp = 0;
-    if (!t || !t->cfg.interactive || !fd_is_tty(t->cfg.out)) return; /* needs a terminal */
+    if (!t || !t->cfg.interactive) return;
+    /* Needs a terminal both ways: frames out, keys in. With stdin at end of input
+     * (</dev/null, a closed pipe, a launcher that gives it none) the key poll returned
+     * at once and the loop repainted tens of thousands of frames a second. */
+    if (!fd_is_tty(t->cfg.out) || !fd_is_tty(stdin)) {
+        gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: stdin or the output is not a terminal; "
+                  "the live dashboard does not run (gptps_tui_snapshot renders a frame)");
+        return;
+    }
     buf = (char *)malloc(cap);
     if (!buf) return;
     term_enable(t);
@@ -1459,6 +1871,15 @@ void gptps_tui_close(gptps_tui *t)
     if (!t) return;
     term_restore(t);                 /* in case run() was interrupted */
     for (i = 0; i < t->ntasks; ++i) free(t->tasks[i].payload);
+    if (t->nheld) {                  /* never silent: they were taken from the engine */
+        char msg[160];
+        size_t k;
+        snprintf(msg, sizeof msg, "gptps_tui_close: %lu dead letter(s) held by the dashboard were discarded",
+                 (unsigned long)t->nheld);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+        for (k = 0; k < t->nheld; ++k) held_free(&t->held[k]);
+    }
+    free(t->held);
     free(t->recent);
     free(t->lat);
     mu_destroy(&t->mu);

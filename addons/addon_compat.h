@@ -26,6 +26,11 @@
 #  define APX_UNUSED
 #endif
 
+/* A file offset: 64 bits everywhere. `long` is 32 bits on Windows (and on 32-bit
+ * POSIX), so ftell/fseek on a long stop at 2 GiB - past it ftell reports -1, and an
+ * offset kept in a long goes stale. Use apx_ftell / apx_fseek / apx_truncate. */
+typedef long long apx_off;
+
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <io.h>
@@ -47,7 +52,12 @@ static APX_UNUSED void apx_cond_destroy(apx_cond *c)   { (void)c; }  /* no destr
 static APX_UNUSED int apx_cond_wait_ms(apx_cond *c, apx_mutex *m, unsigned ms)
 { return SleepConditionVariableCS(c, m, (DWORD)ms) ? 1 : 0; }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return _commit(_fileno(f)); }
-static APX_UNUSED int  apx_truncate(FILE *f, long len) { return _chsize(_fileno(f), len); }
+/* 64-bit file offsets (see apx_off above): long is 32 bits on Windows, so ftell,
+ * fseek and _chsize stop at 2 GiB there. */
+static APX_UNUSED apx_off apx_ftell(FILE *f)           { return (apx_off)_ftelli64(f); }
+static APX_UNUSED int  apx_fseek(FILE *f, apx_off at, int whence) { return _fseeki64(f, (__int64)at, whence); }
+static APX_UNUSED int  apx_truncate(FILE *f, apx_off len)
+{ return len < 0 ? -1 : (_chsize_s(_fileno(f), (__int64)len) == 0 ? 0 : -1); }
 /* Sync by descriptor, for a file another thread may be writing at the same time:
  * _commit holds the CRT's per-descriptor lock for the whole flush, which would stall
  * every write to the file behind it, so this flushes the OS handle directly. */
@@ -126,7 +136,22 @@ static APX_UNUSED int  apx_fsync_fd(int fd)
     return fsync(fd);
 }
 static APX_UNUSED int  apx_fsync(FILE *f)              { return apx_fsync_fd(fileno(f)); }
-static APX_UNUSED int  apx_truncate(FILE *f, long len) { return ftruncate(fileno(f), (off_t)len); }
+/* 64-bit file offsets (see apx_off above), through off_t. Where off_t is 32 bits (a
+ * 32-bit build without _FILE_OFFSET_BITS=64) an offset it cannot hold is refused:
+ * ftello reports -1 (EOVERFLOW) past it, and apx_fseek / apx_truncate fail rather than
+ * truncate the value. */
+static APX_UNUSED apx_off apx_ftell(FILE *f)           { return (apx_off)ftello(f); }
+static APX_UNUSED int  apx_off_fits(apx_off v)         { return (apx_off)(off_t)v == v; }
+static APX_UNUSED int  apx_fseek(FILE *f, apx_off at, int whence)
+{
+    if (!apx_off_fits(at)) { errno = EOVERFLOW; return -1; }
+    return fseeko(f, (off_t)at, whence);
+}
+static APX_UNUSED int  apx_truncate(FILE *f, apx_off len)
+{
+    if (len < 0 || !apx_off_fits(len)) { errno = EINVAL; return -1; }
+    return ftruncate(fileno(f), (off_t)len);
+}
 /* An errno that says this directory cannot be synced here, rather than that a sync
  * failed: the process may write and search it but not read it, so cannot open it
  * (EACCES, EPERM), or its file system has no fsync for a directory (EINVAL, ENOTSUP,

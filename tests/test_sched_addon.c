@@ -83,6 +83,21 @@ static void sub(gptps *e, char c, int32_t prio, int due, uint64_t due_in)
     for (i = 0; i < MAXO; ++i) if (!g_tag[i]) { g_tag[i] = h; g_tag_c[i] = c; break; }
 }
 
+/* the same, for task type `task` (no options) */
+static void sub_task(gptps *e, const char *task, char c)
+{
+    gptps_handle h = 0; int i;
+    CHECK(gptps_submit(e, task, &c, 1, &h) == GPTPS_OK);
+    for (i = 0; i < MAXO; ++i) if (!g_tag[i]) { g_tag[i] = h; g_tag_c[i] = c; break; }
+}
+
+static int g_log_warns;
+static void count_log(gptps_log_level lvl, const char *msg, void *ud)
+{
+    (void)ud;
+    if (lvl >= GPTPS_LOG_WARN && strstr(msg, "max_tenants")) ++g_log_warns;
+}
+
 static void drain(gptps *e) { size_t n; while (gptps_step(e, &n) == GPTPS_OK && n) { } }
 static void spin_ms(uint64_t ms) { uint64_t t = gptps_now_ms(NULL); while (gptps_now_ms(NULL) - t < ms) { } }
 
@@ -226,19 +241,55 @@ int main(void)
         (void)deep;
     }
 
-    /* 5b) more tenants than the table: they share, and everything runs */
+    /* 5b) more tenants than the table: they share ONE share of their own, and
+     *     everything runs. The overflow used to be slot 0, so whichever of x and y
+     *     owned it lost half its share to z (x y x y x y z z z, say), and nothing
+     *     said so; now it is warned of once and counted. */
     {
-        int done = 0;
+        int done = 0, i;
         size_t n;
         e = open_manual(1);
+        g_log_warns = 0;
+        gptps_set_log_sink(count_log, NULL);
         CHECK(gptps_sched_fair(e, by_payload, NULL, 2, &s) == GPTPS_OK);
-        sub(e, 'x', 0, 0, 0); sub(e, 'y', 0, 0, 0); sub(e, 'z', 0, 0, 0);
-        sub(e, 'x', 0, 0, 0); sub(e, 'y', 0, 0, 0); sub(e, 'z', 0, 0, 0);
+        for (i = 0; i < 3; ++i) sub(e, 'x', 0, 0, 0);
+        for (i = 0; i < 3; ++i) sub(e, 'y', 0, 0, 0);
+        for (i = 0; i < 3; ++i) sub(e, 'z', 0, 0, 0);
         while (gptps_step(e, &n) == GPTPS_OK && n) done += (int)n;
-        CHECK(g_n == 6);
+        CHECK(g_n == 9);
+        CHECK(strcmp(g_order, "xyzxyzxyz") == 0);         /* x and y keep their shares */
+        CHECK(gptps_sched_fair_overflow(s) >= 3);           /* z's items, in the shared share */
+        CHECK(g_log_warns == 1);                            /* said so, once */
+        CHECK(gptps_sched_fair_weight(s, 'w', 5) == GPTPS_E_FULL);   /* no slot: refused */
+        CHECK(gptps_sched_fair_weight(s, 'x', 3) == GPTPS_OK);       /* x has one */
+        CHECK(gptps_sched_fair_overflow(NULL) == 0);
+        gptps_set_log_sink(NULL, NULL);
         CHECK(gptps_shutdown(e) == GPTPS_OK);
         gptps_sched_close(s);
         (void)done;
+    }
+
+    /* 5c) the default tenants (task names) can be weighted: gptps_sched_task_tenant is
+     *     the id the default tenant function gives a task type */
+    {
+        gptps_task_def d;
+        int i;
+        e = open_manual(1);
+        memset(&d, 0, sizeof d);
+        d.struct_size = sizeof d; d.name = "u"; d.run = ok_task; d.exec = GPTPS_EXEC_INPROC;
+        d.default_cost.struct_size = sizeof d.default_cost;
+        d.default_policy.struct_size = sizeof d.default_policy;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(gptps_sched_fair(e, NULL, NULL, 0, &s) == GPTPS_OK);
+        CHECK(gptps_sched_task_tenant("t") != gptps_sched_task_tenant("u"));
+        CHECK(gptps_sched_task_tenant(NULL) == gptps_sched_task_tenant(""));
+        CHECK(gptps_sched_fair_weight(s, gptps_sched_task_tenant("t"), 2) == GPTPS_OK);
+        for (i = 0; i < 6; ++i) sub(e, 'T', 0, 0, 0);
+        for (i = 0; i < 3; ++i) sub_task(e, "u", 'U');
+        drain(e);
+        CHECK(strcmp(g_order, "TUTTUTTUT") == 0);           /* 2:1 by task type */
+        CHECK(gptps_shutdown(e) == GPTPS_OK);
+        gptps_sched_close(s);
     }
 
     /* 6) threaded: each ordering, four workers, 2 000 tiny items */

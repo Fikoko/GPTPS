@@ -4,7 +4,8 @@
  * test_pool.c - the N-shard router (scale-up by composition). Proves work spreads
  * evenly round-robin across independent engine shards, that keyed routing pins a
  * key to a fixed shard (affinity), that a pool handle cancels on the right shard,
- * and that dead-letters aggregate across shards. Built on the public API only.
+ * and that dead-letters aggregate across shards, and that close is bounded by one
+ * shutdown grace, not one per shard. Built on the public API only.
  */
 #include "gptps_pool.h"
 #include <stdio.h>
@@ -133,12 +134,81 @@ static void test_dead_letter_aggregate(void)
     gptps_pool_close(p);
 }
 
+/* 5) close is bounded by ONE grace, not one per shard: every shard holds work that
+ *    only a cancel ends, and each has a 400 ms grace. Shut down one after another,
+ *    each with its own full grace, that took 4 x 400 ms; with the grace counted from
+ *    the moment close began it takes about one. */
+static void test_close_one_grace(void)
+{
+    gptps_pool *p = make_pool(task_block, "block");
+    gptps_pool_handle h;
+    uint64_t t0, took;
+    size_t i;
+    reset();
+    CHECK(p != NULL);
+    if (!p) return;
+    for (i = 0; i < NSHARD; ++i) {
+        CHECK(gptps_settings_set(gptps_pool_shard(p, i), "limits.shutdown_grace_ms", "400") == GPTPS_OK);
+        CHECK(gptps_pool_submit_keyed(p, (uint64_t)i, "block", NULL, 0, &h) == GPTPS_OK);
+    }
+    { uint64_t s = gptps_now_ms(NULL); while (get(&started) < NSHARD && gptps_now_ms(NULL) - s < 5000) { } }
+    CHECK(get(&started) == NSHARD);
+    CHECK(gptps_pool_closing(p) == 0);
+    t0 = gptps_now_ms(NULL);
+    gptps_pool_close(p);
+    took = gptps_now_ms(NULL) - t0;
+    printf("pool close with %d blocked shards, 400 ms grace each: %llu ms\n", NSHARD, (unsigned long long)took);
+    CHECK(took >= 350);                    /* the grace was honoured... */
+    CHECK(took < 400u * NSHARD - 300u);    /* ...once, not per shard (was >= 1600) */
+    CHECK(gptps_pool_closing(NULL) == 0);
+}
+
+/* 6) close from a shard's own callback: that shard refuses (GPTPS_E_BUSY), and the
+ *    pool used to be freed anyway, under a running engine. Now it is left in place,
+ *    an ERROR says so, and a second close from this thread finishes it. */
+static int closed_in_cb, log_errors;
+static gptps_pool *g_pool_for_cb;
+static void close_obs2(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_FINISHED && !__atomic_exchange_n(&closed_in_cb, 1, __ATOMIC_SEQ_CST)) {
+        gptps_pool_close(g_pool_for_cb);       /* from shard 0's dispatcher: misuse */
+        __atomic_store_n(&closed_in_cb, 2, __ATOMIC_SEQ_CST);
+    }
+}
+static void count_errors(gptps_log_level lvl, const char *msg, void *ud)
+{
+    (void)ud;
+    if (lvl >= GPTPS_LOG_ERROR && strstr(msg, "gptps_pool_close")) __atomic_add_fetch(&log_errors, 1, __ATOMIC_SEQ_CST);
+}
+static void test_close_from_callback(void)
+{
+    gptps_pool *p = make_pool(task_quick, "quick");
+    gptps_handle h;
+    uint64_t s;
+    CHECK(p != NULL);
+    if (!p) return;
+    g_pool_for_cb = p;
+    gptps_set_log_sink(count_errors, NULL);
+    gptps_register_observer(gptps_pool_shard(p, 0), close_obs2, NULL);
+    CHECK(gptps_submit(gptps_pool_shard(p, 0), "quick", NULL, 0, &h) == GPTPS_OK);
+    s = gptps_now_ms(NULL);
+    while (get(&closed_in_cb) != 2 && gptps_now_ms(NULL) - s < 5000) { }
+    CHECK(get(&closed_in_cb) == 2);
+    CHECK(get(&log_errors) == 1);              /* reported, not silently freed */
+    CHECK(gptps_pool_closing(p) == 1);         /* still there, still closing */
+    gptps_pool_close(p);                       /* from the host's thread: finishes it */
+    gptps_set_log_sink(NULL, NULL);
+}
+
 int main(void)
 {
     test_round_robin();
     test_affinity();
     test_pool_cancel();
     test_dead_letter_aggregate();
+    test_close_one_grace();
+    test_close_from_callback();
 
     if (fails) { printf("%d pool check(s) FAILED\n", fails); return 1; }
     printf("all pool checks passed\n");
