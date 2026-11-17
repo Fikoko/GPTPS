@@ -100,6 +100,16 @@ for (i = 0; i < n; ++i)
     if (strcmp(ev->measures[i].name, GPTPS_M_MEM_PEAK) == 0) { /* ... */ }
 ```
 
+Every field appended since is guarded the same way, against `offsetof` of the field
+plus its size: `stderr_tail` / `stderr_tail_len` on the event and the dead letter
+(2.7), the dead letter's `options` (2.6) and `measures` / `n_measures` (2.8), and
+`deadline_ms` / `now_ms` on the seam inputs (2.6). Each such block is guaranteed to
+start past the end of the struct as it was before - never in its tail padding, where
+an older host's `struct_size` would already cover it - and `tests/test_abi.c` holds
+every one of those layouts to that on every ABI CI builds, along with the rule that
+each `GPTPS_TASK_*`, `GPTPS_SUBMIT_*`, `GPTPS_EV_FLAG_*` and `GPTPS_SCHED_*` flag is
+its own bit.
+
 A plug-in that measures something of its own names it under its namespace
 (`mytool.queue_depth`) and gives every value its method; MEASUREMENTS.md has the rules.
 Observers - yours included - must ignore an event kind they do not know: a later engine
