@@ -205,6 +205,11 @@ static bitem *dispatch_locked(gptps_balance *b)
         gptps_status st;
 
         if (!b->queued) break;
+        /* The pool is closing: hand out nothing more. What is still queued here is
+         * dropped by gptps_balance_close with GPTPS_E_SHUTDOWN, whatever the shards'
+         * loads - it used to go to whichever shard was least loaded, so whether an
+         * item started during close or was dead-lettered depended on load ties. */
+        if (gptps_pool_closing(b->pool)) break;
         for (i = 0; i < b->nsh; ++i)
             if (b->sh[i].load < b->sh[i].cap && (best == (size_t)-1 || b->sh[i].load < bestload))
             { best = i; bestload = b->sh[i].load; }

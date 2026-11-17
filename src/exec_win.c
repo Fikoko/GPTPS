@@ -245,7 +245,11 @@ static wchar_t *win_wide(const char *s)
     return w;
 }
 
-/* Quote wide argv into one CreateProcessW command line (MSDN argv parsing rules). */
+/* Quote wide argv into one CreateProcessW command line (MSDN argv parsing rules, which
+ * CommandLineToArgvW and the C runtimes follow): backslashes are literal unless a quote
+ * follows them. So a run of them is doubled only before a quote - an escaped one in the
+ * argument, or the closing one of a quoted argument. An unquoted argument that ends in
+ * '\' ("/out=D:\Reports\") keeps its backslashes as they are. */
 static wchar_t *build_cmdline_w(wchar_t *const *wv, size_t n)
 {
     size_t cap = 1, i;
@@ -262,7 +266,7 @@ static wchar_t *build_cmdline_w(wchar_t *const *wv, size_t n)
         while (*a) {
             size_t bs = 0, k;
             while (*a == L'\\') { ++bs; ++a; }
-            if (*a == 0) { for (k = 0; k < bs * 2; ++k) *w++ = L'\\'; break; }      /* before closing quote */
+            if (*a == 0) { for (k = 0; k < (quote ? bs * 2 : bs); ++k) *w++ = L'\\'; break; } /* before closing quote */
             else if (*a == L'"') { for (k = 0; k < bs * 2 + 1; ++k) *w++ = L'\\'; *w++ = L'"'; ++a; }
             else { for (k = 0; k < bs; ++k) *w++ = L'\\'; *w++ = *a++; }
         }
@@ -429,7 +433,13 @@ static DWORD WINAPI writer_proc(LPVOID p)
     return 0;
 }
 
-typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, oversize, ioerr;
+/* `oversize` is read by the waiting thread while the reader runs, hence a LONG under
+ * Interlocked*. `graceful`: the job has a stop grace (stop_grace_ms), so output past
+ * the cap does not kill it here - the reader raises `oversize`, keeps draining (and
+ * dropping) what the program writes, so it cannot block on a full pipe during its
+ * clean-up, and the waiting thread stops the job the way it stops a timed-out one. */
+typedef struct { HANDLE h; char *buf; size_t len, cap; int nomem, ioerr;
+                 volatile LONG oversize; int graceful;
                  HANDLE proc, job; int assigned; } reader_ctx;
 
 /* When the reader stops early it must also stop the child, because nothing else
@@ -511,7 +521,15 @@ static DWORD WINAPI reader_proc(LPVOID p)
             break;
         }
         if (got == 0) break;              /* end of the output */
-        if (full) { r->oversize = 1; reader_stop_child(r); break; }   /* >16 MiB */
+        if (full) {                                                  /* >16 MiB */
+            InterlockedExchange(&r->oversize, 1);
+            if (!r->graceful) { reader_stop_child(r); break; }
+            {   /* stopped with its grace by the waiting thread: drain until the end */
+                char sink[4096];
+                while (ReadFile(r->h, sink, (DWORD)sizeof sink, &got, NULL) && got > 0) { }
+            }
+            break;
+        }
         r->len += got;
     }
     return 0;
@@ -533,13 +551,24 @@ typedef struct {
 #define GPTPS_WIN_JOB_CPU_RATE_CLASS 15      /* JobObjectCpuRateControlInformation */
 #define GPTPS_WIN_CPU_RATE_ENABLE    0x1u    /* JOB_OBJECT_CPU_RATE_CONTROL_ENABLE */
 #define GPTPS_WIN_CPU_RATE_HARD_CAP  0x4u    /* JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP */
+/* The machine's logical processors, every processor group's: CpuRate is a share of all
+ * of them. GetSystemInfo counts only the caller's group (at most 64), which on a bigger
+ * machine made the cap a multiple of what was declared. GetActiveProcessorCount is
+ * Windows 7 and later, looked up at run time; before it there are no groups. */
+typedef DWORD (WINAPI *apc_fn)(WORD);
+#define GPTPS_WIN_ALL_PROCESSOR_GROUPS 0xffffu
+static uint64_t win_machine_cpus(void)
+{
+    apc_fn apc = (apc_fn)(void (*)(void))GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                        "GetActiveProcessorCount");
+    DWORD n = apc ? apc((WORD)GPTPS_WIN_ALL_PROCESSOR_GROUPS) : 0;
+    if (!n) { SYSTEM_INFO sys; GetSystemInfo(&sys); n = sys.dwNumberOfProcessors; }
+    return n ? (uint64_t)n : 1u;
+}
 static unsigned win_cpu_rate(HANDLE job, uint64_t millicpus)
 {
     gptps_win_cpu_rate_info r;
-    SYSTEM_INFO sys;
-    uint64_t ncpu, rate;
-    GetSystemInfo(&sys);
-    ncpu = sys.dwNumberOfProcessors ? (uint64_t)sys.dwNumberOfProcessors : 1u;
+    uint64_t ncpu = win_machine_cpus(), rate;
     /* millicpus of ONE cpu, as a share of all of them in 1/10000ths, rounded up so a
      * small cap never becomes 0 - which Windows refuses */
     if (millicpus >= ncpu * 1000u) rate = 10000u;   /* the whole machine, or more: and no overflow below */
@@ -596,28 +625,138 @@ static unsigned win_io_rate(HANDLE job, uint64_t bps)
     return ok;
 }
 
+/* The launch lock: one lock for the process-wide state a launch reads or a stop
+ * changes - which handles are inheritable, which console the host is attached to, and
+ * so the host's standard handles. Held by a launch from reading the host's stderr to
+ * making the child's pipe ends not inheritable again (CreateProcessW in between), and
+ * by win_ctrl_break for the time the host is attached to a job's console. Without it, one worker's CreateProcessW copied another
+ * job's pipe ends into its program (that job then waited for its output to end for as
+ * long as the other program lived), and a launch that probed the console while a stop
+ * had the host attached to another job's took that console for the host's own. A spin
+ * lock with a yield, as nothing here may need initialising: what it covers is a few
+ * system calls. */
+static volatile LONG g_launch_lock;
+static void win_launch_lock(void)
+{
+    unsigned spins = 0;
+    while (InterlockedCompareExchange(&g_launch_lock, 1, 0) != 0) Sleep(++spins < 64 ? 0 : 1);
+}
+static void win_launch_unlock(void) { InterlockedExchange(&g_launch_lock, 0); }
+
+/* PROC_THREAD_ATTRIBUTE_HANDLE_LIST (Vista and later): the child inherits exactly the
+ * handles listed - its three standard handles - and none of the host's other
+ * inheritable ones, whoever made them inheritable. Looked up at run time and spelled
+ * out here, so a build for an older Windows still compiles and runs: without it the
+ * launch lock alone keeps the jobs' pipe ends apart. */
+typedef BOOL (WINAPI *ptal_init_fn)(void *, DWORD, DWORD, SIZE_T *);
+typedef BOOL (WINAPI *ptal_update_fn)(void *, DWORD, DWORD_PTR, void *, SIZE_T, void *, SIZE_T *);
+typedef void (WINAPI *ptal_delete_fn)(void *);
+typedef struct { STARTUPINFOW si; void *attrs; } gptps_win_siex;      /* STARTUPINFOEXW */
+#define GPTPS_WIN_EXTENDED_STARTUPINFO 0x00080000u   /* EXTENDED_STARTUPINFO_PRESENT */
+#define GPTPS_WIN_ATTR_HANDLE_LIST     0x00020002u   /* PROC_THREAD_ATTRIBUTE_HANDLE_LIST */
+
+/* A handle the child may be given in its handle list: a real one. Before Windows 8 a
+ * console handle is a pseudo handle (low two bits set), which the list refuses and the
+ * console passes on by itself. */
+static int win_listable(HANDLE h)
+{
+    return h && h != INVALID_HANDLE_VALUE && ((ULONG_PTR)h & 3u) != 3u;
+}
+
+/* CreateProcessW with stdin/stdout/stderr = in/out/err and nothing else inherited.
+ * The three are not inheritable when they come in, and are not when this returns;
+ * they are only for the launch, under the launch lock. `err` NULL gives the program
+ * the host's own stderr, as an inheritable copy so the host's handle is not changed
+ * (read under the lock, so never a stderr a stop's borrowed console put in its place).
+ * *host_console (when probe is set) is whether the host has a console at the moment of
+ * the launch - read under the lock, so never a console a stop has borrowed. FALSE with
+ * *err_out set when it was not started. */
+static BOOL win_launch(wchar_t *wcmd, DWORD flags, int probe, int *host_console, void *wenv,
+                       const wchar_t *wdir, HANDLE in, HANDLE out, HANDLE err,
+                       PROCESS_INFORMATION *pi, DWORD *err_out)
+{
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    ptal_init_fn   init = k ? (ptal_init_fn)(void (*)(void))GetProcAddress(k, "InitializeProcThreadAttributeList") : NULL;
+    ptal_update_fn upd  = k ? (ptal_update_fn)(void (*)(void))GetProcAddress(k, "UpdateProcThreadAttribute") : NULL;
+    ptal_delete_fn del  = k ? (ptal_delete_fn)(void (*)(void))GetProcAddress(k, "DeleteProcThreadAttributeList") : NULL;
+    gptps_win_siex sx;
+    HANDLE list[3], err_dup = NULL;
+    DWORD n = 0, i, one;
+    SIZE_T asz = 0;
+    void *attrs = NULL;
+    BOOL ok;
+
+    /* From here to CreateProcessW: the host's standard handles are read under the lock
+     * too, because a stop that has the host attached to another job's console holds it,
+     * and that console can replace them - a copy taken then would give this program the
+     * other job's hidden console for its stderr. */
+    win_launch_lock();
+    list[n++] = in; list[n++] = out;
+    if (err) {
+        list[n++] = err;                               /* the job's own stderr pipe */
+    } else {
+        /* The host's stderr. Its own handle is never touched: a copy is listed (and
+         * closed below). One that cannot be copied - a pseudo console handle - is passed
+         * as it is, which is what the console expects. */
+        err = GetStdHandle(STD_ERROR_HANDLE);
+        if (win_listable(err) && DuplicateHandle(GetCurrentProcess(), err, GetCurrentProcess(), &err_dup,
+                                                 0, FALSE, DUPLICATE_SAME_ACCESS))
+            list[n++] = err = err_dup;
+    }
+
+    memset(&sx, 0, sizeof sx);
+    sx.si.cb = sizeof sx.si;
+    sx.si.dwFlags = STARTF_USESTDHANDLES;
+    sx.si.hStdInput = in; sx.si.hStdOutput = out; sx.si.hStdError = err;
+    if (init && upd && del) {
+        (void)init(NULL, 1, 0, &asz);                  /* fails, with the size it needs */
+        if (asz && (attrs = gptps_malloc(asz)) != NULL) {
+            if (!init(attrs, 1, 0, &asz)) { gptps_free(attrs); attrs = NULL; }
+            else if (!upd(attrs, 0, (DWORD_PTR)GPTPS_WIN_ATTR_HANDLE_LIST, list, n * sizeof list[0], NULL, NULL)) {
+                del(attrs); gptps_free(attrs); attrs = NULL;
+            }
+        }
+    }
+    if (attrs) { sx.si.cb = sizeof sx; sx.attrs = attrs; flags |= GPTPS_WIN_EXTENDED_STARTUPINFO; }
+
+    for (i = 0; i < n; ++i) SetHandleInformation(list[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    if (probe) {
+        *host_console = GetConsoleProcessList(&one, 1) != 0;   /* 0: attached to no console */
+        if (!*host_console) flags |= CREATE_NO_WINDOW;
+    } else {
+        flags |= CREATE_NO_WINDOW;
+    }
+    ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, flags, wenv, wdir, &sx.si, pi);
+    *err_out = ok ? 0 : GetLastError();
+    for (i = 0; i < n; ++i) SetHandleInformation(list[i], HANDLE_FLAG_INHERIT, 0);
+    win_launch_unlock();
+
+    if (attrs) { del(attrs); gptps_free(attrs); }
+    if (err_dup) CloseHandle(err_dup);
+    return ok;
+}
+
 /* ABI 2.8: Ctrl+Break to a job's process group, whether or not the HOST has a console.
  * With one, the job shares it and the signal is sent from here. Without one (a
  * service), the job runs in a hidden console of its own; the host attaches to it just
  * long enough to send the signal - to the job's group only, which the host is not in -
- * and detaches. That attachment is process-wide state, so it is taken under a lock and
- * only while the host has no console of its own, and the standard handles it can
- * replace are put back. 1 if the signal was sent. */
-static volatile LONG g_attach_lock;
+ * and detaches. That attachment is process-wide state, so it is taken under the launch
+ * lock and only while the host has no console of its own, and the standard handles it
+ * can replace are put back. 1 if the signal was sent. */
 static int win_ctrl_break(DWORD pid, int host_console)
 {
     HANDLE h_in, h_out, h_err;
     DWORD one;
     int sent = 0;
     if (host_console) return GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
-    while (InterlockedCompareExchange(&g_attach_lock, 1, 0) != 0) Sleep(0);
+    win_launch_lock();
     h_in = GetStdHandle(STD_INPUT_HANDLE); h_out = GetStdHandle(STD_OUTPUT_HANDLE); h_err = GetStdHandle(STD_ERROR_HANDLE);
     if (GetConsoleProcessList(&one, 1) == 0 && AttachConsole(pid)) {
         sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
         FreeConsole();
     }
     SetStdHandle(STD_INPUT_HANDLE, h_in); SetStdHandle(STD_OUTPUT_HANDLE, h_out); SetStdHandle(STD_ERROR_HANDLE, h_err);
-    InterlockedExchange(&g_attach_lock, 0);
+    win_launch_unlock();
     return sent;
 }
 
@@ -647,6 +786,23 @@ static void win_errtext(DWORD err, char *buf, size_t n)
     if (!k || !WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)n, NULL, NULL)) snprintf(buf, n, "error %lu", (unsigned long)err);
 }
 
+/* One WARN per process for a job object that could not be made or the program put in
+ * (the engine's own per-task-type line names what was asked for and did not hold). */
+static volatile LONG g_job_warned;
+static void win_job_warn(const gptps_task_def *def, const char *step, DWORD err, int in_job)
+{
+    char msg[640], txt[160];
+    if (InterlockedExchange(&g_job_warned, 1) != 0) return;
+    win_errtext(err, txt, sizeof txt);
+    snprintf(msg, sizeof msg, "task '%s': its program could not be put in a kill-on-close job object "
+             "(%s failed: %s, error %lu), so for it %s. Said once; later jobs may be in the same state",
+             (def && def->name) ? def->name : "?", step, txt, (unsigned long)err,
+             in_job ? "neither the memory cap nor GPTPS_TASK_DIE_WITH_HOST holds"
+                    : "no memory, CPU or I/O cap holds, nor GPTPS_TASK_DIE_WITH_HOST, and a stop ends "
+                      "only the program itself, not what it started");
+    gptps_log(NULL, GPTPS_LOG_WARN, msg);
+}
+
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
@@ -654,12 +810,14 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     const uint64_t mem_cap = caps->mem;
     unsigned cpu_set = 0;              /* the job object took the CPU-rate cap */
     unsigned io_set = 0;               /* ABI 2.8: ...and the I/O-rate cap */
+    int limits_set = 0;                /* ...and its limits: kill-on-close, the memory cap */
+    const char *job_step = NULL;       /* what failed of the job object, if anything did */
+    DWORD job_err = 0;
     const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
     HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
     HANDLE errR = NULL, errW = NULL, et = NULL;   /* ABI 2.7: stderr, when its tail is kept */
     err_ctx ec;
-    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t *wcmd = NULL, *wdir = NULL, *wenv = NULL;   /* ABI 2.7: CreateProcessW's */
     wchar_t *wpath = NULL;                              /* ABI 2.8: the PATH `env` sets, if any */
@@ -667,8 +825,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     int host_console = 0;                               /* ABI 2.8: ...sent from the host's console */
     writer_ctx wc;
     reader_ctx rc;
-    DWORD code = 1, waited;
-    int killed = 0, assigned = 0;
+    DWORD code = 1, waited, start_err = 0;
+    int killed = 0, assigned = 0, graceful_stop = 0, capped = 0;   /* capped: stopped for its output */
     gptps_status eff;
     gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
 
@@ -677,12 +835,13 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     *out_result = NULL; *out_len = 0;
     if (!argv || !argv[0]) return GPTPS_E_INVAL;
 
-    sa.nLength = sizeof sa; sa.lpSecurityDescriptor = NULL; sa.bInheritHandle = TRUE;
+    /* Every pipe end is made NOT inheritable: the child's ends become inheritable only
+     * for its own launch (win_launch), so no other program started meanwhile - by
+     * another worker, for another job - can be handed one. A program holding another
+     * job's stdout write end kept that job's output from ever ending. */
+    sa.nLength = sizeof sa; sa.lpSecurityDescriptor = NULL; sa.bInheritHandle = FALSE;
     if (!CreatePipe(&inR, &inW, &sa, 0)) return GPTPS_E_IO;
     if (!CreatePipe(&outR, &outW, &sa, 0)) { CloseHandle(inR); CloseHandle(inW); return GPTPS_E_IO; }
-    /* parent-side ends must NOT be inherited by the child */
-    SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
     memset(&ec, 0, sizeof ec);
     if (meter && meter->err_cap) {
         ec.cap = meter->err_cap;
@@ -693,10 +852,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
             return why;
         }
-        SetHandleInformation(errR, HANDLE_FLAG_INHERIT, 0);
     }
 
     job = CreateJobObjectA(NULL, NULL);
+    if (!job) { job_step = "CreateJobObject"; job_err = GetLastError(); }
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
         memset(&jeli, 0, sizeof jeli);
@@ -705,7 +864,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             jeli.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
             jeli.ProcessMemoryLimit = (SIZE_T)mem_cap;
         }
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof jeli);
+        limits_set = SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof jeli) != 0;
+        if (!limits_set) { job_step = "SetInformationJobObject"; job_err = GetLastError(); }
         if (caps->cpu_millicpus) cpu_set = win_cpu_rate(job, caps->cpu_millicpus);
         if (caps->io_rbps || caps->io_wbps) {
             uint64_t one = caps->io_rbps && caps->io_wbps ? (caps->io_rbps < caps->io_wbps ? caps->io_rbps : caps->io_wbps)
@@ -737,31 +897,19 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
                  gptps_free(wdir); gptps_free(wenv);
                  return GPTPS_E_NOMEM; }
 
-    memset(&si, 0, sizeof si); si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput  = inR;
-    si.hStdOutput = outW;
-    si.hStdError  = errW ? errW : GetStdHandle(STD_ERROR_HANDLE);
     memset(&pi, 0, sizeof pi);
-
     /* stop_grace_ms: Windows' SIGTERM is Ctrl+Break, sent to the program's own process
      * group (CREATE_NEW_PROCESS_GROUP), which the host is never in. A host with a
      * console shares it with the program; one without (a service) gives the program a
      * hidden console of its own, and win_ctrl_break reaches it there. */
-    if (caps->stop_grace_ms) {
-        DWORD one;
-        ctrl_break = 1;
-        host_console = GetConsoleProcessList(&one, 1) != 0;   /* 0: attached to no console */
-    }
-    if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
-                        CREATE_SUSPENDED
-                        | (ctrl_break ? CREATE_NEW_PROCESS_GROUP : 0)
-                        | (host_console ? 0 : CREATE_NO_WINDOW)
-                        | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
-                        wenv, wdir, &si, &pi)) {
+    ctrl_break = caps->stop_grace_ms != 0;
+    if (!win_launch(wcmd, CREATE_SUSPENDED
+                          | (ctrl_break ? CREATE_NEW_PROCESS_GROUP : 0)
+                          | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
+                    ctrl_break, &host_console, wenv, wdir, inR, outW, errW, &pi, &start_err)) {
         /* ABI 2.8: it never started - say why, for the event, the dead letter and once
          * in the log. ERROR_DIRECTORY is work_dir's; anything else the program's. */
-        DWORD err = GetLastError();
+        DWORD err = start_err;
         caps->start_what = (err == ERROR_DIRECTORY && wdir) ? GPTPS_START_WORKDIR : GPTPS_START_EXEC;
         caps->start_err = (int)err;
         win_errtext(err, caps->start_msg, sizeof caps->start_msg);
@@ -776,28 +924,45 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     }
     gptps_free(wcmd); gptps_free(wdir); gptps_free(wenv);
     CloseHandle(inR); CloseHandle(outW); /* child owns these; parent keeps inW + outR */
+    if (errW) { CloseHandle(errW); errW = NULL; }
 
-    if (job && AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
+    if (job) {
+        if (AssignProcessToJobObject(job, pi.hProcess)) assigned = 1;
+        else if (!job_step) { job_step = "AssignProcessToJobObject"; job_err = GetLastError(); }
+    }
+    if (job_step) win_job_warn(def, job_step, job_err, assigned);
     /* A cap on a job the program is not in holds nothing. The I/O caps are never set
-     * here (see win_cpu_rate), so the engine reports them as not in force. */
+     * here (see win_cpu_rate), so the engine reports them as not in force. Dying with
+     * the host is the job object's kill-on-close: it holds only with the limit set and
+     * the program in the job - the engine says so for a task that asked, when not. */
     caps->applied = (assigned && cpu_set) ? GPTPS_CAP_CPU : 0u;
     if (assigned && io_set) caps->applied |= GPTPS_CAP_IO | GPTPS_CAP_IO_ONE;
     if (ctrl_break) caps->applied |= GPTPS_CAP_GRACE;
-    caps->applied |= GPTPS_CAP_DIE;      /* the job object dies with its last handle - the host's */
-    ResumeThread(pi.hThread);
+    if (assigned && limits_set) caps->applied |= GPTPS_CAP_DIE;   /* dies with its last handle - the host's */
 
+    /* The helper threads, started while the program is still suspended: a program
+     * nobody reads, or that is handed an empty stdin in place of its payload, must not
+     * run at all - one that exits 0 on that is a success with the wrong result. Without
+     * them the attempt fails with GPTPS_E_NOMEM (a thread is memory), as other resource
+     * failures here do. No payload needs no writer: stdin is closed at once. */
     wc.h = inW; wc.data = (const char *)payload; wc.len = plen; wc.ioerr = 0;
     wc.proc = pi.hProcess; wc.job = job; wc.assigned = assigned;
-    rc.h = outR; rc.buf = NULL; rc.len = rc.cap = 0; rc.nomem = rc.oversize = rc.ioerr = 0;
+    rc.h = outR; rc.buf = NULL; rc.len = rc.cap = 0; rc.nomem = rc.ioerr = 0; rc.oversize = 0;
+    rc.graceful = ctrl_break;
     rc.proc = pi.hProcess; rc.job = job; rc.assigned = assigned;
-    wt = CreateThread(NULL, 0, writer_proc, &wc, 0, NULL);
-    if (!wt) CloseHandle(inW);                 /* no writer => close stdin so the child sees EOF */
+    if (plen) wt = CreateThread(NULL, 0, writer_proc, &wc, 0, NULL);
+    if (!wt) CloseHandle(inW);                 /* stdin's EOF, now */
     rt = CreateThread(NULL, 0, reader_proc, &rc, 0, NULL);
-    if (errW) {
-        CloseHandle(errW); errW = NULL;        /* the child owns its end */
+    if (errR) {
         ec.h = errR;
         et = CreateThread(NULL, 0, err_proc, &ec, 0, NULL);
-        if (!et) { CloseHandle(errR); errR = NULL; }   /* nothing would read it: fail its writes, not block them */
+        if (!et) { CloseHandle(errR); errR = NULL; }
+    }
+    if ((plen && !wt) || !rt || (ec.cap && !et)) {
+        killed = 1; kill_st = GPTPS_E_NOMEM;   /* never resumed: it never ran */
+        if (assigned) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
+    } else {
+        ResumeThread(pi.hThread);
     }
 
     /* Wait for the child in bounded slices so a raised cancel flag (gptps_cancel /
@@ -809,7 +974,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         uint64_t deadline = timeout_s ? gptps_hal_monotonic_ms() + (uint64_t)timeout_s * 1000u : 0;
         win_sampler sm;
         win_sampler_init(&sm, meter);
-        for (;;) {
+        while (!killed) {                     /* killed already: its threads could not start */
             DWORD slice = 200;
             win_sampler_tick(&sm, job, assigned, pi.hProcess);   /* a sample, when due */
             if (deadline) {
@@ -824,12 +989,20 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
              * breach - report the two apart so an operator can tell which happened. */
             if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
             if (waited == WAIT_FAILED) { killed = 1; kill_st = GPTPS_E_IO; break; } /* defensive: never spin */
+            /* stdout past the result cap, in a job with a stop grace: stopped as a
+             * timed-out one is, with its grace - it may be in the middle of its work -
+             * and the attempt fails with GPTPS_E_IO, as an ungraceful one's does */
+            if (InterlockedCompareExchange(&rc.oversize, 0, 0)) {
+                killed = 1; kill_st = GPTPS_E_IO; graceful_stop = 1; capped = 1; break;
+            }
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }
-        /* A grace to give (timeout or cancel, not our own I/O failure): Ctrl+Break to
-         * the program's group, then up to the grace for the WHOLE job to exit before the
-         * kill. Its output threads keep reading meanwhile, so it cannot block on us. */
-        if (killed && ctrl_break && kill_st != GPTPS_E_IO) {
+        /* A grace to give (timeout, cancel, too much output - not our own failure):
+         * Ctrl+Break to the program's group, then up to the grace for the WHOLE job to
+         * exit before the kill. Its output threads keep reading meanwhile, so it cannot
+         * block on us. */
+        if (killed && (kill_st == GPTPS_E_TIMEOUT || kill_st == GPTPS_E_CANCELLED)) graceful_stop = 1;
+        if (killed && ctrl_break && graceful_stop) {
             if (win_ctrl_break(pi.dwProcessId, host_console)) {
                 uint64_t until = gptps_hal_monotonic_ms() + caps->stop_grace_ms;
                 while (win_job_alive(job, assigned, pi.hProcess) && gptps_hal_monotonic_ms() < until)
@@ -905,6 +1078,9 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     else if (rc.ioerr)      eff = GPTPS_E_IO;   /* the output could not be read */
     else if (rc.nomem)      eff = GPTPS_E_NOMEM;
     else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
+    /* The engine says why, once - when the cap is why: not when the job was already
+     * being stopped for its deadline or a cancel and ran past the cap in its grace */
+    if (rc.oversize && (!killed || capped)) caps->out_capped = GPTPS_WIN_RESULT_CAP;
     /* ABI 2.7: how it ended, when it ended on its own - every branch above but the last
      * may have terminated it, and then its code is ours, not the program's */
     if (!killed && !rc.oversize && !wc.ioerr && !rc.ioerr && !rc.nomem)

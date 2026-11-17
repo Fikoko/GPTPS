@@ -10,7 +10,8 @@
 #include "gptps.h"
 #include "gptps_hal.h"   /* the acquire/release pair (executor cancel), gptps_hal_monotonic_ms */
 
-#include <stddef.h>   /* offsetof */
+#include <stddef.h>   /* offsetof, wchar_t */
+#include <stdio.h>    /* FILE, for gptps_fopen_path */
 
 /* --- append-safe ABI struct guards ---
  * A caller-extensible struct only ever GROWS by appending (see gptps.h "ABI
@@ -67,10 +68,15 @@ typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flag
  * the trap, and would have started returning E_INVAL to every caller already compiled.
  * Retrofitting the floor is strictly more permissive (anyone passing sizeof still
  * passes), so it breaks nobody and unblocks the append. Its floor is frozen at the
- * 1.0.0 layout, which ends at `dead`. gptps_setting_info still carries the old check;
- * it can be retrofitted the same way the day something needs to grow it. */
+ * 1.0.0 layout, which ends at `dead`. gptps_setting_info had the old check too, until
+ * ABI 2.8 appended `key_copy` / `desc_copy`; its floor is frozen at the 1.0.0 layout,
+ * which ends at `defval`. The copies are filled only when struct_size reaches the END
+ * of `desc_copy`, so an old struct_size that includes trailing padding past `defval`
+ * is never mistaken for one that has them. */
 #define GPTPS_ADDON_INFO_MIN_SIZE     GPTPS_LAST_FIELD_END(gptps_addon_info, enabled)
 #define GPTPS_TASK_INFO_MIN_SIZE      GPTPS_LAST_FIELD_END(gptps_task_info, dead)
+#define GPTPS_SETTING_INFO_MIN_SIZE   GPTPS_LAST_FIELD_END(gptps_setting_info, defval)
+#define GPTPS_SETTING_INFO_COPY_SIZE  GPTPS_LAST_FIELD_END(gptps_setting_info, desc_copy)
 /* Same tail-padding hazard as gptps_task_def above, same remedy: `flags` must stay the
  * widest member so offsetof(flags) lands exactly on the pre-2.2 padded sizeof and can
  * never hide inside old trailing padding - otherwise a 1.0.0 struct_size could be
@@ -155,6 +161,7 @@ void gptps_meter_put(gptps_exec_meter *mt, const char *name, uint64_t value,
 #define GPTPS_CAP_DIE    0x10u  /* ABI 2.8: GPTPS_TASK_DIE_WITH_HOST is in force */
 #define GPTPS_CAP_IO_ONE 0x20u  /* ABI 2.8: the I/O caps hold as ONE read+write figure (Windows) */
 #define GPTPS_CAP_START  0x40u  /* engine-side only: a start failure was reported (WARN once) */
+#define GPTPS_CAP_OUTCAP 0x80u  /* engine-side only: stdout passed the result cap (WARN once) */
 /* ABI 2.8: which step of starting a program failed (gptps_exec_caps.start_what) */
 #define GPTPS_START_WORKDIR 1u  /* work_dir could not be entered */
 #define GPTPS_START_EXEC    2u  /* the program could not be run (not found, not executable, ...) */
@@ -167,6 +174,8 @@ typedef struct {
     unsigned start_what;       /* OUT ABI 2.8: 0, or the GPTPS_START_* step that failed */
     int      start_err;        /* OUT: its OS error (errno / GetLastError) */
     char     start_msg[160];   /* OUT: that error as text */
+    uint32_t out_capped;       /* OUT: 0, or the result cap (bytes) the program's stdout
+                                * ran past - the job was stopped, the attempt is E_IO */
     unsigned applied;          /* OUT: GPTPS_CAP_*; the engine sets it 0 */
 } gptps_exec_caps;
 
@@ -174,7 +183,25 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
                                gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter);
 
+/* --- file paths (config_toml.c) ---
+ * Paths are UTF-8, as every other string in the API is (argv, work_dir, env). On
+ * Windows a path that is valid UTF-8 and not plain ASCII is opened through the UTF-16
+ * API (_wfopen, _wremove), so a directory with a Turkish name works on any ANSI
+ * code page; one that is not valid UTF-8 goes to the narrow CRT call as before, read
+ * in the ANSI code page - the rule exec_win.c's win_wide applies to a program's
+ * strings. Elsewhere these are fopen and remove. Both set errno on failure. */
+FILE *gptps_fopen_path(const char *path, const char *mode);
+int   gptps_remove_path(const char *path);
+/* The UTF-16 form of a UTF-8 `path`, for a *W Win32 call (LoadLibraryW, MoveFileExW):
+ * 1 with *out set (gptps_free it); 0 when the narrow (*A) call is the one to make -
+ * the path is plain ASCII, or not valid UTF-8 and so ANSI; -1 when memory ran out.
+ * Only where wchar_t is 16 bits (Windows); elsewhere it always returns 0. */
+int   gptps_path_wide(const char *path, wchar_t **out);
+
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
+/* U+FEFF in UTF-8: the byte order mark a config file may open with. The parser skips
+ * it; a save writes it back (settings.c). */
+#define GPTPS_UTF8_BOM "\xEF\xBB\xBF"
 typedef struct gptps_toml gptps_toml;
 gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen); /* NULL on error */
 /* Why parse_file_ex or read_file returned NULL, through their `why` (may be NULL; left
@@ -326,8 +353,9 @@ int             gptps_settings_publish_locked(gptps_settings *r, gptps_setting_p
  * the item's cooperative cancel flag - the pump kills the child when it is raised,
  * so a no-timeout program can still be cancelled / shut down (reported as
  * GPTPS_E_CANCELLED, distinct from a deadline's GPTPS_E_TIMEOUT). Stdout EOF means the
- * child closed its output, NOT that it exited, so the reap is bounded: a program that
- * goes silent and keeps running is SIGKILLed after a grace period. */
+ * child closed its output, NOT that it exited: a program that goes on running after it
+ * runs until it exits, its deadline or a cancel, and is waited for in bounded slices,
+ * never in a blocking waitpid(). */
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter);

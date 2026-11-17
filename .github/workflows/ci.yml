@@ -8,8 +8,15 @@ permissions:
   contents: read
 
 on:
+  # Every branch push. A v* tag push is left to release.yml, which runs this whole
+  # workflow at the tag (workflow_call, below) as the gate before it publishes;
+  # running it here too would only be a second, ungating copy. Other tags still run.
   push:
+    branches: ['**']
+    tags-ignore: ['v*']
   pull_request:
+  # release.yml calls this workflow and publishes only if every job here passed.
+  workflow_call:
   # A dormant repo's green badge decays into fiction: toolchains, runner images and
   # dependencies move underneath a tree that has not been pushed to in months. The
   # weekly run keeps the badge a statement about TODAY.
@@ -451,13 +458,13 @@ jobs:
             export GPTPS_STRESS_SEED=$GPTPS_SIM_SEED
             echo "sim seed $GPTPS_SIM_SEED (replay: GPTPS_SIM_SEED=$GPTPS_SIM_SEED GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$GPTPS_SIM_SEED GPTPS_STRESS_MS=1500)"
             ctest --test-dir build-sim --output-on-failure --no-tests=error \
-              -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui)$'
+              -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui)$'
           done
       - name: The tests on real processes, paced to real time
         run: |
           export GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 GPTPS_SIM_SEED=$(( ${{ github.run_number }} * 3 ))
           ctest --test-dir build-sim --output-on-failure --no-tests=error \
-            -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui)$'
+            -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui)$'
 
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER
@@ -554,3 +561,35 @@ jobs:
              -I include -I src tests/test_hal_conformance.c freestanding/hal_stub.c \
              -o hal_conformance_stub
           ./hal_conformance_stub --freestanding
+      - name: The documented port path - CMake with a custom HAL and executor
+        # docs/HAL.md "Porting": -DGPTPS_HAL_SOURCE + -DGPTPS_EXEC_SOURCE must configure
+        # and build with no Threads package and no POSIX executor, as an RTOS or
+        # bare-metal toolchain has neither. Threads must not even be looked for, and
+        # the library must link the demo with no thread / loader symbol.
+        run: |
+          cmake -S . -B build-port \
+            -DGPTPS_HAL_SOURCE="$PWD/freestanding/hal_stub.c" \
+            -DGPTPS_EXEC_SOURCE="$PWD/freestanding/exec_stub.c" \
+            -DGPTPS_BUILD_TESTS=OFF -DGPTPS_BUILD_EXAMPLES=OFF -DGPTPS_BUILD_ADDONS=OFF \
+            -DCMAKE_C_FLAGS="-ffreestanding -fno-builtin -Werror"
+          cmake --build build-port --target gptps
+          if grep -Eq '^(Threads_FOUND|CMAKE_HAVE_LIBC_PTHREAD|CMAKE_THREAD_LIBS_INIT)' build-port/CMakeCache.txt; then
+            echo "ERROR: the port configure looked for a thread library"; exit 1
+          fi
+          cc -ffreestanding -fno-builtin -std=c99 -Wall -Wextra -Werror -I include \
+             freestanding/demo_freestanding.c build-port/libgptps.a -o demo_port
+          ./demo_port
+          if nm -u demo_port | grep -Eq ' (pthread_|dlopen|dlsym|dlclose|fork)'; then
+            nm -u demo_port | grep -E ' (pthread_|dlopen|dlsym|dlclose|fork)'; exit 1
+          fi
+      - name: The documented port path - the amalgamation without its bundled backends
+        run: |
+          sh tools/amalgamate.sh amal-port
+          cc -ffreestanding -fno-builtin -std=c99 -Wall -Wextra -Werror -O2 \
+             -DGPTPS_EXTERNAL_HAL -DGPTPS_EXTERNAL_EXEC -I amal-port -I include -I src \
+             amal-port/gptps.c freestanding/hal_stub.c freestanding/exec_stub.c \
+             freestanding/demo_freestanding.c -o demo_amal_port
+          ./demo_amal_port
+          if nm -u demo_amal_port | grep -Eq ' (pthread_|dlopen|dlsym|dlclose|fork)'; then
+            nm -u demo_amal_port | grep -E ' (pthread_|dlopen|dlsym|dlclose|fork)'; exit 1
+          fi

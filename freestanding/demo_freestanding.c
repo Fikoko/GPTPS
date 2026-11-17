@@ -69,7 +69,7 @@ int main(void)
     gptps_handle h;
     size_t ran;
     int guard;
-    static const char payload[5] = "hello";       /* 104+101+108+108+111 = 532 */
+    static const char payload[5] = { 'h', 'e', 'l', 'l', 'o' };  /* no NUL: 5 bytes */       /* 104+101+108+108+111 = 532 */
     unsigned long expected = 0;
     int i;
     for (i = 0; i < 5; ++i) expected += (unsigned char)payload[i];

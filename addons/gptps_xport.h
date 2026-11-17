@@ -134,8 +134,13 @@ typedef void (*gptps_xport_reply_ex_fn)(const gptps_xport_reply *reply, void *us
 /* ENGINE MODE hook: runs in EACH worker process, after its engine is open and the
  * task table registered, before the first request. Define named resources, register
  * constraints, install gptps_stats / gptps_durable_queue, set priorities - anything
- * you would do to an in-process engine between open and the first submit. */
+ * you would do to an in-process engine between open and the first submit, the
+ * engine's event callback (gptps_set_event_cb) included: the worker sends its replies
+ * from an observer, which nothing set here displaces. */
 typedef void (*gptps_xport_child_init_fn)(gptps *worker_engine, void *user_data);
+/* The same, able to say that the setup failed: anything but GPTPS_OK fails
+ * gptps_xport_open_ex (see there). */
+typedef gptps_status (*gptps_xport_child_init_ex_fn)(gptps *worker_engine, void *user_data);
 
 typedef struct {
     size_t   struct_size;              /* = sizeof(gptps_xport_config) */
@@ -159,9 +164,19 @@ typedef struct {
     size_t                  ntasks;
     gptps_xport_child_init_fn child_init; /* optional */
     void                   *child_init_ud;
+    /* Appended in 1.10 (a struct ending at child_init_ud is still accepted). Optional,
+     * runs after child_init, with child_init_ud; its failure fails the open. */
+    gptps_xport_child_init_ex_fn child_init_ex;
 } gptps_xport_config;
 
-/* Open N workers. NULL on any failure (nothing is left running). */
+/* Open N workers. NULL on any failure (nothing is left running), and a failure inside
+ * a worker counts: each worker reports that its setup succeeded before this returns -
+ * in engine mode its gptps_open_ex(engine_cfg), every gptps_register_task and
+ * child_init_ex - and one that fails, or exits before it says, fails the open, with an
+ * ERROR to the core's log sink naming the worker, the step and its status. A worker
+ * that exits later than that (a crash, a kill) is reported too: a WARN when its link
+ * breaks while the transport is open, and how it exited when gptps_xport_close reaps
+ * it, if that was not a clean exit. */
 gptps_xport *gptps_xport_open_ex(const gptps_xport_config *cfg);
 
 /* HANDLER MODE shorthand, unchanged from before: N workers running `run`. */

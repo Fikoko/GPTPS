@@ -117,7 +117,9 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
  * length written (excluding NUL). Pure read of live state - no terminal needed. */
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
 
-/* Apply a key as if pressed: a bound hotkey submits its task (returns 1); 'q'/ESC
+/* Apply a key as if pressed: a bound hotkey submits its task (returns 1; if the engine
+ * refuses the submit - the type is paused or unknown, the queue is full, a constraint
+ * denies it - the toast says why and it returns 0); 'q'/ESC
  * requests quit (returns -1); 'k'/'j' scroll the log (returns 2); 'm' cycles the
  * KPI level and 'p' toggles pause (returns 3, "reconfigured"); 's' opens the
  * settings editor and '?' toggles the help overlay (returns 4, "UI"); else 0. */
@@ -138,7 +140,27 @@ gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms);
 void gptps_tui_snapshot(gptps_tui *t);
 
 /* Blocking live loop: clear screen, then redraw every refresh_ms and dispatch
- * keystrokes until quit. No-op (returns immediately) when not attached to a TTY. */
+ * keystrokes until quit. No-op (returns immediately) unless both the output and stdin
+ * are terminals - with a WARN when cfg.interactive asked for it anyway. Typed text is
+ * UTF-8 (on Windows the console's UTF-16 is converted, keys told apart by their
+ * virtual-key code); bytes that do not form UTF-8 characters - a terminal not set to
+ * UTF-8 - are left out, and the status line says so. Anything shown that the
+ * dashboard did not write - a job's stderr; a setting's key, value, default,
+ * description and choices; a task's name and label; the status line, which repeats
+ * a committed value - is shown as printable, valid UTF-8 only: control bytes, encoded
+ * C1 controls, malformed sequences and invisible bidi/formatting characters never
+ * reach the terminal. Settings and task names are read from the copies the engine
+ * takes under its lock (ABI 2.8: gptps_setting_info.key_copy / desc_copy,
+ * gptps_task_info.name_copy), so a task unregistered on another thread while the
+ * dashboard draws cannot leave it reading freed memory.
+ *
+ * DEAD-LETTER VIEW ('l'). The engine's dead letters can only be read by draining them,
+ * which takes them, so the view shows their number until the operator loads them
+ * ('g'; 'r' and 'D' load them too). Loaded, they are HELD by the dashboard, each shown
+ * with its task, status and why it failed (exit code or start error, and its stderr's
+ * last line), and re-submitted ('r' all, 'e' the selected one) or discarded ('x' the
+ * selected one, 'D' all). A re-submit the engine refuses keeps the item held, with the
+ * reason. gptps_tui_close discards what is still held, with a WARN. */
 void gptps_tui_run(gptps_tui *t);
 
 /* Restore the terminal and free. Call AFTER gptps_shutdown(e). */

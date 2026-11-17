@@ -22,16 +22,29 @@
 
 #include <windows.h>
 #include <process.h>   /* _beginthreadex */
+#include <io.h>        /* _open_osfhandle, _close: gptps_hal_open_private */
+#include <fcntl.h>     /* _O_WRONLY, _O_BINARY */
 #include <stdlib.h>
 
 /* --- hardware detection -------------------------------------------------- */
+/* Logical processors in every processor group. GetSystemInfo counts only the caller's
+ * group (at most 64), so a 128-processor server read as 64. GetActiveProcessorCount is
+ * Windows 7 and later, looked up at run time; before it there are no groups. */
+typedef DWORD (WINAPI *hal_win_apc_fn)(WORD);
+static unsigned hal_win_cpus(void)
+{
+    HMODULE k = GetModuleHandleA("kernel32.dll");
+    hal_win_apc_fn apc = k ? (hal_win_apc_fn)(void (*)(void))GetProcAddress(k, "GetActiveProcessorCount") : NULL;
+    DWORD n = apc ? apc((WORD)0xffffu /* ALL_PROCESSOR_GROUPS */) : 0;
+    if (!n) { SYSTEM_INFO si; GetSystemInfo(&si); n = si.dwNumberOfProcessors; }
+    return n ? (unsigned)n : 1u;
+}
+
 gptps_status gptps_hal_detect(gptps_hwinfo *out)
 {
-    SYSTEM_INFO si;
     MEMORYSTATUSEX ms;
     if (!out) return GPTPS_E_INVAL;
-    GetSystemInfo(&si);
-    out->cpu_count = si.dwNumberOfProcessors ? (unsigned)si.dwNumberOfProcessors : 1u;
+    out->cpu_count = hal_win_cpus();
     ms.dwLength = sizeof ms;
     out->ram_bytes = GlobalMemoryStatusEx(&ms) ? (uint64_t)ms.ullTotalPhys : 0;
     out->has_gpu = false; /* best-effort: a GPU add-on is the real detector */
@@ -146,15 +159,120 @@ void gptps_hal_store_release_u32(uint32_t *p, uint32_t v)
 void     gptps_hal_fork_guard_install(void) { }
 uint64_t gptps_hal_fork_generation(void) { return 0; }
 
+/* --- paths --------------------------------------------------------------- */
+/* A path as UTF-16 for the wide Win32 calls. Paths are UTF-8, as every other GPTPS
+ * string is on Windows (argv, work_dir, env) - and a TOML file, where `addons` paths
+ * come from, is UTF-8 by definition. One that is not valid UTF-8 is read in the ANSI
+ * code page, which is what the ANSI calls used before made of every path, so a host
+ * that passes ANSI paths keeps working. NULL when out of memory or unconvertible;
+ * free() it. */
+static wchar_t *hal_win_wide(const char *s)
+{
+    UINT cp = CP_UTF8;
+    DWORD fl = MB_ERR_INVALID_CHARS;
+    int n = MultiByteToWideChar(cp, fl, s, -1, NULL, 0);
+    wchar_t *w;
+    if (n <= 0) { cp = CP_ACP; fl = 0; n = MultiByteToWideChar(cp, fl, s, -1, NULL, 0); }
+    if (n <= 0) return NULL;
+    w = (wchar_t *)malloc((size_t)n * sizeof *w);
+    if (!w) return NULL;
+    if (MultiByteToWideChar(cp, fl, s, -1, w, n) <= 0) { free(w); return NULL; }
+    return w;
+}
+
 /* --- dynamic loading ----------------------------------------------------- */
-gptps_dl *gptps_dl_open(const char *path) { return (gptps_dl *)LoadLibraryA(path); }
+gptps_dl *gptps_dl_open(const char *path)
+{
+    wchar_t *w;
+    HMODULE h;
+    if (!path) return NULL;
+    w = hal_win_wide(path);
+    if (!w) return NULL;
+    h = LoadLibraryW(w);
+    free(w);
+    return (gptps_dl *)h;
+}
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol) { return (void *)GetProcAddress((HMODULE)h, symbol); }
 void      gptps_dl_close(gptps_dl *h) { if (h) FreeLibrary((HMODULE)h); }
 /* The handle IS the HMODULE here - nothing was allocated to wrap it - so keeping
  * the mapping and dropping the bookkeeping is simply doing nothing. */
 void      gptps_dl_release(gptps_dl *h) { (void)h; }
+/* The system's message for the thread's last error, which a failed LoadLibrary /
+ * GetProcAddress just set: a dependent DLL that is missing, a 32/64-bit mismatch,
+ * a procedure that was not found. Read before anything else can overwrite it. */
+size_t gptps_dl_error(char *buf, size_t cap)
+{
+    DWORD err = GetLastError();
+    char sys[256];
+    DWORD n;
+    size_t i = 0;
+    const char *p;
+    char num[16];
+    int k = 0;
+    if (!buf || !cap) return 0;
+    buf[0] = 0;
+    if (!err) return 0;
+    n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err,
+                       0, sys, (DWORD)sizeof sys, NULL);
+    while (n && (sys[n - 1] == '\r' || sys[n - 1] == '\n' || sys[n - 1] == ' ' || sys[n - 1] == '.')) --n;
+    sys[n < sizeof sys ? n : sizeof sys - 1] = 0;
+    for (p = n ? sys : "Windows error"; *p && i + 1 < cap; ++p) buf[i++] = *p;
+    for (p = " (error "; *p && i + 1 < cap; ++p) buf[i++] = *p;
+    do { num[k++] = (char)('0' + err % 10u); err /= 10u; } while (err && k < (int)sizeof num);
+    while (k > 0 && i + 1 < cap) buf[i++] = num[--k];
+    if (i + 1 < cap) buf[i++] = ')';
+    buf[i] = 0;
+    return i;
+}
 
+/* Atomic AND durable: the new file's data goes to the disk (FlushFileBuffers) before
+ * it takes the old one's name, and the rename itself is written through - otherwise a
+ * power loss soon after a save could leave the config empty or zero-filled under its
+ * name, every setting lost rather than only the last change. A file system that
+ * cannot flush (some network redirectors answer ERROR_INVALID_FUNCTION) gets the
+ * rename alone, as before; any other flush failure is the disk's, and the old file is
+ * kept. Paths are UTF-8 (hal_win_wide). */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
-{ return MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING) ? GPTPS_OK : GPTPS_E_IO; }
+{
+    wchar_t *wt, *wf;
+    gptps_status st = GPTPS_E_IO;
+    HANDLE h;
+    if (!tmp_path || !final_path) return GPTPS_E_INVAL;
+    wt = hal_win_wide(tmp_path);
+    wf = hal_win_wide(final_path);
+    if (!wt || !wf) { free(wt); free(wf); return GPTPS_E_NOMEM; }
+    h = CreateFileW(wt, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        BOOL flushed = FlushFileBuffers(h);
+        DWORD e = flushed ? 0 : GetLastError();
+        CloseHandle(h);
+        if ((flushed || e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED) &&
+            MoveFileExW(wt, wf, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            st = GPTPS_OK;
+    }
+    free(wt); free(wf);
+    return st;
+}
+
+/* A new file inherits its directory's ACL, as the target did; opened with no
+ * sharing, so no other handle - anyone's - can be had on it until it is closed. */
+FILE *gptps_hal_open_private(const char *path)
+{
+    HANDLE h;
+    int fd;
+    FILE *f;
+    wchar_t *w;
+    if (!path || !(w = hal_win_wide(path))) return NULL;   /* UTF-8, else ANSI: as atomic_replace */
+    if (!DeleteFileW(w) && GetLastError() != ERROR_FILE_NOT_FOUND) { free(w); return NULL; }
+    h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { free(w); return NULL; }
+    fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); DeleteFileW(w); free(w); return NULL; }
+    f = _fdopen(fd, "wb");
+    if (!f) { _close(fd); DeleteFileW(w); }
+    free(w);
+    return f;
+}
 
 #endif /* _WIN32 */

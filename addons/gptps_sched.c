@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>    /* snprintf: the overflow warning */
 
 enum { K_EDF = 1, K_AGING, K_FAIR, K_SHED };
 
@@ -53,8 +54,12 @@ struct gptps_sched {
     /* fair */
     gptps_sched_tenant_fn tenant_fn;
     void      *tenant_ud;
-    tenant    *tenants;   /* open addressing on id; slot 0 doubles as the overflow */
+    tenant    *tenants;   /* open addressing on id */
     size_t     ntenants;
+    tenant     overflow;  /* the one share every tenant past max_tenants is merged into */
+    uint64_t   overflowed;   /* items tagged in it (gptps_sched_fair_overflow) */
+    int        warn_due;     /* the first merge: warned once, from the observer */
+    int        warned;
     tagged    *items;     /* open addressing on handle, linear probing, no tombstones */
     size_t     icap, ilen;
     uint64_t   vtime;     /* virtual time: the start tag of the latest item to start */
@@ -100,13 +105,18 @@ static int64_t aging_score(const gptps_sched_input *in, void *ud)
 
 /* ---- fair share ------------------------------------------------------------ */
 
-static uint64_t name_tenant(const gptps_sched_input *in, void *ud)
+uint64_t gptps_sched_task_tenant(const char *task_name)
 {
-    const unsigned char *p = (const unsigned char *)(in->task_name ? in->task_name : "");
+    const unsigned char *p = (const unsigned char *)(task_name ? task_name : "");
     uint64_t h = 1469598103934665603ull;      /* FNV-1a */
-    (void)ud;
     while (*p) { h ^= *p++; h *= 1099511628211ull; }
     return h;
+}
+
+static uint64_t name_tenant(const gptps_sched_input *in, void *ud)
+{
+    (void)ud;
+    return gptps_sched_task_tenant(in->task_name);
 }
 
 static size_t mix(uint64_t x, size_t cap)
@@ -115,9 +125,8 @@ static size_t mix(uint64_t x, size_t cap)
     return (size_t)(x & (uint64_t)(cap - 1));     /* cap is a power of two */
 }
 
-/* The tenant's slot. A full table sends a new tenant to slot 0, which it then
- * shares - documented as what max_tenants means. Caller holds mu. */
-static tenant *tenant_of(gptps_sched *s, uint64_t id)
+/* The tenant's slot, claimed if it has none; NULL when the table is full. */
+static tenant *tenant_slot(gptps_sched *s, uint64_t id)
 {
     size_t i = mix(id, s->ntenants), n;
     for (n = 0; n < s->ntenants; ++n, i = (i + 1) & (s->ntenants - 1)) {
@@ -125,7 +134,22 @@ static tenant *tenant_of(gptps_sched *s, uint64_t id)
         if (!t->used) { t->used = 1; t->id = id; t->weight = 1; t->finish = 0; return t; }
         if (t->id == id) return t;
     }
-    return &s->tenants[0];
+    return NULL;
+}
+
+/* The tenant an item is charged to. Past max_tenants, every further tenant shares
+ * the overflow share (weight 1) - what max_tenants means, as documented. It used to
+ * be slot 0, so an unrelated tenant that happened to own it lost half its share, and
+ * nothing said so: now it is a share of its own, counted (gptps_sched_fair_overflow)
+ * and warned of once. Caller holds mu - the warning itself is sent from fair_obs,
+ * outside the scheduler hook. */
+static tenant *tenant_of(gptps_sched *s, uint64_t id)
+{
+    tenant *t = tenant_slot(s, id);
+    if (t) return t;
+    s->overflowed += 1;
+    if (!s->warned) { s->warned = 1; s->warn_due = 1; }
+    return &s->overflow;
 }
 
 static tagged *item_find(gptps_sched *s, gptps_handle h)
@@ -208,6 +232,8 @@ static void fair_obs(const gptps_event *ev, void *ud)
 {
     gptps_sched *s = (gptps_sched *)ud;
     tagged *it;
+    int warn;
+    size_t cap;
     switch (ev->kind) {
     case GPTPS_EV_STARTED: case GPTPS_EV_FINISHED: case GPTPS_EV_FAILED:
     case GPTPS_EV_DROPPED: case GPTPS_EV_DEAD_LETTERED:
@@ -221,7 +247,16 @@ static void fair_obs(const gptps_event *ev, void *ud)
         if (ev->kind == GPTPS_EV_STARTED && it->start > s->vtime) s->vtime = it->start;
         item_del(s, it);
     }
+    warn = s->warn_due; s->warn_due = 0; cap = s->ntenants;
     apx_mutex_unlock(&s->mu);
+    if (warn) {                                    /* never silent: once per scheduler */
+        char msg[256];
+        snprintf(msg, sizeof msg, "gptps_sched_fair: more tenants than max_tenants (%lu): further "
+                 "tenants now share ONE share between them; gptps_sched_fair_overflow counts the "
+                 "items charged to it. Size max_tenants for the tenants you have.",
+                 (unsigned long)cap);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
 }
 
 /* ---- shed late ------------------------------------------------------------- */
@@ -292,6 +327,7 @@ gptps_status gptps_sched_fair(gptps *e, gptps_sched_tenant_fn tenant_fn, void *u
     s->tenant_fn = tenant_fn ? tenant_fn : name_tenant;
     s->tenant_ud = tenant_fn ? user_data : NULL;
     s->ntenants = n;
+    s->overflow.used = 1; s->overflow.weight = 1;
     s->tenants = (tenant *)calloc(n, sizeof *s->tenants);
     if (!s->tenants || item_grow(s) != 0) { gptps_sched_close(s); return GPTPS_E_NOMEM; }
     /* The observer first: once the hook is in, items get tagged, and only the observer
@@ -311,11 +347,24 @@ gptps_status gptps_sched_fair(gptps *e, gptps_sched_tenant_fn tenant_fn, void *u
 
 gptps_status gptps_sched_fair_weight(gptps_sched *s, uint64_t id, uint32_t weight)
 {
+    tenant *t;
     if (!s || s->kind != K_FAIR || weight < 1 || weight > FAIR_MAX_WEIGHT) return GPTPS_E_INVAL;
     apx_mutex_lock(&s->mu);
-    tenant_of(s, id)->weight = weight;
+    t = tenant_slot(s, id);       /* a full table: refused, rather than weighting a share
+                                   * this tenant does not have (it used to rewrite slot 0's) */
+    if (t) t->weight = weight;
     apx_mutex_unlock(&s->mu);
-    return GPTPS_OK;
+    return t ? GPTPS_OK : GPTPS_E_FULL;
+}
+
+uint64_t gptps_sched_fair_overflow(const gptps_sched *s)
+{
+    uint64_t n;
+    if (!s || s->kind != K_FAIR) return 0;
+    apx_mutex_lock((apx_mutex *)&s->mu);
+    n = s->overflowed;
+    apx_mutex_unlock((apx_mutex *)&s->mu);
+    return n;
 }
 
 gptps_status gptps_sched_shed_late(gptps *e, uint32_t grace_ms, gptps_sched **out)

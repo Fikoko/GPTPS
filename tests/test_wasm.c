@@ -9,11 +9,21 @@
  * The mock "runs a module" by upper-casing the payload, and fails for any module
  * whose path contains "bad".
  */
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
+#endif
 #include "gptps.h"
 #include "gptps_wasm_exec.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#  include <windows.h>
+static void nap(void) { Sleep(1); }
+#else
+#  include <time.h>
+static void nap(void) { struct timespec ts = { 0, 1000000L }; nanosleep(&ts, NULL); }
+#endif
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -41,10 +51,31 @@ static gptps_status mock_wasm(const char *module, const void *payload, size_t le
     return GPTPS_OK;
 }
 
+/* --- the ctx-aware runtime (gptps_wasm_install_ex) ---
+ * A module containing "spin" never returns by itself: like a runaway wasm loop that
+ * checks for interruption between slices, it only stops when the ctx is cancelled.
+ * With the ctx-less callback there would be nothing to poll, and cancel would hang. */
+static int g_spin_started, g_spin_saw_cancel;
+static gptps_status mock_wasm_ex(gptps_ctx *ctx, const char *module, const void *payload,
+                                 size_t len, void **out_result, size_t *out_len, void *ud)
+{
+    if (strstr(module, "spin")) {
+        unsigned long i;
+        inc(&g_spin_started);
+        for (i = 0; i < 20000ul; ++i) {      /* ~20 s ceiling: a hang fails, not blocks */
+            if (gptps_is_cancelled(ctx)) { inc(&g_spin_saw_cancel); return GPTPS_E_CANCELLED; }
+            nap();
+        }
+        return GPTPS_OK;
+    }
+    return mock_wasm(module, payload, len, out_result, out_len, ud);
+}
+
 /* --- capture results by task name --- */
 static char g_up[64];   static int g_up_len,  g_up_done;
 static char g_oop[64];  static int g_oop_len, g_oop_done;
 static int  g_bad_failed;
+static int  g_ex_done, g_spin_cancelled;
 
 static void on_event(const gptps_event *ev, void *ud)
 {
@@ -55,8 +86,14 @@ static void on_event(const gptps_event *ev, void *ud)
         } else if (strcmp(ev->task_name, "up_oop") == 0 && ev->result_len <= sizeof g_oop) {
             memcpy(g_oop, ev->result, ev->result_len); g_oop_len = (int)ev->result_len; inc(&g_oop_done);
         }
+        else if (strcmp(ev->task_name, "up_ex") == 0 && ev->result_len == 2 &&
+                 memcmp(ev->result, "OK", 2) == 0)
+            inc(&g_ex_done);
     } else if (ev->kind == GPTPS_EV_FAILED && strcmp(ev->task_name, "bad") == 0) {
         inc(&g_bad_failed);
+    } else if (ev->kind == GPTPS_EV_FAILED && strcmp(ev->task_name, "spin") == 0 &&
+               ev->status == GPTPS_E_CANCELLED) {
+        inc(&g_spin_cancelled);
     }
 }
 
@@ -102,6 +139,33 @@ int main(void)
                                         per-task module_path plumbing + error propagation proven */
 
     gptps_wasm_close(w);   /* after shutdown */
+
+    /* In-process cancel reaches a module only through gptps_wasm_install_ex's ctx. */
+    {
+        gptps *e2 = NULL;
+        gptps_wasm *w2;
+        unsigned long waited;
+        CHECK(gptps_open_ex(&cfg, &e2) == GPTPS_OK);
+        if (!e2) return 1;
+        gptps_set_event_cb(e2, on_event, NULL);
+        CHECK(gptps_wasm_install_ex(e2, NULL, NULL) == NULL);
+        w2 = gptps_wasm_install_ex(e2, mock_wasm_ex, NULL);
+        CHECK(w2 != NULL);
+        if (!w2) { gptps_shutdown(e2); return 1; }
+        CHECK(gptps_wasm_register(w2, "up_ex", "/modules/upper.wasm", 0, NULL, NULL) == GPTPS_OK);
+        CHECK(gptps_wasm_register(w2, "spin",  "/modules/spin.wasm",  0, NULL, NULL) == GPTPS_OK);
+        CHECK(gptps_submit(e2, "up_ex", "ok", 2, &h) == GPTPS_OK);
+        CHECK(gptps_submit(e2, "spin", "x", 1, &h) == GPTPS_OK);
+        for (waited = 0; !get(&g_spin_started) && waited < 10000ul; ++waited) nap();
+        CHECK(get(&g_spin_started) == 1);
+        CHECK(gptps_cancel(e2, h) == GPTPS_OK);
+        for (waited = 0; !get(&g_spin_cancelled) && waited < 10000ul; ++waited) nap();
+        CHECK(get(&g_spin_saw_cancel) == 1);   /* the runtime saw the cancel... */
+        CHECK(get(&g_spin_cancelled) == 1);    /* ...and the item ended CANCELLED, promptly */
+        gptps_shutdown(e2);
+        CHECK(get(&g_ex_done) == 1);           /* the ctx-aware path still runs modules */
+        gptps_wasm_close(w2);
+    }
     if (fails) { printf("%d wasm check(s) FAILED\n", fails); return 1; }
     printf("all wasm-executor checks passed\n");
     return 0;

@@ -3,11 +3,12 @@
 /*
  * gptps_remote.h - the GPTPS remote WIRE PROTOCOL (codec only, for now).
  *
- * addons/gptps_xport carries work to other PROCESSES over a socketpair, and its
- * header says the local socketpair "is the only thing standing between this and
- * cross-MACHINE execution: swap it for a TCP socket and the same protocol reaches
- * another host." That is true of the shape and false of the details, and this file
- * exists to make the details honest before any socket is opened.
+ * addons/gptps_xport carries work to other PROCESSES over a socketpair. Its frames
+ * are native-endian and unversioned, which is safe only because both ends are the
+ * same forked binary - so its header says plainly that it is NOT cross-host, and that
+ * a cross-host transport needs this codec. The shape carries over to a network; the
+ * details do not, and this file exists to make the details honest before any socket
+ * is opened.
  *
  * WHY THE CODEC SHIPS AND IS REVIEWED BEFORE THE TRANSPORT
  *
@@ -29,14 +30,22 @@
  *     one. So the wire carries its OWN stable codes and this file maps between them.
  *     An unknown code from a newer peer degrades to GPTPS_E_IO rather than being
  *     reinterpreted as whatever that number means locally.
- *  3. A REQUEST ID. gptps_xport holds a lock across the whole round trip, so it needs
- *     no correlation. That caps a link at one in-flight request - fine at socketpair
- *     latency, and a hard ceiling of a few thousand/sec over a real network no matter
- *     how fast the far side is. req_id is here so a transport CAN multiplex later.
+ *  3. A REQUEST ID. A link that allows one request in flight needs no correlation,
+ *     and is capped at a few thousand round trips/sec over a real network no matter
+ *     how fast the far side is. gptps_xport multiplexes (a u64 id on every frame, a
+ *     reader thread per link, up to max_in_flight outstanding per worker); req_id is
+ *     here so a network transport can do the same.
  *  4. A LENGTH CAP THAT IS A DEFENCE, NOT A SANITY CHECK. gptps_xport allows 256 MiB,
  *     reasonable against your own forked child. From an unauthenticated peer it is a
  *     one-packet memory exhaustion, so the default here is 1 MiB and it is per-link
  *     configurable.
+ *
+ * WHAT VERSION 1 DOES NOT CARRY (YET). gptps_xport's frames have grown since this
+ * codec was frozen: a request also carries the submit options (priority, due time,
+ * the rest of gptps_submit_options), and a reply the last attempt's measurements and
+ * stderr tail. Version 1 has no field for any of them and no extension slot (see
+ * GPTPS_REMOTE_VERSION), so a transport built on it today would drop them; carrying
+ * them needs a version 2.
  *
  * SECURITY, STATED PLAINLY: the `task` field of a request is a dispatch key chosen by
  * the peer. On a listening socket that is REMOTE CODE SELECTION by whoever can

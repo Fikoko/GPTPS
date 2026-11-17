@@ -6,6 +6,7 @@
  * reading the live value back). Headless / portable.
  */
 #include "gptps.h"
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -284,6 +285,88 @@ static void test_pool_size_is_restart_only(void)
     CHECK(__atomic_load_n(&g_hold_peak, __ATOMIC_SEQ_CST) == 2);
 }
 
+/* ---- ABI 2.8: gptps_setting_info carries COPIES of key and desc ----
+ * `key` and `desc` are borrowed from the registry and freed when the task they belong
+ * to is unregistered - by another thread, possibly, while a dashboard is still
+ * printing them. The copies stay: read them after the task is gone (an ASan build
+ * flags any use of the borrowed ones here). A struct sized to the 1.0 layout is still
+ * accepted (the floor was `sizeof`, which would have refused every older caller the
+ * day the struct grew) and nothing past it is written. A key too long for the copy
+ * gives "", never a shortened key; a long description is cut at a character. */
+static size_t dummy_rd(void *t, char *b, size_t c) { (void)t; return (size_t)snprintf(b, c, "1"); }
+static gptps_status dummy_wr(void *t, const char *v) { (void)t; (void)v; return GPTPS_OK; }
+
+static void test_info_copies(void)
+{
+    gptps *e = NULL;
+    gptps_setting_info info;
+    size_t i, n, at = (size_t)-1;
+    char longkey[GPTPS_SETTINGS_VALUE_MAX + 40], desc[GPTPS_SETTINGS_VALUE_MAX + 40];
+    gptps_setting_def d;
+    CHECK(gptps_open(NULL, &e) == GPTPS_OK);
+    if (!e) return;
+    reg(e, "gone");
+    n = gptps_settings_count(e);
+    for (i = 0; i < n; ++i) {
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        if (gptps_settings_get_info(e, i, &info) == GPTPS_OK && strncmp(info.key, "tasks.gone.", 11) == 0) { at = i; break; }
+    }
+    CHECK(at != (size_t)-1);
+    {   /* gptps_task_info.name_copy (ABI 2.8), the same way */
+        gptps_task_info ti;
+        size_t k, nt = gptps_task_count(e);
+        for (k = 0; k < nt; ++k) {
+            memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+            if (gptps_task_get_info(e, k, &ti) == GPTPS_OK && strcmp(ti.name, "gone") == 0) break;
+        }
+        CHECK(k < nt && strcmp(ti.name_copy, "gone") == 0);
+    }
+    CHECK(strncmp(info.key_copy, "tasks.gone.", 11) == 0);
+    CHECK(strcmp(info.key_copy, info.key) == 0);
+    CHECK(gptps_unregister_task(e, "gone", GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);   /* frees info.key */
+    CHECK(strncmp(info.key_copy, "tasks.gone.", 11) == 0);                             /* the copy stays */
+
+    /* the 1.0 layout: accepted, and nothing past defval touched */
+    {
+        unsigned char raw[sizeof(gptps_setting_info)];
+        gptps_setting_info *old = (gptps_setting_info *)(void *)raw;
+        size_t floor = offsetof(gptps_setting_info, defval) + sizeof old->defval;
+        memset(raw, 0xAB, sizeof raw);
+        old->struct_size = floor;
+        CHECK(gptps_settings_get_info(e, 0, old) == GPTPS_OK);
+        for (i = floor; i < sizeof raw; ++i) if (raw[i] != 0xAB) break;
+        CHECK(i == sizeof raw);
+        old->struct_size = floor - 1;
+        CHECK(gptps_settings_get_info(e, 0, old) == GPTPS_E_INVAL);
+    }
+
+    /* a key that does not fit the copy, and a description cut inside a character */
+    memset(longkey, 'k', sizeof longkey - 1); longkey[sizeof longkey - 1] = 0;
+    memcpy(longkey, "app.", 4);
+    desc[0] = 'x'; desc[1] = 'x';                         /* then u-umlauts: byte 255 is a lead byte */
+    for (i = 2; i + 2 < sizeof desc; i += 2) { desc[i] = (char)0xC3; desc[i + 1] = (char)0xBC; }
+    desc[i] = 0;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = longkey; d.type = GPTPS_SETTING_UINT; d.desc = desc; d.hot = 1;
+    d.read = dummy_rd; d.write = dummy_wr;
+    CHECK(gptps_register_setting(e, &d) == GPTPS_OK);
+    n = gptps_settings_count(e);
+    for (i = 0; i < n; ++i) {
+        memset(&info, 0, sizeof info); info.struct_size = sizeof info;
+        if (gptps_settings_get_info(e, i, &info) == GPTPS_OK && strcmp(info.key, longkey) == 0) break;
+    }
+    CHECK(i < n);
+    CHECK(info.key_copy[0] == 0);                         /* not a shortened key */
+    {
+        size_t dl = strlen(info.desc_copy);
+        CHECK(dl > 0 && dl < sizeof info.desc_copy);
+        CHECK(dl == sizeof info.desc_copy - 2);           /* 254: the character at 254..255 left out whole */
+        CHECK(memcmp(info.desc_copy, desc, dl) == 0);
+        CHECK(((unsigned char)info.desc_copy[dl - 1] & 0xC0u) == 0x80u);   /* ends on a whole character */
+    }
+    gptps_shutdown(e);
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -307,16 +390,26 @@ int main(void)
     CHECK(has_key(e, "stats.dead_letters_evicted"));
     CHECK(has_key(e, "scheduler.reserve_after_skips"));
 
-    /* a task adds its nine knobs: six, and the three process caps of ABI 2.6 */
+    /* a task adds its eleven knobs: six, the three process caps of ABI 2.6, and
+     * (1.10) the two PROGRAM numbers of ABI 2.7 */
     reg(e, "work");
-    CHECK(gptps_settings_count(e) == core_n + 9);
+    CHECK(gptps_settings_count(e) == core_n + 11);
     CHECK(has_key(e, "tasks.work.timeout_seconds"));
     CHECK(has_key(e, "tasks.work.on_failure"));
     CHECK(has_key(e, "tasks.work.cpu_max_millicpus"));
     CHECK(has_key(e, "tasks.work.io_max_read_bps"));
     CHECK(has_key(e, "tasks.work.io_max_write_bps"));
+    CHECK(has_key(e, "tasks.work.stop_grace_ms"));
+    CHECK(has_key(e, "tasks.work.stderr_tail_bytes"));
     reg(e, "bulk");
-    CHECK(gptps_settings_count(e) == core_n + 18);
+    CHECK(gptps_settings_count(e) == core_n + 22);
+    /* their ranges are the executor's caps: past them a value is refused, not clamped */
+    CHECK(gptps_settings_set(e, "tasks.work.stop_grace_ms", "300000") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.work.stop_grace_ms", "300001") != GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.work.stderr_tail_bytes", "65536") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.work.stderr_tail_bytes", "65537") != GPTPS_OK);
+    CHECK(gptps_settings_get(e, "tasks.work.stop_grace_ms", buf, sizeof buf) == GPTPS_OK && strcmp(buf, "300000") == 0);
+    CHECK(gptps_settings_get(e, "tasks.work.stderr_tail_bytes", buf, sizeof buf) == GPTPS_OK && strcmp(buf, "65536") == 0);
 
     /* get a default */
     CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", buf, sizeof buf) == GPTPS_OK);
@@ -414,6 +507,7 @@ int main(void)
     test_range_and_escape();
     test_string_buffers();
     test_pool_size_is_restart_only();
+    test_info_copies();
 
     if (fails) { printf("%d settings check(s) FAILED\n", fails); return 1; }
     printf("all settings checks passed\n");

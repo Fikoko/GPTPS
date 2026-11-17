@@ -11,6 +11,10 @@
  * RLIMIT_AS, covered by test_oop. A GPTPS_CGROUP_PARENT already set names a
  * delegated parent to use as it is: CI's cgroup step makes one by hand, and runs
  * this test (and test_measure) inside it.
+ *
+ * Also: a job's cgroup is removed when the job ends - all of it when GPTPS stopped
+ * the job (a process that left its process group too), and, when the job ended on
+ * its own and left a process running, once that process has gone, with one WARN.
  */
 #define _POSIX_C_SOURCE 200809L
 #include "gptps.h"
@@ -18,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -235,6 +241,116 @@ static int io_delegated(const char *parent)
     return ok;
 }
 
+/* ---- the job's cgroup is removed (PROGRAM jobs, through /bin/sh) ---- */
+static int g_cg_warns, g_left_ok, g_left_done, g_stopped_st;
+static void on_cg_log(gptps_log_level lvl, const char *msg, void *ud)
+{
+    (void)ud;
+    if (lvl == GPTPS_LOG_WARN && msg && strstr(msg, "cgroup") && strstr(msg, "cannot be removed")) inc(&g_cg_warns);
+}
+static void on_cg_ev(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind != GPTPS_EV_FINISHED && ev->kind != GPTPS_EV_FAILED) return;
+    if (ev->kind == GPTPS_EV_FINISHED) inc(&g_left_ok);
+    else __atomic_store_n(&g_stopped_st, (int)ev->status, __ATOMIC_SEQ_CST);
+    inc(&g_left_done);
+}
+static int job_cgroups(const char *parent)       /* gptps.* under the parent */
+{
+    DIR *d = opendir(parent);
+    struct dirent *de;
+    int n = 0;
+    if (!d) return -1;
+    while ((de = readdir(d)) != NULL) if (strncmp(de->d_name, "gptps.", 6) == 0) ++n;
+    closedir(d);
+    return n;
+}
+/* there and not a zombie: an init that does not reap (a container's) keeps those */
+static int running(long pid)
+{
+    char path[64], st[512], *rp;
+    FILE *f;
+    size_t n;
+    if (kill((pid_t)pid, 0) != 0) return 0;
+    snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+    if (!(f = fopen(path, "r"))) return 0;
+    n = fread(st, 1, sizeof st - 1, f);
+    fclose(f);
+    st[n] = 0;
+    rp = strrchr(st, ')');
+    return !(rp && rp[1] == ' ' && (rp[2] == 'Z' || rp[2] == 'X'));
+}
+static void def_sh(gptps_task_def *d, const char *name, const char *const *argv, uint32_t timeout_s)
+{
+    memset(d, 0, sizeof *d);
+    d->struct_size = sizeof *d; d->name = name; d->exec = GPTPS_EXEC_PROGRAM; d->argv = argv;
+    d->default_cost.struct_size = sizeof d->default_cost;
+    d->default_cost.mem_bytes = 64u << 20;       /* a cap, so the job has a cgroup */
+    d->default_policy.struct_size = sizeof d->default_policy;
+    d->default_policy.timeout_seconds = timeout_s;
+}
+static void sleep_ms(unsigned ms)
+{
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u); ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0) { }
+}
+static void cgroup_removal(const char *parent, const gptps_config *cfg)
+{
+    static const char *const a_left[] = { "/bin/sh", "-c", "sleep 2 </dev/null >/dev/null 2>&1 & echo ok", NULL };
+    static const char *const a_quick[] = { "/bin/sh", "-c", "echo ok", NULL };
+    static const char *const a_esc[] = { "/bin/sh", "-c",
+        "setsid sh -c 'echo $$ > gptps_cg_escapee.txt; exec sleep 30' </dev/null >/dev/null 2>&1 & sleep 30", NULL };
+    gptps *e = NULL;
+    gptps_task_def d;
+    int base = job_cgroups(parent), t;
+    long esc = 0;
+    FILE *f;
+    gptps_set_log_sink(on_cg_log, NULL);
+    CHECK(gptps_open_ex(cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    gptps_set_event_cb(e, on_cg_ev, NULL);
+    def_sh(&d, "left", a_left, 0);  CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    def_sh(&d, "quick", a_quick, 0); CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    def_sh(&d, "esc", a_esc, 1);     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+
+    /* 1) ended on its own, left `sleep 2` running: the cgroup stays while it runs,
+     * and that is said */
+    CHECK(gptps_submit(e, "left", NULL, 0, NULL) == GPTPS_OK);
+    for (t = 0; t < 1000 && __atomic_load_n(&g_left_done, __ATOMIC_SEQ_CST) < 1; ++t) sleep_ms(10);
+    CHECK(get(&g_left_ok) == 1);
+    CHECK(job_cgroups(parent) == base + 1);
+    CHECK(get(&g_cg_warns) == 1);
+    /* ... and is removed once it has gone, when a later job ends */
+    sleep_ms(2500);
+    CHECK(gptps_submit(e, "quick", NULL, 0, NULL) == GPTPS_OK);
+    for (t = 0; t < 1000 && __atomic_load_n(&g_left_done, __ATOMIC_SEQ_CST) < 2; ++t) sleep_ms(10);
+    CHECK(job_cgroups(parent) == base);
+    CHECK(get(&g_cg_warns) == 1);                   /* said once */
+
+    /* 2) stopped by its deadline: everything in its cgroup goes, a process that left
+     * the job's process group too, and so does the cgroup */
+    remove("gptps_cg_escapee.txt");
+    CHECK(gptps_submit(e, "esc", NULL, 0, NULL) == GPTPS_OK);
+    for (t = 0; t < 1000 && __atomic_load_n(&g_left_done, __ATOMIC_SEQ_CST) < 3; ++t) sleep_ms(10);
+    CHECK(__atomic_load_n(&g_stopped_st, __ATOMIC_SEQ_CST) == (int)GPTPS_E_TIMEOUT);
+    if ((f = fopen("gptps_cg_escapee.txt", "r")) != NULL) {
+        if (fscanf(f, "%ld", &esc) != 1) esc = 0;
+        fclose(f);
+    }
+    CHECK(esc > 1);
+    if (esc > 1) {
+        for (t = 0; t < 100 && running(esc); ++t) sleep_ms(10);
+        CHECK(!running(esc));
+        if (running(esc)) kill((pid_t)esc, SIGKILL);
+    }
+    CHECK(job_cgroups(parent) == base);
+    gptps_shutdown(e);
+    gptps_set_log_sink(NULL, NULL);
+    remove("gptps_cg_escapee.txt");
+}
+
 static void def_oop(gptps_task_def *d, const char *name, gptps_run_fn run)
 {
     memset(d, 0, sizeof *d);
@@ -313,6 +429,8 @@ int main(void)
             CHECK(get(&c_io_capped) == 1);           /* the job's own cgroup holds both limits */
         }
     }
+
+    cgroup_removal(parent, &cfg);
 
     if (g_owned) rmdir(parent); /* GPTPS removed its per-task children already */
     if (fails) { printf("%d cgroup check(s) FAILED\n", fails); return 1; }

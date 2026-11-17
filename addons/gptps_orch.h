@@ -21,6 +21,12 @@
  * completed handles for the process lifetime - prune in a long-running host).
  * Deps within one gate must be distinct.
  *
+ * Memory: a held gate keeps a copy of its task name, payload and dependencies until it
+ * is submitted, and frees them then - the orchestrator holds only the gates still
+ * waiting, and the abandoned ones (see STALLED GATES and
+ * gptps_orch_discard_stalled). The completed-handle set is the other thing that
+ * grows; see gptps_orch_install_ex.
+ *
  * WHAT COUNTS AS "TERMINAL" - and what never gets there:
  *   A dependency is satisfied by the LAST event its handle will ever produce:
  *   FINISHED, DROPPED, DEAD_LETTERED, or FAILED carrying GPTPS_E_CANCELLED.
@@ -154,6 +160,13 @@ gptps_status gptps_orch_stalled_at(gptps_orch *o, size_t index,
  * on an idle engine there may never be another one. Gates that are refused again
  * are simply abandoned again. */
 size_t gptps_orch_retry(gptps_orch *o);
+
+/* Free every abandoned gate - its task name, payload copy and dependencies - without
+ * submitting it; returns how many. Abandoned gates are kept, payload and all, until
+ * this, gptps_orch_retry submits them, or gptps_orch_close: they are what
+ * gptps_orch_stalled_at reports. Call it once you have read them and decided they are
+ * not to run. */
+size_t gptps_orch_discard_stalled(gptps_orch *o);
 
 /* Free the orchestrator. Call AFTER gptps_shutdown(e) so no observer fires. */
 void gptps_orch_close(gptps_orch *o);

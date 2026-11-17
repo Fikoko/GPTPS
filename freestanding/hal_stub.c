@@ -80,7 +80,17 @@ gptps_dl *gptps_dl_open(const char *path) { (void)path; return 0; }
 void     *gptps_dl_sym(gptps_dl *h, const char *symbol) { (void)h; (void)symbol; return 0; }
 void      gptps_dl_close(gptps_dl *h) { (void)h; }
 void      gptps_dl_release(gptps_dl *h) { (void)h; }
+size_t    gptps_dl_error(char *buf, size_t cap)
+{
+    static const char why[] = "this build has no dynamic loading";
+    size_t i = 0;
+    if (!buf || !cap) return 0;
+    for (; why[i] && i + 1 < cap; ++i) buf[i] = why[i];
+    buf[i] = 0;
+    return i;
+}
 
 /* --- atomic file replace: no filesystem ----------------------------------- */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
 { (void)tmp_path; (void)final_path; return GPTPS_E_IO; }
+FILE *gptps_hal_open_private(const char *path) { (void)path; return 0; }

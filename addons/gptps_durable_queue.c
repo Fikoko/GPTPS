@@ -30,6 +30,7 @@
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
+#  define _FILE_OFFSET_BITS 64   /* a 64-bit off_t for ftello/fseeko on 32-bit builds too */
 #endif
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #  define _DARWIN_C_SOURCE   /* F_FULLFSYNC: see apx_fsync_fd in addon_compat.h */
@@ -190,8 +191,9 @@ struct gptps_dq {
     int             fd;        /* SMU, changed under JMU too: fp's descriptor, -1 with none */
     dq_waiter      *waiters;   /* SMU */
     uint64_t        tickets;   /* SMU: durable writes issued */
-    long            last_end;  /* SMU: the file offset just past the newest durable write */
-    long            synced;    /* SMU: every byte below it is on disk */
+    apx_off         last_end;  /* SMU: the file offset just past the newest durable write;
+                                * -1 when the newest one's offset could not be read */
+    apx_off         synced;    /* SMU: every byte below it is on disk; -1: not known */
     int             syncing;   /* SMU: an fsync is running; its caller holds no lock */
     int             dir_dirty; /* SMU: a compaction's rename is not known durable yet */
 };
@@ -359,12 +361,13 @@ static int write_record(FILE *f, char type, uint64_t seq,
  * The DQ_FHDR_LEN floor is a safety net, not an optimisation: every legitimate
  * rollback point is at or past the file header (do_rewrite always writes it
  * first), so an offset below it means ftell lied - an append-mode stream that has
- * not been repositioned reports 0 on the Windows CRT, and ftell returns -1 past
- * LONG_MAX on 32-bit builds. Truncating on such an offset would erase the whole
+ * not been repositioned reports 0 on the Windows CRT - or failed (-1). Offsets are
+ * 64-bit (apx_off, addon_compat.h): a `long` stopped at 2 GiB on Windows, where every
+ * offset past it read as -1 and the group commit's `synced` went stale. Truncating on such an offset would erase the whole
  * journal; refusing leaves at worst a torn record, which replay() already
  * handles - for a marker. A write whose failure is about to be reported must not stay
  * in the file, so for that one a refusal breaks the queue (see cut_back). */
-static int rollback_to(FILE *f, long start)
+static int rollback_to(FILE *f, apx_off start)
 {
     int rc;
     if (!f) return -1;
@@ -372,7 +375,7 @@ static int rollback_to(FILE *f, long start)
     if (start < DQ_FHDR_LEN) return -1;
     fflush(f);
     clearerr(f);
-    rc = (apx_truncate(f, start) == 0 && fseek(f, start, SEEK_SET) == 0) ? 0 : -1;
+    rc = (apx_truncate(f, start) == 0 && apx_fseek(f, start, SEEK_SET) == 0) ? 0 : -1;
     clearerr(f);
     return rc;
 }
@@ -465,11 +468,11 @@ static void warn_if_broke(gptps_dq *dq)
  * nobody was told otherwise. Caller holds mu, not jmu. */
 static void append_marker(gptps_dq *dq, char type, uint64_t seq)
 {
-    long start;
+    apx_off start;
     apx_mutex_lock(&dq->jmu);
     if (dq->fp && !dq->broken) {   /* else lost: see "a broken queue" */
-        fseek(dq->fp, 0, SEEK_END);   /* see write_durable */
-        start = ftell(dq->fp);
+        apx_fseek(dq->fp, 0, SEEK_END);   /* see write_durable */
+        start = apx_ftell(dq->fp);
         if (write_record(dq->fp, type, seq, "", NULL, 0) != 0 || fflush(dq->fp) != 0)
             (void)rollback_to(dq->fp, start);
     }
@@ -477,15 +480,19 @@ static void append_marker(gptps_dq *dq, char type, uint64_t seq)
 }
 
 /* Link `w` into the waiter list, for a write of `type` about seq .. seq_end that ends
- * the file at `end` (-1: a cut, which ends nothing). Caller holds jmu. */
+ * the file at `end` (a cut ends nothing, and passes -1). For a write, -1 means its end
+ * could not be read: last_end becomes "not known", and so does `synced` once an fsync
+ * covers it, so a later failed fsync breaks the queue instead of cutting the file back
+ * to an offset that is no longer the last good one (see sync_until). It used to be
+ * skipped, which left last_end at the previous write's end. Caller holds jmu. */
 static void register_waiter(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
-                            uint64_t seq_end, long end)
+                            uint64_t seq_end, apx_off end)
 {
     apx_mutex_lock(&dq->smu);
     w->ticket = ++dq->tickets; w->seq = seq; w->seq_end = seq_end; w->type = type;
     w->state = DQ_W_WAITING;
     w->next = dq->waiters; dq->waiters = w;
-    if (end >= 0) dq->last_end = end;
+    if (type != DQ_W_CUT) dq->last_end = end < 0 ? -1 : end;
     apx_mutex_unlock(&dq->smu);
 }
 
@@ -494,7 +501,7 @@ static void register_waiter(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
  * that makes it durable - before reporting the failure (see "group commit"). -1 then;
  * -2 if the file could not be cut back, which breaks the queue, `w` not registered.
  * Caller holds jmu. */
-static int cut_back(gptps_dq *dq, dq_waiter *w, long start, uint64_t seq, uint64_t seq_end)
+static int cut_back(gptps_dq *dq, dq_waiter *w, apx_off start, uint64_t seq, uint64_t seq_end)
 {
     if (rollback_to(dq->fp, start) != 0) { break_queue(dq); return -2; }
     register_waiter(dq, w, DQ_W_CUT, seq, seq_end, -1);
@@ -510,7 +517,7 @@ static int cut_back(gptps_dq *dq, dq_waiter *w, long start, uint64_t seq, uint64
 static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
                          const char *name, const void *payload, size_t plen, const dq_opts *o)
 {
-    long start;
+    apx_off start;
     unsigned char ob[DQ_OPTS_LEN];
     if (!dq->fp || dq->broken) return -2;   /* see "a broken queue" */
     /* Seek to EOF before sampling the rollback point. C99 leaves an append
@@ -518,15 +525,15 @@ static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
      * documents it as the START of the file until the first I/O, so the first
      * append after open/compact would otherwise roll back to offset 0 - i.e.
      * truncate every recovered record away on a transient ENOSPC. */
-    fseek(dq->fp, 0, SEEK_END);
-    start = ftell(dq->fp);
+    apx_fseek(dq->fp, 0, SEEK_END);
+    start = apx_ftell(dq->fp);
     if (o && o->flags) opts_encode(ob, o);
     /* the 'O' rides in the same write and the same fsync as its 'P' (see "submit options") */
     if (write_record(dq->fp, type, seq, name, payload, plen) != 0 ||
         (o && o->flags && write_record(dq->fp, 'O', seq, "", ob, sizeof ob) != 0) ||
         fflush(dq->fp) != 0)
         return cut_back(dq, w, start, seq, seq);
-    register_waiter(dq, w, type, seq, seq, ftell(dq->fp));
+    register_waiter(dq, w, type, seq, seq, apx_ftell(dq->fp));
     return 0;
 }
 
@@ -536,19 +543,19 @@ static int write_durable(gptps_dq *dq, dq_waiter *w, char type, uint64_t seq,
 static int write_durable_batch(gptps_dq *dq, dq_waiter *w, const gptps_dq_item *items,
                                size_t n, uint64_t first, const dq_opts *o)
 {
-    long start;
+    apx_off start;
     size_t i;
     unsigned char ob[DQ_OPTS_LEN];
     if (o && o->flags) opts_encode(ob, o);
     if (!dq->fp || dq->broken) return -2;
-    fseek(dq->fp, 0, SEEK_END);       /* see write_durable */
-    start = ftell(dq->fp);
+    apx_fseek(dq->fp, 0, SEEK_END);   /* see write_durable */
+    start = apx_ftell(dq->fp);
     for (i = 0; i < n; ++i)
         if (write_record(dq->fp, 'P', first + i, items[i].task_name, items[i].payload, items[i].len) != 0 ||
             (o && o->flags && write_record(dq->fp, 'O', first + i, "", ob, sizeof ob) != 0))
             return cut_back(dq, w, start, first, first + n - 1);
     if (fflush(dq->fp) != 0) return cut_back(dq, w, start, first, first + n - 1);
-    register_waiter(dq, w, 'P', first, first + n - 1, ftell(dq->fp));
+    register_waiter(dq, w, 'P', first, first + n - 1, apx_ftell(dq->fp));
     return 0;
 }
 
@@ -576,8 +583,8 @@ static void sync_until(gptps_dq *dq, const dq_waiter *w)
         if (w ? w->state != DQ_W_WAITING : (!dq->syncing && !any_waiting(dq))) break;
         if (!dq->syncing && any_waiting(dq)) {
             uint64_t upto = dq->tickets;
-            long     end  = dq->last_end;
-            long     good = dq->synced;   /* only this caller moves it until syncing clears */
+            apx_off  end  = dq->last_end;   /* -1: not known (see register_waiter) */
+            apx_off  good = dq->synced;     /* only this caller moves it until syncing clears */
             int      fd   = dq->fd;
             int      dir  = dq->dir_dirty;
             int      rc;
@@ -588,7 +595,8 @@ static void sync_until(gptps_dq *dq, const dq_waiter *w)
             if (rc == 0) {
                 apx_mutex_lock(&dq->smu);
                 settle(dq, upto, DQ_W_DURABLE);
-                if (end > dq->synced) dq->synced = end;
+                if (end < 0) dq->synced = -1;             /* a cut there would be blind */
+                else if (end > dq->synced) dq->synced = end;
                 if (dir) dq->dir_dirty = 0;   /* no compaction runs while syncing is set */
             } else {
                 /* Cut back to the last good fsync, and make the cut durable BEFORE
@@ -596,7 +604,7 @@ static void sync_until(gptps_dq *dq, const dq_waiter *w)
                  * above). jmu is held across that fsync, so no write lands between the
                  * cut and it; it is the failure path, and no other fsync is running. */
                 apx_mutex_lock(&dq->jmu);     /* jmu before smu, always */
-                if (rollback_to(dq->fp, good) != 0 || apx_fsync(dq->fp) != 0) break_queue(dq);
+                if (rollback_to(dq->fp, good) != 0 || apx_fsync(dq->fp) != 0) break_queue(dq);   /* good < 0: refused */
                 apx_mutex_lock(&dq->smu);
                 settle(dq, UINT64_MAX, DQ_W_FAILED);
                 dq->last_end = good;
@@ -794,8 +802,8 @@ static dq_rec *find_open(gptps_dq *dq, gptps_handle h)
  * loses nothing more by being compacted, so there the open goes on, warning that the
  * copy failed - as it did before.
  *
- * Offsets are longs. Past LONG_MAX (2 GiB with a 32-bit long) ftell cannot report the
- * size, and replay then reads as it always did: up to the first record that does not
+ * Offsets are 64-bit (apx_off). Should the size still not be known - apx_ftell
+ * failed - replay reads as it always did: up to the first record that does not
  * verify. Running out of memory fails the open instead of compacting away what could
  * not be loaded, and so does a read that fails: a bad sector, EIO, a journal this
  * process may not read. Replay used to take a failed fopen for "no journal yet" and a
@@ -821,7 +829,7 @@ typedef struct {               /* one record as read, before it is applied */
 
 /* Read the record at the stream's position, `left` bytes before the end of the file
  * (-1: unknown). On DQ_READ_OK, r->body is the caller's to free. */
-static int read_rec(FILE *f, long left, dq_raw *r)
+static int read_rec(FILE *f, apx_off left, dq_raw *r)
 {
     unsigned char hdr[DQ_RHDR_LEN];
     size_t got, blen;
@@ -835,7 +843,7 @@ static int read_rec(FILE *f, long left, dq_raw *r)
     r->type = (char)hdr[4]; r->nlen = get16(hdr + 6); r->plen = get32(hdr + 8); r->seq = get64(hdr + 12);
     if (r->nlen > DQ_MAX_NAME || r->plen > DQ_MAX_PAYLOAD) return DQ_READ_BAD;
     blen = (size_t)r->nlen + r->plen + 4;
-    if (left > 0 && (size_t)left < DQ_RHDR_LEN + blen) return DQ_READ_TORN;
+    if (left > 0 && left < (apx_off)(DQ_RHDR_LEN + blen)) return DQ_READ_TORN;
     r->body = (unsigned char *)malloc(blen);
     if (!r->body) return DQ_READ_NOMEM;
     crc = fnv(hdr, DQ_RHDR_LEN, DQ_FNV_SEED);
@@ -850,32 +858,32 @@ static int read_rec(FILE *f, long left, dq_raw *r)
 /* After a record at `bad` that does not verify: the offset of the next record that
  * does, and that may stand there (see above), with the stream left at it; -1 if there
  * is none before `end`; -2 out of memory or a failed read. */
-static long resync(FILE *f, long bad, long end, uint64_t last_p)
+static apx_off resync(FILE *f, apx_off bad, apx_off end, uint64_t last_p)
 {
     unsigned char buf[4096];
-    long base = bad + 1;
+    apx_off base = bad + 1;
     while (end - base >= DQ_RHDR_LEN + 4) {
         size_t want = sizeof buf, got, i;
-        if ((long)want > end - base) want = (size_t)(end - base);
-        if (fseek(f, base, SEEK_SET) != 0) return -1;
+        if ((apx_off)want > end - base) want = (size_t)(end - base);
+        if (apx_fseek(f, base, SEEK_SET) != 0) return -1;
         got = fread(buf, 1, want, f);
         if (ferror(f)) return -2;
         if (got < 4) return -1;
         for (i = 0; i + 4 <= got; ++i) {
-            long at = base + (long)i;
+            apx_off at = base + (apx_off)i;
             dq_raw r;
             int k;
             if (get32(buf + i) != DQ_REC_MAGIC) continue;
-            if (fseek(f, at, SEEK_SET) != 0) return -1;
+            if (apx_fseek(f, at, SEEK_SET) != 0) return -1;
             k = read_rec(f, end - at, &r);
             if (k == DQ_READ_NOMEM || k == DQ_READ_ERR) return -2;
             if (k != DQ_READ_OK) continue;
             free(r.body);
             if (r.type == 'P' && r.seq <= last_p) continue;   /* stale, or not a record at all */
-            if (fseek(f, at, SEEK_SET) != 0) return -1;
+            if (apx_fseek(f, at, SEEK_SET) != 0) return -1;
             return at;
         }
-        base += (long)got - 3;   /* a magic may straddle the next chunk */
+        base += (apx_off)got - 3;   /* a magic may straddle the next chunk */
     }
     return -1;
 }
@@ -926,8 +934,8 @@ static int apply_rec(gptps_dq *dq, const dq_raw *r)
 
 typedef struct {
     int           regions;     /* damaged regions found */
-    long          first;       /* offset of the first */
-    unsigned long bytes;       /* damaged bytes skipped, or not read past a cut */
+    apx_off       first;       /* offset of the first */
+    apx_off       bytes;       /* damaged bytes skipped, or not read past a cut */
     int           cut;         /* stopped at damage that cannot be told from a torn write */
 } dq_damage;
 
@@ -937,7 +945,7 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
 {
     FILE *f = fopen(dq->path, "rb");
     unsigned char fh[DQ_FHDR_LEN];
-    long end = -1, pos = DQ_FHDR_LEN;
+    apx_off end = -1, pos = DQ_FHDR_LEN;
     uint64_t last_p = 0;
     size_t r;
     memset(dmg, 0, sizeof *dmg);
@@ -948,11 +956,11 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
     if (r < DQ_FHDR_LEN || get32(fh) != DQ_FILE_MAGIC || get32(fh + 4) != DQ_VERSION) {
         fclose(f); return -1;                         /* corrupt header */
     }
-    if (fseek(f, 0, SEEK_END) == 0) end = ftell(f);
-    if (fseek(f, DQ_FHDR_LEN, SEEK_SET) != 0) { fclose(f); return -1; }
+    if (apx_fseek(f, 0, SEEK_END) == 0) end = apx_ftell(f);
+    if (apx_fseek(f, DQ_FHDR_LEN, SEEK_SET) != 0) { fclose(f); return -1; }
     for (;;) {
         dq_raw rr;
-        long next;
+        apx_off next;
         int k = read_rec(f, end < 0 ? -1 : end - pos, &rr);
         if (k == DQ_READ_END) break;
         if (k == DQ_READ_NOMEM || k == DQ_READ_ERR) { fclose(f); return -1; }
@@ -964,10 +972,10 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
              * work stayed pending and ran again, and a dead-lettered record was not
              * quarantined. And any seq past DQ_MAX_SEQ (see there). Both are damage, as
              * resync already judges such a 'P' it finds: skipped whole, and reported. */
-            long len = DQ_RHDR_LEN + (long)rr.nlen + (long)rr.plen + 4;
+            apx_off len = DQ_RHDR_LEN + (apx_off)rr.nlen + (apx_off)rr.plen + 4;
             free(rr.body);
             if (!dmg->regions++) dmg->first = pos;
-            dmg->bytes += (unsigned long)len;
+            dmg->bytes += len;
             pos += len;
             continue;
         }
@@ -976,12 +984,12 @@ static int replay(gptps_dq *dq, dq_damage *dmg)
             if (next == -2) { fclose(f); return -1; }
             if (next < 0) break;                      /* a torn tail */
             if (!dmg->regions++) dmg->first = pos;
-            if (k == DQ_READ_TORN) { dmg->cut = 1; dmg->bytes += (unsigned long)(end - pos); break; }
-            dmg->bytes += (unsigned long)(next - pos);
+            if (k == DQ_READ_TORN) { dmg->cut = 1; dmg->bytes += end - pos; break; }
+            dmg->bytes += next - pos;
             pos = next;
             continue;
         }
-        pos += DQ_RHDR_LEN + (long)rr.nlen + (long)rr.plen + 4;
+        pos += DQ_RHDR_LEN + (apx_off)rr.nlen + (apx_off)rr.plen + 4;
         if (rr.type == 'P' && rr.seq > last_p) last_p = rr.seq;
         k = apply_rec(dq, &rr);
         free(rr.body);
@@ -1105,16 +1113,16 @@ static void report_damage(const gptps_dq *dq, const dq_damage *d, const char *co
                               : "The original could not be preserved.";
     if (d->cut)
         snprintf(msg, sizeof msg,
-                 "gptps_durable_queue: %s is damaged at byte %ld, where a record claims more "
-                 "bytes than the file holds, and valid records follow; the %lu bytes from there "
+                 "gptps_durable_queue: %s is damaged at byte %lld, where a record claims more "
+                 "bytes than the file holds, and valid records follow; the %lld bytes from there "
                  "were not read. %s%s",
-                 dq->path, d->first, d->bytes, kept, copy ? copy : "");
+                 dq->path, (long long)d->first, (long long)d->bytes, kept, copy ? copy : "");
     else
         snprintf(msg, sizeof msg,
-                 "gptps_durable_queue: %s is damaged: %lu byte(s) in %d place(s), the first at "
-                 "byte %ld - unreadable, or a record numbered as no writer numbers one - were "
+                 "gptps_durable_queue: %s is damaged: %lld byte(s) in %d place(s), the first at "
+                 "byte %lld - unreadable, or a record numbered as no writer numbers one - were "
                  "skipped and every valid record after them kept; whatever they held is lost. %s%s",
-                 dq->path, d->bytes, d->regions, d->first, kept, copy ? copy : "");
+                 dq->path, (long long)d->bytes, d->regions, (long long)d->first, kept, copy ? copy : "");
     gptps_log(NULL, GPTPS_LOG_WARN, msg);
 }
 
@@ -1122,7 +1130,7 @@ static void report_damage(const gptps_dq *dq, const dq_damage *d, const char *co
 static void reopen_append(gptps_dq *dq)
 {
     dq->fp = fopen(dq->path, "ab");
-    if (dq->fp) fseek(dq->fp, 0, SEEK_END);   /* an append stream's position is not portable */
+    if (dq->fp) apx_fseek(dq->fp, 0, SEEK_END);   /* an append stream's position is not portable */
     apx_mutex_lock(&dq->smu);
     dq->fd = dq->fp ? apx_fileno(dq->fp) : -1;
     apx_mutex_unlock(&dq->smu);
@@ -1140,7 +1148,7 @@ static gptps_status do_rewrite(gptps_dq *dq, int *replaced)
     size_t tn = strlen(dq->path) + 5, i, keep = 0;
     char *tmp = (char *)malloc(tn);
     FILE *t;
-    long end;
+    apx_off end;
     int reopened, dirty, had;
     *replaced = 0;
     if (!tmp) return GPTPS_E_NOMEM;
@@ -1219,7 +1227,7 @@ static gptps_status do_rewrite(gptps_dq *dq, int *replaced)
     free(tmp);
     reopen_append(dq);
     reopened = (dq->fp != NULL);
-    end = reopened ? ftell(dq->fp) : -1;
+    end = reopened ? apx_ftell(dq->fp) : -1;
     apx_mutex_lock(&dq->smu);
     dq->synced = dq->last_end = end;   /* the whole new file was fsync'd before the rename */
     dq->dir_dirty = dirty;

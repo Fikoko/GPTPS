@@ -32,6 +32,8 @@
 #include <dlfcn.h>
 #include <signal.h>   /* sig_atomic_t: the pthread_atfork child flag */
 #include <sys/stat.h> /* the replaced file's permission bits, kept by atomic_replace */
+#include <fcntl.h>    /* atomic_replace: open, F_FULLFSYNC */
+#include <errno.h>
 #if defined(__linux__)
 #  include <sys/sysinfo.h>
 #  include <sched.h>   /* sched_getaffinity / CPU_COUNT (container CPU bound) */
@@ -132,26 +134,247 @@ uint64_t gptps_hal_monotonic_ms(void)
 /* ------------------------------------------------------------------------- */
 
 #if defined(__linux__)
-/* Clamp detected CPU/RAM to this process's cgroup v2 limits + CPU affinity, so
- * auto-tune inside a container sizes to the container, not the host. Best-effort:
- * any unreadable/absent control file or "max" value leaves the host figure. */
-static void cgroup_v2_clamp(gptps_hwinfo *out)
+/* Clamp detected CPU/RAM to the limits of the cgroup THIS process is in, so auto-tune
+ * sizes to the container or service, not the host. The cgroup is found the way the
+ * kernel describes it: /proc/self/cgroup names it, /proc/self/mountinfo says where its
+ * hierarchy is mounted (and which part of it - a container without its own cgroup
+ * namespace sees the host's tree), and the limits are read from it AND every cgroup
+ * above it up to the mount, the tightest winning - a systemd service's MemoryMax=
+ * sits on its own cgroup, a slice's on the parent, and neither on the root that is
+ * /sys/fs/cgroup outside a container. cgroup v2 (memory.max, cpu.max) and v1
+ * (memory.limit_in_bytes, cpu.cfs_quota_us / cpu.cfs_period_us) both. Best-effort:
+ * a file that is absent, unreadable or says "max" leaves the figure as it was.
+ *
+ * gptps__cgroup_clamp_at is the whole of it with the three inputs named - the files
+ * and a prefix for every mount point - so tests/test_hal_posix.c can hand it a tree of
+ * its own. Internal: not in any header but its test's. */
+void gptps__cgroup_clamp_at(const char *self_cgroup, const char *mountinfo, const char *prefix,
+                            gptps_hwinfo *out);
+
+#define GPTPS_CG_PATH 1024
+typedef struct { char root[GPTPS_CG_PATH], point[GPTPS_CG_PATH], path[GPTPS_CG_PATH]; int have_mnt, have_path; } cg_hier;
+
+/* "a,b,c" holds `tok` as one of its comma-separated words */
+static int cg_has_word(const char *list, const char *tok)
 {
+    size_t n = strlen(tok);
+    const char *p = list;
+    while (p && *p) {
+        const char *e = strchr(p, ',');
+        size_t L = e ? (size_t)(e - p) : strlen(p);
+        if (L == n && strncmp(p, tok, n) == 0) return 1;
+        p = e ? e + 1 : NULL;
+    }
+    return 0;
+}
+
+/* mountinfo escapes space, tab, newline and backslash as \ooo */
+static void cg_unescape(char *dst, size_t cap, const char *src)
+{
+    size_t n = 0;
+    while (*src && n + 1 < cap) {
+        if (src[0] == '\\' && src[1] >= '0' && src[1] <= '7' && src[2] >= '0' && src[2] <= '7' &&
+            src[3] >= '0' && src[3] <= '7') {
+            dst[n++] = (char)(((src[1] - '0') << 6) | ((src[2] - '0') << 3) | (src[3] - '0'));
+            src += 4;
+        } else {
+            dst[n++] = *src++;
+        }
+    }
+    dst[n] = 0;
+}
+
+/* Read a whole line into buf; a longer one is cut and its rest skipped. 0 at EOF. */
+static int cg_line(FILE *f, char *buf, size_t cap)
+{
+    size_t n;
+    if (!fgets(buf, (int)cap, f)) return 0;
+    n = strlen(buf);
+    if (n && buf[n - 1] == '\n') buf[--n] = 0;
+    else { int c; while ((c = fgetc(f)) != EOF && c != '\n') { } }
+    return 1;
+}
+
+/* The first line of a small file, or 0. */
+static int cg_read1(const char *path, char *buf, size_t cap)
+{
+    FILE *f = fopen(path, "r");
+    int ok;
+    if (!f) return 0;
+    ok = cg_line(f, buf, cap);
+    fclose(f);
+    return ok;
+}
+
+/* The directory of this process's cgroup in `h`, into dir (prefix + mount point +
+ * the path below the mount's root). 0 when it cannot be placed. */
+static int cg_dir(const cg_hier *h, const char *prefix, char *dir, size_t cap)
+{
+    const char *rel = h->path;
+    size_t rl = strlen(h->root);
+    int n;
+    if (!h->have_mnt || !h->have_path) return 0;
+    if (strcmp(h->root, "/") != 0) {
+        /* the mount shows part of the tree: the path must be below that part */
+        if (strncmp(h->path, h->root, rl) == 0 && (h->path[rl] == '/' || h->path[rl] == 0)) rel = h->path + rl;
+        else rel = "";                             /* not ours to place: the mount's own */
+    }
+    if (strcmp(rel, "/") == 0) rel = "";
+    n = snprintf(dir, cap, "%s%s%s", prefix, strcmp(h->point, "/") == 0 ? "" : h->point, rel);
+    return n > 0 && (size_t)n < cap;
+}
+
+/* The first line of `dir`/`file`, or 0 - also for a path too long to build. */
+static int cg_read_at(const char *dir, const char *file, char *buf, size_t cap)
+{
+    char path[3 * GPTPS_CG_PATH + 64];
+    int n = snprintf(path, sizeof path, "%s/%s", dir, file);
+    if (n < 0 || (size_t)n >= sizeof path) return 0;
+    return cg_read1(path, buf, cap);
+}
+
+/* Walk from `dir` up to (and including) the mount point at `stop` chars, calling the
+ * reader at each level. */
+typedef void (*cg_level_fn)(const char *dir, gptps_hwinfo *out);
+static void cg_walk(char *dir, size_t stop, cg_level_fn fn, gptps_hwinfo *out)
+{
+    for (;;) {
+        char *slash;
+        fn(dir, out);
+        if (strlen(dir) <= stop) return;
+        slash = strrchr(dir, '/');
+        if (!slash || (size_t)(slash - dir) < stop) return;
+        *slash = 0;
+        if (strlen(dir) < stop) return;
+    }
+}
+
+static void cg_mem_limit(gptps_hwinfo *out, const char *val)
+{
+    char *end;
+    uint64_t lim;
+    if (strncmp(val, "max", 3) == 0) return;
+    lim = (uint64_t)strtoull(val, &end, 10);
+    if (end == val || lim == 0) return;
+    if (out->ram_bytes == 0 || lim < out->ram_bytes) out->ram_bytes = lim;   /* v1 "no limit" is huge */
+}
+
+static void cg_cpu_limit(gptps_hwinfo *out, long long quota, long long period)
+{
+    unsigned eff;
+    if (quota <= 0 || period <= 0) return;
+    eff = (unsigned)((quota + period - 1) / period);   /* ceil */
+    if (eff < 1u) eff = 1u;
+    if (eff < out->cpu_count) out->cpu_count = eff;
+}
+
+static void cg_v2_level(const char *dir, gptps_hwinfo *out)
+{
+    char buf[128];
+    if (cg_read_at(dir, "memory.max", buf, sizeof buf)) cg_mem_limit(out, buf);
+    if (cg_read_at(dir, "cpu.max", buf, sizeof buf)) {
+        char q[32];
+        long long period = 0;
+        if (sscanf(buf, "%31s %lld", q, &period) == 2 && strcmp(q, "max") != 0)
+            cg_cpu_limit(out, strtoll(q, NULL, 10), period);
+    }
+}
+
+static void cg_v1_mem_level(const char *dir, gptps_hwinfo *out)
+{
+    char buf[64];
+    if (cg_read_at(dir, "memory.limit_in_bytes", buf, sizeof buf)) cg_mem_limit(out, buf);
+}
+
+static void cg_v1_cpu_level(const char *dir, gptps_hwinfo *out)
+{
+    char q[64], p[64];
+    if (!cg_read_at(dir, "cpu.cfs_quota_us", q, sizeof q)) return;
+    if (!cg_read_at(dir, "cpu.cfs_period_us", p, sizeof p)) return;
+    cg_cpu_limit(out, strtoll(q, NULL, 10), strtoll(p, NULL, 10));   /* -1 = no quota */
+}
+
+static void cg_apply(const cg_hier *h, const char *prefix, cg_level_fn fn, gptps_hwinfo *out)
+{
+    char dir[3 * GPTPS_CG_PATH];
+    size_t stop;
+    if (!cg_dir(h, prefix, dir, sizeof dir)) return;
+    stop = strlen(prefix) + (strcmp(h->point, "/") == 0 ? 0 : strlen(h->point));
+    cg_walk(dir, stop, fn, out);
+}
+
+void gptps__cgroup_clamp_at(const char *self_cgroup, const char *mountinfo, const char *prefix,
+                            gptps_hwinfo *out)
+{
+    cg_hier v2, mem1, cpu1;
+    char line[4 * GPTPS_CG_PATH];
     FILE *f;
-    /* CPU quota: cpu.max = "<quota> <period>" (or "max <period>" for unlimited). */
-    f = fopen("/sys/fs/cgroup/cpu.max", "r");
-    if (f) {
-        char q[32]; unsigned long long period = 0;
-        if (fscanf(f, "%31s %llu", q, &period) == 2 && period > 0 && strcmp(q, "max") != 0) {
-            unsigned long long quota = strtoull(q, NULL, 10);
-            if (quota > 0) {
-                unsigned eff = (unsigned)((quota + period - 1) / period); /* ceil */
-                if (eff < 1u) eff = 1u;
-                if (eff < out->cpu_count) out->cpu_count = eff;
+    memset(&v2, 0, sizeof v2); memset(&mem1, 0, sizeof mem1); memset(&cpu1, 0, sizeof cpu1);
+    /* which cgroup: "0::<path>" (v2), "<id>:<controllers>:<path>" (v1) */
+    if ((f = fopen(self_cgroup, "r")) != NULL) {
+        while (cg_line(f, line, sizeof line)) {
+            char *c1 = strchr(line, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+            if (!c2) continue;
+            *c1 = 0; *c2 = 0;
+            if (strcmp(line, "0") == 0 && c1[1] == 0) {
+                snprintf(v2.path, sizeof v2.path, "%s", c2 + 1); v2.have_path = 1;
+            } else {
+                if (cg_has_word(c1 + 1, "memory")) { snprintf(mem1.path, sizeof mem1.path, "%s", c2 + 1); mem1.have_path = 1; }
+                if (cg_has_word(c1 + 1, "cpu"))    { snprintf(cpu1.path, sizeof cpu1.path, "%s", c2 + 1); cpu1.have_path = 1; }
             }
         }
         fclose(f);
     }
+    /* where: "<id> <parent> <maj:min> <root> <point> <opts> [optional...] - <fstype> <src> <super>" */
+    if ((f = fopen(mountinfo, "r")) != NULL) {
+        while (cg_line(f, line, sizeof line)) {
+            char *fld[6], *p = line, *dash, *fstype, *super = NULL, *tok;
+            int i;
+            dash = strstr(line, " - ");
+            if (!dash) continue;
+            *dash = 0;
+            fstype = dash + 3;
+            tok = strchr(fstype, ' ');
+            if (tok) { *tok = 0; tok = strchr(tok + 1, ' '); if (tok) super = tok + 1; }
+            for (i = 0; i < 6; ++i) {
+                while (*p == ' ') ++p;
+                fld[i] = p;
+                p = strchr(p, ' ');
+                if (!p) { if (i < 4) goto next; break; }
+                *p++ = 0;
+            }
+            if (strcmp(fstype, "cgroup2") == 0 && !v2.have_mnt) {
+                cg_unescape(v2.root, sizeof v2.root, fld[3]); cg_unescape(v2.point, sizeof v2.point, fld[4]);
+                v2.have_mnt = 1;
+            } else if (strcmp(fstype, "cgroup") == 0 && super) {
+                if (!mem1.have_mnt && cg_has_word(super, "memory")) {
+                    cg_unescape(mem1.root, sizeof mem1.root, fld[3]); cg_unescape(mem1.point, sizeof mem1.point, fld[4]);
+                    mem1.have_mnt = 1;
+                }
+                if (!cpu1.have_mnt && cg_has_word(super, "cpu")) {
+                    cg_unescape(cpu1.root, sizeof cpu1.root, fld[3]); cg_unescape(cpu1.point, sizeof cpu1.point, fld[4]);
+                    cpu1.have_mnt = 1;
+                }
+            }
+        next:;
+        }
+        fclose(f);
+    }
+    if (v2.have_mnt && v2.have_path) {
+        cg_apply(&v2, prefix, cg_v2_level, out);
+    } else if (!v2.have_mnt && !mem1.have_mnt && !cpu1.have_mnt) {
+        /* no mountinfo to go by: the conventional place, as before */
+        char dir[GPTPS_CG_PATH + 32];
+        int n = snprintf(dir, sizeof dir, "%s/sys/fs/cgroup", prefix);
+        if (n > 0 && (size_t)n < sizeof dir) cg_v2_level(dir, out);
+    }
+    if (mem1.have_mnt && mem1.have_path) cg_apply(&mem1, prefix, cg_v1_mem_level, out);
+    if (cpu1.have_mnt && cpu1.have_path) cg_apply(&cpu1, prefix, cg_v1_cpu_level, out);
+}
+
+static void cgroup_clamp(gptps_hwinfo *out)
+{
+    gptps__cgroup_clamp_at("/proc/self/cgroup", "/proc/self/mountinfo", "", out);
     /* CPU affinity mask: a tighter bound than online CPUs (e.g. cpuset pinning). */
     {
         cpu_set_t set;
@@ -159,16 +382,6 @@ static void cgroup_v2_clamp(gptps_hwinfo *out)
             int c = CPU_COUNT(&set);
             if (c > 0 && (unsigned)c < out->cpu_count) out->cpu_count = (unsigned)c;
         }
-    }
-    /* Memory limit: memory.max = "<bytes>" (or "max" for unlimited). */
-    f = fopen("/sys/fs/cgroup/memory.max", "r");
-    if (f) {
-        char m[64];
-        if (fscanf(f, "%63s", m) == 1 && strcmp(m, "max") != 0) {
-            uint64_t lim = strtoull(m, NULL, 10);
-            if (lim > 0 && (out->ram_bytes == 0 || lim < out->ram_bytes)) out->ram_bytes = lim;
-        }
-        fclose(f);
     }
 }
 #endif
@@ -206,7 +419,7 @@ gptps_status gptps_hal_detect(gptps_hwinfo *out)
 #endif
 
 #if defined(__linux__)
-    cgroup_v2_clamp(out);   /* size to the container, not the host */
+    cgroup_clamp(out);   /* size to the container or service, not the host */
 #endif
 
     out->has_gpu = false; /* unknown without a vendor GPU add-on */
@@ -380,16 +593,181 @@ void *gptps_dl_sym(gptps_dl *h, const char *symbol) { return h ? dlsym(h->handle
 void  gptps_dl_close(gptps_dl *h) { if (h) { dlclose(h->handle); free(h); } }
 /* Drop the wrapper, keep the mapping (see gptps_hal.h). */
 void  gptps_dl_release(gptps_dl *h) { free(h); }
+/* dlerror(): the reason of the last failed dlopen / dlsym, on this thread - which
+ * library or symbol was missing, a wrong architecture, ... */
+size_t gptps_dl_error(char *buf, size_t cap)
+{
+    const char *m = dlerror();
+    int n;
+    if (!buf || !cap) return 0;
+    buf[0] = 0;
+    if (!m) return 0;
+    n = snprintf(buf, cap, "%s", m);
+    if (n < 0) { buf[0] = 0; return 0; }
+    return (size_t)n < cap ? (size_t)n : cap - 1;
+}
 
-/* The replaced file's permission bits carry over to its replacement. A save edits
- * the operator's config file: one they kept to themselves must not come back
- * readable by others, nor one kept read-only to the group come back writable by it -
- * the file can name add-ons to load, so write access to it is code execution. */
+/* ---- atomic, durable file replace (the settings save) -----------------------
+ * Atomic: rename(). Durable: the new file's data is synced before the rename, and
+ * the directory after it - without both, a power cut soon after a save can leave the
+ * operator's config empty or zero-filled on a file system that does not order data
+ * before a rename (XFS and others; ext4 mostly hides it). macOS gets F_FULLFSYNC,
+ * which also flushes the drive's cache; a file system that refuses a sync (some
+ * network and FUSE mounts) gets the best it offers, as in the durable queue.
+ *
+ * Permissions: the replaced file's carry over to its replacement. A save edits the
+ * operator's config file: one they kept to themselves must not come back readable by
+ * others, nor one kept read-only to the group come back writable by it - the file can
+ * name add-ons to load, so write access to it is code execution. Setting them on the
+ * temp file at the end is not enough when the temp was created more open than the
+ * target (umask): a descriptor opened on it while it was written keeps that access,
+ * and after the rename that inode IS the config. So then the content goes into a new
+ * inode, created private (mkstemp) and given the target's owner and mode, and the
+ * temp file is unlinked: a descriptor anyone holds on it AFTER the replace reaches
+ * nothing that is read. That is not enough on its own: what someone wrote into the
+ * temp file BEFORE the replace is copied with it. So the temp file must be private
+ * from its creation - gptps_hal_open_private, which settings save uses: O_EXCL, mode
+ * 0600, whatever the umask, so nobody but its owner can open it at all. The new-inode
+ * copy then only matters when the owner differs (root saving a user's file), and for
+ * a temp file a caller made some other way. */
+static int gptps__cannot_sync(int err)
+{
+    switch (err) {
+    case EINVAL: case EBADF: case EISDIR: case EROFS: case EACCES: case EPERM:
+#if defined(ENOTSUP)
+    case ENOTSUP:
+#endif
+#if defined(EOPNOTSUPP) && (!defined(ENOTSUP) || EOPNOTSUPP != ENOTSUP)
+    case EOPNOTSUPP:
+#endif
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* 0 once the descriptor's data is on disk, or the file system cannot be asked */
+static int gptps__fsync_fd(int fd)
+{
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    if (fcntl(fd, F_FULLFSYNC) == 0) return 0;
+#endif
+    while (fsync(fd) != 0) {
+        if (errno == EINTR) continue;
+        return gptps__cannot_sync(errno) ? 0 : -1;
+    }
+    return 0;
+}
+
+static int gptps__fsync_path(const char *path, int dir)
+{
+    int fd, rc;
+#if defined(O_DIRECTORY)
+    fd = open(path, O_RDONLY | (dir ? O_DIRECTORY : 0) | O_CLOEXEC);
+#else
+    (void)dir;
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+#endif
+    if (fd < 0) return gptps__cannot_sync(errno) ? 0 : -1;
+    rc = gptps__fsync_fd(fd);
+    close(fd);
+    return rc;
+}
+
+/* The directory holding `path`, synced so the rename itself is on disk. Best-effort:
+ * the replace has happened by now and cannot be taken back. */
+static void gptps__fsync_parent(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    char *dir;
+    size_t n;
+    if (!slash) { (void)gptps__fsync_path(".", 1); return; }
+    n = (slash == path) ? 1u : (size_t)(slash - path);
+    dir = (char *)malloc(n + 1);
+    if (!dir) return;
+    memcpy(dir, path, n);
+    dir[n] = 0;
+    (void)gptps__fsync_path(dir, 1);
+    free(dir);
+}
+
+/* Copy tmp into a new private file beside final, with final's owner and mode, and
+ * sync it. Returns the new file's malloc'd name, or NULL. */
+static char *gptps__fresh_copy(const char *tmp_path, const char *final_path, const struct stat *st)
+{
+    size_t n = strlen(final_path) + 16;
+    char *name = (char *)malloc(n), buf[8192];
+    int in = -1, out = -1, ok = 0;
+    if (!name) return NULL;
+    snprintf(name, n, "%s.gptps-XXXXXX", final_path);
+    out = mkstemp(name);                           /* O_EXCL, mode 0600 */
+    if (out < 0) { free(name); return NULL; }
+    (void)fcntl(out, F_SETFD, FD_CLOEXEC);         /* another thread may fork and exec */
+    in = open(tmp_path, O_RDONLY | O_CLOEXEC);
+    if (in >= 0) {
+        ok = 1;
+        for (;;) {
+            ssize_t r = read(in, buf, sizeof buf), off = 0;
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) { if (r < 0) ok = 0; break; }
+            while (off < r) {
+                ssize_t w = write(out, buf + off, (size_t)(r - off));
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) { ok = 0; break; }
+                off += w;
+            }
+            if (!ok) break;
+        }
+        close(in);
+    }
+    /* owner first: chown clears set-id bits, which the mode then restores. Another
+     * owner takes privilege, so an unprivileged save keeps its own - as rename did. */
+    if (ok) {
+        if (fchown(out, st->st_uid, st->st_gid) != 0) { /* not privileged: it stays ours */ }
+        ok = fchmod(out, st->st_mode & 07777) == 0;
+    }
+    if (ok) ok = gptps__fsync_fd(out) == 0;
+    if (close(out) != 0) ok = 0;
+    if (!ok) { unlink(name); free(name); return NULL; }
+    return name;
+}
+
+FILE *gptps_hal_open_private(const char *path)
+{
+    int fd;
+    FILE *f;
+    if (unlink(path) != 0 && errno != ENOENT) return NULL;
+    /* O_EXCL: a file - or a symlink - someone put there in between is refused, never
+     * written through; 0600 whatever the umask; close-on-exec, as another thread may
+     * fork and exec while the save writes it */
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    f = fdopen(fd, "wb");
+    if (!f) { close(fd); (void)unlink(path); }
+    return f;
+}
+
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
 {
-    struct stat st;
+    struct stat st, ts;
+    if (stat(tmp_path, &ts) != 0) return GPTPS_E_IO;
+    if (stat(final_path, &st) == 0 &&
+        ((ts.st_mode & 0777 & ~(st.st_mode & 0777)) != 0 || ts.st_uid != st.st_uid || ts.st_gid != st.st_gid)) {
+        /* the temp file was open to someone the target is not: a new inode */
+        char *fresh = gptps__fresh_copy(tmp_path, final_path, &st);
+        if (!fresh) return GPTPS_E_IO;
+        if (rename(fresh, final_path) != 0) { unlink(fresh); free(fresh); return GPTPS_E_IO; }
+        free(fresh);
+        (void)unlink(tmp_path);
+        gptps__fsync_parent(final_path);
+        return GPTPS_OK;
+    }
+    /* nobody could have opened the temp file with more than the target allows */
     if (stat(final_path, &st) == 0) (void)chmod(tmp_path, st.st_mode & 07777);
-    return rename(tmp_path, final_path) == 0 ? GPTPS_OK : GPTPS_E_IO;
+    if (gptps__fsync_path(tmp_path, 0) != 0) return GPTPS_E_IO;
+    if (rename(tmp_path, final_path) != 0) return GPTPS_E_IO;
+    gptps__fsync_parent(final_path);
+    return GPTPS_OK;
 }
 
 #endif /* !_WIN32 */

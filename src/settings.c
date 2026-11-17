@@ -573,10 +573,21 @@ gptps_status gptps_settings_info_at(gptps_settings *r, size_t index, gptps_setti
     gptps_setting_entry *e;
     size_t i = 0;
     if (!r || !out) return GPTPS_E_INVAL;
-    if (out->struct_size < sizeof *out) return GPTPS_E_INVAL;
+    if (out->struct_size < GPTPS_SETTING_INFO_MIN_SIZE) return GPTPS_E_INVAL;
     gptps_mutex_lock(r->m);
     for (e = r->head; e && i < index; e = e->next) ++i;
     if (!e) { gptps_mutex_unlock(r->m); return GPTPS_E_NOTFOUND; }
+    if (out->struct_size >= GPTPS_SETTING_INFO_COPY_SIZE) {   /* ABI 2.8: copies that outlive the entry */
+        size_t kn = strlen(e->key), dn = e->desc ? strlen(e->desc) : 0;
+        if (kn < sizeof out->key_copy) memcpy(out->key_copy, e->key, kn + 1);
+        else out->key_copy[0] = 0;                 /* never a shortened key */
+        if (dn >= sizeof out->desc_copy) {         /* cut at a character boundary */
+            dn = sizeof out->desc_copy - 1;
+            while (dn && ((unsigned char)e->desc[dn] & 0xC0u) == 0x80u) --dn;
+        }
+        if (dn) memcpy(out->desc_copy, e->desc, dn);
+        out->desc_copy[dn] = 0;
+    }
     out->key = e->key; out->type = e->type; out->desc = e->desc;
     out->hot = e->hot; out->has_range = e->has_range; out->min = e->min; out->max = e->max;
     out->choices = e->choices;
@@ -1015,7 +1026,7 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
      * was read and logs: a return in between would leave r->m held, and the next save
      * would wait for it forever. */
     gptps_mutex_lock(r->m);
-    f = fopen(path, "rb");
+    f = gptps_fopen_path(path, "rb");
     if (!f && errno == ENOENT && base && strcmp(base, path) != 0) {
         /* A new file starts as a copy of the config file the engine loaded - its
          * add-ons, [task_defaults], comments and all - with the live changes made
@@ -1059,20 +1070,28 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
     if (!tmp) { st = GPTPS_E_NOMEM; goto out; }
     snprintf(tmp, tn, "%s.tmp", path);
 
-    f = fopen(tmp, "wb");
+    /* private from the start: nobody else can read the settings while they are
+     * written, nor write into the file before it becomes the config (which can name
+     * add-ons to load). The path is UTF-8, as gptps_fopen_path reads it (HAL) */
+    f = gptps_hal_open_private(tmp);
     if (!f) st = GPTPS_E_IO;
     else {
+        const char *body = text ? text : "";
         made = 1;
         if (!text)
             fputs("# GPTPS settings, written by gptps_settings_save: the values changed live and\n"
                   "# the ones the config file set. Edit freely - a later save updates the values\n"
                   "# you change and keeps the rest, comments included. Every key: docs/CONFIG.md.\n\n", f);
-        if (write_settings(r, f, text ? text : "", t, in_file, copy ? refused : NULL, ud) != 0) st = GPTPS_E_NOMEM;
+        /* A byte order mark the file opens with stays where it is - the tool that wrote
+         * it may need it to read the file as UTF-8 - and the lines are edited after it,
+         * so line 1 is read (a comment, a key to rewrite) as the parser read it. */
+        if (!strncmp(body, GPTPS_UTF8_BOM, 3)) { fputs(GPTPS_UTF8_BOM, f); body += 3; }
+        if (write_settings(r, f, body, t, in_file, copy ? refused : NULL, ud) != 0) st = GPTPS_E_NOMEM;
         if (fflush(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
         if (fclose(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
     }
     if (st == GPTPS_OK) st = gptps_hal_atomic_replace(tmp, path);
-    if (st != GPTPS_OK && made) remove(tmp);
+    if (st != GPTPS_OK && made) gptps_remove_path(tmp);
 out:
     gptps_mutex_unlock(r->m);
     gptps_toml_free(t);

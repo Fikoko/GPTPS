@@ -91,7 +91,10 @@ gptps_status gptps_sched_aging(gptps *e, uint32_t ms_per_level, gptps_sched **ou
  * yourself (a tenant per cost class) if that matters.
  *
  * `max_tenants` bounds the tenant table (0 = 64). Past it, further tenants share one
- * slot - and one share - between them; size it for the tenants you have. Items are
+ * share (of weight 1) between them - a share of its own, which no tenant in the table
+ * loses anything to; size it for the tenants you have. The first such merge is warned
+ * of once (WARN, to the core's log sink), and gptps_sched_fair_overflow counts the
+ * items charged to the shared share. Items are
  * tracked only while they wait, so that table grows with the queue, not with time.
  * GPTPS_E_BUSY if the scheduler seam is taken, GPTPS_E_NOMEM, or whatever registering
  * the observer returned. */
@@ -100,8 +103,21 @@ gptps_status gptps_sched_fair(gptps *e, gptps_sched_tenant_fn tenant, void *user
                               size_t max_tenants, gptps_sched **out);
 
 /* Set a tenant's weight (1..1048576), for items scored from now on. GPTPS_E_INVAL for a
- * weight out of range or a handle that is not a fair-share one. Callable at any time. */
+ * weight out of range or a handle that is not a fair-share one; GPTPS_E_FULL, changing
+ * nothing, for a tenant not yet seen when the table already holds max_tenants (it
+ * would be in the shared overflow share). Callable at any time; weighting a tenant
+ * before its first item claims its slot. With the default tenant function (NULL), a
+ * task type's tenant id is gptps_sched_task_tenant(name). */
 gptps_status gptps_sched_fair_weight(gptps_sched *s, uint64_t tenant, uint32_t weight);
+
+/* The tenant id the default tenant function (gptps_sched_fair with NULL) gives items
+ * of task type `task_name` - what gptps_sched_fair_weight takes to weight that type. A
+ * hash of the name (64-bit FNV-1a); NULL is the empty name. */
+uint64_t gptps_sched_task_tenant(const char *task_name);
+
+/* Items charged to the shared overflow share so far, because the tenant table was
+ * full (0 for any other kind). */
+uint64_t gptps_sched_fair_overflow(const gptps_sched *s);
 
 /* SHED LATE WORK (a constraint). An item whose due time passed more than `grace_ms`
  * ago when it comes up for admission is refused: dead-lettered with GPTPS_E_DENIED,

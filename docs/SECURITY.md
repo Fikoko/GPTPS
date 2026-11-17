@@ -67,21 +67,46 @@ boundary a determined attacker respects.
 
 If the host process crashes or is killed, what happens to the jobs it started?
 
-- **Windows:** every job is in a job object created with
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the jobs die with the host. Nothing to do.
+- **Windows:** every job is put in a job object created with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the jobs die with the host. Nothing to do -
+  as long as the job object can be made and the program put in it. A host that is itself
+  in a job that allows no nested one (Windows 7, Server 2008 R2) or that a job object is
+  refused to cannot: its jobs may then outlive it, as on Linux by default. GPTPS says so
+  with a WARN that names the step and the Windows error, and a task with
+  `GPTPS_TASK_DIE_WITH_HOST` gets its own WARN that the flag is not in force.
 - **Linux, macOS:** by default they keep running. A restarted host can then start a
   second copy next to the first - two MRP runs against one database. GPTPS does not
   change that default, because a host may *want* a job to outlive it.
 
 **Since ABI 2.8 it is one flag:** set `GPTPS_TASK_DIE_WITH_HOST` in the task's
-`flags` and GPTPS arranges it in the child, correctly: `PR_SET_PDEATHSIG` on Linux,
-`PROC_PDEATHSIG_CTL` on FreeBSD, with the `getppid()` check below, for `OOP` and
-`PROGRAM` jobs. SIGKILL, not SIGTERM: the kernel sends one signal and never follows
-it up, so nothing may be left to linger. Where the OS has no such signal (macOS, other
-POSIX) the job runs anyway and the type's first attempt logs a WARN - use a supervisor
-there. `tests/test_program_stop.c` crashes a host on purpose and checks its job died.
+`flags`. SIGKILL, not SIGTERM: nothing may be left to linger.
 
-What the flag does, by hand - for a host that needs it in its own `child_setup`:
+- A **`PROGRAM`** job dies whole, on every POSIX system (macOS included): GPTPS keeps a
+  small watcher process beside the job, outside it - one more child process of the
+  host, which a host with a `SIGCHLD` handler or process accounting will see. It holds
+  a pipe whose write end the host holds; the job's leader tells it the job's process
+  group before anything runs, so the host never writes to it (a watcher that is gone
+  cannot raise `SIGPIPE` in the host), and a host that dies at any moment after the
+  job's fork still takes the job. When the host ends, however it ends, the pipe closes
+  and the watcher SIGKILLs the job's process group - a launcher's workers too - and, in cgroup mode,
+  everything in the job's cgroup (`cgroup.kill`, Linux 5.14+). A parent-death signal
+  alone would not do: the kernel clears it in the job's own children, so it reaches
+  only the process it was set in. A process that leaves the job's process group
+  (`setsid`) is no longer the job, unless cgroup mode holds it. The program itself
+  also gets `PR_SET_PDEATHSIG` (Linux) / `PROC_PDEATHSIG_CTL` (FreeBSD). A watcher that
+  is already gone when the job starts fails the attempt (`start.error`) before the
+  program runs; one lost while the job runs (an administrator's or the OOM killer's
+  SIGKILL) is seen when the job ends and logged once per task type as a WARN.
+- An **`OOP`** job, the host's own forked copy, gets `PR_SET_PDEATHSIG` on Linux and
+  `PROC_PDEATHSIG_CTL` on FreeBSD, with the `getppid()` check below. Elsewhere (macOS,
+  other POSIX) it runs anyway and the type's first attempt logs a WARN - use a
+  supervisor there.
+
+`tests/test_program_stop.c` crashes a host on purpose and checks its job died, a
+launcher's worker included.
+
+What the flag does for one process, by hand - for a host that needs it in its own
+`child_setup`:
 
 ```c
 #include <stdint.h>
@@ -112,9 +137,9 @@ Two things to know:
 
 `prctl` and `getppid` are system calls, so this is async-signal-safe. Under systemd
 the service's `KillMode=control-group` (the default) also kills every job when the
-service stops, crash or not. On **macOS** there is no `PR_SET_PDEATHSIG`; run the
-host under `launchd` with `AbandonProcessGroup` left false, or have each program
-watch its parent.
+service stops, crash or not. On **macOS** there is no `PR_SET_PDEATHSIG`: a `PROGRAM`
+job has the flag's watcher; otherwise run the host under `launchd` with
+`AbandonProcessGroup` left false, or have each program watch its parent.
 
 ## Fork safety
 

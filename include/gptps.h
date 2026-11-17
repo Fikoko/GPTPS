@@ -90,8 +90,10 @@ extern "C" {
  * `stop_grace_ms` and `stderr_tail_bytes` to gptps_task_def for GPTPS_EXEC_PROGRAM,
  * `stderr_tail` / `stderr_tail_len` to gptps_event and gptps_dead_letter, and adds
  * the exit.code / exit.signal measurements and their unit, GPTPS_UNIT_CODE; 2.8 appends
- * `measures` / `n_measures` to gptps_dead_letter and adds GPTPS_TASK_DIE_WITH_HOST and
- * the start.error measurement. Additive, and the loader compares
+ * `measures` / `n_measures` to gptps_dead_letter, `key_copy` / `desc_copy` to
+ * gptps_setting_info and `name_copy` to gptps_task_info, adds GPTPS_TASK_DIE_WITH_HOST
+ * and the start.error measurement, and appends `task_flags` and `event_measure` to the
+ * host table (gptps_api_routines). Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 8u
@@ -214,7 +216,9 @@ typedef struct {
  * ==========================================================================*/
 typedef enum { GPTPS_LOG_DEBUG, GPTPS_LOG_INFO, GPTPS_LOG_WARN, GPTPS_LOG_ERROR } gptps_log_level;
 
-/* True once the watchdog has signalled the deadline. In-process tasks MUST
+/* True once the item is asked to stop: a cancel, a removal, a shutdown, or its
+ * deadline having passed (it compares gptps_deadline_ms() itself, so it fires in
+ * MANUAL mode too, where no watchdog runs beside the body). In-process tasks MUST
  * poll this in long loops; a task that never polls cannot be stopped in-proc
  * (route UNBOUNDED or crash-prone work to a GPTPS_EXEC_OOP executor - that buys
  * a hard kill and an OS memory cap, but NOT privilege isolation; see
@@ -281,16 +285,27 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * only, THREADED mode only (a service's infinite loop cannot be run to completion
  * by the MANUAL gptps_step pump), and no timeout_seconds. */
 #define GPTPS_TASK_SERVICE 0x1u
+/* Every GPTPS_TASK_* flag is its own bit of the one flags word (gptps_task_def.flags,
+ * gptps_task_info.flags, gptps_task_flags): SERVICE 0x1, RETIRE_ON_OK 0x2,
+ * DIE_WITH_HOST 0x4. */
 /* ABI 2.8, OOP and PROGRAM: the job dies with the host. If the host process ends -
  * crashes, is killed, exits without gptps_shutdown - the job is killed too, so a
  * restarted host cannot find yesterday's run still going beside today's. Without the
  * flag a POSIX job outlives a dead host, which some hosts want (a job that must finish
- * whatever happens). Enforced by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on
- * FreeBSD (SIGKILL: nothing may linger), and on Windows always, flag or not (the job
- * object is killed on close). Where it cannot be enforced (macOS, other POSIX) the job
- * runs anyway and the first attempt of the type logs a WARN. Ignored for INPROC, which
- * is the host. */
-#define GPTPS_TASK_DIE_WITH_HOST 0x2u
+ * whatever happens). SIGKILL: nothing may linger. A PROGRAM job is killed whole, on
+ * every POSIX system: every process in its process group - a launcher's workers too -
+ * and in cgroup mode everything in its cgroup (Linux 5.14+), by a small watcher process
+ * GPTPS keeps beside each such job (one more child process of the host while the job
+ * runs; a watcher that cannot be had fails the attempt before the program runs, and
+ * one lost while the job runs - killed from outside - is said in one WARN per type).
+ * A process that leaves the job's process group
+ * (setsid) outside cgroup mode is no longer the job. An OOP job, the host's own forked
+ * copy, is killed by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on FreeBSD; on
+ * Windows every job, flag or not (the job object is killed on close) - unless the
+ * program could not be put in a kill-on-close job object (a host in a job that allows
+ * no nested one). Where it cannot be enforced (an OOP job on macOS or other POSIX, that
+ * Windows case) the job runs anyway and the first attempt of the type logs a WARN. Ignored for INPROC, which is the host. */
+#define GPTPS_TASK_DIE_WITH_HOST 0x4u
 /* RETIRE_ON_OK (services only; ignored otherwise): by default a service is
  * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a
  * clean GPTPS_OK return. Set this to instead RESTART ONLY ON FAILURE: a run() that
@@ -439,7 +454,8 @@ typedef struct {
      *                      status is the same either way (GPTPS_E_TIMEOUT /
      *                      GPTPS_E_CANCELLED), and so is the bound: the stop takes at
      *                      most this much longer. Capped at 300000 (5 min). Output the
-     *                      program writes to stdout after the SIGTERM is not read.
+     *                      program writes to stdout after the SIGTERM is drained so it
+     *                      cannot block, but discarded: it is not the attempt's result.
      *                      The grace is the WHOLE job's: it ends when every process
      *                      of the program's group (POSIX: Linux and macOS; elsewhere
      *                      the program itself) or of its job object (Windows) has
@@ -460,7 +476,11 @@ typedef struct {
      *                      failure's own evidence, kept apart from every other job's.
      *                      Earlier output is read and dropped, so a chatty program
      *                      never blocks on it. Capped at 65536. Not on FINISHED: a job
-     *                      that succeeded needs no evidence. */
+     *                      that succeeded needs no evidence.
+     *   Both are also per-task settings (1.10): tasks.<name>.stop_grace_ms and
+     *   tasks.<name>.stderr_tail_bytes, live or from [task_defaults] / [tasks.<name>]
+     *   in the config file, range-checked against the caps above. An item uses the
+     *   values its type had when it was submitted, as it does the CPU and I/O caps. */
     uint32_t            stop_grace_ms;
     uint32_t            stderr_tail_bytes;
 } gptps_task_def;
@@ -666,7 +686,13 @@ typedef struct {
                                     * parse, or the open fails with GPTPS_E_CONFIG
                                     * (GPTPS_E_NOMEM if memory ran out). Also
                                     * the default path for gptps_settings_save /
-                                    * _reload. NULL => limits below + defaults */
+                                    * _reload. NULL => limits below + defaults.
+                                    * UTF-8, as every string here is - so are a
+                                    * save path and the file's `addons` paths; on
+                                    * Windows a path that is not valid UTF-8 is
+                                    * read in the ANSI code page, as before. The
+                                    * file may open with a UTF-8 byte order mark,
+                                    * and a save keeps it */
     gptps_limits  limits;          /* explicit values win over auto-tune & file */
     gptps_run_mode mode;           /* v1.6: THREADED (default) or MANUAL (gptps_step) */
     /* ABI 2.4: BOUNDED MODE (docs/BOUNDED.md). 0, the default, keeps the classic
@@ -798,6 +824,11 @@ typedef struct {
      * SERVICE, and the difference decides whether a handle ends once or once per
      * run; gptps_balance refuses a service for exactly that reason. */
     uint64_t             flags;
+    /* ABI 2.8: a COPY of `name`, taken under the engine's lock, so it stays valid after
+     * the call even if another thread unregisters the type meanwhile (which frees
+     * `name`). Filled only if your struct_size covers it. A reader that keeps the
+     * record, or runs while types come and go - a dashboard - uses this. */
+    char                 name_copy[GPTPS_TASK_NAME_MAX + 1];
 } gptps_task_info;
 
 /* Number of registered task types (includes types that are draining toward removal,
@@ -919,7 +950,8 @@ GPTPS_API gptps_status gptps_submit(gptps *e, const char *task_name,
  * cloning the task type. */
 #define GPTPS_SUBMIT_PRIORITY    0x1u  /* apply `priority`   */
 #define GPTPS_SUBMIT_POLICY      0x2u  /* apply `policy`     (timeout/retries/backoff/on_failure) */
-#define GPTPS_SUBMIT_TIMEOUT_MS  0x4u  /* apply `timeout_ms` (sub-second deadline; in-process cooperative path) */
+#define GPTPS_SUBMIT_TIMEOUT_MS  0x4u  /* apply `timeout_ms` (a per-attempt deadline in ms, in place of
+                                        * policy.timeout_seconds) */
 /* ABI 2.6: apply `deadline_in_ms` - when the item is DUE, as an ordering input. Not a
  * timeout: nothing is cancelled, dropped or reordered by the core because of it. The
  * core turns it into an absolute time on the engine's monotonic clock (the clock of
@@ -933,7 +965,13 @@ typedef struct {
     unsigned             flags;        /* OR of GPTPS_SUBMIT_* selecting which overrides apply */
     int32_t              priority;     /* this item's scheduling priority (higher runs first) */
     gptps_failure_policy policy;       /* this item's failure policy */
-    uint32_t             timeout_ms;   /* this item's deadline in ms (in-process cooperative path) */
+    /* This item's per-attempt deadline in ms, for every exec kind. In-process: the
+     * cooperative path, as timeout_seconds (gptps_is_cancelled). OOP / PROGRAM: in
+     * THREADED mode the job is stopped at it to the ~200 ms slice - stop_grace_ms
+     * included - and the attempt fails GPTPS_E_TIMEOUT; in MANUAL mode, where nothing
+     * runs beside the job, the executor holds it to the value rounded UP to whole
+     * seconds. Since 1.10; before, a process job ignored it. */
+    uint32_t             timeout_ms;
     /* ABI 2.6: ms from this submit until the item is due (GPTPS_SUBMIT_DEADLINE). 0 is
      * "due now". Read only when struct_size covers it, so an older caller has none.
      * uint64_t so that it always GROWS sizeof and never sits in the 2.5 struct's tail
@@ -952,7 +990,9 @@ GPTPS_API gptps_status gptps_submit_ex(gptps *e, const char *task_name,
 /* Cancel one submitted work item by its handle. A still-queued item is removed
  * before it runs; an in-flight or admitted item gets the cooperative cancel flag
  * (in-process tasks MUST poll gptps_is_cancelled() to stop; OOP/PROGRAM children
- * are hard-killed within ~200ms even with no deadline set). The item ends terminal:
+ * are hard-killed within ~200ms even with no deadline set - or, for a PROGRAM type
+ * with stop_grace_ms, sent SIGTERM / Ctrl+Break and killed up to that long later,
+ * at most 300000 ms). The item ends terminal:
  * exactly one GPTPS_EV_FAILED carrying GPTPS_E_CANCELLED - never a retry or a
  * dead-letter, and never GPTPS_E_TIMEOUT, so an operator's cancel stays
  * distinguishable from a deadline breach. A cancel can also reach an attempt that
@@ -975,7 +1015,11 @@ GPTPS_API gptps_status gptps_cancel(gptps *e, gptps_handle h);
  * waiting on a retry backoff. Drain with `while (gptps_step(e,&n)==GPTPS_OK && n);`,
  * or call periodically as your host's main loop ticks. Because a task runs to
  * completion on this thread, a wall-clock timeout cannot preempt it; cooperative
- * tasks should poll gptps_is_cancelled() / gptps_deadline_ms(). */
+ * tasks should poll gptps_is_cancelled(), which turns true once the deadline has
+ * passed (or compare gptps_deadline_ms() themselves). Either way the outcome is the
+ * THREADED one: a body that returns after its deadline - polling or not - ends the
+ * attempt with GPTPS_E_TIMEOUT, never FINISHED, and its policy's retry or dead letter
+ * follows. */
 GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
 
 /* Drain in-flight + queued work, join the threads, free the engine.
@@ -984,9 +1028,12 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * settable, 0 = wait forever; at open, gptps_config.shutdown_grace_ms, where
  * GPTPS_LIMIT_NONE waits forever) to finish on its own, after which every running
  * item's cancel flag is raised - the enforced executors then hard-kill their child
- * within ~200ms. Without that bound a single external child that ignores its
- * (absent) deadline would hang the HOST's exit path forever and be orphaned when
- * the supervisor gave up. An in-process body that never polls
+ * within ~200ms, or, for a PROGRAM type with stop_grace_ms, stop it gracefully and
+ * kill it at most stop_grace_ms (capped at 300000) later. So gptps_shutdown can take
+ * up to shutdown_grace_ms + the largest stop_grace_ms of a running PROGRAM type +
+ * ~200ms: size a service manager's stop timeout from that sum. Without that bound
+ * a single external child that ignores its (absent) deadline would hang the HOST's
+ * exit path forever and be orphaned when the supervisor gave up. An in-process body that never polls
  * gptps_is_cancelled() still cannot be preempted - nothing in-process can be.
  * Once the grace expires nothing more is admitted. Work still waiting then - queued
  * and not yet admitted, or in backoff: a retry, an item between REQUEUE cycles, or
@@ -1335,6 +1382,17 @@ typedef struct {
     const char *const  *choices;       /* borrowed; NULL unless ENUM */
     char                value[GPTPS_SETTINGS_VALUE_MAX];   /* current, rendered */
     char                defval[GPTPS_SETTINGS_VALUE_MAX];  /* default at registration */
+    /* ABI 2.8 - COPIES of `key` and `desc`, taken under the registry's lock, so they
+     * stay valid after the call returns even if another thread unregisters the task
+     * (or the add-on) the setting belongs to. A reader that keeps the record past the
+     * call, or that runs while tasks come and go - a dashboard, a control plane - uses
+     * these, not the borrowed pointers above.
+     *   key_copy   the whole key, or "" when the key is GPTPS_SETTINGS_VALUE_MAX bytes
+     *              or longer (never a shortened key, which could name another setting).
+     *   desc_copy  the description, cut to fit at a UTF-8 character boundary - for
+     *              display. */
+    char                key_copy[GPTPS_SETTINGS_VALUE_MAX];
+    char                desc_copy[GPTPS_SETTINGS_VALUE_MAX];
 } gptps_setting_info;
 
 /* Register a setting into the engine's registry (GPTPS_E_DUP on a duplicate key). */
@@ -1402,7 +1460,9 @@ GPTPS_API gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gpt
 GPTPS_API gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out);
 GPTPS_API gptps_status gptps_task_setting_str(gptps_ctx *ctx, const char *key, char *buf, size_t cap);
 
-/* Introspection (index-based; indices are stable until a new task/add-on registers). */
+/* Introspection (index-based; indices are stable until a new task/add-on registers).
+ * get_info accepts any struct_size from the 1.0 layout (ending at `defval`) up; the
+ * ABI 2.8 copies are filled only when struct_size covers them. */
 GPTPS_API size_t       gptps_settings_count(gptps *e);
 GPTPS_API gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_setting_info *out);
 
@@ -1692,6 +1752,15 @@ typedef struct {
     gptps_status (*set_scheduler_ex)(gptps *e, gptps_sched_fn fn, void *user_data,
                                      const char *owner, unsigned flags);
 
+    /* --- ABI 2.8: two lookups the compiled-in add-ons use that a binary plug-in could
+     * not reach. task_flags tells a SERVICE type - whose handle has a terminal event
+     * per RUN - from a one-shot (gptps_balance refuses services with it); event_measure
+     * finds a measurement by name, struct_size-checked (gptps_retry and gptps_adapt
+     * read exit.code / start.error / mem.peak with it). Check struct_size first: an
+     * older core's table ends before them. */
+    gptps_status         (*task_flags)(gptps *e, const char *task_name, uint64_t *out_flags);
+    const gptps_measure *(*event_measure)(const gptps_event *ev, const char *name);
+
     /* DELIBERATELY ABSENT, so the omissions read as decisions rather than oversights:
      *   open / open_ex / shutdown / step - engine LIFECYCLE is the host's. A module
      *     that wants to own an engine is a compiled-in module by definition (it has
@@ -1835,7 +1904,13 @@ GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, vo
  * The dispatcher's mechanism is fixed and general: it admits the best-ordered
  * pending item that fits the live budget, skips a too-large item to backfill
  * smaller work behind it (no head-of-line blocking), and reserves for a
- * repeatedly-skipped top item so it cannot starve. What "best-ordered" MEANS is
+ * repeatedly-skipped item so it cannot starve (every item a backfill passes is
+ * charged a skip, the highest-ranked one that has used up its skips is reserved
+ * for) - unless what it lacks is held by
+ * running GPTPS_TASK_SERVICE instances, which do not drain: then it waits for a
+ * service to stop, other work goes on, and a WARN says so once per task type
+ * (reserving would stop all admission for as long as the services live). What
+ * "best-ordered" MEANS is
  * the one policy knob - by default it is scheduling PRIORITY (higher first, ties
  * FIFO). Install a scheduler to replace that ordering key with your own discipline
  * (deadline-first, per-tenant fair-share, cost-aware, aging, ...) WITHOUT touching
@@ -1851,8 +1926,8 @@ GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, vo
  * table); check in->struct_size before reading fields appended in a later minor.
  *
  * NOTE: a score should be a reasonably STABLE ordering key for a given item across
- * passes. The starvation guard charges "skips" to whichever item is currently
- * top-of-order, so a scheduler that returns wildly fluctuating scores for the same
+ * passes. The starvation guard charges "skips" to the items a backfill passes in the
+ * current order, so a scheduler that returns wildly fluctuating scores for the same
  * item can spread those skips across different items and weaken the per-item
  * anti-starvation bound. Age-based aging is fine (it is monotonic); prefer a key
  * that only moves an item UP over time (e.g. -deadline, or priority + age).

@@ -22,7 +22,8 @@ typedef struct wasm_task {
 
 struct gptps_wasm {
     gptps            *e;
-    gptps_wasm_run_fn run;
+    gptps_wasm_run_fn run;        /* exactly one of run / run_ex is set */
+    gptps_wasm_run_ex_fn run_ex;  /* ...this one is given the ctx (cooperative cancel) */
     void             *user_data;
     wasm_task        *tasks;   /* per-registration bookkeeping, freed at close */
 };
@@ -38,7 +39,9 @@ static gptps_status wasm_dispatch(gptps_ctx *ctx, void *ud)
     const void *payload = gptps_payload(ctx, &plen);
     void *res = NULL;
     size_t rlen = 0;
-    gptps_status st = wt->owner->run(wt->module_path, payload, plen, &res, &rlen, wt->owner->user_data);
+    gptps_status st = wt->owner->run_ex
+        ? wt->owner->run_ex(ctx, wt->module_path, payload, plen, &res, &rlen, wt->owner->user_data)
+        : wt->owner->run(wt->module_path, payload, plen, &res, &rlen, wt->owner->user_data);
     if (st == GPTPS_OK && res && rlen)
         return gptps_result_set_nocopy(ctx, res, rlen, free); /* engine takes ownership */
     free(res);
@@ -52,6 +55,16 @@ gptps_wasm *gptps_wasm_install(gptps *e, gptps_wasm_run_fn run, void *user_data)
     w = (gptps_wasm *)calloc(1, sizeof *w);
     if (!w) return NULL;
     w->e = e; w->run = run; w->user_data = user_data;
+    return w;
+}
+
+gptps_wasm *gptps_wasm_install_ex(gptps *e, gptps_wasm_run_ex_fn run, void *user_data)
+{
+    gptps_wasm *w;
+    if (!e || !run) return NULL;
+    w = (gptps_wasm *)calloc(1, sizeof *w);
+    if (!w) return NULL;
+    w->e = e; w->run_ex = run; w->user_data = user_data;
     return w;
 }
 

@@ -59,6 +59,8 @@ The meanings are those the tables below give, from the same descriptions.
 | `tasks.<task>.cpu_max_millicpus` | no cap | - |
 | `tasks.<task>.io_max_read_bps` | no cap | - |
 | `tasks.<task>.io_max_write_bps` | no cap | - |
+| `tasks.<task>.stop_grace_ms` | killed at once | - |
+| `tasks.<task>.stderr_tail_bytes` | not captured (stderr is the host's) | - |
 | `resources.<name>` | none: a submit that costs any is refused, and queued work that does is dead-lettered (GPTPS_E_BUDGET) - not a pause | - |
 | `tasks.<task>.resources.<name>` | none | - |
 
@@ -122,8 +124,10 @@ Values for every task, applied as it registers. A value in `[tasks.<task>]` wins
 | `priority` | whole number, -2147483648 to 2147483647 | `0` | at once | admission order: higher runs first; may be negative |
 | `on_failure` | one of `"dead_letter"`, `"requeue"`, `"drop"` | `"dead_letter"` | at once | once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it |
 | `cpu_max_millicpus` | whole number, 0 or more | `0` | at once | CPU a process job (oop/program) may use, in thousandths of one CPU; throttled past it, never killed. Enforced in cgroup mode and on Windows; elsewhere warned once. 0 = no cap |
-| `io_max_read_bps` | whole number, 0 or more | `0` | at once | block-device reads a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
-| `io_max_write_bps` | whole number, 0 or more | `0` | at once | block-device writes a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
+| `io_max_read_bps` | whole number, 0 or more | `0` | at once | block-device reads a process job may make, bytes/s on each device. Enforced in cgroup mode, and on Windows 10 1607 / Server 2016 and later, which hold reads and writes together as one per-volume limit - the smaller of the two caps, warned once when they differ; elsewhere warned once. 0 = no cap |
+| `io_max_write_bps` | whole number, 0 or more | `0` | at once | block-device writes a process job may make, bytes/s on each device. Enforced in cgroup mode, and on Windows 10 1607 / Server 2016 and later, which hold reads and writes together as one per-volume limit - the smaller of the two caps, warned once when they differ; elsewhere warned once. 0 = no cap |
+| `stop_grace_ms` | whole number, 0 to 300000 | `0` | at once | program jobs: ms a program that has to be stopped (timeout, cancel, removal, shutdown) gets after SIGTERM (Ctrl+Break on Windows) before it is killed; 0 = killed at once |
+| `stderr_tail_bytes` | whole number, 0 to 65536 | `0` | at once | program jobs: bytes of the end of a failed attempt's stderr kept for its FAILED event and dead letter; 0 = not captured (stderr is the host's) |
 
 ## [tasks.<task>]
 
@@ -138,8 +142,10 @@ One task's values, applied when a task of that name registers. A table for a tas
 | `priority` | whole number, -2147483648 to 2147483647 | `0` | at once | admission order: higher runs first; may be negative |
 | `on_failure` | one of `"dead_letter"`, `"requeue"`, `"drop"` | `"dead_letter"` | at once | once the retries are spent: dead_letter keeps the item, requeue starts it over, drop discards it |
 | `cpu_max_millicpus` | whole number, 0 or more | `0` | at once | CPU a process job (oop/program) may use, in thousandths of one CPU; throttled past it, never killed. Enforced in cgroup mode and on Windows; elsewhere warned once. 0 = no cap |
-| `io_max_read_bps` | whole number, 0 or more | `0` | at once | block-device reads a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
-| `io_max_write_bps` | whole number, 0 or more | `0` | at once | block-device writes a process job may make, bytes/s on each device; enforced in cgroup mode only, elsewhere warned once. 0 = no cap |
+| `io_max_read_bps` | whole number, 0 or more | `0` | at once | block-device reads a process job may make, bytes/s on each device. Enforced in cgroup mode, and on Windows 10 1607 / Server 2016 and later, which hold reads and writes together as one per-volume limit - the smaller of the two caps, warned once when they differ; elsewhere warned once. 0 = no cap |
+| `io_max_write_bps` | whole number, 0 or more | `0` | at once | block-device writes a process job may make, bytes/s on each device. Enforced in cgroup mode, and on Windows 10 1607 / Server 2016 and later, which hold reads and writes together as one per-volume limit - the smaller of the two caps, warned once when they differ; elsewhere warned once. 0 = no cap |
+| `stop_grace_ms` | whole number, 0 to 300000 | `0` | at once | program jobs: ms a program that has to be stopped (timeout, cancel, removal, shutdown) gets after SIGTERM (Ctrl+Break on Windows) before it is killed; 0 = killed at once |
+| `stderr_tail_bytes` | whole number, 0 to 65536 | `0` | at once | program jobs: bytes of the end of a failed attempt's stderr kept for its FAILED event and dead letter; 0 = not captured (stderr is the host's) |
 
 ## [tasks.<task>.resources]
 

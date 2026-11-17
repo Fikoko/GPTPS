@@ -9,13 +9,15 @@ pair.)
 Everything else in the core is ISO C99 — it compiles under `-std=c99
 -pedantic-errors` — and calls nothing else of the platform. Two more files are
 platform code without being HAL: the executors for forked and external-program
-tasks (`src/exec_oop_posix.c`, `src/exec_win.c`). A target without processes
-supplies stubs for them, as [`freestanding/exec_stub.c`](../freestanding/exec_stub.c)
-does.
+tasks (`src/exec_oop_posix.c`, `src/exec_win.c`). The engine calls
+`gptps_oop_execute` and `gptps_program_execute` unconditionally, so a target without
+processes supplies stubs for them, as [`freestanding/exec_stub.c`](../freestanding/exec_stub.c)
+does (every such job fails with `GPTPS_E_IO`).
 
 Three backends ship: `src/hal_posix.c`, `src/hal_win.c`, and the freestanding stub
 [`freestanding/hal_stub.c`](../freestanding/hal_stub.c). A port is one more file,
-built in with `-DGPTPS_HAL_SOURCE=<file>`.
+built in with `-DGPTPS_HAL_SOURCE=<file>` - see [Porting](#porting) for the executor
+and the thread library.
 
 ## Two profiles
 
@@ -45,8 +47,9 @@ CI platform.
 | **A thread id is stable within a thread and distinct among live threads.** It may be reused after a thread exits. | Re-entrancy detection: `gptps_shutdown`, `gptps_step` and an unregister that waits refuse a call from inside a callback. | `thread_id: stable ...`, `thread_id: distinct among live threads ...` |
 | **On a platform with `fork`, the generation changes in the child, and only there.** Install is idempotent. Without `fork`, a constant. | An engine created before a fork is refused in the child instead of deadlocking on a mutex a vanished thread held. | `fork: ...` (three checks) |
 | **Detection returns `GPTPS_OK` and at least one CPU**; RAM may be 0 for unknown; `NULL` is `GPTPS_E_INVAL`. `has_gpu` is not part of the contract: the core never reads it. | Auto-tuning the worker count and the memory budget. A GPU is a named resource the host or the config file defines, not something the HAL detects. | `detect: ...` |
-| **Optional — dynamic loading.** Open returns `NULL` on failure, a lookup of a missing symbol returns `NULL`, close unloads, release frees the handle but keeps the mapping. | Binary plug-ins (`addons = [...]` in TOML). Without it, open returns `NULL` and plug-ins are unavailable. | `dl: ...` (CTest `hal_conformance_dl`) |
+| **Optional — dynamic loading.** Open returns `NULL` on failure, a lookup of a missing symbol returns `NULL`, close unloads, release frees the handle but keeps the mapping, and `gptps_dl_error` (1.10) describes the calling thread's last failed open or lookup in the OS's words - or writes "" and returns 0, which is a complete implementation. | Binary plug-ins (`addons = [...]` in TOML). Without it, open returns `NULL` and plug-ins are unavailable. | `dl: ...` (CTest `hal_conformance_dl`) |
 | **Optional — atomic replace.** The target is replaced in one step, also when it exists; `GPTPS_E_IO` on failure. Recommended, not checked: the replacement keeps the replaced file's permissions, as the bundled POSIX HAL does, because save edits an operator's config file. | `gptps_settings_save` writes a temporary file and replaces the real one. Without a filesystem it returns `GPTPS_E_IO`, and saving is unavailable. | `atomic_replace: ...` (four checks) |
+| **Optional — private temp file** (`gptps_hal_open_private`, ABI 2.8). Creates the file anew - removing one already there - open for writing, with access for its owner only; `NULL` on failure. A port with no file ownership may return `fopen(path, "wb")`; one without a filesystem returns `NULL`. | The settings save's temporary file: the config it becomes can name add-ons to load, so nobody else may read it as it is written or write into it before the replace. | `open_private: ...` (two checks) |
 
 ## What a port may do
 
@@ -204,12 +207,53 @@ so it runs the same seeds again.
 - **That `dl_release` keeps the mapping.** The check only shows it returns, and
   LeakSanitizer shows the handle was freed.
 
+## Porting
+
+What a port provides, and what the build takes away for it:
+
+| You provide | CMake | Amalgamation (`gptps.c`) |
+|---|---|---|
+| A HAL: every function in `gptps_hal.h` | `-DGPTPS_HAL_SOURCE=hal_x.c` | `-DGPTPS_EXTERNAL_HAL`, and compile `hal_x.c` beside it |
+| The process executors: `gptps_oop_execute` and `gptps_program_execute`. On a hosted POSIX or Windows target keep the bundled one; with no process model use `freestanding/exec_stub.c` | `-DGPTPS_EXEC_SOURCE=exec_x.c` | `-DGPTPS_EXTERNAL_EXEC`, and compile `exec_x.c` beside it |
+| Whatever your HAL links against | `-DGPTPS_PORT_LIBS="lib1;lib2"` (linked PUBLIC, and written to `gptps.pc`) | your own link line |
+
+The bundled HAL and the bundled POSIX executor need the platform thread library and
+the dynamic loader, so while either is in the build CMake requires `Threads` and links
+it with `-ldl`. Replace **both** and it does neither: the core calls nothing of the
+platform but the HAL, so an RTOS or bare-metal toolchain configures with no thread
+library at all (configure says so once). Building the test suite or the examples
+still needs one, as they are hosted programs; an RTOS cross build turns them off:
+
+```sh
+cmake -S . -B build-port -DCMAKE_TOOLCHAIN_FILE=arm-none-eabi.cmake \
+      -DGPTPS_HAL_SOURCE=$PWD/hal_myrtos.c -DGPTPS_EXEC_SOURCE=$PWD/freestanding/exec_stub.c \
+      -DGPTPS_BUILD_TESTS=OFF -DGPTPS_BUILD_EXAMPLES=OFF -DGPTPS_BUILD_ADDONS=OFF \
+      -DGPTPS_BUILD_CONFORMANCE=OFF
+cmake --build build-port --target gptps        # libgptps.a: core + your HAL + the stubs
+```
+
+and the amalgamation, with no build system:
+
+```sh
+sh tools/amalgamate.sh out
+cc -std=c99 -DGPTPS_EXTERNAL_HAL -DGPTPS_EXTERNAL_EXEC -I out -I include -I src \
+   out/gptps.c hal_myrtos.c freestanding/exec_stub.c app.c
+```
+
+(`hal_x.c` and `exec_stub.c` include the internal headers, hence `-I include -I src`.)
+CI's `freestanding` job builds both, with `freestanding/hal_stub.c` as the HAL, and
+fails if either looks for a thread library or references `pthread_*`, `dlopen` or
+`fork`. Add-ons are hosted code (some use threads, sockets or `fork`) and are not part
+of a port.
+
 ## Running it
 
 - **The stock backends.** CTest runs `hal_conformance` and `hal_conformance_dl` in
   every build.
-- **A port.** Build with `-DGPTPS_HAL_SOURCE=/path/to/hal_mytarget.c`, then
-  `ctest -R hal_conformance`. The same file runs against your HAL.
+- **A port on a target that can run the suite** (a hosted RTOS simulator, a POSIX-like
+  OS): build with `-DGPTPS_HAL_SOURCE=/path/to/hal_mytarget.c`, then
+  `ctest -R hal_conformance`. The same file runs against your HAL. CI does this with
+  `tests/hal_chaos.c` and `tests/hal_sim.c`.
 - **A target with no OS.** The test needs only the HAL and hosted C99, so it can be
   built against a HAL alone. CI checks the stub this way:
 

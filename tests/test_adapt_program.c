@@ -108,6 +108,30 @@ int main(void)
         CHECK(r.cap_hits == 1 && r.hit_declared == 32 * MiB);
         CHECK(r.suggested == 48 * MiB);                  /* 32 MiB + 50%, at once */
     }
+    /* 2c) attempts whose program never started (start.error, ABI 2.8) are no evidence:
+     * on Linux in cgroup mode they carried the pre-exec child's few hundred KiB as a
+     * cgroup.job.resident peak, and min_samples of them suggested about 1 MiB */
+    {
+        gptps_measure m[3];
+        gptps_event ev;
+        memset(m, 0, sizeof m);
+        m[0].name = GPTPS_M_MEM_PEAK;     m[0].value = 300 * 1024; m[0].unit = GPTPS_UNIT_BYTES;
+        m[0].kind = GPTPS_MEASURE_PEAK;   m[0].method = "cgroup.job.resident";
+        m[1].name = GPTPS_M_CPU_USER_MS;  m[1].value = 1;          m[1].unit = GPTPS_UNIT_MS;
+        m[1].kind = GPTPS_MEASURE_TOTAL;  m[1].method = "cgroup.job";
+        m[2].name = GPTPS_M_START_ERROR;  m[2].value = 2;          m[2].unit = GPTPS_UNIT_CODE;
+        m[2].kind = GPTPS_MEASURE_CURRENT; m[2].method = "errno";
+        memset(&ev, 0, sizeof ev);
+        ev.struct_size = sizeof ev;
+        ev.kind = GPTPS_EV_FAILED; ev.task_name = "nostart"; ev.status = GPTPS_E_TASK;
+        ev.mem_bytes = 512 * MiB; ev.measures = m; ev.n_measures = 3;
+        for (i = 0; i < 5; ++i) obs(&ev, a);
+        memset(&r, 0, sizeof r); r.struct_size = sizeof r;
+        CHECK(gptps_adapt_get(a, "nostart", &r) == GPTPS_E_NOTFOUND);   /* nothing counted */
+        ev.n_measures = 2;                         /* the same attempt, but it ran: counted */
+        obs(&ev, a);
+        CHECK(gptps_adapt_get(a, "nostart", &r) == GPTPS_OK && r.samples == 1);
+    }
 
     CHECK(gptps_shutdown(e) == GPTPS_OK);
     gptps_adapt_close(a);

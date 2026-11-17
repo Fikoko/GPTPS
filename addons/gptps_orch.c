@@ -265,10 +265,41 @@ static void release_gate(gptps_orch *o, gate *g)
      * further (chaining onto a deferred gate is out of scope - see the header). */
 }
 
+/* Free every gate that was submitted, and close up the array, keeping the order of
+ * the rest (gptps_orch_stalled_at counts in it). A submitted gate is never read again:
+ * its task is an ordinary engine item now. Only a gate still waiting, or one that was
+ * abandoned (kept for gptps_orch_stalled_at / gptps_orch_retry), stays. They used to
+ * stay until gptps_orch_close, payload and all, so a long-running host kept every
+ * payload it ever gated, and every terminal event walked every gate ever made.
+ * Caller holds o->mu. */
+static void compact_gates(gptps_orch *o)
+{
+    size_t i, k = 0;
+    for (i = 0; i < o->ng; ++i) {
+        gate *g = &o->gates[i];
+        if (g->released && !g->abandoned) {
+            free(g->task); free(g->payload); free(g->deps);
+            continue;
+        }
+        if (k != i) o->gates[k] = *g;
+        ++k;
+    }
+    o->ng = k;
+    /* give memory back after a burst: shrink when three quarters are unused */
+    if (o->gcap > 8 && o->ng < o->gcap / 4) {
+        size_t nc = o->gcap;
+        gate *ng;
+        while (nc > 8 && o->ng < nc / 4) nc /= 2;   /* keep room to grow: half used at most */
+        ng = (gate *)realloc(o->gates, nc * sizeof *ng);
+        if (ng) { o->gates = ng; o->gcap = nc; }   /* a failed shrink keeps the old block */
+    }
+}
+
 static void orch_obs(const gptps_event *ev, void *ud)
 {
     gptps_orch *o = (gptps_orch *)ud;
     size_t i, j;
+    int freed = 0;
     /* only terminal events advance dependencies; ignore QUEUED/STARTED/RETRIED and
      * every non-final FAILED (see is_terminal). Returning before taking the lock also
      * means a re-entrant QUEUED - emitted by the gptps_submit in release_gate, while
@@ -283,8 +314,9 @@ static void orch_obs(const gptps_event *ev, void *ud)
         for (j = 0; j < g->ndeps; ++j) {
             if (g->deps[j] == ev->handle && g->remaining > 0) { g->remaining -= 1; break; }
         }
-        if (g->remaining == 0) release_gate(o, g);
+        if (g->remaining == 0) { release_gate(o, g); freed |= g->released && !g->abandoned; }
     }
+    if (freed) compact_gates(o);
     apx_mutex_unlock(&o->mu);
 }
 
@@ -385,6 +417,19 @@ size_t gptps_orch_retry(gptps_orch *o)
         release_gate(o, g);
         if (!g->abandoned) ++n;
     }
+    compact_gates(o);   /* the ones submitted now */
+    apx_mutex_unlock(&o->mu);
+    return n;
+}
+
+size_t gptps_orch_discard_stalled(gptps_orch *o)
+{
+    size_t i, n = 0;
+    if (!o) return 0;
+    apx_mutex_lock(&o->mu);
+    for (i = 0; i < o->ng; ++i)
+        if (o->gates[i].abandoned) { o->gates[i].abandoned = 0; o->gates[i].released = 1; ++n; }
+    compact_gates(o);   /* released and not abandoned: freed */
     apx_mutex_unlock(&o->mu);
     return n;
 }

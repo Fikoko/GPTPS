@@ -103,11 +103,18 @@ mem_bytes       = 268435456          # advertise this task's per-run memory cost
 priority        = 10                 # run resizes ahead of lower-priority work
 # For a task that runs as a separate process (exec OOP or PROGRAM), 1.8 can also cap
 # what one run may use while it runs - throttled, never killed. Enforced in cgroup
-# mode (GPTPS_CGROUP_PARENT) and, for the CPU cap, on Windows; elsewhere the first
-# run logs one warning per cap. 0 = no cap. In-process tasks ignore them.
+# mode (GPTPS_CGROUP_PARENT) and on Windows (the I/O caps from Windows 10 1607 /
+# Server 2016); elsewhere the first run logs one warning per cap. 0 = no cap.
+# In-process tasks ignore them. Windows limits a job's reads and writes together,
+# per volume: two different I/O caps hold as one, the smaller (warned once).
 # cpu_max_millicpus = 2000           # at most two CPUs' worth (1000 = one CPU)
 # io_max_read_bps   = 104857600      # 100 MiB/s of block-device reads, per device
 # io_max_write_bps  = 52428800       # 50 MiB/s of writes, per device
+# For a PROGRAM task (1.10): how it is stopped, and what a failure keeps.
+# stop_grace_ms     = 30000          # SIGTERM / Ctrl+Break, then up to 30 s before the
+#                                    # kill (timeout, cancel, removal, shutdown); max 300000
+# stderr_tail_bytes = 4096           # the end of a failed run's stderr, on its FAILED
+#                                    # event and dead letter; max 65536, 0 = not captured
 
 [tasks.resize.resources]
 gpu = 1                              # each resize holds one of the two GPUs while it runs

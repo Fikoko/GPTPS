@@ -278,7 +278,10 @@ auto-tune. `gptps_open_ex` reads the same file when `cfg.config_path` is set, an
 explicit value in `cfg.limits`, `cfg.max_dead_letters` or `cfg.shutdown_grace_ms` wins
 over the file's. A subset of TOML is supported
 (tables, `int`/`float`/`bool`/`"string"` and single-line string arrays, `"quoted"` parts in
-keys and table names such as `[tasks."resize v2"]`, `#` comments). **[docs/CONFIG.md](docs/CONFIG.md) lists every key** with its type,
+keys and table names such as `[tasks."resize v2"]`, `#` comments). The file is UTF-8 and
+may open with a byte order mark, as Windows tools often write it; a save keeps the mark.
+Its path, a save path and the paths in `addons` are UTF-8 as well - on Windows too, so
+a Turkish directory name works on any code page. **[docs/CONFIG.md](docs/CONFIG.md) lists every key** with its type,
 range, default and when a change applies; it is generated from the code, and a test
 fails when the two disagree.
 
@@ -681,7 +684,10 @@ device), or live as `tasks.<name>.cpu_max_millicpus` etc. These bound what a job
 started may *use*; what may *start* is still admission's business (a CPU budget for that is
 a named resource: `gptps_define_resource(e, "cpu", 8000)`). They are enforced as `cpu.max`
 / `io.max` on the job's cgroup in cgroup mode (the parent must delegate `+cpu` / `+io`),
-and the CPU cap through the job object's hard CPU-rate limit on Windows. Where nothing can
+and on Windows through the job object: the CPU cap as its hard CPU-rate limit, the I/O
+caps (ABI 2.8, Windows 10 1607 / Server 2016 and later) as its I/O rate control, which
+holds reads and writes together per volume - two different I/O caps hold as one, the
+smaller, and that is warned once. Where nothing can
 hold one, the job still runs and the log sink gets **one** `WARN` per cap per task type —
 never silence. A CPU cap held by a cgroup reports `cpu.throttled_ms` on the job's
 `FINISHED` / `FAILED`: the evidence that the cap is why it was slow.
@@ -692,14 +698,24 @@ environment; a bare `"NAME"` removes one), on POSIX and Windows alike; strings a
 so a Turkish path works on any Windows code page. `def.stop_grace_ms` lets a job GPTPS has
 to stop clean up first: SIGTERM (Ctrl+Break on Windows, service hosts included), up to
 that long for the whole job - launcher and workers - then the kill, its output read
-throughout. `GPTPS_TASK_DIE_WITH_HOST` kills a job when its host dies (Linux, FreeBSD;
-Windows always). A program that never started reports `start.error` with the OS's
-reason instead of an exit code, and a dead letter carries the last attempt's
-measurements, so a report can say why. `def.stderr_tail_bytes` captures the job's stderr and hands its last
+throughout. `GPTPS_TASK_DIE_WITH_HOST` (ABI 2.8) kills a job when its host dies: on
+Linux (tested in CI for `PROGRAM` and `OOP` jobs, with a host that really crashes),
+on Windows always unless the host's own job allows no nested one - then a WARN (tested the same way), and on FreeBSD by the same code through
+`procctl` - which no CI runner builds or runs, so it is untested there; elsewhere one
+WARN says it is not in force. A program that never started reports `start.error` with
+the OS's reason instead of an exit code, and a dead letter carries the last attempt's
+measurements (ABI 2.8), so a report can say why. `def.stderr_tail_bytes` captures the job's stderr and hands its last
 bytes back on the `FAILED` event and the dead letter, so forty jobs' errors stay apart.
 Every `FINISHED` / `FAILED` also carries `exit.code` (or `exit.signal`) when the program
 ended on its own. What happens to running jobs if the host itself dies is in
 [docs/SECURITY.md](docs/SECURITY.md).
+
+**Which failures to retry.** The core retries every failure the same way; which ones
+are worth retrying is policy, and a program's exit code usually says.
+[`gptps_retry`](addons/README.md#retry--retry-rules-by-exit-code) maps exit codes - and
+`start.error`, for a program that never started - to "never" (dead-letter at once) or
+"retry, after this long", per task type or for all of them: a vendor's convention of 1
+retry, 2 bad input, 3 licence server busy is three calls.
 
 **What a job actually used.** Admission counts what a task *declares*; the
 out-of-process executors also report what each attempt *used*, because they collect its
@@ -885,6 +901,7 @@ gptps/
 │   ├── gptps_balance.c  late-binding load balancer above pool (join-shortest-queue; any task size)
 │   ├── gptps_stats.c    counters / gauges / latency on the observer seam (per engine, per task, mergeable)
 │   ├── gptps_sched.c    EDF / aging / weighted fair share orderings + shed-late;  gptps_adapt.c  mem_bytes from measured peaks
+│   ├── gptps_retry.c    retry rules by exit code: never, or after a wait
 │   ├── gptps_await.c    blocking wait(handle);  gptps_orch.c  run-after / fan-in dependencies
 │   ├── gptps_durable_queue.c  crash-durable journal;  gptps_gpu_quota.c  named-resource quota
 │   ├── gptps_wasm_exec.c  module-as-task;  gptps_tui.c  live terminal dashboard
@@ -908,7 +925,7 @@ gptps/
 │   ├── gptps_conformance.c  prove a binary plug-in before you ship it (installs to bin/)
 │   └── check_addon_coverage.sh  every add-on is built, obtainable and documented
 ├── CMakeLists.txt
-└── .github/workflows/ci.yml   Linux/macOS/Windows (mingw + MSVC), i386 + s390x + freestanding,
+└── .github/workflows/ci.yml   Linux/macOS/Windows (mingw + MSVC), i386 + s390x + freestanding (no FreeBSD runner),
                                ASan/UBSan + TSan, and a `package` job that installs and consumes
 ```
 
@@ -929,7 +946,8 @@ add-ons cannot silently fight over it), **scale-up** (`gptps_pool` shards) and
 crash-durable queue, a blocking `wait(handle)`, run-after/fan-in dependencies, GPU-quota
 and WASM-executor add-ons, **ready-made admission disciplines** (`gptps_sched`: EDF, aging,
 weighted fair share, shed-late) over a per-item **due time**, **CPU and I/O caps** for process
-jobs, **declarations from evidence** (`gptps_adapt`), **observer-seam stats** (`gptps_stats`: totals, gauges,
+jobs, **declarations from evidence** (`gptps_adapt`), **retry rules by exit code** (`gptps_retry`),
+**observer-seam stats** (`gptps_stats`: totals, gauges,
 latency, per task, mergeable across shards), **measurements** of what each process job
 actually used (peak memory, CPU, I/O, cap hit; sampled while it runs if asked; carried
 back from `gptps_xport` workers), the examples + benchmark, CMake + CI + single-file
@@ -939,10 +957,11 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **59** public functions · **ABI 2.7** (append-only; 2.0 was the first
+At a glance: **59** public functions · **ABI 2.8** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **103** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
-matrix), every one required to pass.
+plug-in · **108** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+matrix), every one required to pass - and a release tag publishes nothing until all of
+them have passed at that tag (`release.yml` runs `ci.yml` as its gate).
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can
 hang it hangs your host's exit path — so these are contractual, and

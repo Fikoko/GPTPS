@@ -9,18 +9,38 @@ name: release
 # reference a stable, verifiable URL.
 #
 # The payload is built and RUN here before it is attached - a release artifact that
-# was never compiled is a promise, not a deliverable.
+# was never compiled is a promise, not a deliverable. And it is published only after
+# the full CI (ci.yml, called below) has passed at the tag on every platform it
+# covers: Linux, macOS, Windows with mingw-w64 and with MSVC.
 
 on:
   push:
     tags:
       - 'v*'
 
-permissions:
-  contents: write        # required to create the Release
+# Nothing by default; each job below asks for what it needs.
+permissions: {}
 
 jobs:
+  # The WHOLE of ci.yml, at the tagged commit, as a gate: Linux and macOS
+  # (build-test), Windows with mingw-w64 (windows) and with MSVC (msvc), the
+  # sanitizers, the HAL jobs, cross and freestanding. The Readme says every CI job
+  # is required to pass; before this, a release only waited for the Linux build in
+  # the job below, while ci.yml's Windows and macOS jobs ran BESIDE it on the same
+  # tag push - so a release could publish while the platform its main user runs on
+  # (Windows Server) was red. ci.yml skips v* tag pushes itself, so this is the one
+  # run of it for a release tag, not a second one.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    # Publishes only once every ci.yml job above has passed. A failed, cancelled or
+    # skipped gate skips this job, and nothing is published.
+    needs: [ci]
+    permissions:
+      contents: write        # required to create the Release
     # Pinned, unlike ci.yml: ubuntu-latest moves to Ubuntu 26 from 2026-10-19, and
     # whatever a new image's compiler or tools break should surface on a CI push,
     # not on a tag push. Move this forward once ci.yml is green on the new image.
@@ -157,6 +177,8 @@ jobs:
             echo '```sh'
             echo "cc -std=c99 myapp.c gptps.c -I. -lpthread -ldl   # Linux"
             echo "cc -std=c99 myapp.c gptps.c -I. -lpthread        # macOS"
+            echo "gcc -std=gnu99 myapp.c gptps.c -I.               # Windows, mingw-w64"
+            echo "cl /std:c11 /I. myapp.c gptps.c                  # Windows, MSVC"
             echo '```'
             echo ""
             echo 'Or build from source with CMake: `cmake -S . -B build && cmake --build build`.'

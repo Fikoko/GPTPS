@@ -1,0 +1,3 @@
+﻿# nightly config
+[limits]
+max_concurrent_tasks = 4

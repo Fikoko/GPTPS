@@ -21,6 +21,11 @@ if(MSVC)
     # Quiet the C4996 deprecation noise MSVC emits for ISO C (fopen, ...) and POSIX
     # (_isatty, ...) names; the code uses them portably and correctly.
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+    # Sources are UTF-8. Without /utf-8 MSVC reads a file with no byte order mark in
+    # the build machine's ANSI code page, so a non-ASCII letter in a string literal
+    # (or a comment) would mean something else on each runner. The sources spell such
+    # letters with escapes anyway; this keeps a slip from changing a test's meaning.
+    add_compile_options(/utf-8)
     # The test/example suite uses GCC __atomic_* builtins for cross-thread counters;
     # force-include a shim mapping them to Win32 Interlocked* under MSVC. Inert for
     # the library itself (it routes atomics through the HAL, not these builtins).
@@ -66,10 +71,10 @@ unset(_gptps_hdr)
 set(GPTPS_SRC src/alloc.c src/config.c src/config_toml.c src/settings.c src/engine.c)
 if(WIN32)
     set(_gptps_hal src/hal_win.c)
-    list(APPEND GPTPS_SRC src/exec_win.c)                       # CreateProcess/Job-Object program executor
+    set(_gptps_exec src/exec_win.c)                             # CreateProcess/Job-Object program executor
 else()
     set(_gptps_hal src/hal_posix.c)
-    list(APPEND GPTPS_SRC src/exec_oop_posix.c)                 # out-of-process executor
+    set(_gptps_exec src/exec_oop_posix.c)                       # out-of-process executor
 endif()
 # The HAL is a real module boundary (freestanding/hal_stub.c proves it), so a
 # downstream on an unlisted platform can substitute its own implementation of
@@ -84,7 +89,24 @@ if(GPTPS_HAL_SOURCE)
     set(_gptps_hal "${GPTPS_HAL_SOURCE}")
     message(STATUS "gptps: using custom HAL ${GPTPS_HAL_SOURCE}")
 endif()
-list(APPEND GPTPS_SRC ${_gptps_hal})
+# The process executors (GPTPS_EXEC_OOP / GPTPS_EXEC_PROGRAM) are platform code
+# without being HAL: the engine calls gptps_oop_execute and gptps_program_execute
+# unconditionally, so a target is linked with exactly one file defining both. The
+# bundled ones need fork/poll/<sys/wait.h> (POSIX) or CreateProcess (Windows). A
+# target with no process model - an RTOS, bare metal - replaces it here, usually with
+# freestanding/exec_stub.c, which reports GPTPS_E_IO for every such job. Without this
+# option -DGPTPS_HAL_SOURCE alone still compiled exec_oop_posix.c and could not
+# configure or build for such a target at all.
+set(GPTPS_EXEC_SOURCE "" CACHE FILEPATH
+    "Replace the bundled process executor with this file (e.g. freestanding/exec_stub.c)")
+if(GPTPS_EXEC_SOURCE)
+    if(NOT EXISTS "${GPTPS_EXEC_SOURCE}")
+        message(FATAL_ERROR "GPTPS_EXEC_SOURCE does not exist: ${GPTPS_EXEC_SOURCE}")
+    endif()
+    set(_gptps_exec "${GPTPS_EXEC_SOURCE}")
+    message(STATUS "gptps: using custom process executor ${GPTPS_EXEC_SOURCE}")
+endif()
+list(APPEND GPTPS_SRC ${_gptps_exec} ${_gptps_hal})
 add_library(gptps STATIC ${GPTPS_SRC})
 target_include_directories(gptps
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -106,12 +128,6 @@ option(GPTPS_HAL_FAST "Build the platform-optimized HAL (adaptive mutexes; glibc
 if(GPTPS_HAL_FAST)
     target_compile_definitions(gptps PRIVATE GPTPS_HAL_FAST)
 endif()
-
-# threads (HAL uses pthreads on POSIX)
-set(THREADS_PREFER_PTHREAD_FLAG ON)
-find_package(Threads REQUIRED)
-target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
-
 # --- what to build (a downstream consumer gets the LIBRARY only) -----------
 # Default ON at top level, OFF when GPTPS is add_subdirectory'd / FetchContent'd:
 # without this a consumer inherited all 43 CTest tests and had to build every test
@@ -125,6 +141,52 @@ endif()
 option(GPTPS_BUILD_TESTS    "Build the GPTPS test suite"  ${GPTPS_IS_TOP_LEVEL})
 option(GPTPS_BUILD_EXAMPLES "Build the GPTPS examples"    ${GPTPS_IS_TOP_LEVEL})
 
+# The thread library and the dynamic loader. The bundled HALs use them (pthreads and
+# dlopen on POSIX), and so does the bundled POSIX executor (pthread_sigmask). A port
+# that replaces BOTH files (-DGPTPS_HAL_SOURCE and -DGPTPS_EXEC_SOURCE) gets neither
+# from here: the core itself calls only the HAL, so an RTOS or bare-metal target
+# configures with no thread library at all, and links whatever its own HAL needs
+# (target_link_libraries(gptps ...) after add_subdirectory, or GPTPS_PORT_LIBS). Said
+# once at configure time, so nobody is left wondering where -lpthread went.
+# The suite and the examples are hosted programs that use threads themselves, so
+# building them still requires the library.
+set(GPTPS_PORT_LIBS "" CACHE STRING
+    "Libraries a custom HAL / executor needs (linked PUBLIC to gptps)")
+if(GPTPS_HAL_SOURCE AND GPTPS_EXEC_SOURCE)
+    set(_gptps_bundled_platform OFF)
+else()
+    set(_gptps_bundled_platform ON)
+endif()
+set(GPTPS_PC_PRIVATE_LIBS "")
+if(_gptps_bundled_platform OR GPTPS_BUILD_TESTS OR GPTPS_BUILD_EXAMPLES)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+endif()
+if(_gptps_bundled_platform)
+    target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    # The core calls dlopen for the add-on loader, so a static `pkg-config --libs gptps`
+    # link without -ldl fails with an undefined reference on glibc < 2.34.
+    set(GPTPS_PC_PRIVATE_LIBS "-lpthread")
+    foreach(_l IN LISTS CMAKE_DL_LIBS)
+        set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} -l${_l}")
+    endforeach()
+    set(GPTPS_CONFIG_NEEDS_THREADS ON)
+else()
+    message(STATUS "gptps: custom HAL and executor - linking no thread or loader "
+                   "library into gptps; GPTPS_PORT_LIBS='${GPTPS_PORT_LIBS}'")
+    set(GPTPS_CONFIG_NEEDS_THREADS OFF)
+endif()
+if(GPTPS_PORT_LIBS)
+    target_link_libraries(gptps PUBLIC ${GPTPS_PORT_LIBS})
+    foreach(_l IN LISTS GPTPS_PORT_LIBS)
+        if(_l MATCHES "^-" OR IS_ABSOLUTE "${_l}")
+            set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} ${_l}")
+        else()
+            set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} -l${_l}")
+        endif()
+    endforeach()
+endif()
+
 # pkg-config substitutions. Computed HERE, above add_subdirectory(addons), because
 # the add-on .pc files are generated inside that subdirectory and would otherwise
 # interpolate an empty prefix - which resolves to the pkgconfig directory itself and
@@ -137,12 +199,8 @@ option(GPTPS_BUILD_EXAMPLES "Build the GPTPS examples"    ${GPTPS_IS_TOP_LEVEL})
 file(RELATIVE_PATH GPTPS_PC_PREFIX_REL
      "${CMAKE_INSTALL_FULL_LIBDIR}/pkgconfig" "${CMAKE_INSTALL_PREFIX}")
 string(REGEX REPLACE "/$" "" GPTPS_PC_PREFIX_REL "${GPTPS_PC_PREFIX_REL}")
-# The core calls dlopen for the add-on loader, so a static `pkg-config --libs gptps`
-# link without -ldl fails with an undefined reference on glibc < 2.34.
-set(GPTPS_PC_PRIVATE_LIBS "-lpthread")
-foreach(_l IN LISTS CMAKE_DL_LIBS)
-    set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} -l${_l}")
-endforeach()
+# GPTPS_PC_PRIVATE_LIBS (-lpthread, -ldl, or a port's own) is set with the thread
+# library above.
 
 # --- add-ons (one installable library each) --------------------------------
 # The suite links the real add-on LIBRARIES rather than compiling their sources in,
@@ -254,6 +312,9 @@ set_tests_properties(service PROPERTIES TIMEOUT 30)
 add_executable(test_abi tests/test_abi.c)   # append-safe input-struct guards (frozen minimums)
 target_include_directories(test_abi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_abi PRIVATE gptps)
+# read back to check every GPTPS_TASK_* / _SUBMIT_* / ... flag is listed and distinct
+target_compile_definitions(test_abi PRIVATE
+    GPTPS_PUBLIC_HEADER="${CMAKE_CURRENT_SOURCE_DIR}/include/gptps.h")
 add_test(NAME abi COMMAND test_abi)
 set_tests_properties(abi PROPERTIES TIMEOUT 30)
 
@@ -309,6 +370,14 @@ add_dependencies(test_hal_conformance addon_demo)
 add_test(NAME hal_conformance COMMAND test_hal_conformance)
 add_test(NAME hal_conformance_dl COMMAND test_hal_conformance --dl-only $<TARGET_FILE:addon_demo>)
 set_tests_properties(hal_conformance hal_conformance_dl PROPERTIES TIMEOUT 120)
+# What the bundled POSIX HAL does beyond the contract: the cgroup clamp auto-tune
+# sizes by, and a settings save's replace (permissions with no window, durable).
+if(NOT WIN32 AND NOT GPTPS_HAL_SOURCE)
+    add_executable(test_hal_posix tests/test_hal_posix.c)
+    target_include_directories(test_hal_posix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(test_hal_posix PRIVATE gptps)
+    add_test(NAME hal_posix COMMAND test_hal_posix)
+endif()
 
 add_executable(test_engine tests/test_engine.c)
 target_include_directories(test_engine
@@ -766,6 +835,13 @@ target_include_directories(test_durable_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_durable_oom PRIVATE gptps)
 add_test(NAME durable_oom COMMAND test_durable_oom)
 set_tests_properties(durable_oom PROPERTIES TIMEOUT 30)
+# 64-bit journal offsets: the helpers on a sparse 5 GiB file, and the group commit when
+# an offset cannot be read (the add-on compiled in, its offset reads redirected)
+add_executable(test_durable_offset tests/test_durable_offset.c)
+target_include_directories(test_durable_offset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable_offset PRIVATE gptps)
+add_test(NAME durable_offset COMMAND test_durable_offset)
+set_tests_properties(durable_offset PROPERTIES TIMEOUT 30)
 # Crashed at every I/O call it makes, and recovered after each: compiles the add-on in
 # with its file calls wrapped (GNU ld's --wrap, so Linux only) and forks a child per run.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -792,7 +868,12 @@ add_executable(test_orch tests/test_orch.c)           # run-after / fan-in orche
 target_include_directories(test_orch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_orch PRIVATE gptps_orch)
 add_test(NAME orch COMMAND test_orch)
-set_tests_properties(orch PROPERTIES TIMEOUT 30)
+# a submitted gate is freed (the add-on compiled in, so its gate table can be read)
+add_executable(test_orch_gc tests/test_orch_gc.c)
+target_include_directories(test_orch_gc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_orch_gc PRIVATE gptps)
+add_test(NAME orch_gc COMMAND test_orch_gc)
+set_tests_properties(orch orch_gc PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_remote)
@@ -967,6 +1048,24 @@ add_dependencies(test_program_stop prog_helper)
 add_test(NAME program_stop COMMAND test_program_stop)
 set_tests_properties(program_stop PROPERTIES TIMEOUT 120)
 
+# The core's fixes before 1.10.0: the starvation guard beside services, MANUAL
+# deadlines, TIMEOUT_MS on PROGRAM jobs, a dead letter's own stderr tail, every
+# per-task key from the file, distinct task flags, clone of an older def, the host
+# table's 2.8 routines, and why an add-on did not load.
+add_library(addon_hostapi MODULE tests/addon_hostapi.c)
+target_include_directories(addon_hostapi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_hostapi PROPERTIES PREFIX "")
+add_executable(test_engine_fixes tests/test_engine_fixes.c)
+target_include_directories(test_engine_fixes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_engine_fixes PRIVATE gptps)
+target_compile_definitions(test_engine_fixes PRIVATE
+    HELPER_PATH="$<TARGET_FILE:prog_helper>"
+    ADDON_HOSTAPI_PATH="$<TARGET_FILE:addon_hostapi>"
+    ADDON_BAD_PATH="$<TARGET_FILE:addon_bad>")
+add_dependencies(test_engine_fixes prog_helper addon_hostapi addon_bad)
+add_test(NAME engine_fixes COMMAND test_engine_fixes)
+set_tests_properties(engine_fixes PROPERTIES TIMEOUT 120)
+
 # The CPU cap on Windows: a job object throttles a capped PROGRAM job (ABI 2.6). Linux's
 # is a cgroup's and is tested in test_cgroup; nothing else could vouch for this one.
 if(WIN32)
@@ -985,6 +1084,20 @@ target_compile_definitions(test_io_cap_win PRIVATE HELPER_PATH="$<TARGET_FILE:pr
 add_dependencies(test_io_cap_win prog_helper)
 add_test(NAME io_cap_win COMMAND test_io_cap_win)
 set_tests_properties(io_cap_win PROPERTIES TIMEOUT 120)
+# The Windows executor and HAL where the system misbehaves or races: the test compiles
+# src/exec_win.c and src/hal_win.c itself, with Win32 calls it can fail or delay -
+# pipe ends kept to their job, the console probe against a stop, die-with-host only
+# when it holds, thread failures, processor groups, argv quoting, UTF-8 and durable
+# save paths.
+add_executable(test_exec_win_faults tests/test_exec_win_faults.c)
+target_include_directories(test_exec_win_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_exec_win_faults PRIVATE gptps)
+target_compile_definitions(test_exec_win_faults PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>"
+                           ADDON_PATH="$<TARGET_FILE:addon_demo>")
+add_dependencies(test_exec_win_faults prog_helper addon_demo)
+add_test(NAME exec_win_faults COMMAND test_exec_win_faults)
+set_tests_properties(exec_win_faults PROPERTIES TIMEOUT 120)
 endif()
 
 # gptps_adapt with PROGRAM jobs - every platform, Windows included. It includes the
@@ -1117,6 +1230,13 @@ target_link_libraries(test_tui PRIVATE gptps_tui)
 target_compile_definitions(test_tui PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")   # why a job failed
 add_dependencies(test_tui prog_helper)
 add_test(NAME tui COMMAND test_tui)
+# the dashboard's text sanitiser, line fitting, editors and dead-letter actions, with
+# the add-on compiled in (its static helpers and observer in reach)
+add_executable(test_tui_unit tests/test_tui_unit.c)
+target_include_directories(test_tui_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_tui_unit PRIVATE gptps)
+add_test(NAME tui_unit COMMAND test_tui_unit)
+set_tests_properties(tui_unit PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 endif()
 
