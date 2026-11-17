@@ -685,7 +685,13 @@ typedef struct {
                                     * parse, or the open fails with GPTPS_E_CONFIG
                                     * (GPTPS_E_NOMEM if memory ran out). Also
                                     * the default path for gptps_settings_save /
-                                    * _reload. NULL => limits below + defaults */
+                                    * _reload. NULL => limits below + defaults.
+                                    * UTF-8, as every string here is - so are a
+                                    * save path and the file's `addons` paths; on
+                                    * Windows a path that is not valid UTF-8 is
+                                    * read in the ANSI code page, as before. The
+                                    * file may open with a UTF-8 byte order mark,
+                                    * and a save keeps it */
     gptps_limits  limits;          /* explicit values win over auto-tune & file */
     gptps_run_mode mode;           /* v1.6: THREADED (default) or MANUAL (gptps_step) */
     /* ABI 2.4: BOUNDED MODE (docs/BOUNDED.md). 0, the default, keeps the classic

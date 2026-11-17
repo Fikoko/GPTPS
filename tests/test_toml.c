@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>               /* MultiByteToWideChar: the rule gptps_path_wide keeps */
+#endif
 
 #ifndef ADDON_DEMO_PATH
 #define ADDON_DEMO_PATH "./addon_demo.so"
@@ -453,6 +456,157 @@ static void test_reload_zero_means_auto(void)
 #endif
 }
 
+/* A UTF-8 byte order mark opening the file. Windows tools write one (PowerShell 5's
+ * Set-Content -Encoding UTF8, Notepad before 1903), and it used to be read as part of
+ * line 1: "bom.toml:1: expected key = value" for a line that showed "# nightly
+ * config", and a "[limits]" on line 1 was no header at all. */
+static void test_bom(void)
+{
+    gptps_toml *t;
+    gptps *e = NULL;
+    long long ll = 0;
+    char err[512], b[GPTPS_SETTINGS_VALUE_MAX];
+
+    t = gptps_toml_parse_text("bom.toml", "\xEF\xBB\xBF# nightly config\r\n[limits]\r\nmax_concurrent_tasks = 4\r\n",
+                              err, sizeof err, NULL);
+    if (!t) printf("  %s\n", err);
+    CHECK(t != NULL);
+    CHECK(t && gptps_toml_int(t, "limits", "max_concurrent_tasks", &ll) && ll == 4);
+    CHECK(t && gptps_toml_line_at(t, 0) == 3);         /* the mark moves no line */
+    gptps_toml_free(t);
+    /* the header itself on line 1 */
+    t = gptps_toml_parse_text("bom.toml", "\xEF\xBB\xBF[limits]\nmax_concurrent_tasks = 5\n", err, sizeof err, NULL);
+    CHECK(t && gptps_toml_int(t, "limits", "max_concurrent_tasks", &ll) && ll == 5);
+    gptps_toml_free(t);
+    /* a key on line 1; and a file that is only the mark */
+    t = gptps_toml_parse_text("bom.toml", "\xEF\xBB\xBFx = 6", err, sizeof err, NULL);
+    CHECK(t && gptps_toml_int(t, "", "x", &ll) && ll == 6);
+    gptps_toml_free(t);
+    t = gptps_toml_parse_text("bom.toml", "\xEF\xBB\xBF", err, sizeof err, NULL);
+    CHECK(t != NULL && gptps_toml_count(t) == 0);
+    gptps_toml_free(t);
+    /* U+FEFF inside a string is text, and stays */
+    t = gptps_toml_parse_text("bom.toml", "s = \"\xEF\xBB\xBFz\"\n", err, sizeof err, NULL);
+    CHECK(t && gptps_toml_str(t, "", "s") && strcmp(gptps_toml_str(t, "", "s"), "\xEF\xBB\xBFz") == 0);
+    gptps_toml_free(t);
+    /* a second mark - two files joined - is named, with its line */
+    err[0] = 0;
+    t = gptps_toml_parse_text("bom.toml", "\xEF\xBB\xBFx = 1\n\xEF\xBB\xBFy = 2\n", err, sizeof err, NULL);
+    CHECK(t == NULL);
+    if (!strstr(err, "bom.toml:2: a UTF-8 byte order mark")) printf("  got: %s\n", err);
+    CHECK(strstr(err, "bom.toml:2: a UTF-8 byte order mark") != NULL);
+    gptps_toml_free(t);
+    /* and end to end, from a file */
+    CHECK(write_bad("\xEF\xBB\xBF# nightly config\r\n[limits]\r\nmax_concurrent_tasks = 4\r\n") == 0);
+    CHECK(gptps_open(BAD_PATH, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK && strcmp(b, "4") == 0);
+        CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);
+        gptps_shutdown(e); e = NULL;
+    }
+    remove(BAD_PATH);
+}
+
+/* Paths are UTF-8 on Windows too, as a program's argv and work_dir are: a config file
+ * under a directory with a Turkish name used to fail with "cannot open the file" on
+ * any ANSI code page without the letter (fopen read the UTF-8 bytes as ANSI). */
+#define UTF8_NAME "gptps_toml_\xC5\x9Eirket.toml"            /* "...\u015Eirket.toml" */
+/* The same name as UTF-16, spelled with an escape: a raw letter in a wide literal is
+ * read in the compiler's source code page, which for MSVC without /utf-8 is the
+ * build machine's ANSI one (C5 9E became L"\u00C5\u017E" on cp1252). */
+#define WIDE_NAME L"gptps_toml_\x015E" L"irket.toml"
+static FILE *native_open(const char *mode)
+{
+#if defined(_WIN32)
+    return _wfopen(WIDE_NAME, mode[0] == 'w' ? L"wb" : L"rb");
+#else
+    return fopen(UTF8_NAME, mode);
+#endif
+}
+static void test_utf8_path(void)
+{
+    gptps *e = NULL;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+    wchar_t *w = NULL;
+    FILE *f;
+
+    /* Not UTF-8 (cp1252's c-cedilla): the narrow call, read in the ANSI code page as
+     * before - the file the host's own narrow fopen made is the one opened. */
+    f = fopen("gptps_toml_\xE7.toml", "wb");
+    if (f) {
+        fputs("[limits]\nmax_concurrent_tasks = 2\n", f);
+        fclose(f);
+        CHECK(gptps_open("gptps_toml_\xE7.toml", &e) == GPTPS_OK);
+        if (e) {
+            CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK && strcmp(b, "2") == 0);
+            gptps_shutdown(e); e = NULL;
+        }
+        CHECK(gptps_remove_path("gptps_toml_\xE7.toml") == 0);
+    }
+
+    f = native_open("wb");
+    if (!f) {   /* a file system (Wine under a non-UTF-8 locale) that cannot name it */
+        printf("  (no file named %s can be made here: the UTF-8 path check is skipped)\n", UTF8_NAME);
+        return;
+    }
+    fputs("[limits]\nmax_concurrent_tasks = 3\n", f);
+    fclose(f);
+    CHECK(gptps_open(UTF8_NAME, &e) == GPTPS_OK);
+    if (e) {
+        CHECK(gptps_settings_get(e, "limits.max_concurrent_tasks", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
+        CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);
+        gptps_shutdown(e); e = NULL;
+    }
+    /* the helpers themselves */
+    f = gptps_fopen_path(UTF8_NAME, "rb");
+    CHECK(f != NULL);
+    if (f) fclose(f);
+    CHECK(gptps_remove_path(UTF8_NAME) == 0);
+    CHECK((f = native_open("rb")) == NULL);
+    if (f) fclose(f);
+#if defined(_WIN32)
+    /* the conversion: UTF-16 for non-ASCII UTF-8, the narrow call for the rest */
+    CHECK(gptps_path_wide("a\xC5\x9E\xF0\x9F\x98\x80", &w) == 1);
+    CHECK(w && w[0] == L'a' && w[1] == 0x015E && w[2] == 0xD83D && w[3] == 0xDE00 && w[4] == 0);
+    gptps_free(w); w = NULL;
+    CHECK(gptps_path_wide("plain.toml", &w) == 0 && w == NULL);            /* ASCII */
+    CHECK(gptps_path_wide("ANSI \xE7.toml", &w) == 0 && w == NULL);        /* cp1252, not UTF-8 */
+    CHECK(gptps_path_wide("\xC0\x80", &w) == 0 && w == NULL);              /* overlong */
+    CHECK(gptps_path_wide("\xED\xA0\x80", &w) == 0 && w == NULL);          /* a surrogate */
+    CHECK(gptps_path_wide("\xF4\x90\x80\x80", &w) == 0 && w == NULL);      /* past U+10FFFF */
+    CHECK(gptps_path_wide("\xC5", &w) == 0 && w == NULL);                  /* cut short */
+    /* The same rule as the converters beside the Win32 calls (exec_win.c's win_wide,
+     * the HAL's for LoadLibraryW / MoveFileExW): wide exactly when the system's own
+     * strict UTF-8 reading accepts the bytes, with the same UTF-16 - so a path opens
+     * the same file whichever call it reaches. */
+    {
+        static const char *const corpus[] = {
+            "a\xC5\x9E\xF0\x9F\x98\x80", "\xC5\x9F\xC4\xB1rket", "\xE2\x82\xAC.toml",
+            "\xEF\xBF\xBF", "\xF4\x8F\xBF\xBF", "\xF0\x90\x80\x80", "\xC2\x80",
+            "\xC0\x80", "\xC1\xBF", "\xE0\x80\x80", "\xE0\x9F\xBF", "\xF0\x80\x80\x80",
+            "\xF0\x8F\xBF\xBF", "\xF4\x90\x80\x80", "\xF5\x80\x80\x80", "\xF8\x88\x80\x80\x80",
+            "\xFE", "\xFF", "\x80", "a\xBF", "\xC5", "\xE2\x82", "\xF0\x9F\x98", "\xC5\x41",
+            "\xE2\x28\xA1", "ANSI \xE7.toml", "\xE7\xE8\xE9", "C:\\Users\\\xC5\x9E\\x.toml"
+        };
+        size_t k;
+        for (k = 0; k < sizeof corpus / sizeof *corpus; ++k) {
+            wchar_t sys[64];
+            int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, corpus[k], -1, sys, 64);
+            int rc = gptps_path_wide(corpus[k], &w);
+            if (n > 0) {
+                CHECK(rc == 1 && w && memcmp(w, sys, (size_t)n * sizeof *w) == 0);
+            } else {
+                CHECK(rc == 0 && w == NULL);
+            }
+            if (!(n > 0 ? rc == 1 : rc == 0)) printf("  path_wide disagrees with the system on corpus[%u]\n", (unsigned)k);
+            gptps_free(w); w = NULL;
+        }
+    }
+#else
+    CHECK(gptps_path_wide("a\xC5\x9E", &w) == 0 && w == NULL);             /* no *W calls here */
+#endif
+}
+
 int main(void)
 {
     gptps *e = NULL;
@@ -474,6 +628,8 @@ int main(void)
     test_limits_range();
     test_open_ex_reads_its_file();
     test_reload_zero_means_auto();
+    test_bom();
+    test_utf8_path();
 
     /* Phase A: addons[] auto-load -> the plugin's task runs end-to-end */
     reset();

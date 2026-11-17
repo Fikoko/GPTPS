@@ -33,6 +33,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <float.h>
+#include <wchar.h>    /* _wfopen, _wremove (Windows) */
 
 typedef enum { TT_INT, TT_DBL, TT_BOOL, TT_STR, TT_ARR } toml_type;
 
@@ -511,6 +512,97 @@ static int parse_line(struct gptps_toml *t, char *raw, int line, char *section, 
     }
 }
 
+/* ---- file paths: UTF-8, on Windows too (gptps_internal.h) ---- */
+
+/* The code point of the UTF-8 sequence at *pp, which is moved past it; -1 when the
+ * bytes are not UTF-8 as MultiByteToWideChar's MB_ERR_INVALID_CHARS reads it: no
+ * overlong form, no surrogate, nothing past U+10FFFF, no stray continuation byte. */
+static long utf8_next(const unsigned char **pp)
+{
+    const unsigned char *p = *pp;
+    unsigned long c = p[0], min;
+    int n, k;
+    if (c < 0x80) { *pp = p + 1; return (long)c; }
+    if (c >= 0xC2 && c <= 0xDF)      { n = 1; c &= 0x1F; min = 0x80; }
+    else if (c >= 0xE0 && c <= 0xEF) { n = 2; c &= 0x0F; min = 0x800; }
+    else if (c >= 0xF0 && c <= 0xF4) { n = 3; c &= 0x07; min = 0x10000; }
+    else return -1;
+    for (k = 1; k <= n; ++k) {
+        if ((p[k] & 0xC0) != 0x80) return -1;      /* a NUL ends it here too */
+        c = (c << 6) | (p[k] & 0x3F);
+    }
+    if (c < min || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) return -1;
+    *pp = p + n + 1;
+    return (long)c;
+}
+
+int gptps_path_wide(const char *path, wchar_t **out)
+{
+    const unsigned char *p;
+    size_t units = 0, i = 0;
+    int ascii = 1;
+    wchar_t *w;
+    *out = NULL;
+    /* Only where a wchar_t is a UTF-16 unit: the *W calls are Windows'. */
+    if (sizeof(wchar_t) != 2 || !path) return 0;
+    for (p = (const unsigned char *)path; *p; ) {
+        long c = utf8_next(&p);
+        if (c < 0) return 0;                        /* not UTF-8: the ANSI call */
+        if (c >= 0x80) ascii = 0;
+        units += c >= 0x10000 ? 2 : 1;
+    }
+    if (ascii) return 0;                            /* the same file either way */
+    w = (wchar_t *)gptps_malloc((units + 1) * sizeof *w);
+    if (!w) return -1;
+    for (p = (const unsigned char *)path; *p; ) {
+        unsigned long c = (unsigned long)utf8_next(&p);
+        if (c >= 0x10000) {
+            c -= 0x10000;
+            w[i++] = (wchar_t)(0xD800 + (c >> 10));
+            w[i++] = (wchar_t)(0xDC00 + (c & 0x3FF));
+        } else {
+            w[i++] = (wchar_t)c;
+        }
+    }
+    w[i] = 0;
+    *out = w;
+    return 1;
+}
+
+FILE *gptps_fopen_path(const char *path, const char *mode)
+{
+#if defined(_WIN32)
+    wchar_t *w = NULL, wmode[8];
+    size_t k;
+    FILE *f;
+    int rc = gptps_path_wide(path, &w);
+    if (rc < 0) { errno = ENOMEM; return NULL; }
+    if (rc == 0) return fopen(path, mode);
+    for (k = 0; mode[k] && k + 1 < sizeof wmode / sizeof *wmode; ++k) wmode[k] = (wchar_t)(unsigned char)mode[k];
+    wmode[k] = 0;
+    f = _wfopen(w, wmode);
+    gptps_free(w);
+    return f;
+#else
+    return fopen(path, mode);
+#endif
+}
+
+int gptps_remove_path(const char *path)
+{
+#if defined(_WIN32)
+    wchar_t *w = NULL;
+    int rc = gptps_path_wide(path, &w);
+    if (rc < 0) { errno = ENOMEM; return -1; }
+    if (rc == 0) return remove(path);
+    rc = _wremove(w);
+    gptps_free(w);
+    return rc;
+#else
+    return remove(path);
+#endif
+}
+
 /* ---- public-ish (internal) API ---- */
 
 char *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen, int *why)
@@ -522,7 +614,7 @@ char *gptps_toml_read_file(const char *path, char *errbuf, size_t errlen, int *w
 
 #define UNREAD() do { if (why) *why = GPTPS_TOML_UNREAD; } while (0)
     if (errbuf && errlen) errbuf[0] = 0;
-    f = fopen(path, "rb");
+    f = gptps_fopen_path(path, "rb");
     if (!f) { UNREAD(); fail(errbuf, errlen, path, 0, "cannot open the file (%s)", strerror(errno)); return NULL; }
     /* Each step below is checked AND fills errbuf. Unchecked, a mistyped path
      * surfaced as gptps_open's E_CONFIG with a blank error string - and for the
@@ -600,13 +692,30 @@ static gptps_toml *parse_buf(const char *path, char *buf, char *errbuf, size_t e
     size_t used = 0;
 
     if (errbuf && errlen) errbuf[0] = 0;
+    /* A UTF-8 byte order mark opening the file is not text: Windows tools write one
+     * (PowerShell 5's Set-Content -Encoding UTF8, Notepad before 1903). Read as part
+     * of line 1, it made "[limits]" or "# notes" an "expected key = value" that named
+     * nothing the reader could see. It is skipped - as blanks, so every byte keeps its
+     * place - and a save keeps it (settings.c). */
+    if (!strncmp(buf, GPTPS_UTF8_BOM, 3)) memset(buf, ' ', 3);
     {   /* A carriage return ends a line only before a newline (CRLF). A file whose
          * lines end in CR alone reads as ONE line, and when that line starts with a
          * comment, every value in the file is silently ignored. */
         const char *c;
         int ln = 1;
         for (c = buf; *c; ++c) {
-            if (*c == '\n') ++ln;
+            if (*c == '\n') {
+                ++ln;
+                /* One further in: two files joined (`type a.toml b.toml > c.toml`),
+                 * each with its mark. No line starts with U+FEFF in a file that parses,
+                 * so it is named, not reported as a key it is not. */
+                if (!strncmp(c + 1, GPTPS_UTF8_BOM, 3)) {
+                    fail(errbuf, errlen, path, ln, "a UTF-8 byte order mark (EF BB BF) at the start of the line - "
+                         "only the file's first line may carry one; were two files joined?");
+                    gptps_free(buf);
+                    return NULL;
+                }
+            }
             else if (*c == '\r' && c[1] != '\n' && c[1] != 0) {
                 fail(errbuf, errlen, path, ln, "a carriage return inside the line - if the file's lines end in CR "
                      "alone, save it with LF or CRLF line endings");

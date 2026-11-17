@@ -262,13 +262,16 @@ FILE *gptps_hal_open_private(const char *path)
     HANDLE h;
     int fd;
     FILE *f;
-    if (!DeleteFileA(path) && GetLastError() != ERROR_FILE_NOT_FOUND) return NULL;
-    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
+    wchar_t *w;
+    if (!path || !(w = hal_win_wide(path))) return NULL;   /* UTF-8, else ANSI: as atomic_replace */
+    if (!DeleteFileW(w) && GetLastError() != ERROR_FILE_NOT_FOUND) { free(w); return NULL; }
+    h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { free(w); return NULL; }
     fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
-    if (fd < 0) { CloseHandle(h); DeleteFileA(path); return NULL; }
+    if (fd < 0) { CloseHandle(h); DeleteFileW(w); free(w); return NULL; }
     f = _fdopen(fd, "wb");
-    if (!f) { _close(fd); DeleteFileA(path); }
+    if (!f) { _close(fd); DeleteFileW(w); }
+    free(w);
     return f;
 }
 

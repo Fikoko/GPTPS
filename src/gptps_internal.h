@@ -10,7 +10,8 @@
 #include "gptps.h"
 #include "gptps_hal.h"   /* the acquire/release pair (executor cancel), gptps_hal_monotonic_ms */
 
-#include <stddef.h>   /* offsetof */
+#include <stddef.h>   /* offsetof, wchar_t */
+#include <stdio.h>    /* FILE, for gptps_fopen_path */
 
 /* --- append-safe ABI struct guards ---
  * A caller-extensible struct only ever GROWS by appending (see gptps.h "ABI
@@ -177,7 +178,25 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
                                gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                void **out_result, size_t *out_len, gptps_exec_meter *meter);
 
+/* --- file paths (config_toml.c) ---
+ * Paths are UTF-8, as every other string in the API is (argv, work_dir, env). On
+ * Windows a path that is valid UTF-8 and not plain ASCII is opened through the UTF-16
+ * API (_wfopen, _wremove), so a directory with a Turkish name works on any ANSI
+ * code page; one that is not valid UTF-8 goes to the narrow CRT call as before, read
+ * in the ANSI code page - the rule exec_win.c's win_wide applies to a program's
+ * strings. Elsewhere these are fopen and remove. Both set errno on failure. */
+FILE *gptps_fopen_path(const char *path, const char *mode);
+int   gptps_remove_path(const char *path);
+/* The UTF-16 form of a UTF-8 `path`, for a *W Win32 call (LoadLibraryW, MoveFileExW):
+ * 1 with *out set (gptps_free it); 0 when the narrow (*A) call is the one to make -
+ * the path is plain ASCII, or not valid UTF-8 and so ANSI; -1 when memory ran out.
+ * Only where wchar_t is 16 bits (Windows); elsewhere it always returns 0. */
+int   gptps_path_wide(const char *path, wchar_t **out);
+
 /* --- minimal TOML-subset config parser (config_toml.c) --- */
+/* U+FEFF in UTF-8: the byte order mark a config file may open with. The parser skips
+ * it; a save writes it back (settings.c). */
+#define GPTPS_UTF8_BOM "\xEF\xBB\xBF"
 typedef struct gptps_toml gptps_toml;
 gptps_toml *gptps_toml_parse_file(const char *path, char *errbuf, size_t errlen); /* NULL on error */
 /* Why parse_file_ex or read_file returned NULL, through their `why` (may be NULL; left
