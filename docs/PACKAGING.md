@@ -87,6 +87,8 @@ bin/gptps_conformance               prove a plug-in before shipping it
 | `GPTPS_ADDON_<NAME>` | from the list | per-add-on override, for packagers |
 | `GPTPS_HAL_FAST` | OFF | adaptive mutexes on glibc — a latency knob |
 | `GPTPS_HAL_SOURCE` | *(unset)* | replace the bundled HAL with your own implementation of `gptps_hal.h` |
+| `GPTPS_EXEC_SOURCE` | *(unset)* | replace the bundled process executor (e.g. with `freestanding/exec_stub.c` on a target without processes). With both this and `GPTPS_HAL_SOURCE` set, no thread library or `-ldl` is required or linked ([HAL.md, Porting](HAL.md#porting)) |
+| `GPTPS_PORT_LIBS` | *(empty)* | libraries a custom HAL / executor needs; linked PUBLIC to `gptps` and written to `gptps.pc` |
 | `GPTPS_BUILD_CONFORMANCE` | ON | build + install `bin/gptps_conformance` |
 
 A typo in `GPTPS_ADDONS` is a **hard error**, not an empty selection. A selector that

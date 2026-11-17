@@ -71,10 +71,10 @@ unset(_gptps_hdr)
 set(GPTPS_SRC src/alloc.c src/config.c src/config_toml.c src/settings.c src/engine.c)
 if(WIN32)
     set(_gptps_hal src/hal_win.c)
-    list(APPEND GPTPS_SRC src/exec_win.c)                       # CreateProcess/Job-Object program executor
+    set(_gptps_exec src/exec_win.c)                             # CreateProcess/Job-Object program executor
 else()
     set(_gptps_hal src/hal_posix.c)
-    list(APPEND GPTPS_SRC src/exec_oop_posix.c)                 # out-of-process executor
+    set(_gptps_exec src/exec_oop_posix.c)                       # out-of-process executor
 endif()
 # The HAL is a real module boundary (freestanding/hal_stub.c proves it), so a
 # downstream on an unlisted platform can substitute its own implementation of
@@ -89,7 +89,24 @@ if(GPTPS_HAL_SOURCE)
     set(_gptps_hal "${GPTPS_HAL_SOURCE}")
     message(STATUS "gptps: using custom HAL ${GPTPS_HAL_SOURCE}")
 endif()
-list(APPEND GPTPS_SRC ${_gptps_hal})
+# The process executors (GPTPS_EXEC_OOP / GPTPS_EXEC_PROGRAM) are platform code
+# without being HAL: the engine calls gptps_oop_execute and gptps_program_execute
+# unconditionally, so a target is linked with exactly one file defining both. The
+# bundled ones need fork/poll/<sys/wait.h> (POSIX) or CreateProcess (Windows). A
+# target with no process model - an RTOS, bare metal - replaces it here, usually with
+# freestanding/exec_stub.c, which reports GPTPS_E_IO for every such job. Without this
+# option -DGPTPS_HAL_SOURCE alone still compiled exec_oop_posix.c and could not
+# configure or build for such a target at all.
+set(GPTPS_EXEC_SOURCE "" CACHE FILEPATH
+    "Replace the bundled process executor with this file (e.g. freestanding/exec_stub.c)")
+if(GPTPS_EXEC_SOURCE)
+    if(NOT EXISTS "${GPTPS_EXEC_SOURCE}")
+        message(FATAL_ERROR "GPTPS_EXEC_SOURCE does not exist: ${GPTPS_EXEC_SOURCE}")
+    endif()
+    set(_gptps_exec "${GPTPS_EXEC_SOURCE}")
+    message(STATUS "gptps: using custom process executor ${GPTPS_EXEC_SOURCE}")
+endif()
+list(APPEND GPTPS_SRC ${_gptps_exec} ${_gptps_hal})
 add_library(gptps STATIC ${GPTPS_SRC})
 target_include_directories(gptps
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -111,12 +128,6 @@ option(GPTPS_HAL_FAST "Build the platform-optimized HAL (adaptive mutexes; glibc
 if(GPTPS_HAL_FAST)
     target_compile_definitions(gptps PRIVATE GPTPS_HAL_FAST)
 endif()
-
-# threads (HAL uses pthreads on POSIX)
-set(THREADS_PREFER_PTHREAD_FLAG ON)
-find_package(Threads REQUIRED)
-target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
-
 # --- what to build (a downstream consumer gets the LIBRARY only) -----------
 # Default ON at top level, OFF when GPTPS is add_subdirectory'd / FetchContent'd:
 # without this a consumer inherited all 43 CTest tests and had to build every test
@@ -130,6 +141,52 @@ endif()
 option(GPTPS_BUILD_TESTS    "Build the GPTPS test suite"  ${GPTPS_IS_TOP_LEVEL})
 option(GPTPS_BUILD_EXAMPLES "Build the GPTPS examples"    ${GPTPS_IS_TOP_LEVEL})
 
+# The thread library and the dynamic loader. The bundled HALs use them (pthreads and
+# dlopen on POSIX), and so does the bundled POSIX executor (pthread_sigmask). A port
+# that replaces BOTH files (-DGPTPS_HAL_SOURCE and -DGPTPS_EXEC_SOURCE) gets neither
+# from here: the core itself calls only the HAL, so an RTOS or bare-metal target
+# configures with no thread library at all, and links whatever its own HAL needs
+# (target_link_libraries(gptps ...) after add_subdirectory, or GPTPS_PORT_LIBS). Said
+# once at configure time, so nobody is left wondering where -lpthread went.
+# The suite and the examples are hosted programs that use threads themselves, so
+# building them still requires the library.
+set(GPTPS_PORT_LIBS "" CACHE STRING
+    "Libraries a custom HAL / executor needs (linked PUBLIC to gptps)")
+if(GPTPS_HAL_SOURCE AND GPTPS_EXEC_SOURCE)
+    set(_gptps_bundled_platform OFF)
+else()
+    set(_gptps_bundled_platform ON)
+endif()
+set(GPTPS_PC_PRIVATE_LIBS "")
+if(_gptps_bundled_platform OR GPTPS_BUILD_TESTS OR GPTPS_BUILD_EXAMPLES)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
+endif()
+if(_gptps_bundled_platform)
+    target_link_libraries(gptps PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    # The core calls dlopen for the add-on loader, so a static `pkg-config --libs gptps`
+    # link without -ldl fails with an undefined reference on glibc < 2.34.
+    set(GPTPS_PC_PRIVATE_LIBS "-lpthread")
+    foreach(_l IN LISTS CMAKE_DL_LIBS)
+        set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} -l${_l}")
+    endforeach()
+    set(GPTPS_CONFIG_NEEDS_THREADS ON)
+else()
+    message(STATUS "gptps: custom HAL and executor - linking no thread or loader "
+                   "library into gptps; GPTPS_PORT_LIBS='${GPTPS_PORT_LIBS}'")
+    set(GPTPS_CONFIG_NEEDS_THREADS OFF)
+endif()
+if(GPTPS_PORT_LIBS)
+    target_link_libraries(gptps PUBLIC ${GPTPS_PORT_LIBS})
+    foreach(_l IN LISTS GPTPS_PORT_LIBS)
+        if(_l MATCHES "^-" OR IS_ABSOLUTE "${_l}")
+            set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} ${_l}")
+        else()
+            set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} -l${_l}")
+        endif()
+    endforeach()
+endif()
+
 # pkg-config substitutions. Computed HERE, above add_subdirectory(addons), because
 # the add-on .pc files are generated inside that subdirectory and would otherwise
 # interpolate an empty prefix - which resolves to the pkgconfig directory itself and
@@ -142,12 +199,8 @@ option(GPTPS_BUILD_EXAMPLES "Build the GPTPS examples"    ${GPTPS_IS_TOP_LEVEL})
 file(RELATIVE_PATH GPTPS_PC_PREFIX_REL
      "${CMAKE_INSTALL_FULL_LIBDIR}/pkgconfig" "${CMAKE_INSTALL_PREFIX}")
 string(REGEX REPLACE "/$" "" GPTPS_PC_PREFIX_REL "${GPTPS_PC_PREFIX_REL}")
-# The core calls dlopen for the add-on loader, so a static `pkg-config --libs gptps`
-# link without -ldl fails with an undefined reference on glibc < 2.34.
-set(GPTPS_PC_PRIVATE_LIBS "-lpthread")
-foreach(_l IN LISTS CMAKE_DL_LIBS)
-    set(GPTPS_PC_PRIVATE_LIBS "${GPTPS_PC_PRIVATE_LIBS} -l${_l}")
-endforeach()
+# GPTPS_PC_PRIVATE_LIBS (-lpthread, -ldl, or a port's own) is set with the thread
+# library above.
 
 # --- add-ons (one installable library each) --------------------------------
 # The suite links the real add-on LIBRARIES rather than compiling their sources in,
@@ -259,6 +312,9 @@ set_tests_properties(service PROPERTIES TIMEOUT 30)
 add_executable(test_abi tests/test_abi.c)   # append-safe input-struct guards (frozen minimums)
 target_include_directories(test_abi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(test_abi PRIVATE gptps)
+# read back to check every GPTPS_TASK_* / _SUBMIT_* / ... flag is listed and distinct
+target_compile_definitions(test_abi PRIVATE
+    GPTPS_PUBLIC_HEADER="${CMAKE_CURRENT_SOURCE_DIR}/include/gptps.h")
 add_test(NAME abi COMMAND test_abi)
 set_tests_properties(abi PROPERTIES TIMEOUT 30)
 

@@ -1,9 +1,13 @@
 @PACKAGE_INIT@
 
-# GPTPS links the platform thread library; re-find it for consumers.
+# GPTPS links the platform thread library; re-find it for consumers. A port built
+# with its own HAL and executor (-DGPTPS_HAL_SOURCE + -DGPTPS_EXEC_SOURCE) links none,
+# and a target with no thread library must not be made to find one.
 include(CMakeFindDependencyMacro)
-set(THREADS_PREFER_PTHREAD_FLAG ON)
-find_dependency(Threads)
+if(@GPTPS_CONFIG_NEEDS_THREADS@)
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_dependency(Threads)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/gptps-targets.cmake")
 

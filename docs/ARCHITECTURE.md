@@ -386,8 +386,14 @@ at the top of each backend (and at the top of the amalgamation), so a plain
 build-system `-D` flags.
 
 **Porting to a new target (RTOS / bare-metal).** Write one backend implementing
-this interface, build it in with `-DGPTPS_HAL_SOURCE=<file>`, and run
-`ctest -R hal_conformance`: [`docs/HAL.md`](HAL.md) is the checklist. In MANUAL
+this interface and build it in with `-DGPTPS_HAL_SOURCE=<file>`. A target without
+processes also replaces the process executors, `-DGPTPS_EXEC_SOURCE=freestanding/exec_stub.c`;
+with both replaced, CMake neither looks for nor links a thread library or `-ldl`, and a
+port adds what its own HAL needs with `-DGPTPS_PORT_LIBS`. The amalgamation drops its
+bundled HAL and executor with `-DGPTPS_EXTERNAL_HAL` / `-DGPTPS_EXTERNAL_EXEC`. Then
+check the HAL with `test_hal_conformance` (`ctest -R hal_conformance` where the suite
+can be built, or the one-file build in [`docs/HAL.md`](HAL.md), which is the
+checklist). CI builds both port paths with the freestanding stubs. In MANUAL
 mode (§3.1) the required subset is small, because a single-threaded host calls no
 wait and starts no thread: mutex and condvar create/destroy/lock/unlock/signal/
 broadcast (no-ops will do), the monotonic clock, the thread id and the
@@ -437,7 +443,7 @@ the `GPTPS_ADDON_INIT(...)` macro. The loader validates `magic` /
 `abi_version_major` / `struct_size` **before** using the add-on.
 
 Not every add-on must be a shared object — a module that only uses the public API
-and the observer/constraint seams can simply be compiled into the host. **Thirteen** ship
+and the observer/constraint seams can simply be compiled into the host. **Fourteen** ship
 in `addons/`: `durable_queue.c` (observer seam → crash-durable journal),
 `gptps_sched.c` (scheduler + observer + constraint seams → EDF, aging, weighted fair
 share, shed-late), `gptps_adapt.c` (observer seam + settings → `mem_bytes` from measured
@@ -447,7 +453,8 @@ peaks),
 settings → live dashboard), `gptps_orch.c` (observer + submit → run-after/fan-in
 dependencies), `gptps_await.c` (observer seam → block until a handle is terminal),
 `gptps_stats.c` (observer seam → counters, gauges and latency, bound to no wire
-format), `gptps_remote.c` (the cross-host wire codec `gptps_xport` is specified
+format), `gptps_retry.c` (observer + constraint seams → retry rules by exit code:
+never, or after a wait), `gptps_remote.c` (the cross-host wire codec `gptps_xport` is specified
 against), and the three composition libraries `gptps_pool.c` (N engines in one
 process, scale-up), `gptps_balance.c` (one queue in front of a pool, routed late to
 the least-loaded shard) and `gptps_xport.c` (N worker processes, scale-out).
@@ -624,7 +631,11 @@ out-of-tree against the installed package), `windows` (mingw-w64), `msvc` (cl.ex
 fuzzers), `tsan`, `hal_fast`, `hal_chaos` (the whole suite on the weakest HAL the
 contract allows), `hal_sim` (the suite on a simulation HAL where a seed picks every
 thread switch, so a failure replays), `cross` (i386 + big-endian s390x under QEMU),
-and `freestanding`.
+and `freestanding` (the stub HAL, plus both documented port paths: CMake with
+`GPTPS_HAL_SOURCE` + `GPTPS_EXEC_SOURCE`, and the amalgamation without its backends).
+`release.yml` runs all of `ci.yml` at a release tag and publishes only when every job
+passed. No runner is FreeBSD: its `procctl` branch of `GPTPS_TASK_DIE_WITH_HOST` is
+neither built nor run by CI.
 The `tsan`, `hal_chaos`, `hal_sim` and `cross` jobs select tests with an EXCLUDE
 list, so a newly added test is covered by default rather than silently skipped.
 

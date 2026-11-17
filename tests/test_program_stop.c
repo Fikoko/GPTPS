@@ -13,10 +13,14 @@
  *  4) Windows: all of it with and without a console in the host - a service has none.
  *  5) A dead letter carries the last attempt's measurements: exit.code, start.error.
  *  6) GPTPS_TASK_DIE_WITH_HOST: a host that dies takes its jobs with it - the WHOLE
- *     job, a launcher's workers too (every POSIX system; Windows always); without
- *     the flag a POSIX job outlives it; a job that ends leaves no watcher behind;
- *     where it cannot be enforced (an OOP job off Linux / FreeBSD), or a job's
- *     watcher was killed from outside while it ran, one WARN per task type.
+ *     PROGRAM job, a launcher's workers too, on every POSIX system; an OOP job on
+ *     Linux (FreeBSD shares the code but has no CI runner); a PROGRAM job on Windows
+ *     with or without the flag (the job object dies with the host's handle). Without
+ *     the flag a POSIX job outlives its host; a job that ends leaves no watcher
+ *     behind; where it cannot be enforced (an OOP job off Linux / FreeBSD), or a job's
+ *     watcher was killed from outside while it ran, one WARN per task type. The host
+ *     really crashes: a forked copy (POSIX) or a second run of this program (Windows,
+ *     "crashhost") that the test terminates.
  *  7) stdout past the 16 MiB result cap: E_IO, one WARN per task type; on Windows the
  *     job's stop grace is given first.
  *
@@ -253,9 +257,25 @@ static long read_pid(void)
     fclose(f);
     return pid;
 }
+enum { CH_PROGRAM, CH_LAUNCHER, CH_OOP };
+/* An OOP job: this process, forked, runs it. It says who it is, then waits to be
+ * killed - by its host's death, or by the test. */
+static gptps_status oop_pidsleep(gptps_ctx *ctx, void *ud)
+{
+    FILE *f = fopen(PID_FILE ".tmp", "w");
+    (void)ctx; (void)ud;
+    if (f) {
+        fprintf(f, "%ld\n", (long)getpid());
+        fclose(f);
+        rename(PID_FILE ".tmp", PID_FILE);   /* whole, or not there */
+    }
+    for (;;) sleep_ms(50);
+    return GPTPS_OK;
+}
 /* A host that starts a job and is then killed outright. Returns the pid the job
- * wrote: its leader's, or with `launcher` the pid of the worker the leader started. */
-static long crash_host(int die_flag, int launcher)
+ * wrote: its leader's, the OOP copy's, or with CH_LAUNCHER the pid of the worker the
+ * leader started. */
+static long crash_host(int die_flag, int kind)
 {
     pid_t host;
     int st;
@@ -266,8 +286,20 @@ static long crash_host(int die_flag, int launcher)
         static const char *const a_pid[] = { HELPER_PATH, "pidsleep", PID_FILE, NULL };
         static const char *const a_spawn[] = { HELPER_PATH, "spawn", "pidsleep", PID_FILE, NULL };
         gptps *e = open_engine(0);
+        uint64_t fl = die_flag ? GPTPS_TASK_DIE_WITH_HOST : 0u;
         if (!e) _exit(2);
-        reg(e, "victim", launcher ? a_spawn : a_pid, 0, 0, die_flag ? GPTPS_TASK_DIE_WITH_HOST : 0u);
+        if (kind == CH_OOP) {
+            gptps_task_def d;
+            memset(&d, 0, sizeof d);
+            d.struct_size = sizeof d; d.name = "victim"; d.exec = GPTPS_EXEC_OOP;
+            d.run = oop_pidsleep;
+            d.default_cost.struct_size = sizeof d.default_cost;
+            d.default_policy.struct_size = sizeof d.default_policy;
+            d.flags = fl;
+            if (gptps_register_task(e, &d) != GPTPS_OK) _exit(5);
+        } else {
+            reg(e, "victim", kind == CH_LAUNCHER ? a_spawn : a_pid, 0, 0, fl);
+        }
         if (gptps_submit(e, "victim", NULL, 0, NULL) != GPTPS_OK) _exit(3);
         { int i; for (i = 0; i < 1000 && !read_pid(); ++i) sleep_ms(10); }
         kill(getpid(), SIGKILL);                 /* a crash: no shutdown, no cleanup */
@@ -284,6 +316,55 @@ static int alive_after(long pid, unsigned ms)
         sleep_ms(20); waited += 20;
     }
     return 1;
+}
+#else
+/* Windows: the crashing host is this program again, run as "crashhost <flag>". It
+ * starts the job and waits; the test, once it holds a handle on the job's process,
+ * terminates it - no shutdown, no cleanup, every handle closed by the OS, as in a
+ * crash. The handle is taken while the host still lives, so the job cannot have died
+ * and had its pid reused by an unrelated process before the test looks at it. */
+static int crash_host_main(int die_flag)
+{
+    static const char *const a_pid[] = { HELPER_PATH, "pidsleep", PID_FILE, NULL };
+    gptps *e = open_engine(0);
+    if (!e) return 2;
+    reg(e, "victim", a_pid, 0, 0, die_flag ? GPTPS_TASK_DIE_WITH_HOST : 0u);
+    if (gptps_submit(e, "victim", NULL, 0, NULL) != GPTPS_OK) return 3;
+    for (;;) sleep_ms(100);                  /* until the test kills this host */
+}
+/* The job's process, opened while its host lived; NULL on failure. */
+static HANDLE crash_host_win(int die_flag)
+{
+    char self[MAX_PATH], cmd[MAX_PATH + 64];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    HANDLE job = NULL;
+    int i;
+    remove(PID_FILE);
+    if (!GetModuleFileNameA(NULL, self, sizeof self)) return NULL;
+    snprintf(cmd, sizeof cmd, "\"%s\" crashhost %d", self, die_flag);
+    memset(&si, 0, sizeof si); si.cb = sizeof si;
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return NULL;
+    for (i = 0; i < 3000 && !job; ++i) {
+        FILE *f = fopen(PID_FILE, "r");
+        long pid = 0;
+        if (f) { if (fscanf(f, "%ld", &pid) != 1) pid = 0; fclose(f); }
+        if (pid > 0) job = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, (DWORD)pid);
+        else if (WaitForSingleObject(pi.hProcess, 10) == WAIT_OBJECT_0) break;   /* host failed */
+    }
+    TerminateProcess(pi.hProcess, 9);        /* the crash */
+    WaitForSingleObject(pi.hProcess, 30000);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return job;
+}
+/* 1 if the job is still running after `ms`; it is killed either way, and the handle
+ * closed */
+static int win_alive_after(HANDLE h, unsigned ms)
+{
+    int alive = WaitForSingleObject(h, ms) == WAIT_TIMEOUT;
+    if (alive) TerminateProcess(h, 9);
+    CloseHandle(h);
+    return alive;
 }
 #endif
 
@@ -320,25 +401,55 @@ static void die_with_host(void)
 {
 #if !defined(_WIN32)
     long pid;
-    /* without the flag the job outlives its host - which some hosts want */
-    pid = crash_host(0, 0);
+    /* PROGRAM jobs: without the flag the job outlives its host - which some hosts
+     * want; with it the WHOLE job dies with the host, a launcher's worker too (which a
+     * parent-death signal, cleared at fork, never reaches). Every POSIX system. */
+    pid = crash_host(0, CH_PROGRAM);
     CHECK(pid > 0);
     if (pid > 0) { CHECK(alive_after(pid, 500)); kill((pid_t)pid, SIGKILL); }
-    pid = crash_host(1, 0);
+    pid = crash_host(1, CH_PROGRAM);
     CHECK(pid > 0);
     if (pid > 0) {
         int alive = alive_after(pid, 3000);
+        if (alive) printf("  PROGRAM job outlived its host\n");
         CHECK(!alive);                           /* killed with its host */
         if (alive) kill((pid_t)pid, SIGKILL);
     }
-    /* the whole job: a launcher's worker - which a parent-death signal, cleared at
-     * fork, never reaches - goes with the host too */
-    pid = crash_host(1, 1);
+    pid = crash_host(1, CH_LAUNCHER);
     CHECK(pid > 0);
     if (pid > 0) {
         int alive = alive_after(pid, 3000);
+        if (alive) printf("  launcher's worker outlived its host\n");
         CHECK(!alive);
         if (alive) { pid_t g = getpgid((pid_t)pid); if (g > 1) kill(-g, SIGKILL); }
+    }
+    /* OOP jobs, the host's own forked copy: held by a parent-death signal */
+    pid = crash_host(0, CH_OOP);
+    CHECK(pid > 0);
+    if (pid > 0) { CHECK(alive_after(pid, 500)); kill((pid_t)pid, SIGKILL); }
+#  if defined(__linux__) || defined(__FreeBSD__)
+    pid = crash_host(1, CH_OOP);
+    CHECK(pid > 0);
+    if (pid > 0) {
+        int alive = alive_after(pid, 3000);
+        if (alive) printf("  OOP job outlived its host\n");
+        CHECK(!alive);
+        if (alive) kill((pid_t)pid, SIGKILL);
+    }
+#  endif
+#else
+    {   /* Windows: a job object closed with its host's last handle kills its jobs -
+         * with the flag, and without it */
+        int flag;
+        for (flag = 1; flag >= 0; --flag) {
+            HANDLE job = crash_host_win(flag);
+            CHECK(job != NULL);
+            if (job) {
+                int alive = win_alive_after(job, 5000);
+                if (alive) printf("  job (flag %d) outlived its host\n", flag);
+                CHECK(!alive);
+            }
+        }
     }
 #endif
     {   /* where it cannot be enforced, the first attempt of the type says so - once */
@@ -407,8 +518,13 @@ static void die_with_host(void)
 #endif
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+#if defined(_WIN32)
+    if (argc > 2 && strcmp(argv[1], "crashhost") == 0) return crash_host_main(atoi(argv[2]));
+#else
+    (void)argc; (void)argv;
+#endif
     gptps_set_log_sink(on_log, NULL);
 #if defined(_WIN32)
     {

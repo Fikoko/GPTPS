@@ -46,6 +46,11 @@
  *             "brk"   : Windows: on Ctrl+Break write "cleaned" to the file argv[2]
  *                       and exit 0; until then, sleep - "term", the Windows way, with
  *                       the same argv[3] / argv[4].
+ *             "brkignore": Windows: on Ctrl+Break write "seen" to the file argv[2]
+ *                       and carry on sleeping - the handler swallows the event (returns
+ *                       TRUE without exiting), as a batch program that will not be
+ *                       interrupted does. "termignore", the Windows way: one that the
+ *                       executor must end itself when the grace runs out.
  *             "spawn" : a launcher: start this helper again as argv[2..] (in the same
  *                       process group, and console), then sleep with the default stop
  *                       action - so the launcher dies at once and its worker cleans up.
@@ -177,6 +182,19 @@ static BOOL WINAPI on_brk(DWORD kind)
     return TRUE;
 }
 
+/* "brkignore": a separate handler, so "brk" stays exactly what it was. Swallows
+ * Ctrl+Break and keeps the process running; leaves evidence that it did. */
+static const char *g_brk_seen_file;
+static BOOL WINAPI on_brk_ignore(DWORD kind)
+{
+    if (kind != CTRL_BREAK_EVENT) return FALSE;
+    if (g_brk_seen_file) {
+        FILE *f = fopen(g_brk_seen_file, "wb");
+        if (f) { fputs("seen", f); fclose(f); }
+    }
+    return TRUE;                  /* handled - and nothing else: the program runs on */
+}
+
 /* a wide string, written to stdout as UTF-8 */
 static void put_w(const wchar_t *w)
 {
@@ -301,6 +319,11 @@ int main(int argc, char **argv)
         g_clean_ms = (argc > 3) ? strtoul(argv[3], NULL, 10) : 0;
         g_clean_spam = (argc > 4) ? strtoul(argv[4], NULL, 10) : 0;
         SetConsoleCtrlHandler(on_brk, TRUE);
+        for (;;) sleep_ms(10);
+    }
+    if (strcmp(mode, "brkignore") == 0) {
+        g_brk_seen_file = (argc > 2) ? argv[2] : NULL;
+        SetConsoleCtrlHandler(on_brk_ignore, TRUE);
         for (;;) sleep_ms(10);
     }
 #endif

@@ -17,9 +17,12 @@
  *  6) stderr_tail_bytes: a failing program's last stderr bytes arrive on FAILED and
  *     on its dead letter - and a program that writes far more than a pipe holds
  *     does not block; nothing on FINISHED; nothing when the type does not ask.
- *  7) stop_grace_ms (POSIX): a stopped program gets SIGTERM and time to clean up;
- *     one that ignores it is SIGKILLed when the grace runs out. Windows: stopped at
- *     once, and the first attempt logs that the grace is not in force.
+ *  7) stop_grace_ms: a stopped program gets SIGTERM (POSIX) or Ctrl+Break (Windows)
+ *     and time to clean up, with no WARN - on Windows both for a host with a console
+ *     and for one without (the job then gets a hidden console of its own, ABI 2.8).
+ *     A program that ignores the signal is killed when the grace runs out, and the
+ *     stop is bounded by it: SIGKILL to the group on POSIX, TerminateJobObject on
+ *     Windows.
  *  8) Stdout EOF is not the end: a program that points its stdout elsewhere and runs
  *     on (`exec >>job.log 2>&1`) runs to its own exit, with no deadline, and is
  *     reported by its exit code; a deadline still ends it.
@@ -141,6 +144,38 @@ static int run1(gptps *e, const char *task)
     while (gptps_step(e, &n) == GPTPS_OK && n) { }
     return g_done;
 }
+
+#if defined(_WIN32)
+/* "brkignore" swallows Ctrl+Break and runs on: the executor must end it itself when
+ * the grace runs out (TerminateJobObject), so the stop takes the timeout plus the
+ * grace - not less, which would be no grace, and not forever. On real Windows the
+ * break must also have been delivered: the program wrote "seen". Wine neither runs
+ * the program's handler nor keeps the job alive past the break, so there only the
+ * upper bound - the stop ends - is checked. */
+static void check_ignored_break(gptps *e, const char *task, int wine)
+{
+    static const char *const a_ign[] = { HELPER_PATH, "brkignore", "gptps_launch_seen.txt", NULL };
+    gptps_task_def d;
+    uint64_t t0, dt;
+    FILE *f;
+    remove("gptps_launch_seen.txt");
+    def_prog(&d, task, a_ign); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 400;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    t0 = gptps_now_ms(NULL);
+    CHECK(run1(e, task) && !g_ok && g_st == GPTPS_E_TIMEOUT);
+    dt = gptps_now_ms(NULL) - t0;
+    if (dt >= 4000 || (!wine && dt < 1300))
+        printf("  %s: stopped after %lu ms\n", task, (unsigned long)dt);
+    CHECK(dt < 4000);                      /* bounded: killed when the grace ran out */
+    f = fopen("gptps_launch_seen.txt", "rb");
+    if (!wine) {
+        CHECK(dt >= 1300);                 /* 1 s timeout + the 400 ms it was given */
+        CHECK(f != NULL);                  /* the break arrived, and was ignored */
+    }
+    if (f) fclose(f);
+    remove("gptps_launch_seen.txt");
+}
+#endif
 
 /* make DIR_U8 holding marker.txt = "here" */
 static int make_dir(void)
@@ -501,6 +536,9 @@ int main(void)
             CHECK(strcmp(got, "cleaned") == 0);
         }
         if (f) fclose(f);
+        /* ... and one that ignores the Ctrl+Break is ended when the grace runs out */
+        check_ignored_break(e, "ign_nc", wine);
+        CHECK(g_grace_warns == 0);
 
         /* b) a host with a (hidden) console of its own: the job shares it */
         CHECK(AllocConsole());
@@ -522,6 +560,8 @@ int main(void)
         }
         if (f) fclose(f);
         remove("gptps_launch_cleaned.txt");
+        check_ignored_break(e, "ign_c", wine);
+        CHECK(g_grace_warns == 0);
         FreeConsole();
         gptps_set_log_sink(NULL, NULL);
     }
