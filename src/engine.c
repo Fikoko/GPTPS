@@ -1219,10 +1219,21 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_DIE) {
+#if defined(_WIN32)
+        /* Windows holds it with a kill-on-close job object; withheld only when the
+         * program could not be put in one (the executor's own WARN names the step and
+         * the Windows error) */
+        snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST is not enforced for this job - "
+                 "its program could not be put in a kill-on-close job object (the executor's own WARN names "
+                 "the step and the Windows error; a host already in a job that allows no nested one, "
+                 "as before Windows 8, is the usual cause); a job may outlive a host that dies. Start "
+                 "the host outside such a job", item_name(it));
+#else
         snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST is not enforced here - this OS "
                  "has no parent-death signal (it is Linux, FreeBSD and Windows); a job may outlive a "
                  "host that dies. Run the host under a supervisor that kills its process group "
                  "(launchd, systemd's KillMode=control-group)", item_name(it));
+#endif
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_START) {

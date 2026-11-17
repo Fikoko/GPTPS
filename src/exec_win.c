@@ -626,10 +626,10 @@ static unsigned win_io_rate(HANDLE job, uint64_t bps)
 }
 
 /* The launch lock: one lock for the process-wide state a launch reads or a stop
- * changes - which handles are inheritable, and which console the host is attached to.
- * Held from making the child's pipe ends inheritable to making them not inheritable
- * again (CreateProcessW in between), and by win_ctrl_break for the time the host is
- * attached to a job's console. Without it, one worker's CreateProcessW copied another
+ * changes - which handles are inheritable, which console the host is attached to, and
+ * so the host's standard handles. Held by a launch from reading the host's stderr to
+ * making the child's pipe ends not inheritable again (CreateProcessW in between), and
+ * by win_ctrl_break for the time the host is attached to a job's console. Without it, one worker's CreateProcessW copied another
  * job's pipe ends into its program (that job then waited for its output to end for as
  * long as the other program lived), and a launch that probed the console while a stop
  * had the host attached to another job's took that console for the host's own. A spin
@@ -666,7 +666,8 @@ static int win_listable(HANDLE h)
 /* CreateProcessW with stdin/stdout/stderr = in/out/err and nothing else inherited.
  * The three are not inheritable when they come in, and are not when this returns;
  * they are only for the launch, under the launch lock. `err` NULL gives the program
- * the host's own stderr, as an inheritable copy so the host's handle is not changed.
+ * the host's own stderr, as an inheritable copy so the host's handle is not changed
+ * (read under the lock, so never a stderr a stop's borrowed console put in its place).
  * *host_console (when probe is set) is whether the host has a console at the moment of
  * the launch - read under the lock, so never a console a stop has borrowed. FALSE with
  * *err_out set when it was not started. */
@@ -685,6 +686,11 @@ static BOOL win_launch(wchar_t *wcmd, DWORD flags, int probe, int *host_console,
     void *attrs = NULL;
     BOOL ok;
 
+    /* From here to CreateProcessW: the host's standard handles are read under the lock
+     * too, because a stop that has the host attached to another job's console holds it,
+     * and that console can replace them - a copy taken then would give this program the
+     * other job's hidden console for its stderr. */
+    win_launch_lock();
     list[n++] = in; list[n++] = out;
     if (err) {
         list[n++] = err;                               /* the job's own stderr pipe */
@@ -713,7 +719,6 @@ static BOOL win_launch(wchar_t *wcmd, DWORD flags, int probe, int *host_console,
     }
     if (attrs) { sx.si.cb = sizeof sx; sx.attrs = attrs; flags |= GPTPS_WIN_EXTENDED_STARTUPINFO; }
 
-    win_launch_lock();
     for (i = 0; i < n; ++i) SetHandleInformation(list[i], HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
     if (probe) {
         *host_console = GetConsoleProcessList(&one, 1) != 0;   /* 0: attached to no console */
@@ -821,7 +826,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     writer_ctx wc;
     reader_ctx rc;
     DWORD code = 1, waited, start_err = 0;
-    int killed = 0, assigned = 0, graceful_stop = 0;
+    int killed = 0, assigned = 0, graceful_stop = 0, capped = 0;   /* capped: stopped for its output */
     gptps_status eff;
     gptps_status kill_st = GPTPS_E_TIMEOUT;   /* why we killed the child, if we did */
 
@@ -988,7 +993,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
              * timed-out one is, with its grace - it may be in the middle of its work -
              * and the attempt fails with GPTPS_E_IO, as an ungraceful one's does */
             if (InterlockedCompareExchange(&rc.oversize, 0, 0)) {
-                killed = 1; kill_st = GPTPS_E_IO; graceful_stop = 1; break;
+                killed = 1; kill_st = GPTPS_E_IO; graceful_stop = 1; capped = 1; break;
             }
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }
@@ -1073,7 +1078,9 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     else if (rc.ioerr)      eff = GPTPS_E_IO;   /* the output could not be read */
     else if (rc.nomem)      eff = GPTPS_E_NOMEM;
     else                    eff = (code == 0) ? GPTPS_OK : GPTPS_E_TASK;
-    if (rc.oversize) caps->out_capped = GPTPS_WIN_RESULT_CAP;   /* the engine says why, once */
+    /* The engine says why, once - when the cap is why: not when the job was already
+     * being stopped for its deadline or a cancel and ran past the cap in its grace */
+    if (rc.oversize && (!killed || capped)) caps->out_capped = GPTPS_WIN_RESULT_CAP;
     /* ABI 2.7: how it ended, when it ended on its own - every branch above but the last
      * may have terminated it, and then its code is ours, not the program's */
     if (!killed && !rc.oversize && !wc.ioerr && !rc.ioerr && !rc.nomem)

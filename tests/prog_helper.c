@@ -49,6 +49,9 @@
  *             "flood" : the stop handler of "term" ("brk" on Windows) for the file
  *                       argv[2], then argv[3] bytes on stdout, then sleep - a program
  *                       that logs to stdout past the 16 MiB result cap.
+ *             "lateflood": sleep argv[2] ms, then argv[3] bytes on stdout, then
+ *                       sleep - output past the cap that comes only after a stop
+ *                       for another reason has begun.
  *             "envsorted": Windows: print "sorted" if this process's environment
  *                       block is in Windows' order (names, ordinal, ignoring case),
  *                       else "unsorted at NAME". Elsewhere: "sorted".
@@ -263,6 +266,19 @@ int main(int argc, char **argv)
         g_term_file = argv[2];
         signal(SIGTERM, on_term);
 #endif
+        memset(ys, 'y', sizeof ys);
+        while (left) {
+            size_t n = (left < sizeof ys) ? (size_t)left : sizeof ys;
+            if (fwrite(ys, 1, n, stdout) != n) break;
+            left -= (unsigned long)n;
+        }
+        fflush(stdout);
+        for (;;) sleep_ms(10);
+    }
+    if (strcmp(mode, "lateflood") == 0 && argc > 3) {
+        static char ys[65536];
+        unsigned long left = strtoul(argv[3], NULL, 10);
+        sleep_ms(strtoul(argv[2], NULL, 10));
         memset(ys, 'y', sizeof ys);
         while (left) {
             size_t n = (left < sizeof ys) ? (size_t)left : sizeof ys;

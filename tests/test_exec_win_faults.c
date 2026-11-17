@@ -14,9 +14,11 @@
  *     A must still end as soon as its program does - B must not hold A's stdout.
  *  2) The console probe is not fooled by a stop [18]: while a stop has the host
  *     attached to another job's console, a job started meanwhile must still be
- *     started without a console window of the host's (CREATE_NO_WINDOW).
+ *     started without a console window of the host's (CREATE_NO_WINDOW), and must
+ *     not be given a copy of that console's stderr for its own.
  *  3) Die-with-host is claimed only when it holds [19]: no job object, its limits
- *     refused, or the program not in it - and a WARN says so.
+ *     refused, or the program not in it - and a WARN says so, and the task type's own
+ *     WARN gives that cause, not a missing parent-death signal.
  *  4) Threads that cannot be started fail the attempt with GPTPS_E_NOMEM [20], never
  *     a success with an empty payload or result.
  *  5) The CPU count is the machine's, every processor group's [21]: the CPU cap and
@@ -24,6 +26,8 @@
  *  6) The Windows command line keeps an unquoted argument's trailing backslashes [54].
  *  7) Paths are UTF-8 for add-ons and the settings save, and the save is flushed and
  *     written through [9] [25].
+ *  8) The output-cap report names the cap only when the cap ended the attempt [53]:
+ *     a job past its deadline that writes too much in its grace is a timeout.
  */
 #include <windows.h>
 #include <psapi.h>
@@ -49,6 +53,8 @@ static volatile LONG w_fake_console, w_attached;             /* the console, whe
 static volatile LONG w_last_flags;                           /* the last CreateProcessW's flags */
 static HANDLE w_ev_attached, w_ev_launched;
 static volatile LONG w_flushes, w_move_flags;
+static HANDLE w_borrowed;                                     /* the stderr a borrowed console sets */
+static volatile LONG w_dup_borrowed;                          /* ...and it was copied for a program */
 static void (*w_job_hook)(void);                              /* once, from CreateJobObjectA */
 
 static HANDLE WINAPI fake_CreateThread(LPSECURITY_ATTRIBUTES a, SIZE_T s, LPTHREAD_START_ROUTINE f,
@@ -95,6 +101,7 @@ static BOOL WINAPI fake_AttachConsole(DWORD pid)
 {
     if (!w_fake_console) return AttachConsole(pid);
     InterlockedExchange(&w_attached, 1);           /* the host is on another job's console */
+    if (w_borrowed) SetStdHandle(STD_ERROR_HANDLE, w_borrowed);   /* which brings its own handles */
     SetEvent(w_ev_attached);
     WaitForSingleObject(w_ev_launched, 1500);      /* a launch that runs now sees it */
     return TRUE;
@@ -117,6 +124,11 @@ static BOOL WINAPI fake_CreateProcessW(LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRI
     InterlockedExchange(&w_last_flags, (LONG)fl);
     if (w_fake_console) SetEvent(w_ev_launched);
     return ok;
+}
+static BOOL WINAPI fake_DuplicateHandle(HANDLE sp, HANDLE s, HANDLE tp, LPHANDLE t, DWORD acc, BOOL inh, DWORD o)
+{
+    if (w_borrowed && s == w_borrowed) InterlockedExchange(&w_dup_borrowed, 1);
+    return DuplicateHandle(sp, s, tp, t, acc, inh, o);
 }
 static BOOL WINAPI fake_FlushFileBuffers(HANDLE h)
 {
@@ -141,6 +153,7 @@ static BOOL WINAPI fake_MoveFileExW(LPCWSTR a, LPCWSTR b, DWORD fl)
 #define CreateProcessW            fake_CreateProcessW
 #define FlushFileBuffers          fake_FlushFileBuffers
 #define MoveFileExW               fake_MoveFileExW
+#define DuplicateHandle           fake_DuplicateHandle
 #include "../src/hal_win.c"
 #include "../src/exec_win.c"
 #undef CreateThread
@@ -155,13 +168,25 @@ static BOOL WINAPI fake_MoveFileExW(LPCWSTR a, LPCWSTR b, DWORD fl)
 #undef CreateProcessW
 #undef FlushFileBuffers
 #undef MoveFileExW
+#undef DuplicateHandle
 
 /* ---- helpers ------------------------------------------------------------ */
-static volatile LONG g_warn_job;
+static volatile LONG g_warn_job, g_warn_die_type, g_warn_die_wrong, g_warn_out;
 static void on_log(gptps_log_level lvl, const char *msg, void *ud)
 {
     (void)ud;
-    if (lvl == GPTPS_LOG_WARN && msg && strstr(msg, "kill-on-close job object")) InterlockedIncrement(&g_warn_job);
+    if (lvl != GPTPS_LOG_WARN || !msg) return;
+    if (strstr(msg, "is not enforced for this job")) InterlockedIncrement(&g_warn_die_type);    /* the type's */
+    else if (strstr(msg, "kill-on-close job object")) InterlockedIncrement(&g_warn_job);       /* the executor's */
+    if (strstr(msg, "parent-death")) InterlockedIncrement(&g_warn_die_wrong);
+    if (strstr(msg, "the most a result may be")) InterlockedIncrement(&g_warn_out);
+}
+
+static volatile LONG g_done;
+static void on_ev(const gptps_event *ev, void *ud)
+{
+    (void)ud;
+    if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) InterlockedIncrement(&g_done);
 }
 
 static void def_prog(gptps_task_def *d, const char *const *argv, uint64_t flags)
@@ -171,8 +196,8 @@ static void def_prog(gptps_task_def *d, const char *const *argv, uint64_t flags)
 }
 
 /* Run one attempt; *res gets the result as a string (or ""). */
-static gptps_status run(const char *const *argv, const char *payload, uint32_t grace_ms, size_t err_cap,
-                        gptps_exec_caps *caps, char *res, size_t rn)
+static gptps_status run_tm(const char *const *argv, const char *payload, uint32_t grace_ms, size_t err_cap,
+                           uint32_t timeout_s, gptps_exec_caps *caps, char *res, size_t rn)
 {
     gptps_task_def d;
     gptps_exec_meter m;
@@ -185,7 +210,7 @@ static gptps_status run(const char *const *argv, const char *payload, uint32_t g
     caps->stop_grace_ms = grace_ms;
     memset(&m, 0, sizeof m);
     m.err_cap = err_cap;
-    st = gptps_program_execute(&d, payload, payload ? strlen(payload) : 0, caps, 20, &cancel, &out, &len, &m);
+    st = gptps_program_execute(&d, payload, payload ? strlen(payload) : 0, caps, timeout_s, &cancel, &out, &len, &m);
     if (res && rn) {
         size_t n = (out && len < rn) ? len : 0;
         if (n) memcpy(res, out, n);
@@ -194,6 +219,11 @@ static gptps_status run(const char *const *argv, const char *payload, uint32_t g
     gptps_free(out);
     gptps_free(m.err);
     return st;
+}
+static gptps_status run(const char *const *argv, const char *payload, uint32_t grace_ms, size_t err_cap,
+                        gptps_exec_caps *caps, char *res, size_t rn)
+{
+    return run_tm(argv, payload, grace_ms, err_cap, 20, caps, res, rn);
 }
 
 /* ---- 1) pipe ends stay with their job ------------------------------------ */
@@ -262,14 +292,23 @@ static void console_probe(void)
     HANDLE t;
     w_ev_attached = CreateEventA(NULL, TRUE, FALSE, NULL);
     w_ev_launched = CreateEventA(NULL, TRUE, FALSE, NULL);
+    HANDLE own_err = GetStdHandle(STD_ERROR_HANDLE);
+    w_borrowed = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    CHECK(w_borrowed != INVALID_HANDLE_VALUE);
+    if (w_borrowed == INVALID_HANDLE_VALUE) w_borrowed = NULL;
+    InterlockedExchange(&w_dup_borrowed, 0);
     InterlockedExchange(&w_fake_console, 1);       /* a host with no console: a service */
     t = (HANDLE)_beginthreadex(NULL, 0, stopper, NULL, 0, NULL);
     CHECK(t != NULL);
     CHECK(WaitForSingleObject(w_ev_attached, 10000) == WAIT_OBJECT_0);
-    CHECK(run(a_exit0, NULL, 1000, 0, &caps, NULL, 0) == GPTPS_OK);   /* with a stop grace */
+    /* with a stop grace, and stderr not kept: the program gets the host's stderr */
+    CHECK(run(a_exit0, NULL, 1000, 0, &caps, NULL, 0) == GPTPS_OK);
     CHECK(((DWORD)w_last_flags & CREATE_NO_WINDOW) != 0);   /* the host has no console of its own */
+    CHECK(w_dup_borrowed == 0);            /* ...nor the borrowed console's stderr */
     if (t) { WaitForSingleObject(t, 10000); CloseHandle(t); }
+    CHECK(GetStdHandle(STD_ERROR_HANDLE) == own_err);       /* the stop put the host's back */
     InterlockedExchange(&w_fake_console, 0);
+    if (w_borrowed) { CloseHandle(w_borrowed); w_borrowed = NULL; }
     CloseHandle(w_ev_attached); CloseHandle(w_ev_launched);
 }
 
@@ -296,6 +335,36 @@ static void die_claim(void)
     CHECK((caps.applied & GPTPS_CAP_DIE) == 0);
     w_job_fail = 0;
     CHECK(g_warn_job == 1);                /* said, once */
+    {   /* through the engine: the type's own WARN gives the Windows cause */
+        gptps_config cfg;
+        gptps_task_def d;
+        gptps *e = NULL;
+        int i;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+        cfg.limits.max_concurrent_tasks = 1;
+        CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+        if (e) CHECK(gptps_set_event_cb(e, on_ev, NULL) == GPTPS_OK);
+        def_prog(&d, a_cat, GPTPS_TASK_DIE_WITH_HOST);
+        d.name = "diejob";
+        d.default_cost.struct_size = sizeof d.default_cost;
+        d.default_policy.struct_size = sizeof d.default_policy;
+        InterlockedExchange(&g_warn_die_type, 0);
+        InterlockedExchange(&g_warn_die_wrong, 0);
+        InterlockedExchange(&g_done, 0);
+        w_job_fail = 1;
+        if (e && gptps_register_task(e, &d) == GPTPS_OK) {
+            for (i = 0; i < 2; ++i) CHECK(gptps_submit(e, "diejob", "x", 1, NULL) == GPTPS_OK);
+            for (i = 0; i < 3000 && g_done < 2; ++i) Sleep(10);
+            CHECK(g_done == 2);
+        } else {
+            CHECK(!"engine");
+        }
+        if (e) CHECK(gptps_shutdown(e) == GPTPS_OK);
+        w_job_fail = 0;
+        CHECK(g_warn_die_type == 1);       /* once for the type */
+        CHECK(g_warn_die_wrong == 0);      /* and not the "no parent-death signal" of POSIX */
+    }
 }
 
 /* ---- 4) threads that cannot be started ---------------------------------- */
@@ -412,6 +481,28 @@ static void utf8_paths(void)
     RemoveDirectoryW(DIR_W);
 }
 
+/* ---- 8) the output cap, named only when it is the cause ---------------- */
+static void out_cap(void)
+{
+    static const char *const a_zeros[] = { HELPER_PATH, "zeros", "17000000", NULL };
+    static const char *const a_late[]  = { HELPER_PATH, "lateflood", "1500", "17000000", NULL };
+    gptps_exec_caps caps;
+    /* past the cap on its own: E_IO, and the cap is named */
+    CHECK(run(a_zeros, NULL, 0, 0, &caps, NULL, 0) == GPTPS_E_IO);
+    CHECK(caps.out_capped != 0);
+    /* past its deadline first, then too much output in its grace: a timeout, and the
+     * cap is not what ended it. A service host, so the stop goes through a borrowed
+     * console (faked: Wine cannot deliver Ctrl+Break) and the grace is given. */
+    w_ev_attached = CreateEventA(NULL, TRUE, TRUE, NULL);
+    w_ev_launched = CreateEventA(NULL, TRUE, TRUE, NULL);
+    InterlockedExchange(&w_fake_console, 1);
+    CHECK(run_tm(a_late, NULL, 4000, 0, 1, &caps, NULL, 0) == GPTPS_E_TIMEOUT);
+    CHECK(caps.out_capped == 0);
+    if (caps.out_capped) printf("a timed-out job's output past the cap was reported as the cause\n");
+    InterlockedExchange(&w_fake_console, 0);
+    CloseHandle(w_ev_attached); CloseHandle(w_ev_launched);
+}
+
 int main(void)
 {
     gptps_set_log_sink(on_log, NULL);
@@ -423,6 +514,7 @@ int main(void)
     thread_faults();
     cpu_groups();
     utf8_paths();
+    out_cap();
     gptps_set_log_sink(NULL, NULL);
     if (fails) { printf("%d Windows executor fault check(s) FAILED\n", fails); return 1; }
     printf("Windows executor faults: all checks passed\n");

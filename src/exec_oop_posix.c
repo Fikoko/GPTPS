@@ -1571,7 +1571,6 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
-        if (oversize) caps->out_capped = GPTPS_PROG_RESULT_CAP;   /* the engine says why, once */
         if (killed)                  eff = kill_st;
         else if (oversize)           eff = GPTPS_E_IO;
         else if (nomem)              eff = GPTPS_E_NOMEM;
@@ -1587,6 +1586,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (cgdir && eff != GPTPS_OK && eff != GPTPS_E_TIMEOUT && cgroup_oom_killed(cgdir))
             eff = GPTPS_E_NOMEM;     /* exceeded the memory cap */
 #endif
+        /* the engine says why, once - when the cap is why the attempt failed */
+        if (oversize && !killed && eff == GPTPS_E_IO) caps->out_capped = GPTPS_PROG_RESULT_CAP;
         err_drain(&et);                            /* what it wrote last; a grandchild may hold the pipe */
         if (et.fd >= 0) { exec_close(et.fd); et.fd = -1; }
         if (meter && et.len) { meter->err = et.buf; meter->err_len = et.len; }

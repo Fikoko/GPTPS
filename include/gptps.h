@@ -287,9 +287,10 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * flag a POSIX job outlives a dead host, which some hosts want (a job that must finish
  * whatever happens). Enforced by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on
  * FreeBSD (SIGKILL: nothing may linger), and on Windows always, flag or not (the job
- * object is killed on close). Where it cannot be enforced (macOS, other POSIX) the job
- * runs anyway and the first attempt of the type logs a WARN. Ignored for INPROC, which
- * is the host. */
+ * object is killed on close) - unless the program could not be put in a kill-on-close
+ * job object (a host in a job that allows no nested one). Where it cannot be enforced
+ * (macOS, other POSIX, that Windows case) the job runs anyway and the first attempt of
+ * the type logs a WARN. Ignored for INPROC, which is the host. */
 #define GPTPS_TASK_DIE_WITH_HOST 0x2u
 /* RETIRE_ON_OK (services only; ignored otherwise): by default a service is
  * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a
