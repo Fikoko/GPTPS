@@ -31,6 +31,7 @@
 typedef struct {
     char     task[NAME_MAX_LEN + 1];   /* "" = every task type */
     int      any;
+    int      start;                    /* a rule for start failures (start.error), not a code */
     uint32_t code;
     uint32_t wait_ms;
 } rule;
@@ -47,17 +48,19 @@ struct gptps_retry {
     size_t    nrules, caprules;
     verdict  *pend;           /* oldest first */
     size_t    npend, cappend;
-    uint64_t  refused, delayed;
+    uint64_t  refused, delayed, forgotten;
+    int       forgot_said;    /* the one WARN about a forgotten verdict is out */
 };
 
-/* the rule for (task, code): a task's own first, then an all-tasks one; NULL = none */
-static const rule *find_rule(const gptps_retry *r, const char *task, uint32_t code)
+/* the rule for (task, code) - or for a start failure, with start set: a task's own
+ * first, then an all-tasks one; NULL = none */
+static const rule *find_rule(const gptps_retry *r, const char *task, int start, uint32_t code)
 {
     const rule *any = NULL;
     size_t i;
     for (i = 0; i < r->nrules; ++i) {
         const rule *x = &r->rules[i];
-        if (x->code != code) continue;
+        if (x->start != start || (!start && x->code != code)) continue;
         if (x->any) { any = x; continue; }
         if (task && strcmp(x->task, task) == 0) return x;
     }
@@ -77,39 +80,54 @@ static void drop_pend(gptps_retry *r, size_t i)
     r->npend -= 1;
 }
 
-static void put_pend(gptps_retry *r, gptps_handle h, uint32_t wait_ms)
+/* Returns 1 when a verdict had to be forgotten to make room (never silently: the
+ * caller counts it, and says so once, outside the lock). */
+static int put_pend(gptps_retry *r, gptps_handle h, uint32_t wait_ms)
 {
     size_t i = find_pend(r, h);
+    int forgot = 0;
     if (i != (size_t)-1) drop_pend(r, i);
     if (r->npend == r->cappend) {
         size_t ncap = r->cappend ? r->cappend * 2 : 16;
         verdict *np;
         if (ncap > MAX_PENDING) ncap = MAX_PENDING;
-        if (ncap == r->cappend) drop_pend(r, 0);            /* full: forget the oldest */
+        if (ncap == r->cappend) { drop_pend(r, 0); forgot = 1; }           /* full: forget the oldest */
         else if ((np = (verdict *)realloc(r->pend, ncap * sizeof *np)) != NULL) { r->pend = np; r->cappend = ncap; }
-        else if (r->npend) drop_pend(r, 0);                 /* out of memory: make room */
-        else return;
+        else if (r->npend) { drop_pend(r, 0); forgot = 1; }                /* out of memory: make room */
+        else { r->forgotten += 1; return 1; }                              /* nowhere to keep this one */
     }
     r->pend[r->npend].handle = h;
     r->pend[r->npend].wait_ms = wait_ms;
     r->pend[r->npend].until_ms = 0;
     r->npend += 1;
+    if (forgot) r->forgotten += 1;
+    return forgot;
 }
 
 static void retry_obs(const gptps_event *ev, void *ud)
 {
     gptps_retry *r = (gptps_retry *)ud;
-    const gptps_measure *m;
+    const gptps_measure *m, *ms;
     const rule *x;
     size_t i;
+    int say = 0;
     switch (ev->kind) {
     case GPTPS_EV_FAILED:
         m = gptps_event_measure(ev, GPTPS_M_EXIT_CODE);
+        ms = gptps_event_measure(ev, GPTPS_M_START_ERROR);   /* ABI 2.8: it never started */
         apx_mutex_lock(&r->mu);
-        x = (m && m->value <= 0xFFFFFFFFu) ? find_rule(r, ev->task_name, (uint32_t)m->value) : NULL;
-        if (x && x->wait_ms) put_pend(r, ev->handle, x->wait_ms);
-        else if ((i = find_pend(r, ev->handle)) != (size_t)-1) drop_pend(r, i);   /* this failure has no verdict */
+        x = ms ? find_rule(r, ev->task_name, 1, 0)
+          : (m && m->value <= 0xFFFFFFFFu) ? find_rule(r, ev->task_name, 0, (uint32_t)m->value) : NULL;
+        if (x && x->wait_ms) {
+            if (put_pend(r, ev->handle, x->wait_ms) && !r->forgot_said) { r->forgot_said = 1; say = 1; }
+        } else if ((i = find_pend(r, ev->handle)) != (size_t)-1) {
+            drop_pend(r, i);                                  /* this failure has no verdict */
+        }
         apx_mutex_unlock(&r->mu);
+        if (say)
+            gptps_log(NULL, GPTPS_LOG_WARN, "gptps_retry: more failed items are waiting for a retry decision "
+                      "than it keeps (4096); the oldest decision was dropped and that item retries as its "
+                      "policy says. gptps_retry_forgotten() counts them");
         break;
     case GPTPS_EV_FINISHED:
     case GPTPS_EV_DEAD_LETTERED:
@@ -176,15 +194,16 @@ gptps_status gptps_retry_install(gptps *e, gptps_retry **out)
     return GPTPS_OK;
 }
 
-gptps_status gptps_retry_on_exit(gptps_retry *r, const char *task_name, uint32_t exit_code,
-                                 uint32_t wait_ms)
+static gptps_status set_rule(gptps_retry *r, const char *task_name, int start, uint32_t exit_code,
+                             uint32_t wait_ms)
 {
     size_t i;
     if (!r || (task_name && strlen(task_name) > NAME_MAX_LEN)) return GPTPS_E_INVAL;
     apx_mutex_lock(&r->mu);
     for (i = 0; i < r->nrules; ++i) {
         rule *x = &r->rules[i];
-        if (x->code == exit_code && (task_name ? (!x->any && strcmp(x->task, task_name) == 0) : x->any)) {
+        if (x->start == start && (start || x->code == exit_code) &&
+            (task_name ? (!x->any && strcmp(x->task, task_name) == 0) : x->any)) {
             x->wait_ms = wait_ms;                         /* replaces */
             apx_mutex_unlock(&r->mu);
             return GPTPS_OK;
@@ -199,11 +218,33 @@ gptps_status gptps_retry_on_exit(gptps_retry *r, const char *task_name, uint32_t
     memset(&r->rules[r->nrules], 0, sizeof *r->rules);
     r->rules[r->nrules].any = task_name == NULL;
     if (task_name) memcpy(r->rules[r->nrules].task, task_name, strlen(task_name) + 1);
+    r->rules[r->nrules].start = start;
     r->rules[r->nrules].code = exit_code;
     r->rules[r->nrules].wait_ms = wait_ms;
     r->nrules += 1;
     apx_mutex_unlock(&r->mu);
     return GPTPS_OK;
+}
+
+gptps_status gptps_retry_on_exit(gptps_retry *r, const char *task_name, uint32_t exit_code,
+                                 uint32_t wait_ms)
+{
+    return set_rule(r, task_name, 0, exit_code, wait_ms);
+}
+
+gptps_status gptps_retry_on_start_error(gptps_retry *r, const char *task_name, uint32_t wait_ms)
+{
+    return set_rule(r, task_name, 1, 0, wait_ms);
+}
+
+uint64_t gptps_retry_forgotten(const gptps_retry *r)
+{
+    uint64_t n;
+    if (!r) return 0;
+    apx_mutex_lock((apx_mutex *)&r->mu);
+    n = r->forgotten;
+    apx_mutex_unlock((apx_mutex *)&r->mu);
+    return n;
 }
 
 uint64_t gptps_retry_refused(const gptps_retry *r)

@@ -70,7 +70,55 @@ typedef struct {
     char     mem_method[40];
 } tui_task;
 
-typedef struct { uint64_t ts; int kind; char name[64]; uint64_t handle; gptps_status status; } tui_event;
+typedef struct { uint64_t ts; int kind; char name[64]; uint64_t handle; gptps_status status;
+                 char why[96]; } tui_event;   /* why a FAILED failed: its exit and its stderr's last line */
+
+/* Why an attempt failed, in one short line: "exit 3", "signal 9", "not started (error
+ * 2)" or the status, then the last line of its stderr tail when it kept one (ABI 2.7 /
+ * 2.8). The tail is the job's own output: only printable bytes are kept - an escape
+ * sequence in it must not reach the operator's terminal - and a cut never splits a
+ * UTF-8 character. */
+static void tui_why(const gptps_event *ev, char *out, size_t n)
+{
+    const gptps_measure *m;
+    size_t pos = 0;
+    out[0] = 0;
+    if (ev->kind != GPTPS_EV_FAILED || n < 8) return;
+    if ((m = gptps_event_measure(ev, GPTPS_M_START_ERROR)) != NULL)
+        pos = (size_t)snprintf(out, n, "not started (error %llu)", (unsigned long long)m->value);
+    else if ((m = gptps_event_measure(ev, GPTPS_M_EXIT_CODE)) != NULL)
+        pos = (size_t)snprintf(out, n, "exit %llu", (unsigned long long)m->value);
+    else if ((m = gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL)) != NULL)
+        pos = (size_t)snprintf(out, n, "signal %llu", (unsigned long long)m->value);
+    else
+        pos = (size_t)snprintf(out, n, "%s", gptps_strerror(ev->status));
+    if (pos >= n) pos = n - 1;
+    if (ev->struct_size >= offsetof(gptps_event, stderr_tail_len) + sizeof ev->stderr_tail_len &&
+        ev->stderr_tail && ev->stderr_tail_len) {
+        const char *t = ev->stderr_tail;
+        size_t end = ev->stderr_tail_len, start, i;
+        while (end && (t[end - 1] == '\n' || t[end - 1] == '\r' || t[end - 1] == ' ')) --end;
+        start = end;
+        while (start && t[start - 1] != '\n') --start;               /* its last line */
+        if (end > start && pos + 4 < n) {
+            pos += (size_t)snprintf(out + pos, n - pos, " \xc2\xb7 ");
+            if (pos >= n) pos = n - 1;
+            for (i = start; i < end && pos + 1 < n; ++i) {
+                unsigned char c = (unsigned char)t[i];
+                if (c < 0x20 || c == 0x7f) c = ' ';                    /* no control bytes */
+                if (c >= 0xc0) {                                        /* a whole UTF-8 sequence, or none */
+                    size_t len = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : 2;
+                    if (pos + len + 1 > n || i + len > end) break;
+                    memcpy(out + pos, t + i, len); pos += len; i += len - 1;
+                    continue;
+                }
+                if (c >= 0x80) continue;                                /* a stray continuation byte */
+                out[pos++] = (char)c;
+            }
+            out[pos] = 0;
+        }
+    }
+}
 
 struct gptps_tui {
     gptps           *e;
@@ -273,6 +321,7 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         tui_event *re = &t->recent[t->rhead];
         re->ts = ev->ts_ms; re->kind = ev->kind; re->handle = ev->handle; re->status = ev->status;
         strncpy(re->name, ev->task_name, sizeof re->name - 1); re->name[sizeof re->name - 1] = 0;
+        tui_why(ev, re->why, sizeof re->why);
         t->rhead = (t->rhead + 1) % t->rcap;
         if (t->rn < t->rcap) t->rn++;
     }
@@ -827,8 +876,9 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
                               re->kind == GPTPS_EV_DROPPED) ? R
                            : (re->kind == GPTPS_EV_FINISHED) ? G : D;
             double rel = (double)(re->ts - t->start_ms) / 1000.0; /* seconds since install */
-            pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %-14.14s #%llu\n",
-                          D, rel, X, kc, kind_str(re->kind), X, re->name, (unsigned long long)re->handle);
+            pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %-14.14s #%llu%s%s%s%s\n",
+                          D, rel, X, kc, kind_str(re->kind), X, re->name, (unsigned long long)re->handle,
+                          re->why[0] ? "  " : "", D, re->why, X);
         }
     }
 

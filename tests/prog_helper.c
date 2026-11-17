@@ -32,10 +32,23 @@
  *             "errout": write argv[2] bytes of '.' to stderr, then the line argv[3],
  *                       then exit argv[4] (default 3) - a chatty program that fails.
  *             "term"  : POSIX: on SIGTERM write "cleaned" to the file argv[2] and
- *                       exit 0; until then, sleep - a program that cleans up.
+ *                       exit 0; until then, sleep - a program that cleans up. Before
+ *                       the file: wait argv[3] ms, then write argv[4] bytes to stdout
+ *                       (both default 0) - a slow clean-up, a noisy one.
  *             "termignore": ignore SIGTERM and sleep - one that never does.
  *             "brk"   : Windows: on Ctrl+Break write "cleaned" to the file argv[2]
- *                       and exit 0; until then, sleep - "term", the Windows way.
+ *                       and exit 0; until then, sleep - "term", the Windows way, with
+ *                       the same argv[3] / argv[4].
+ *             "spawn" : a launcher: start this helper again as argv[2..] (in the same
+ *                       process group, and console), then sleep with the default stop
+ *                       action - so the launcher dies at once and its worker cleans up.
+ *             "pidsleep": write this process's id to the file argv[2], then sleep.
+ *             "diskwrite": write argv[3] MiB to the file argv[2] past the cache
+ *                       (Windows: unbuffered, write-through; POSIX: fsync), then
+ *                       delete it - I/O that a bandwidth cap has to slow down.
+ *             "envsorted": Windows: print "sorted" if this process's environment
+ *                       block is in Windows' order (names, ordinal, ignoring case),
+ *                       else "unsorted at NAME". Elsewhere: "sorted".
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L   /* nanosleep under -std=c99 */
@@ -100,10 +113,25 @@ static void sleep_ms(unsigned long ms)
  * async-signal-safe) */
 #  include <fcntl.h>
 static const char *g_term_file;
+static unsigned long g_clean_ms, g_clean_spam;
 static void on_term(int sig)
 {
     int fd;
+    static char xs[4096];
+    unsigned long left = g_clean_spam;
     (void)sig;
+    if (g_clean_ms) {
+        struct timespec ts;
+        ts.tv_sec = (time_t)(g_clean_ms / 1000u); ts.tv_nsec = (long)(g_clean_ms % 1000u) * 1000000L;
+        while (nanosleep(&ts, &ts) != 0) { }
+    }
+    memset(xs, 'x', sizeof xs);
+    while (left) {                          /* noisy: a blocked write would hang us here */
+        size_t n = left < sizeof xs ? (size_t)left : sizeof xs;
+        ssize_t w = write(STDOUT_FILENO, xs, n);
+        if (w <= 0) break;
+        left -= (unsigned long)w;
+    }
     if (g_term_file && (fd = open(g_term_file, O_WRONLY | O_CREAT | O_TRUNC, 0600)) >= 0) {
         ssize_t w = write(fd, "cleaned", 7);
         (void)w;
@@ -115,9 +143,19 @@ static void on_term(int sig)
 
 #if defined(_WIN32)
 static const char *g_brk_file;
+static unsigned long g_clean_ms, g_clean_spam;
 static BOOL WINAPI on_brk(DWORD kind)
 {
+    static char xs[4096];
+    unsigned long left = g_clean_spam;
     if (kind != CTRL_BREAK_EVENT) return FALSE;
+    if (g_clean_ms) Sleep((DWORD)g_clean_ms);
+    memset(xs, 'x', sizeof xs);
+    while (left) {
+        DWORD w = 0, n = (DWORD)(left < sizeof xs ? left : sizeof xs);
+        if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), xs, n, &w, NULL) || !w) break;
+        left -= w;
+    }
     if (g_brk_file) {
         FILE *f = fopen(g_brk_file, "wb");
         if (f) { fputs("cleaned", f); fclose(f); }
@@ -200,6 +238,8 @@ int main(int argc, char **argv)
 #if !defined(_WIN32)
     if (strcmp(mode, "term") == 0) {
         g_term_file = (argc > 2) ? argv[2] : NULL;
+        g_clean_ms = (argc > 3) ? strtoul(argv[3], NULL, 10) : 0;
+        g_clean_spam = (argc > 4) ? strtoul(argv[4], NULL, 10) : 0;
         signal(SIGTERM, on_term);
         for (;;) sleep_ms(10);
     }
@@ -211,10 +251,93 @@ int main(int argc, char **argv)
 #if defined(_WIN32)
     if (strcmp(mode, "brk") == 0) {
         g_brk_file = (argc > 2) ? argv[2] : NULL;
+        g_clean_ms = (argc > 3) ? strtoul(argv[3], NULL, 10) : 0;
+        g_clean_spam = (argc > 4) ? strtoul(argv[4], NULL, 10) : 0;
         SetConsoleCtrlHandler(on_brk, TRUE);
         for (;;) sleep_ms(10);
     }
 #endif
+    if (strcmp(mode, "diskwrite") == 0 && argc > 3) {
+        unsigned long mb = strtoul(argv[3], NULL, 10), i;
+#if defined(_WIN32)
+        DWORD w;
+        void *buf = VirtualAlloc(NULL, 1u << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);  /* page-aligned */
+        HANDLE f = CreateFileA(argv[2], GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH, NULL);
+        if (!buf || f == INVALID_HANDLE_VALUE) return 8;
+        memset(buf, 7, 1u << 20);
+        for (i = 0; i < mb; ++i) if (!WriteFile(f, buf, 1u << 20, &w, NULL) || w != (1u << 20)) { CloseHandle(f); return 9; }
+        CloseHandle(f);
+        DeleteFileA(argv[2]);
+#else
+        static char buf[1u << 20];
+        FILE *f = fopen(argv[2], "wb");
+        if (!f) return 8;
+        memset(buf, 7, sizeof buf);
+        for (i = 0; i < mb; ++i) if (fwrite(buf, 1, sizeof buf, f) != sizeof buf) { fclose(f); return 9; }
+        fflush(f); fsync(fileno(f)); fclose(f);
+        remove(argv[2]);
+#endif
+        return 0;
+    }
+    if (strcmp(mode, "envsorted") == 0) {
+#if defined(_WIN32)
+        wchar_t *blk = GetEnvironmentStringsW(), *p, *prev = NULL;
+        for (p = blk; p && *p; p += wcslen(p) + 1) {
+            if (_wcsnicmp(p, L"WINE", 4) == 0) continue;     /* Wine adds its own, unsorted */
+            if (prev && p[0] != L'=' && prev[0] != L'=') {   /* the per-drive "=C:" entries lead */
+                const wchar_t *a = wcschr(prev + 1, L'='), *b = wcschr(p + 1, L'=');
+                int la = a ? (int)(a - prev) : (int)wcslen(prev), lb = b ? (int)(b - p) : (int)wcslen(p);
+                if (CompareStringOrdinal(prev, la, p, lb, TRUE) == CSTR_GREATER_THAN) {
+                    fputs("unsorted at ", stdout); put_w(p); fputs(" after ", stdout); put_w(prev); fflush(stdout);
+                    return 0;
+                }
+            }
+            prev = p;
+        }
+        if (blk) FreeEnvironmentStringsW(blk);
+#endif
+        fputs("sorted", stdout);
+        fflush(stdout);
+        return 0;
+    }
+    if (strcmp(mode, "pidsleep") == 0) {
+        FILE *f = (argc > 2) ? fopen(argv[2], "w") : NULL;
+        if (!f) return 4;
+#if defined(_WIN32)
+        fprintf(f, "%lu", (unsigned long)GetCurrentProcessId());
+#else
+        fprintf(f, "%ld", (long)getpid());
+#endif
+        fclose(f);
+        for (;;) sleep_ms(10);
+    }
+    if (strcmp(mode, "spawn") == 0 && argc > 2) {
+#if defined(_WIN32)
+        /* the worker shares this console and process group (no flags): a Ctrl+Break
+         * to the group reaches both, and this launcher's default handler ends it */
+        char cmd[2048];
+        int i;
+        STARTUPINFOA si;
+        PROCESS_INFORMATION pi;
+        snprintf(cmd, sizeof cmd, "\"%s\"", argv[0]);
+        for (i = 2; i < argc; ++i) {
+            size_t L = strlen(cmd);
+            snprintf(cmd + L, sizeof cmd - L, " \"%s\"", argv[i]);
+        }
+        memset(&si, 0, sizeof si); si.cb = sizeof si;
+        memset(&pi, 0, sizeof pi);
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return 7;
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+#else
+        /* the worker stays in this process group: SIGTERM to the group reaches both,
+         * and this launcher has SIGTERM's default action */
+        pid_t c = fork();
+        if (c < 0) return 7;
+        if (c == 0) { argv[1] = argv[0]; execv(argv[0], argv + 1); _exit(127); }
+#endif
+        for (;;) sleep_ms(10);
+    }
     if (strcmp(mode, "sig") == 0) {
 #if !defined(_WIN32)
         raise(SIGTERM);

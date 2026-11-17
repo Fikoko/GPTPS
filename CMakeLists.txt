@@ -811,6 +811,11 @@ target_compile_definitions(test_retry_addon PRIVATE HELPER_PATH="$<TARGET_FILE:p
 add_dependencies(test_retry_addon prog_helper)
 add_test(NAME retry_addon COMMAND test_retry_addon)
 set_tests_properties(retry_addon PROPERTIES TIMEOUT 60)
+add_executable(test_retry_forget tests/test_retry_forget.c)   # its bound, never silent (includes the source)
+target_include_directories(test_retry_forget PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_retry_forget PRIVATE gptps)
+add_test(NAME retry_forget COMMAND test_retry_forget)
+set_tests_properties(retry_forget PROPERTIES TIMEOUT 60)
 endif()
 
 if(TARGET gptps_sched)
@@ -951,6 +956,16 @@ target_compile_definitions(test_program_launch PRIVATE HELPER_PATH="$<TARGET_FIL
 add_dependencies(test_program_launch prog_helper)
 add_test(NAME program_launch COMMAND test_program_launch)
 set_tests_properties(program_launch PROPERTIES TIMEOUT 30)
+# How a job is stopped (grace on timeout / cancel / shutdown, the whole job, noisy
+# clean-ups, with and without a console on Windows), dead letters' measurements, and
+# GPTPS_TASK_DIE_WITH_HOST (ABI 2.7 / 2.8).
+add_executable(test_program_stop tests/test_program_stop.c)
+target_include_directories(test_program_stop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_program_stop PRIVATE gptps)
+target_compile_definitions(test_program_stop PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_program_stop prog_helper)
+add_test(NAME program_stop COMMAND test_program_stop)
+set_tests_properties(program_stop PROPERTIES TIMEOUT 120)
 
 # The CPU cap on Windows: a job object throttles a capped PROGRAM job (ABI 2.6). Linux's
 # is a cgroup's and is tested in test_cgroup; nothing else could vouch for this one.
@@ -962,6 +977,14 @@ target_compile_definitions(test_cpu_cap_win PRIVATE HELPER_PATH="$<TARGET_FILE:p
 add_dependencies(test_cpu_cap_win prog_helper)
 add_test(NAME cpu_cap_win COMMAND test_cpu_cap_win)
 set_tests_properties(cpu_cap_win PROPERTIES TIMEOUT 120)
+# ...and the I/O caps, through the job object's I/O rate control (ABI 2.8)
+add_executable(test_io_cap_win tests/test_io_cap_win.c)
+target_include_directories(test_io_cap_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_io_cap_win PRIVATE gptps)
+target_compile_definitions(test_io_cap_win PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")
+add_dependencies(test_io_cap_win prog_helper)
+add_test(NAME io_cap_win COMMAND test_io_cap_win)
+set_tests_properties(io_cap_win PROPERTIES TIMEOUT 120)
 endif()
 
 # gptps_adapt with PROGRAM jobs - every platform, Windows included. It includes the
@@ -1091,6 +1114,8 @@ target_include_directories(test_tui
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons
 )
 target_link_libraries(test_tui PRIVATE gptps_tui)
+target_compile_definitions(test_tui PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")   # why a job failed
+add_dependencies(test_tui prog_helper)
 add_test(NAME tui COMMAND test_tui)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 endif()

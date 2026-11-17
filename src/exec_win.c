@@ -25,6 +25,7 @@
 
 #include <windows.h>
 #include <psapi.h>     /* PROCESS_MEMORY_COUNTERS_EX: the type only; see pmi_fn */
+#include <stdio.h>     /* snprintf: the start-failure text */
 #include <stdlib.h>
 #include <string.h>
 
@@ -226,33 +227,6 @@ static void win_sampler_tick(win_sampler *sm, HANDLE job, int assigned, HANDLE p
     sm->mt->sample(sm->mt, cur, 1);
 }
 
-/* Quote argv into one CreateProcess command line (MSDN argv parsing rules). */
-static char *build_cmdline(const char *const *argv)
-{
-    size_t cap = 1, i;
-    char *out, *w;
-    for (i = 0; argv[i]; ++i) cap += 2 * strlen(argv[i]) + 3;
-    out = (char *)gptps_malloc(cap);
-    if (!out) return NULL;
-    w = out;
-    for (i = 0; argv[i]; ++i) {
-        const char *a = argv[i];
-        int quote = (*a == 0) || strpbrk(a, " \t\"") != NULL;
-        if (i) *w++ = ' ';
-        if (quote) *w++ = '"';
-        while (*a) {
-            size_t bs = 0, k;
-            while (*a == '\\') { ++bs; ++a; }
-            if (*a == 0) { for (k = 0; k < bs * 2; ++k) *w++ = '\\'; break; }      /* before closing quote */
-            else if (*a == '"') { for (k = 0; k < bs * 2 + 1; ++k) *w++ = '\\'; *w++ = '"'; ++a; }
-            else { for (k = 0; k < bs; ++k) *w++ = '\\'; *w++ = *a++; }
-        }
-        if (quote) *w++ = '"';
-    }
-    *w = 0;
-    return out;
-}
-
 /* UTF-8 to UTF-16 for CreateProcessW (ABI 2.7). A string that is not valid UTF-8 is
  * read in the ANSI code page instead - what CreateProcessA made of every string - so a
  * host that passed ANSI text before 2.7 is started as it was. NULL when out of memory
@@ -271,6 +245,52 @@ static wchar_t *win_wide(const char *s)
     return w;
 }
 
+/* Quote wide argv into one CreateProcessW command line (MSDN argv parsing rules). */
+static wchar_t *build_cmdline_w(wchar_t *const *wv, size_t n)
+{
+    size_t cap = 1, i;
+    wchar_t *out, *w;
+    for (i = 0; i < n; ++i) cap += 2 * wcslen(wv[i]) + 3;
+    out = (wchar_t *)gptps_malloc(cap * sizeof *out);
+    if (!out) return NULL;
+    w = out;
+    for (i = 0; i < n; ++i) {
+        const wchar_t *a = wv[i];
+        int quote = (*a == 0) || wcspbrk(a, L" \t\"") != NULL;
+        if (i) *w++ = L' ';
+        if (quote) *w++ = L'"';
+        while (*a) {
+            size_t bs = 0, k;
+            while (*a == L'\\') { ++bs; ++a; }
+            if (*a == 0) { for (k = 0; k < bs * 2; ++k) *w++ = L'\\'; break; }      /* before closing quote */
+            else if (*a == L'"') { for (k = 0; k < bs * 2 + 1; ++k) *w++ = L'\\'; *w++ = L'"'; ++a; }
+            else { for (k = 0; k < bs; ++k) *w++ = L'\\'; *w++ = *a++; }
+        }
+        if (quote) *w++ = L'"';
+    }
+    *w = 0;
+    return out;
+}
+
+/* Names compare as Windows compares them: ordinally, ignoring case - CompareStringOrdinal
+ * where the system has it (Vista and later), else the C library's case-folding. */
+typedef int (WINAPI *cso_fn)(LPCWCH, int, LPCWCH, int, BOOL);
+static int wname_cmp(const wchar_t *a, size_t la, const wchar_t *b, size_t lb)
+{
+    static cso_fn cso;
+    static int looked;
+    if (!looked) { cso = (cso_fn)(void (*)(void))GetProcAddress(GetModuleHandleA("kernel32.dll"), "CompareStringOrdinal"); looked = 1; }
+    if (cso) {
+        int r = cso(a, (int)la, b, (int)lb, TRUE);
+        if (r) return r - 2;                       /* CSTR_LESS_THAN 1, EQUAL 2, GREATER 3 */
+    }
+    {
+        size_t n = la < lb ? la : lb;
+        int r = _wcsnicmp(a, b, n);
+        return r ? r : (la < lb ? -1 : la > lb ? 1 : 0);
+    }
+}
+
 /* the name's length in "NAME=value" or a bare "NAME"; Windows' own per-drive entries
  * ("=C:=C:\\x") begin with '=', which is part of their name */
 static size_t wenv_name_len(const wchar_t *s)
@@ -280,16 +300,24 @@ static size_t wenv_name_len(const wchar_t *s)
 }
 static int wenv_same(const wchar_t *a, size_t la, const wchar_t *b, size_t lb)
 {
-    return la == lb && _wcsnicmp(a, b, la) == 0;   /* Windows names ignore case */
+    return la == lb && wname_cmp(a, la, b, lb) == 0;   /* Windows names ignore case */
+}
+static int wenv_order(const void *x, const void *y)
+{
+    const wchar_t *a = *(const wchar_t *const *)x, *b = *(const wchar_t *const *)y;
+    return wname_cmp(a, wenv_name_len(a), b, wenv_name_len(b));
 }
 
 /* The program's environment block (ABI 2.7 gptps_task_def.env): the host's, with each
- * "NAME=value" replacing or adding NAME and each bare "NAME" removing it. NULL when out
- * of memory. */
-static wchar_t *win_env_block(const char *const *over)
+ * "NAME=value" replacing or adding NAME and each bare "NAME" removing it - SORTED by
+ * name, as Windows documents a block must be (programs that bisect it find a variable
+ * only then). *path_out (may be NULL) gets the PATH the program will see, as a copy,
+ * when `over` sets one; NULL otherwise. NULL when out of memory. */
+static wchar_t *win_env_block(const char *const *over, wchar_t **path_out)
 {
-    wchar_t *host, *p, *blk = NULL, *w, **ov;
-    size_t no = 0, i, j, total = 2;
+    wchar_t *host, *p, *blk = NULL, *w, **ov, **all = NULL;
+    size_t no = 0, nh = 0, na = 0, i, j, total = 2;
+    if (path_out) *path_out = NULL;
     while (over[no]) ++no;
     ov = (wchar_t **)gptps_calloc(no + 1, sizeof *ov);
     if (!ov) return NULL;
@@ -298,31 +326,75 @@ static wchar_t *win_env_block(const char *const *over)
         total += wcslen(ov[j]) + 1;
     }
     host = GetEnvironmentStringsW();
-    for (p = host; p && *p; p += wcslen(p) + 1) total += wcslen(p) + 1;
-    blk = (wchar_t *)gptps_malloc(total * sizeof *blk);
+    for (p = host; p && *p; p += wcslen(p) + 1) { total += wcslen(p) + 1; ++nh; }
+    all = (wchar_t **)gptps_calloc(nh + no + 1, sizeof *all);
+    blk = all ? (wchar_t *)gptps_malloc(total * sizeof *blk) : NULL;
     if (blk) {
-        w = blk;
         for (p = host; p && *p; p += wcslen(p) + 1) {
-            size_t L = wenv_name_len(p), n = wcslen(p) + 1;
+            size_t L = wenv_name_len(p);
             int replaced = 0;
             for (j = 0; j < no && !replaced; ++j) replaced = wenv_same(ov[j], wenv_name_len(ov[j]), p, L);
-            if (!replaced) { memcpy(w, p, n * sizeof *w); w += n; }
+            if (!replaced) all[na++] = p;
         }
         for (j = 0; j < no; ++j) {
-            size_t L = wenv_name_len(ov[j]), n = wcslen(ov[j]) + 1, k;
+            size_t L = wenv_name_len(ov[j]), k;
             int later = 0;          /* the last entry for a name wins */
             if (!wcschr(ov[j] + 1, L'=')) continue;            /* a removal */
             for (k = j + 1; k < no && !later; ++k) later = wenv_same(ov[k], wenv_name_len(ov[k]), ov[j], L);
-            if (!later) { memcpy(w, ov[j], n * sizeof *w); w += n; }
+            if (later) continue;
+            all[na++] = ov[j];
+            if (path_out && wenv_same(ov[j], L, L"PATH", 4)) {
+                size_t vn = wcslen(ov[j] + L + 1) + 1;
+                if ((*path_out = (wchar_t *)gptps_malloc(vn * sizeof **path_out)) != NULL)
+                    memcpy(*path_out, ov[j] + L + 1, vn * sizeof **path_out);
+            }
         }
+        qsort(all, na, sizeof *all, wenv_order);
+        w = blk;
+        for (i = 0; i < na; ++i) { size_t n = wcslen(all[i]) + 1; memcpy(w, all[i], n * sizeof *w); w += n; }
         if (w == blk) *w++ = 0;   /* an empty block is still two NULs */
         *w = 0;
     }
+    gptps_free(all);
     if (host) FreeEnvironmentStringsW(host);
 out:
     for (i = 0; i < no; ++i) gptps_free(ov[i]);
     gptps_free(ov);
     return blk;
+}
+
+/* ABI 2.8: find the program the way POSIX does, on Windows too. A RELATIVE path with a
+ * separator is relative to work_dir, when there is one (POSIX enters work_dir before
+ * exec). A bare name is looked up in the PATH the PROGRAM will see when `env` sets
+ * one (CreateProcessW would search the host's). Anything else is left to
+ * CreateProcessW, as before. Takes ownership of `a0`; returns what to start (NULL when
+ * out of memory). */
+static wchar_t *win_resolve_arg0(wchar_t *a0, const wchar_t *wdir, const wchar_t *path)
+{
+    int sep = wcspbrk(a0, L"\\/") != NULL;
+    int absolute = a0[0] == L'\\' || a0[0] == L'/' || (a0[0] && a0[1] == L':');
+    if (sep && !absolute && wdir && wdir[0]) {
+        size_t ld = wcslen(wdir), la = wcslen(a0);
+        wchar_t *j = (wchar_t *)gptps_malloc((ld + la + 2) * sizeof *j);
+        if (!j) { gptps_free(a0); return NULL; }
+        memcpy(j, wdir, ld * sizeof *j);
+        if (ld && wdir[ld - 1] != L'\\' && wdir[ld - 1] != L'/') j[ld++] = L'\\';
+        memcpy(j + ld, a0, (la + 1) * sizeof *j);
+        gptps_free(a0);
+        return j;
+    }
+    if (!sep && path) {
+        wchar_t found[MAX_PATH * 2];
+        DWORD n = SearchPathW(path, a0, L".exe", (DWORD)(sizeof found / sizeof found[0]), found, NULL);
+        if (n > 0 && n < sizeof found / sizeof found[0]) {
+            wchar_t *r = (wchar_t *)gptps_malloc((n + 1) * sizeof *r);
+            if (!r) { gptps_free(a0); return NULL; }
+            memcpy(r, found, (n + 1) * sizeof *r);
+            gptps_free(a0);
+            return r;
+        }
+    }
+    return a0;
 }
 
 typedef struct { HANDLE h; const char *data; size_t len; int ioerr;
@@ -480,12 +552,108 @@ static unsigned win_cpu_rate(HANDLE job, uint64_t millicpus)
     return SetInformationJobObject(job, (JOBOBJECTINFOCLASS)GPTPS_WIN_JOB_CPU_RATE_CLASS, &r, sizeof r) ? 1u : 0u;
 }
 
+/* ABI 2.8: the I/O caps through the job object's I/O rate control (Windows 10 1607 /
+ * Server 2016 and later, looked up at run time so an older system still runs the job,
+ * uncapped and said so). Windows limits reads and writes TOGETHER, per volume - so the
+ * one figure set on every volume is the smaller of the two caps: neither is exceeded.
+ * The struct is spelled out (JOBOBJECT_IO_RATE_CONTROL_INFORMATION), as the CPU one is.
+ * 1 if at least one volume took it. */
+typedef struct {
+    LONG64  MaxIops;
+    LONG64  MaxBandwidth;
+    LONG64  ReservationIops;
+    PCWSTR  VolumeName;
+    ULONG   BaseIoSize;
+    ULONG   ControlFlags;
+} gptps_win_io_rate_info;
+typedef DWORD (WINAPI *io_rate_fn)(HANDLE, gptps_win_io_rate_info *);
+#define GPTPS_WIN_IO_RATE_ENABLE 0x1u          /* JOB_OBJECT_IO_RATE_CONTROL_ENABLE */
+static unsigned win_io_rate(HANDLE job, uint64_t bps)
+{
+    io_rate_fn set = (io_rate_fn)(void (*)(void))GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                                "SetIoRateControlInformationJobObject");
+    wchar_t vol[MAX_PATH + 1], dev[MAX_PATH + 1];
+    HANDLE it;
+    unsigned ok = 0;
+    if (!set || !bps) return 0;
+    it = FindFirstVolumeW(vol, MAX_PATH);
+    if (it == INVALID_HANDLE_VALUE) return 0;
+    do {
+        /* "\\?\Volume{guid}\" -> "Volume{guid}" -> its NT device name, which the
+         * rate control is keyed by */
+        size_t n = wcslen(vol);
+        gptps_win_io_rate_info r;
+        if (n < 5 || wcsncmp(vol, L"\\\\?\\", 4) != 0) continue;
+        if (vol[n - 1] == L'\\') vol[n - 1] = 0;
+        if (!QueryDosDeviceW(vol + 4, dev, MAX_PATH)) continue;
+        memset(&r, 0, sizeof r);
+        r.MaxBandwidth = (LONG64)(bps > (uint64_t)0x7FFFFFFFFFFFFFFFull ? 0x7FFFFFFFFFFFFFFFull : bps);
+        r.VolumeName = dev;
+        r.ControlFlags = GPTPS_WIN_IO_RATE_ENABLE;
+        if (set(job, &r)) ok = 1;
+    } while (FindNextVolumeW(it, vol, MAX_PATH));
+    FindVolumeClose(it);
+    return ok;
+}
+
+/* ABI 2.8: Ctrl+Break to a job's process group, whether or not the HOST has a console.
+ * With one, the job shares it and the signal is sent from here. Without one (a
+ * service), the job runs in a hidden console of its own; the host attaches to it just
+ * long enough to send the signal - to the job's group only, which the host is not in -
+ * and detaches. That attachment is process-wide state, so it is taken under a lock and
+ * only while the host has no console of its own, and the standard handles it can
+ * replace are put back. 1 if the signal was sent. */
+static volatile LONG g_attach_lock;
+static int win_ctrl_break(DWORD pid, int host_console)
+{
+    HANDLE h_in, h_out, h_err;
+    DWORD one;
+    int sent = 0;
+    if (host_console) return GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+    while (InterlockedCompareExchange(&g_attach_lock, 1, 0) != 0) Sleep(0);
+    h_in = GetStdHandle(STD_INPUT_HANDLE); h_out = GetStdHandle(STD_OUTPUT_HANDLE); h_err = GetStdHandle(STD_ERROR_HANDLE);
+    if (GetConsoleProcessList(&one, 1) == 0 && AttachConsole(pid)) {
+        sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+        FreeConsole();
+    }
+    SetStdHandle(STD_INPUT_HANDLE, h_in); SetStdHandle(STD_OUTPUT_HANDLE, h_out); SetStdHandle(STD_ERROR_HANDLE, h_err);
+    InterlockedExchange(&g_attach_lock, 0);
+    return sent;
+}
+
+/* Is anything of the job still running? The whole job - a launcher that exits at once
+ * must not cost its workers their clean-up - when the program is in the job object;
+ * else the program itself. */
+static int win_job_alive(HANDLE job, int assigned, HANDLE proc)
+{
+    if (assigned) {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION a;
+        if (QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &a, sizeof a, NULL))
+            return a.ActiveProcesses != 0;
+    }
+    return WaitForSingleObject(proc, 0) == WAIT_TIMEOUT;
+}
+
+/* The Win32 error as UTF-8 text, for the start-failure WARN. */
+static void win_errtext(DWORD err, char *buf, size_t n)
+{
+    wchar_t w[256];
+    DWORD k;
+    if (!n) return;
+    buf[0] = 0;
+    k = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, 0, w,
+                       (DWORD)(sizeof w / sizeof w[0]), NULL);
+    while (k && (w[k - 1] == L'\r' || w[k - 1] == L'\n' || w[k - 1] == L' ' || w[k - 1] == L'.')) w[--k] = 0;
+    if (!k || !WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)n, NULL, NULL)) snprintf(buf, n, "error %lu", (unsigned long)err);
+}
+
 gptps_status gptps_program_execute(const gptps_task_def *def, const void *payload, size_t plen,
                                    gptps_exec_caps *caps, uint32_t timeout_s, const uint32_t *cancel,
                                    void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     const uint64_t mem_cap = caps->mem;
     unsigned cpu_set = 0;              /* the job object took the CPU-rate cap */
+    unsigned io_set = 0;               /* ABI 2.8: ...and the I/O-rate cap */
     const char *const *argv = def ? def->argv : NULL;
     SECURITY_ATTRIBUTES sa;
     HANDLE inR = NULL, inW = NULL, outR = NULL, outW = NULL, job = NULL, wt = NULL, rt = NULL;
@@ -494,10 +662,11 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     wchar_t *wcmd = NULL, *wdir = NULL, *wenv = NULL;   /* ABI 2.7: CreateProcessW's */
+    wchar_t *wpath = NULL;                              /* ABI 2.8: the PATH `env` sets, if any */
     int ctrl_break = 0;                                 /* ABI 2.7: stop with Ctrl+Break first */
+    int host_console = 0;                               /* ABI 2.8: ...sent from the host's console */
     writer_ctx wc;
     reader_ctx rc;
-    char *cmd;
     DWORD code = 1, waited;
     int killed = 0, assigned = 0;
     gptps_status eff;
@@ -538,13 +707,29 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         }
         SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof jeli);
         if (caps->cpu_millicpus) cpu_set = win_cpu_rate(job, caps->cpu_millicpus);
+        if (caps->io_rbps || caps->io_wbps) {
+            uint64_t one = caps->io_rbps && caps->io_wbps ? (caps->io_rbps < caps->io_wbps ? caps->io_rbps : caps->io_wbps)
+                                                          : (caps->io_rbps ? caps->io_rbps : caps->io_wbps);
+            io_set = win_io_rate(job, one);
+        }
     }
 
-    cmd = build_cmdline(argv);
-    if (cmd) wcmd = win_wide(cmd);
-    gptps_free(cmd);
-    if (wcmd && def->work_dir && !(wdir = win_wide(def->work_dir))) { gptps_free(wcmd); wcmd = NULL; }
-    if (wcmd && def->env && !(wenv = win_env_block(def->env))) { gptps_free(wcmd); wcmd = NULL; }
+    {   /* each argument to UTF-16 on its own (one in the ANSI code page does not drag the
+         * rest with it), argv[0] found the POSIX way, then quoted into one line */
+        size_t n = 0, i;
+        wchar_t **wv;
+        int ok = 1;
+        while (argv[n]) ++n;
+        wv = (wchar_t **)gptps_calloc(n + 1, sizeof *wv);
+        if (!wv) ok = 0;
+        if (ok && def->work_dir && !(wdir = win_wide(def->work_dir))) ok = 0;
+        if (ok && def->env && !(wenv = win_env_block(def->env, &wpath))) ok = 0;
+        for (i = 0; ok && i < n; ++i) if (!(wv[i] = win_wide(argv[i]))) ok = 0;
+        if (ok && !(wv[0] = win_resolve_arg0(wv[0], wdir, wpath))) ok = 0;
+        if (ok) wcmd = build_cmdline_w(wv, n);
+        if (wv) { for (i = 0; i < n; ++i) gptps_free(wv[i]); gptps_free(wv); }
+        gptps_free(wpath);
+    }
     if (!wcmd) { CloseHandle(inR); CloseHandle(inW); CloseHandle(outR); CloseHandle(outW);
                  if (errR) { CloseHandle(errR); CloseHandle(errW); }
                  gptps_free(ec.buf);
@@ -559,21 +744,29 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     si.hStdError  = errW ? errW : GetStdHandle(STD_ERROR_HANDLE);
     memset(&pi, 0, sizeof pi);
 
-    /* ABI 2.7 stop_grace_ms: Windows' SIGTERM is Ctrl+Break, and a console sends it
-     * only to programs sharing that console. So with a grace and a host that has a
-     * console, the program shares it (no CREATE_NO_WINDOW) in a process group of its
-     * own, which Ctrl+Break can address without reaching the host. A host with no
-     * console - a service - cannot: the program is stopped at once, and the engine
-     * says so once. GPTPS does not give the host a console; that is the host's call
-     * (AllocConsole before starting work). */
+    /* stop_grace_ms: Windows' SIGTERM is Ctrl+Break, sent to the program's own process
+     * group (CREATE_NEW_PROCESS_GROUP), which the host is never in. A host with a
+     * console shares it with the program; one without (a service) gives the program a
+     * hidden console of its own, and win_ctrl_break reaches it there. */
     if (caps->stop_grace_ms) {
         DWORD one;
-        ctrl_break = GetConsoleProcessList(&one, 1) != 0;   /* 0: attached to no console */
+        ctrl_break = 1;
+        host_console = GetConsoleProcessList(&one, 1) != 0;   /* 0: attached to no console */
     }
     if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
-                        CREATE_SUSPENDED | (ctrl_break ? CREATE_NEW_PROCESS_GROUP : CREATE_NO_WINDOW)
+                        CREATE_SUSPENDED
+                        | (ctrl_break ? CREATE_NEW_PROCESS_GROUP : 0)
+                        | (host_console ? 0 : CREATE_NO_WINDOW)
                         | (wenv ? CREATE_UNICODE_ENVIRONMENT : 0),
                         wenv, wdir, &si, &pi)) {
+        /* ABI 2.8: it never started - say why, for the event, the dead letter and once
+         * in the log. ERROR_DIRECTORY is work_dir's; anything else the program's. */
+        DWORD err = GetLastError();
+        caps->start_what = (err == ERROR_DIRECTORY && wdir) ? GPTPS_START_WORKDIR : GPTPS_START_EXEC;
+        caps->start_err = (int)err;
+        win_errtext(err, caps->start_msg, sizeof caps->start_msg);
+        gptps_meter_put(meter, GPTPS_M_START_ERROR, (uint64_t)err, GPTPS_UNIT_CODE, GPTPS_MEASURE_CURRENT,
+                        "win.createprocess");
         gptps_free(wcmd); gptps_free(wdir); gptps_free(wenv);
         if (errR) { CloseHandle(errR); CloseHandle(errW); }
         gptps_free(ec.buf);
@@ -588,7 +781,9 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     /* A cap on a job the program is not in holds nothing. The I/O caps are never set
      * here (see win_cpu_rate), so the engine reports them as not in force. */
     caps->applied = (assigned && cpu_set) ? GPTPS_CAP_CPU : 0u;
+    if (assigned && io_set) caps->applied |= GPTPS_CAP_IO | GPTPS_CAP_IO_ONE;
     if (ctrl_break) caps->applied |= GPTPS_CAP_GRACE;
+    caps->applied |= GPTPS_CAP_DIE;      /* the job object dies with its last handle - the host's */
     ResumeThread(pi.hThread);
 
     wc.h = inW; wc.data = (const char *)payload; wc.len = plen; wc.ioerr = 0;
@@ -632,10 +827,17 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             /* WAIT_TIMEOUT: slice elapsed, loop and re-check deadline/cancel */
         }
         /* A grace to give (timeout or cancel, not our own I/O failure): Ctrl+Break to
-         * the program's group, then up to the grace for it to exit before the kill. */
-        if (killed && ctrl_break && kill_st != GPTPS_E_IO &&
-            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pi.dwProcessId))
-            WaitForSingleObject(pi.hProcess, caps->stop_grace_ms);
+         * the program's group, then up to the grace for the WHOLE job to exit before the
+         * kill. Its output threads keep reading meanwhile, so it cannot block on us. */
+        if (killed && ctrl_break && kill_st != GPTPS_E_IO) {
+            if (win_ctrl_break(pi.dwProcessId, host_console)) {
+                uint64_t until = gptps_hal_monotonic_ms() + caps->stop_grace_ms;
+                while (win_job_alive(job, assigned, pi.hProcess) && gptps_hal_monotonic_ms() < until)
+                    Sleep(10);
+            } else {
+                caps->applied &= ~GPTPS_CAP_GRACE;   /* could not be sent: the engine says so, once */
+            }
+        }
         /* Tear the job down on EVERY path, not just the kill path, and do it BEFORE
          * the joins. "child gone => its stdout closes => reader ends" is false: an
          * anonymous pipe reports EOF only when the LAST write handle closes, so a
@@ -708,6 +910,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     if (!killed && !rc.oversize && !wc.ioerr && !rc.ioerr && !rc.nomem)
         gptps_meter_put(meter, GPTPS_M_EXIT_CODE, (uint64_t)code, GPTPS_UNIT_CODE,
                         GPTPS_MEASURE_CURRENT, "win.exitcode");
+    (void)io_set;
 
     if (eff == GPTPS_OK) { *out_result = rc.buf; *out_len = rc.len; }
     else gptps_free(rc.buf);

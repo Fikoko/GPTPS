@@ -59,7 +59,11 @@ extern char **environ;
 #  define gptps_environ environ
 #endif
 #if defined(__linux__)
-#  include <dirent.h>    /* /sys/block: the devices io.max is written for */
+#  include <dirent.h>    /* /sys/block: the devices io.max is written for; /proc: a job's group */
+#  include <sys/prctl.h> /* PR_SET_PDEATHSIG: GPTPS_TASK_DIE_WITH_HOST */
+#endif
+#if defined(__FreeBSD__)
+#  include <sys/procctl.h> /* PROC_PDEATHSIG_CTL: GPTPS_TASK_DIE_WITH_HOST */
 #endif
 #if defined(__APPLE__)
 #  include <libproc.h>   /* proc_pidinfo: a running child's resident memory (samples) */
@@ -136,28 +140,99 @@ static void err_drain(err_tail *t)
 
 static void nap_ms(long ms) { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = ms * 1000000L; nanosleep(&ts, NULL); }
 
-/* ABI 2.7 stop_grace_ms: SIGTERM to the group, up to `grace_ms` for the leader to
- * exit (seen without reaping it - the caller reaps), then SIGKILL to the group,
- * whatever is left of it. Bounded either way. With no grace, just the SIGKILL. */
-static void stop_group(pid_t pid, uint32_t grace_ms, err_tail *et)
+/* Is anything of process group `pgid` still running? Zombies do not count: the
+ * group's leader stays unreaped while this is asked - which also keeps the group's
+ * ID from being reused under us - so it is there until the caller reaps it.
+ * Linux reads /proc, macOS asks libproc; elsewhere only the leader can be seen. */
+static int group_alive(pid_t pgid)
 {
-    if (grace_ms) {
+#if defined(__linux__)
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+    int alive = 0;
+    if (!d) goto leader;
+    while (!alive && (de = readdir(d)) != NULL) {
+        char path[64], st[512], *rp, state = 0;
+        int fd, ppid = 0, pgrp = 0;
+        ssize_t n;
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        snprintf(path, sizeof path, "/proc/%.20s/stat", de->d_name);
+        if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0) continue;
+        n = read(fd, st, sizeof st - 1);
+        close(fd);
+        if (n <= 0) continue;
+        st[n] = 0;
+        if (!(rp = strrchr(st, ')'))) continue;     /* the name may hold spaces and ')' */
+        if (sscanf(rp + 1, " %c %d %d", &state, &ppid, &pgrp) == 3 &&
+            pgrp == (int)pgid && state != 'Z' && state != 'X') alive = 1;
+    }
+    closedir(d);
+    return alive;
+leader:
+#elif defined(__APPLE__)
+    pid_t pids[512];
+    int bytes = proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, pids, (int)sizeof pids), i;
+    if (bytes > 0) {
+        int n = bytes / (int)sizeof pids[0];
+        if (n >= (int)(sizeof pids / sizeof pids[0])) return 1;   /* too many to list: running */
+        for (i = 0; i < n; ++i) {
+            struct proc_bsdinfo bi;
+            if (pids[i] <= 0) continue;
+            if (proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bi, (int)sizeof bi) == (int)sizeof bi &&
+                bi.pbi_status != 5 /* SZOMB */) return 1;
+        }
+        return 0;
+    }
+#endif
+    {   /* the leader alone, seen without reaping it */
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        while (waitid(P_PID, (id_t)pgid, &si, WEXITED | WNOHANG | WNOWAIT) != 0)
+            if (errno != EINTR) return 0;          /* reaped elsewhere (SIGCHLD ignored): gone */
+        return si.si_pid != pgid;
+    }
+}
+
+/* Read and drop what is waiting on a non-blocking descriptor: a program that is
+ * cleaning up must never block writing to us. */
+static void fd_discard(int fd)
+{
+    char chunk[4096];
+    if (fd < 0) return;
+    for (;;) {
+        ssize_t r = read(fd, chunk, sizeof chunk);
+        if (r > 0) continue;
+        if (r < 0 && errno == EINTR) continue;
+        return;                                    /* EAGAIN, EOF or an error */
+    }
+}
+
+/* How to stop a PROGRAM job's process group (ABI 2.7 stop_grace_ms). */
+typedef struct {
+    pid_t     pid;       /* the leader; also the group's ID */
+    uint32_t  grace_ms;  /* 0 = SIGKILL at once */
+    err_tail *et;        /* its captured stderr, kept reading */
+    int       out_fd;    /* its stdout, kept draining (the result is dropped: it was stopped) */
+} stop_ctx;
+
+/* SIGTERM to the group, then until the WHOLE group is gone or the grace is over -
+ * a launcher that exits at once must not cost its workers their clean-up - reading
+ * every pipe it writes to; then SIGKILL to the group, whatever is left. Bounded. */
+static void stop_group(const stop_ctx *sc)
+{
+    if (sc->grace_ms) {
         uint32_t waited = 0;
-        kill(-pid, SIGTERM);
-        while (waited < grace_ms) {
-            siginfo_t si;
-            memset(&si, 0, sizeof si);
-            if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) != 0) {
-                if (errno == EINTR) continue;
-                break;                             /* reaped elsewhere (SIGCHLD ignored): gone */
-            }
-            if (si.si_pid == pid) break;           /* it has exited */
-            err_drain(et);
-            nap_ms(5);
-            waited += 5;
+        if (sc->out_fd >= 0) (void)fcntl(sc->out_fd, F_SETFL, fcntl(sc->out_fd, F_GETFL) | O_NONBLOCK);
+        kill(-sc->pid, SIGTERM);
+        while (waited < sc->grace_ms) {
+            err_drain(sc->et);
+            fd_discard(sc->out_fd);
+            if (!group_alive(sc->pid)) break;
+            nap_ms(10);
+            waited += 10;
         }
     }
-    kill(-pid, SIGKILL);
+    kill(-sc->pid, SIGKILL);
 }
 
 /* Reap `pid` WITHOUT blocking forever. A child that closes its stdout but keeps
@@ -175,7 +250,7 @@ static void stop_group(pid_t pid, uint32_t grace_ms, err_tail *et)
 static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group,
                                  uint64_t deadline, const uint32_t *cancel,
                                  struct rusage *ru, int *have_ru,
-                                 uint32_t grace_ms, err_tail *et)
+                                 const stop_ctx *sc)
 {
     gptps_status why = GPTPS_OK;
     int waited = 0;
@@ -193,9 +268,9 @@ static gptps_status reap_bounded(pid_t pid, int *wstatus, int *reaped, int group
             if (deadline && now >= deadline)              why = GPTPS_E_TIMEOUT;
             else if (cancel && gptps_hal_load_acquire_u32(cancel))    why = GPTPS_E_CANCELLED;
             else if (waited >= GPTPS_EXEC_EXIT_GRACE_MS)  why = GPTPS_E_TIMEOUT;
-            if (why != GPTPS_OK) { if (group) stop_group(pid, grace_ms, et); else kill(pid, SIGKILL); }
+            if (why != GPTPS_OK) { if (group && sc) stop_group(sc); else if (group) kill(-pid, SIGKILL); else kill(pid, SIGKILL); }
         }
-        err_drain(et);                                 /* a program past its stdout may still log */
+        if (sc) err_drain(sc->et);                     /* a program past its stdout may still log */
         ts.tv_sec = 0; ts.tv_nsec = 5L * 1000000L;   /* 5ms */
         nanosleep(&ts, NULL);
         waited += 5;
@@ -498,6 +573,10 @@ static void cgroup_destroy(char *dir)
  * result cannot be written. */
 #define REPORT_STARTED     1u
 #define REPORT_EXEC        2u
+/* ABI 2.8: the program could not be started. `joined` carries which step failed
+ * (GPTPS_START_*), `hwm_kb` the errno - so the parent can tell "never started" from
+ * a program that ran and exited 127. */
+#define REPORT_FAILED      3u
 #define GPTPS_HWM_UNKNOWN  UINT64_MAX
 /* exec may fault in a few pages after the mark is read - execvp's own code and stack -
  * and they count toward the copy's mark too, so a peak this close above it is not
@@ -516,6 +595,42 @@ static void report_send(int fd, uint32_t stage, int joined, uint64_t hwm_kb)
     if (write_all(fd, &r, sizeof r) != 0) _exit(127);
 }
 
+/* In the child: the program cannot be started - say which step and why, then go.
+ * Best effort: the exit status (127) still marks it if the record cannot be sent. */
+static void report_fail(int fd, unsigned what, int err)
+{
+    child_report r;
+    memset(&r, 0, sizeof r);
+    r.stage = REPORT_FAILED; r.joined = what; r.hwm_kb = (uint64_t)(err > 0 ? err : 0);
+    (void)write_all(fd, &r, sizeof r);
+}
+
+/* ABI 2.8 GPTPS_TASK_DIE_WITH_HOST, in the child before it runs anything of its own:
+ * the kernel kills it when the host goes. PR_SET_PDEATHSIG fires when the THREAD that
+ * forked it ends; that is safe here, because the worker thread that forks a job waits
+ * for it. If the host died before the call took hold, it never will: then go now. */
+static int die_with_host_supported(void)
+{
+#if defined(__linux__) || defined(__FreeBSD__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+static void die_with_host(pid_t host)
+{
+#if defined(__linux__)
+    (void)prctl(PR_SET_PDEATHSIG, SIGKILL);
+    if (getppid() != host) _exit(127);
+#elif defined(__FreeBSD__)
+    int sig = SIGKILL;
+    (void)procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sig);
+    if (getppid() != host) _exit(127);
+#else
+    (void)host;
+#endif
+}
+
 /* What the parent knows about the job it waits for. */
 typedef struct {
     pid_t        pid;
@@ -525,6 +640,8 @@ typedef struct {
     int          fd;         /* the report pipe's read end, non-blocking; -1 after EOF */
     int          failed;     /* reading it failed: the attempt fails with GPTPS_E_IO */
     int          started, joined, at_exec;
+    unsigned     start_what; /* ABI 2.8: GPTPS_START_* - the program never started */
+    int          start_err;
     uint64_t     hwm_kb;
     size_t       got;
     child_report cur;
@@ -541,6 +658,7 @@ static void report_poll(job_watch *jw)
             jw->got = 0;
             if (jw->cur.stage == REPORT_STARTED)   { jw->started = 1; jw->joined = jw->cur.joined != 0; }
             else if (jw->cur.stage == REPORT_EXEC) { jw->at_exec = 1; jw->hwm_kb = jw->cur.hwm_kb; }
+            else if (jw->cur.stage == REPORT_FAILED) { jw->start_what = jw->cur.joined; jw->start_err = (int)jw->cur.hwm_kb; }
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
@@ -884,6 +1002,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
                                void **out_result, size_t *out_len, gptps_exec_meter *meter)
 {
     const uint64_t mem_cap = caps->mem;
+    const pid_t oop_host = getpid();   /* ABI 2.8: GPTPS_TASK_DIE_WITH_HOST */
     int p[2], rp[2];
     pid_t pid;
 #if defined(__linux__)
@@ -932,6 +1051,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
         int joined = 0;
         signal(SIGPIPE, SIG_IGN);
         close(p[0]); close(rp[0]);
+        if (def->flags & GPTPS_TASK_DIE_WITH_HOST) die_with_host(oop_host);
 #if defined(__linux__)
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap */
 #endif
@@ -1037,7 +1157,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
             while (wait_child(pid, &wstatus, 0, &ru, &have_ru) < 0 && errno == EINTR) { /* SIGKILLed: bounded */ }
         } else {
             /* The child owes us nothing more, but it has not necessarily exited. */
-            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel, &ru, &have_ru, 0, NULL);
+            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 0, deadline, cancel, &ru, &have_ru, NULL);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
@@ -1065,6 +1185,7 @@ gptps_status gptps_oop_execute(const gptps_task_def *def, const void *payload, s
          * that never said (killed before it could) keeps what the cgroup held: the
          * caps were not refused, so there is nothing to warn about. */
         if (jw.started && !jw.joined) caps->applied = 0;
+        if ((def->flags & GPTPS_TASK_DIE_WITH_HOST) && die_with_host_supported()) caps->applied |= GPTPS_CAP_DIE;
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif
@@ -1109,6 +1230,22 @@ static char **env_merge(const char *const *over)
     return out;
 }
 
+/* errno as text, thread-safely: glibc's GNU strerror_r returns its string, the XSI one
+ * (musl, the BSDs, macOS) fills the buffer */
+static void os_errtext(int err, char *buf, size_t n)
+{
+    if (!n) return;
+    buf[0] = 0;
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+    {
+        const char *m = strerror_r(err, buf, n);
+        if (m && m != buf) { strncpy(buf, m, n - 1); buf[n - 1] = 0; }
+    }
+#else
+    if (strerror_r(err, buf, n) != 0) snprintf(buf, n, "error %d", err);
+#endif
+}
+
 /* async-signal-safe: a line on the child's stderr before it gives up */
 static void child_say(const char *what, const char *arg)
 {
@@ -1127,6 +1264,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     const uint64_t mem_cap = caps->mem;
     const char *const *argv = def ? def->argv : NULL;
     char **envm = NULL;          /* ABI 2.7: the merged environment, when def->env is set */
+    const pid_t host_pid = getpid();
+    const int die = (def->flags & GPTPS_TASK_DIE_WITH_HOST) != 0;
     int inp[2], outp[2], rp[2];
     int errp[2] = { -1, -1 };    /* ABI 2.7: the program's stderr, when its tail is kept */
     err_tail et;
@@ -1229,18 +1368,21 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
                 int n = fcntl(*ends[i], F_DUPFD, 3);  /* the copy is closed below, so
                                                        * plain F_DUPFD is enough and
                                                        * stays POSIX.1-2001-portable */
-                if (n < 0) _exit(127);
+                if (n < 0) { report_fail(rp[1], GPTPS_START_SETUP, errno); _exit(127); }
                 close(*ends[i]);
                 *ends[i] = n;
             }
         }
-        if (dup2(inp[0], STDIN_FILENO) < 0 || dup2(outp[1], STDOUT_FILENO) < 0) _exit(127);
+        if (dup2(inp[0], STDIN_FILENO) < 0 || dup2(outp[1], STDOUT_FILENO) < 0) {
+            report_fail(rp[1], GPTPS_START_SETUP, errno); _exit(127);
+        }
         if (errp[0] >= 0) {
-            if (dup2(errp[1], STDERR_FILENO) < 0) _exit(127);
+            if (dup2(errp[1], STDERR_FILENO) < 0) { report_fail(rp[1], GPTPS_START_SETUP, errno); _exit(127); }
             close(errp[0]); close(errp[1]);
         }
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]); close(rp[0]);
         setpgid(0, 0); /* own process group: a timeout kill takes down the program AND its children */
+        if (die) die_with_host(host_pid);
 #if defined(__linux__)
         if (cgdir && cgroup_self_join(cgdir) == 0) joined = 1; /* accurate RSS cap before exec */
 #endif
@@ -1249,7 +1391,12 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         report_send(rp[1], REPORT_STARTED, joined, GPTPS_HWM_UNKNOWN);
         /* ABI 2.7: where it starts and what it sees - before the host's hook, so the
          * hook can still change either */
-        if (def->work_dir && chdir(def->work_dir) != 0) { child_say("cannot enter work_dir ", def->work_dir); _exit(127); }
+        if (def->work_dir && chdir(def->work_dir) != 0) {
+            int er = errno;
+            report_fail(rp[1], GPTPS_START_WORKDIR, er);
+            child_say("cannot enter work_dir ", def->work_dir);
+            _exit(127);
+        }
         if (envm) gptps_environ = envm;   /* execvp passes, and PATH-resolves from, environ */
         if (def->child_setup) def->child_setup(def->user_data); /* host hardening hook (seccomp/drop-privs/...) */
 #if defined(__linux__)
@@ -1258,7 +1405,12 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         report_send(rp[1], REPORT_EXEC, joined, GPTPS_HWM_UNKNOWN);
 #endif
         execvp(argv[0], (char *const *)argv); /* PATH-resolves a bare name (e.g. "wasmtime") */
-        _exit(127); /* exec failed */
+        {   /* exec failed: say so, for the parent and for whoever reads stderr */
+            int er = errno;
+            report_fail(rp[1], GPTPS_START_EXEC, er);
+            child_say("cannot start ", argv[0]);
+            _exit(127);
+        }
     }
 
     /* ---- PARENT: pump payload->stdin and stdout->buf CONCURRENTLY, up to the
@@ -1327,14 +1479,14 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             sampler_tick(&sm, &jw);
             if (deadline) {
                 uint64_t now = gptps_hal_monotonic_ms();
-                if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; stop_group(pid, caps->stop_grace_ms, &et); break; }
+                if (now >= deadline) { killed = 1; kill_st = GPTPS_E_TIMEOUT; break; }
                 if (deadline - now < (uint64_t)slice) slice = (int)(deadline - now);
             }
             slice = sampler_slice(&sm, slice);
             pr = poll(pfd, (nfds_t)nfd, slice);
             /* An explicit gptps_cancel / shutdown / task removal is NOT a deadline
              * breach - report the two apart so an operator can tell which happened. */
-            if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; stop_group(pid, caps->stop_grace_ms, &et); break; }
+            if (cancel && gptps_hal_load_acquire_u32(cancel)) { killed = 1; kill_st = GPTPS_E_CANCELLED; break; }
             /* a genuine poll error (e.g. ENOMEM) must still kill the child, or the
              * blocking waitpid below would hang this worker on a still-live child -
              * the very thing this executor promises never to do. */
@@ -1384,7 +1536,15 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
                 }
             }
         }
-        if (in_open) exec_close(inp[1]);
+        /* A stop GPTPS decided (deadline, cancel): the job gets its grace now, with its
+         * stdin at EOF and every pipe it writes to still read, so cleaning up cannot
+         * block on us. Our own I/O failures and the caps stop it at once, above. */
+        if (in_open) { exec_close(inp[1]); in_open = 0; }
+        if (killed && (kill_st == GPTPS_E_TIMEOUT || kill_st == GPTPS_E_CANCELLED)) {
+            stop_ctx sc;
+            sc.pid = pid; sc.grace_ms = caps->stop_grace_ms; sc.et = &et; sc.out_fd = outp[0];
+            stop_group(&sc);
+        }
         exec_close(outp[0]);
 #if !defined(F_SETNOSIGPIPE)
         if (sp_masked) {
@@ -1404,8 +1564,10 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
              * that it exited. A program that keeps running (or ignores signals) would
              * otherwise pin this worker in waitpid() forever, orphaning the child at
              * shutdown. Give it a bounded grace period, then SIGKILL. */
-            gptps_status why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel, &ru, &have_ru,
-                                            caps->stop_grace_ms, &et);
+            stop_ctx sc;
+            gptps_status why;
+            sc.pid = pid; sc.grace_ms = caps->stop_grace_ms; sc.et = &et; sc.out_fd = -1;   /* stdout is at EOF */
+            why = reap_bounded(pid, &wstatus, &reaped, 1, deadline, cancel, &ru, &have_ru, &sc);
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
@@ -1433,7 +1595,15 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (jw.failed && eff == GPTPS_OK) eff = GPTPS_E_IO;   /* our own pipe failed us */
         /* ABI 2.7: how it ended, when it ended on its own (GPTPS killed it otherwise,
          * and the status says why) */
-        if (reaped && !killed && !oversize && !nomem) {
+        if (jw.start_what) {                        /* ABI 2.8: it never started */
+            gptps_meter_put(meter, GPTPS_M_START_ERROR, (uint64_t)jw.start_err, GPTPS_UNIT_CODE,
+                            GPTPS_MEASURE_CURRENT,
+                            jw.start_what == GPTPS_START_WORKDIR ? "posix.chdir" :
+                            jw.start_what == GPTPS_START_EXEC ? "posix.exec" : "posix.setup");
+            caps->start_what = jw.start_what;
+            caps->start_err = jw.start_err;
+            os_errtext(jw.start_err, caps->start_msg, sizeof caps->start_msg);
+        } else if (reaped && !killed && !oversize && !nomem) {
             if (WIFEXITED(wstatus))
                 gptps_meter_put(meter, GPTPS_M_EXIT_CODE, (uint64_t)WEXITSTATUS(wstatus),
                                 GPTPS_UNIT_CODE, GPTPS_MEASURE_CURRENT, "posix.wait");
@@ -1447,6 +1617,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
          * caps were not refused, so there is nothing to warn about. */
         if (jw.started && !jw.joined) caps->applied = 0;
         if (caps->stop_grace_ms) caps->applied |= GPTPS_CAP_GRACE;   /* POSIX always has SIGTERM */
+        if (die && die_with_host_supported()) caps->applied |= GPTPS_CAP_DIE;
 #if defined(__linux__)
         cgroup_destroy(cgdir);
 #endif

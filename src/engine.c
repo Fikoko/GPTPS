@@ -98,6 +98,8 @@ typedef struct gptps_item {
     uint64_t              io_rcap, io_wcap; /* io_max_read_bps / io_max_write_bps, likewise */
     char                 *err_tail;   /* ABI 2.7: the last failed attempt's stderr tail, owned; for the dead letter */
     size_t                err_len;
+    gptps_measure        *last_m;     /* ABI 2.8: the last failed attempt's measurements, owned; for the dead letter */
+    size_t                last_n;     /* (each name and method a string literal of an executor's) */
     unsigned              submit_flags; /* GPTPS_SUBMIT_* gptps_submit_ex applied: what a dead
                                       * letter hands back for a re-drive (gptps_dead_letter.options) */
     uint64_t              due_ms;    /* GPTPS_SUBMIT_DEADLINE: when it is due, monotonic; 0 = none. An
@@ -952,6 +954,8 @@ static void item_free(gptps *e, gptps_item *it)
     if (!it) return;
     gptps_free(it->err_tail);
     it->err_tail = NULL; it->err_len = 0;
+    gptps_free(it->last_m);
+    it->last_m = NULL; it->last_n = 0;
     if (it->pooled) {                       /* bounded: its storage is the pool's */
         gptps_free(it->name_owned);         /* never made once sealed; never leaked either */
         it->name_owned = NULL;
@@ -1168,11 +1172,18 @@ static void emit_sample(gptps_exec_meter *mt, const gptps_measure *cur, size_t n
 static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
 {
     unsigned want = 0, fresh;
-    char msg[640];
+    char msg[800];
+    uint64_t tflags = GPTPS_STRUCT_HAS(gptps_task_def, it->def, flags) ? it->def->flags : 0u;
     if (it->cpu_cap)                 want |= GPTPS_CAP_CPU;
     if (it->io_rcap || it->io_wcap)  want |= GPTPS_CAP_IO;
     if (caps->stop_grace_ms)         want |= GPTPS_CAP_GRACE;
+    if (tflags & GPTPS_TASK_DIE_WITH_HOST) want |= GPTPS_CAP_DIE;
     want &= ~caps->applied;
+    /* not missing, but worth one line each: the I/O caps held as one combined figure
+     * (Windows), and a program that could not be started (a setup mistake) */
+    if ((caps->applied & GPTPS_CAP_IO_ONE) && it->io_rcap && it->io_wcap && it->io_rcap != it->io_wcap)
+        want |= GPTPS_CAP_IO_ONE;
+    if (caps->start_what) want |= GPTPS_CAP_START;
     if (!want || !it->reg) return;
     gptps_mutex_lock(e->m);
     fresh = want & ~it->reg->cap_warned;
@@ -1188,16 +1199,43 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
     if (fresh & GPTPS_CAP_IO) {
         snprintf(msg, sizeof msg, "task '%s': io_max_read_bps=%llu / io_max_write_bps=%llu are not enforced "
                  "here - they need GPTPS_CGROUP_PARENT naming a cgroup v2 parent with the io controller "
-                 "delegated (Linux); the job runs without an I/O cap",
+                 "delegated (Linux), or Windows 10 / Server 2016 or later; the job runs without an I/O cap",
                  item_name(it), (unsigned long long)it->io_rcap, (unsigned long long)it->io_wcap);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
+    if (fresh & GPTPS_CAP_IO_ONE) {
+        snprintf(msg, sizeof msg, "task '%s': Windows limits a job's reads and writes together, so "
+                 "io_max_read_bps=%llu / io_max_write_bps=%llu hold as one limit of %llu bytes/s per "
+                 "volume - the smaller, so neither is exceeded",
+                 item_name(it), (unsigned long long)it->io_rcap, (unsigned long long)it->io_wcap,
+                 (unsigned long long)(it->io_rcap < it->io_wcap ? it->io_rcap : it->io_wcap));
+        gptps_log(NULL, GPTPS_LOG_INFO, msg);
+    }
     if (fresh & GPTPS_CAP_GRACE) {
-        snprintf(msg, sizeof msg, "task '%s': stop_grace_ms=%lu is not in force here - Windows can send "
-                 "Ctrl+Break only to a program that shares the host's console, and this host has none "
-                 "(a service, say); a program this engine has to stop is stopped at once. A host that "
-                 "wants the grace can call AllocConsole() before it starts work",
-                 item_name(it), (unsigned long)caps->stop_grace_ms);
+        snprintf(msg, sizeof msg, "task '%s': stop_grace_ms=%lu could not be given here - the program "
+                 "could not be sent its stop signal - so a program this engine has to stop is stopped "
+                 "at once", item_name(it), (unsigned long)caps->stop_grace_ms);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    if (fresh & GPTPS_CAP_DIE) {
+        snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST is not enforced here - this OS "
+                 "has no parent-death signal (it is Linux, FreeBSD and Windows); a job may outlive a "
+                 "host that dies. Run the host under a supervisor that kills its process group "
+                 "(launchd, systemd's KillMode=control-group)", item_name(it));
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    if (fresh & GPTPS_CAP_START) {
+        const char *a0 = (it->def->argv && it->def->argv[0]) ? it->def->argv[0] : "?";
+        if (caps->start_what == GPTPS_START_WORKDIR)
+            snprintf(msg, sizeof msg, "task '%s': cannot enter work_dir '%s': %s (error %d); the "
+                     "attempt fails with start.error", item_name(it),
+                     it->def->work_dir ? it->def->work_dir : "?", caps->start_msg, caps->start_err);
+        else if (caps->start_what == GPTPS_START_EXEC)
+            snprintf(msg, sizeof msg, "task '%s': cannot start '%s': %s (error %d); the attempt fails "
+                     "with start.error", item_name(it), a0, caps->start_msg, caps->start_err);
+        else
+            snprintf(msg, sizeof msg, "task '%s': could not set up the process for '%s': %s (error %d)",
+                     item_name(it), a0, caps->start_msg, caps->start_err);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
 }
@@ -1306,6 +1344,15 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
         it->err_tail = sp.meter.err; it->err_len = sp.meter.err_len;
     } else {
         gptps_free(sp.meter.err);
+    }
+    /* ...and its measurements (ABI 2.8): the dead letter says why without the events */
+    if (st != GPTPS_OK) {
+        gptps_free(it->last_m);
+        it->last_m = NULL; it->last_n = 0;
+        if (sp.meter.n) {
+            it->last_m = (gptps_measure *)gptps_malloc(sp.meter.n * sizeof *it->last_m);
+            if (it->last_m) { memcpy(it->last_m, sp.meter.m, sp.meter.n * sizeof *it->last_m); it->last_n = sp.meter.n; }
+        }
     }
 
     if (inproc) ctx_clear_result(&ctx);
@@ -6128,6 +6175,8 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
             }
             dl.stderr_tail = it->err_len ? it->err_tail : NULL;
             dl.stderr_tail_len = it->err_len;
+            dl.measures = it->last_n ? it->last_m : NULL;
+            dl.n_measures = it->last_n;
             cb(&dl, user_data);
         }
         item_free(e, it);

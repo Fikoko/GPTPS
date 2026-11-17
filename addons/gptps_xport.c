@@ -200,8 +200,9 @@ static int meas_decode(const unsigned char *b, uint32_t len, gptps_measure **out
 
 /* One reply frame. The status is clamped to the frame cap on the way out so the
  * channel stays byte-synchronised whatever the result size (see the worker). */
+#define XP_TAIL_CAP 65536u    /* gptps_task_def.stderr_tail_bytes' own cap */
 static int write_reply(int fd, uint64_t id, int32_t st, const void *res, uint64_t rlen,
-                       const unsigned char *meas, uint32_t mlen)
+                       const unsigned char *meas, uint32_t mlen, const char *tail, uint32_t tlen)
 {
     if (sock_write_all(fd, &id, sizeof id) != 0) return -1;
     if (sock_write_all(fd, &st, sizeof st) != 0) return -1;
@@ -209,6 +210,9 @@ static int write_reply(int fd, uint64_t id, int32_t st, const void *res, uint64_
     if (rlen && sock_write_all(fd, res, (size_t)rlen) != 0) return -1;
     if (sock_write_all(fd, &mlen, sizeof mlen) != 0) return -1;
     if (mlen && sock_write_all(fd, meas, mlen) != 0) return -1;
+    if (tlen > XP_TAIL_CAP) tlen = XP_TAIL_CAP;
+    if (sock_write_all(fd, &tlen, sizeof tlen) != 0) return -1;    /* ABI 2.8: the stderr tail */
+    if (tlen && sock_write_all(fd, tail, tlen) != 0) return -1;
     return 0;
 }
 
@@ -262,7 +266,7 @@ static void worker_handler_main(int fd, gptps_xport_run_fn run, void *ud)
              * an empty body instead: an honest status, and the channel stays in sync. */
             free(res); res = NULL; st32 = (int32_t)GPTPS_E_BUDGET; rl = 0;
         }
-        {   int w = write_reply(fd, id, st32, res, rl, NULL, 0);
+        {   int w = write_reply(fd, id, st32, res, rl, NULL, 0, NULL, 0);
             free(res); free(payload); free(task);
             if (w != 0) break; }
     }
@@ -275,7 +279,23 @@ static void worker_handler_main(int fd, gptps_xport_run_fn run, void *ud)
  * ==========================================================================*/
 /* An item in flight in the worker's engine, and the measurements of its latest
  * FAILED attempt, kept for the dead letter (or drop) that may follow it. */
-typedef struct { gptps_handle h; uint64_t id; unsigned char *meas; uint32_t mlen; } inflight;
+typedef struct { gptps_handle h; uint64_t id; unsigned char *meas; uint32_t mlen;
+                 char *tail; uint32_t tlen; } inflight;   /* ...and its stderr tail (ABI 2.8) */
+
+/* a copy of an event's stderr tail; NULL when it has none or there is no memory */
+static char *tail_copy(const gptps_event *ev, uint32_t *tlen)
+{
+    char *t;
+    size_t n = ev->struct_size >= offsetof(gptps_event, stderr_tail_len) + sizeof ev->stderr_tail_len
+             ? ev->stderr_tail_len : 0;
+    *tlen = 0;
+    if (!n || !ev->stderr_tail) return NULL;
+    if (n > XP_TAIL_CAP) n = XP_TAIL_CAP;
+    if ((t = (char *)malloc(n)) == NULL) return NULL;
+    memcpy(t, ev->stderr_tail, n);
+    *tlen = (uint32_t)n;
+    return t;
+}
 
 typedef struct {
     int             fd;
@@ -302,20 +322,26 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
     int32_t st;
     unsigned char *meas = NULL, *mine;
     uint32_t mlen = 0, ml;
+    char *tail = NULL, *tmine;
+    uint32_t tlen = 0, tl;
     if (!is_terminal(ev)) {
-        /* A failed attempt that is not the end: keep its measurements for the dead
-         * letter or drop that may close the item, which carries none of its own. */
+        /* A failed attempt that is not the end: keep its measurements and stderr tail
+         * for the dead letter or drop that may close the item, which carries neither. */
         if (ev->kind != GPTPS_EV_FAILED) return;
         mine = meas_encode(ev, &ml);
+        tmine = tail_copy(ev, &tl);
         apx_mutex_lock(&c->mmu);
         for (i = 0; i < c->n; ++i)
             if (c->tab[i].h == ev->handle) {
                 meas_free(c->tab[i].meas);
                 c->tab[i].meas = mine; c->tab[i].mlen = ml; mine = NULL;
+                free(c->tab[i].tail);
+                c->tab[i].tail = tmine; c->tab[i].tlen = tl; tmine = NULL;
                 break;
             }
         apx_mutex_unlock(&c->mmu);
         meas_free(mine);                           /* not ours */
+        free(tmine);
         return;
     }
 
@@ -323,10 +349,17 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
     for (i = 0; i < c->n; ++i)
         if (c->tab[i].h == ev->handle) {
             id = c->tab[i].id; meas = c->tab[i].meas; mlen = c->tab[i].mlen;
+            tail = c->tab[i].tail; tlen = c->tab[i].tlen;
             c->tab[i] = c->tab[--c->n]; found = 1; break;
         }
     apx_mutex_unlock(&c->mmu);
     if (!found) return;                            /* not ours (e.g. child_init's own work) */
+    if (ev->kind == GPTPS_EV_FINISHED) { free(tail); tail = NULL; tlen = 0; }   /* success: no evidence */
+    else if (ev->kind == GPTPS_EV_FAILED) {        /* the cancelled attempt's own, when it has one */
+        uint32_t ol = 0;
+        char *own = tail_copy(ev, &ol);
+        if (own) { free(tail); tail = own; tlen = ol; }
+    }
 
     /* FINISHED ends an attempt and carries its measurements itself; a dead letter or
      * drop carries the last failed attempt's, kept above. A cancelled FAILED carries
@@ -344,12 +377,13 @@ static void worker_engine_ev(const gptps_event *ev, void *ud)
     st = (int32_t)(ev->kind == GPTPS_EV_FINISHED ? GPTPS_OK : ev->status);
     apx_mutex_lock(&c->wmu);
     if (ev->kind == GPTPS_EV_FINISHED && (uint64_t)ev->result_len <= GPTPS_XPORT_MAX_MSG)
-        write_reply(c->fd, id, st, ev->result, (uint64_t)ev->result_len, meas, meas ? mlen : 0);
+        write_reply(c->fd, id, st, ev->result, (uint64_t)ev->result_len, meas, meas ? mlen : 0, NULL, 0);
     else
         write_reply(c->fd, id, ev->kind == GPTPS_EV_FINISHED ? (int32_t)GPTPS_E_BUDGET : st, NULL, 0,
-                    meas, meas ? mlen : 0);
+                    meas, meas ? mlen : 0, tail, tail ? tlen : 0);
     apx_mutex_unlock(&c->wmu);
     meas_free(meas);
+    free(tail);
     /* A failed write means the parent is gone; the main loop will see EOF and shut
      * down, so there is nothing to do here. */
 }
@@ -397,7 +431,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
         if (c.n < c.cap) {
             st = gptps_submit_ex(e, task, payload, (size_t)plen, has_opts ? &opts : NULL, &h);
             if (st == GPTPS_OK) {
-                c.tab[c.n].h = h; c.tab[c.n].id = id; c.tab[c.n].meas = NULL; c.tab[c.n].mlen = 0;
+                c.tab[c.n].h = h; c.tab[c.n].id = id; c.tab[c.n].meas = NULL; c.tab[c.n].mlen = 0; c.tab[c.n].tail = NULL; c.tab[c.n].tlen = 0;
                 c.n += 1;
             }
         } else {
@@ -409,7 +443,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
         if (st != GPTPS_OK) {                      /* rejected at submit: answer now */
             int w;
             apx_mutex_lock(&c.wmu);
-            w = write_reply(fd, id, (int32_t)st, NULL, 0, NULL, 0);
+            w = write_reply(fd, id, (int32_t)st, NULL, 0, NULL, 0, NULL, 0);
             apx_mutex_unlock(&c.wmu);
             if (w != 0) break;
         }
@@ -422,7 +456,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
     close(fd);
     apx_mutex_destroy(&c.wmu);
     apx_mutex_destroy(&c.mmu);
-    for (i = 0; i < c.n; ++i) meas_free(c.tab[i].meas);
+    for (i = 0; i < c.n; ++i) { meas_free(c.tab[i].meas); free(c.tab[i].tail); }
     free(c.tab);
     _exit(0);
 }
@@ -443,6 +477,8 @@ typedef struct pending {
     gptps_measure   *meas;      /* decoded, one block (meas_decode); the waiter's to free */
     size_t           nmeas;
     int              cut;
+    char            *tail;      /* ABI 2.8: the stderr tail; the waiter's to free */
+    uint32_t         tlen;
     /* async: malloc'd; completed on the reader thread, no lock held */
     gptps_xport_reply_fn    cb;
     gptps_xport_reply_ex_fn cb_ex;   /* the _ex form, when set instead of cb */
@@ -451,7 +487,8 @@ typedef struct pending {
 
 /* Run an async record's callback, in whichever form it asked for. */
 static void complete_async(pending *p, gptps_status io, gptps_status st, const void *res,
-                           size_t len, const gptps_measure *m, size_t nm, int cut)
+                           size_t len, const gptps_measure *m, size_t nm, int cut,
+                           const char *tail, uint32_t tlen)
 {
     if (p->cb_ex) {
         gptps_xport_reply r;
@@ -459,6 +496,7 @@ static void complete_async(pending *p, gptps_status io, gptps_status st, const v
         r.struct_size = sizeof r; r.request_id = p->id; r.io = io;
         r.task_status = st; r.result = res; r.result_len = len;
         r.measures = nm ? m : NULL; r.n_measures = nm; r.measures_cut = cut;
+        r.stderr_tail = tlen ? tail : NULL; r.stderr_tail_len = tlen;
         p->cb_ex(&r, p->ud);
     } else {
         p->cb(p->id, io, st, res, len, p->ud);
@@ -556,7 +594,7 @@ static void fail_all(gptps_xport *xp, size_t idx)
     apx_mutex_unlock(&w->pmu);
     while (async_list) {                            /* callbacks, no lock held */
         pending *n = async_list->next;
-        complete_async(async_list, GPTPS_E_IO, GPTPS_E_IO, NULL, 0, NULL, 0, 0);
+        complete_async(async_list, GPTPS_E_IO, GPTPS_E_IO, NULL, 0, NULL, 0, 0, NULL, 0);
         free(async_list);
         async_list = n;
     }
@@ -573,7 +611,7 @@ static void *reader_main(void *arg)
 
     for (;;) {
         uint64_t id, rl; int32_t st; void *res = NULL; pending *p;
-        uint32_t ml = 0; unsigned char *mb = NULL;
+        uint32_t ml = 0, tl = 0; unsigned char *mb = NULL; char *tail = NULL;
         gptps_measure *meas = NULL; size_t nmeas = 0; int cut = 0;
         if (sock_read_all(w->fd, &id, sizeof id) != 0) break;
         if (sock_read_all(w->fd, &st, sizeof st) != 0) break;
@@ -592,22 +630,30 @@ static void *reader_main(void *arg)
                 meas_decode(mb, ml, &meas, &nmeas, &cut) != 0) { free(mb); free(res); break; }
             free(mb);
         }
+        /* the stderr tail (ABI 2.8): bounded like everything else on the link */
+        if (sock_read_all(w->fd, &tl, sizeof tl) != 0 || tl > XP_TAIL_CAP) { free(res); free(meas); break; }
+        if (tl) {
+            tail = (char *)malloc(tl);
+            if (!tail || sock_read_all(w->fd, tail, tl) != 0) { free(tail); free(res); free(meas); break; }
+        }
         apx_mutex_lock(&w->pmu);
         p = pend_take(w, id);
         if (p && !p->is_async) {                      /* complete the waiter under pmu */
             p->st = st; p->res = res; p->rlen = rl; p->io = GPTPS_OK; p->done = 1;
             p->meas = meas; p->nmeas = nmeas; p->cut = cut;
+            p->tail = tail; p->tlen = tl;
             apx_cond_broadcast(&w->pcv);
-            res = NULL; meas = NULL;
+            res = NULL; meas = NULL; tail = NULL;
             p = NULL;                                 /* its stack may be gone after the unlock */
         }
         apx_mutex_unlock(&w->pmu);
         if (p) {                                      /* async: callback with no lock held */
-            complete_async(p, GPTPS_OK, (gptps_status)st, res, (size_t)rl, meas, nmeas, cut);
+            complete_async(p, GPTPS_OK, (gptps_status)st, res, (size_t)rl, meas, nmeas, cut, tail, tl);
             free(p);
         }
         free(res);                                    /* unknown id (should not happen): drop */
         free(meas);
+        free(tail);
     }
     /* EOF or a broken frame. Wake a writer that may be blocked on a dead socket and
      * make sure nobody speaks to this link again, then fail what is outstanding. */
@@ -851,6 +897,7 @@ gptps_status gptps_xport_submit(gptps_xport *xp, const char *task,
     apx_mutex_unlock(&w->pmu);
 
     free(p.meas);                                  /* this form does not report them */
+    free(p.tail);
     if (p.io != GPTPS_OK) { free(p.res); return GPTPS_E_IO; }
     if (out_task_status) *out_task_status = (gptps_status)p.st;
     if (out_result) *out_result = p.res; else free(p.res);
@@ -872,10 +919,15 @@ gptps_status gptps_xport_submit_opts(gptps_xport *xp, const char *task,
     xport_worker *w = NULL;
     gptps_status st;
     uint64_t id;
+    size_t have;
 
-    if (!out || out->struct_size < sizeof *out) return GPTPS_E_INVAL;
-    memset(out, 0, sizeof *out);
-    out->struct_size = sizeof *out;
+    /* A caller compiled before the stderr tail (ABI 2.8) has a struct that ends at
+     * measures_cut: still accepted, and nothing is written past its end. */
+    if (!out || out->struct_size < offsetof(gptps_xport_reply, measures_cut) + sizeof out->measures_cut)
+        return GPTPS_E_INVAL;
+    have = out->struct_size < sizeof *out ? out->struct_size : sizeof *out;
+    memset(out, 0, have);
+    out->struct_size = have;
     out->io = GPTPS_E_IO; out->task_status = GPTPS_E_IO;
     if (xp && on_reader_thread(xp)) return GPTPS_E_BUSY;   /* see gptps_xport_submit */
 
@@ -888,11 +940,17 @@ gptps_status gptps_xport_submit_opts(gptps_xport *xp, const char *task,
     apx_mutex_unlock(&w->pmu);
 
     out->request_id = id;
-    if (p.io != GPTPS_OK) { free(p.res); free(p.meas); return GPTPS_E_IO; }
+    if (p.io != GPTPS_OK) { free(p.res); free(p.meas); free(p.tail); return GPTPS_E_IO; }
     out->io = GPTPS_OK;
     out->task_status = (gptps_status)p.st;
     out->result = p.res; out->result_len = (size_t)p.rlen;
     out->measures = p.meas; out->n_measures = p.nmeas; out->measures_cut = p.cut;
+    if (have >= offsetof(gptps_xport_reply, stderr_tail_len) + sizeof out->stderr_tail_len) {
+        out->stderr_tail = p.tlen ? p.tail : NULL; out->stderr_tail_len = p.tlen;
+        if (!p.tlen) free(p.tail);
+    } else {
+        free(p.tail);                              /* nowhere to hand it */
+    }
     return GPTPS_OK;
 }
 
@@ -903,7 +961,9 @@ void gptps_xport_result_free(gptps_xport_reply *r)
     sz = r->struct_size;
     free((void *)(uintptr_t)r->result);            /* the caller's, from submit_ex */
     free((void *)(uintptr_t)r->measures);          /* one block: the array and its strings */
-    memset(r, 0, sizeof *r);
+    if (sz >= offsetof(gptps_xport_reply, stderr_tail_len) + sizeof r->stderr_tail_len)
+        free((void *)(uintptr_t)r->stderr_tail);
+    memset(r, 0, sz < sizeof *r ? sz : sizeof *r); /* never past an older caller's struct */
     r->struct_size = sz;
 }
 
