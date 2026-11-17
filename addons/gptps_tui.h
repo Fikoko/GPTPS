@@ -142,10 +142,17 @@ void gptps_tui_snapshot(gptps_tui *t);
 /* Blocking live loop: clear screen, then redraw every refresh_ms and dispatch
  * keystrokes until quit. No-op (returns immediately) unless both the output and stdin
  * are terminals - with a WARN when cfg.interactive asked for it anyway. Typed text is
- * UTF-8 (on Windows the console's UTF-16 is converted). Anything shown that the
- * dashboard did not write - a job's stderr, a setting's value - is shown as printable,
- * valid UTF-8 only: control bytes, encoded C1 controls, malformed sequences and
- * invisible bidi/formatting characters never reach the terminal.
+ * UTF-8 (on Windows the console's UTF-16 is converted, keys told apart by their
+ * virtual-key code); bytes that do not form UTF-8 characters - a terminal not set to
+ * UTF-8 - are left out, and the status line says so. Anything shown that the
+ * dashboard did not write - a job's stderr; a setting's key, value, default,
+ * description and choices; a task's name and label; the status line, which repeats
+ * a committed value - is shown as printable, valid UTF-8 only: control bytes, encoded
+ * C1 controls, malformed sequences and invisible bidi/formatting characters never
+ * reach the terminal. Settings and task names are read from the copies the engine
+ * takes under its lock (ABI 2.8: gptps_setting_info.key_copy / desc_copy,
+ * gptps_task_info.name_copy), so a task unregistered on another thread while the
+ * dashboard draws cannot leave it reading freed memory.
  *
  * DEAD-LETTER VIEW ('l'). The engine's dead letters can only be read by draining them,
  * which takes them, so the view shows their number until the operator loads them

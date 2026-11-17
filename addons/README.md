@@ -642,11 +642,16 @@ Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scro
   (exit code or start error, last stderr line): `r` re-submits all, `e` the selected one,
   `x` discards it, `D` discards all. A re-submit the engine refuses (paused, gone, full,
   denied) stays held with the reason instead of being lost.
-- **Untrusted text.** A job's stderr and a setting's value are shown as printable, valid
-  UTF-8 only — no control bytes, encoded C1 controls, malformed sequences or bidi
-  overrides reach your terminal — and fitted to the width, so a long line never wraps the
-  frame. The editors take UTF-8 (non-ASCII paths, argv, env) and backspace whole
-  characters. `gptps_tui_run` needs both stdin and the output on a terminal.
+- **Untrusted text.** A job's stderr, a setting's key, value, default, description and
+  choices, task names and labels, and the status line (which repeats a value you
+  committed) are shown as printable, valid UTF-8 only — no control bytes, encoded C1
+  controls, malformed sequences or bidi overrides reach your terminal — and fitted to
+  the width, so a long line never wraps the frame. The editors take UTF-8 (non-ASCII
+  paths, argv, env) and backspace whole characters; bytes that are not UTF-8 (a
+  terminal set to Latin-1) are left out, and the status line says so. Setting keys and
+  task names are read from copies the engine takes under its lock (ABI 2.8), so a task
+  unregistered while the dashboard draws is safe. `gptps_tui_run` needs both stdin and
+  the output on a terminal.
 
 ```c
 gptps_tui_config cfg = { sizeof cfg };

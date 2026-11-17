@@ -573,10 +573,21 @@ gptps_status gptps_settings_info_at(gptps_settings *r, size_t index, gptps_setti
     gptps_setting_entry *e;
     size_t i = 0;
     if (!r || !out) return GPTPS_E_INVAL;
-    if (out->struct_size < sizeof *out) return GPTPS_E_INVAL;
+    if (out->struct_size < GPTPS_SETTING_INFO_MIN_SIZE) return GPTPS_E_INVAL;
     gptps_mutex_lock(r->m);
     for (e = r->head; e && i < index; e = e->next) ++i;
     if (!e) { gptps_mutex_unlock(r->m); return GPTPS_E_NOTFOUND; }
+    if (out->struct_size >= GPTPS_SETTING_INFO_COPY_SIZE) {   /* ABI 2.8: copies that outlive the entry */
+        size_t kn = strlen(e->key), dn = e->desc ? strlen(e->desc) : 0;
+        if (kn < sizeof out->key_copy) memcpy(out->key_copy, e->key, kn + 1);
+        else out->key_copy[0] = 0;                 /* never a shortened key */
+        if (dn >= sizeof out->desc_copy) {         /* cut at a character boundary */
+            dn = sizeof out->desc_copy - 1;
+            while (dn && ((unsigned char)e->desc[dn] & 0xC0u) == 0x80u) --dn;
+        }
+        if (dn) memcpy(out->desc_copy, e->desc, dn);
+        out->desc_copy[dn] = 0;
+    }
     out->key = e->key; out->type = e->type; out->desc = e->desc;
     out->hot = e->hot; out->has_range = e->has_range; out->min = e->min; out->max = e->max;
     out->choices = e->choices;

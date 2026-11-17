@@ -4452,6 +4452,8 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
     /* appended past the floor: only write it if the caller's struct actually has it */
     if (GPTPS_STRUCT_HAS(gptps_task_info, out, flags))
         out->flags = GPTPS_STRUCT_HAS(gptps_task_def, &r->def, flags) ? r->def.flags : 0u;
+    if (GPTPS_STRUCT_HAS(gptps_task_info, out, name_copy))   /* ABI 2.8; names are <= GPTPS_TASK_NAME_MAX */
+        snprintf(out->name_copy, sizeof out->name_copy, "%s", r->name);
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
 }

@@ -20,6 +20,18 @@
  *     a removed task); one at a time or all; discard.
  *  7) POSIX: gptps_tui_run with output on a terminal but stdin at end of input returns
  *     at once (it spun, repainting tens of thousands of frames a second).
+ *  8) Text a host or a config file put in a setting - its value, default, description
+ *     and an enum's choices - a task's name and the status line are shown cleaned on
+ *     the settings, tasks and detail panes: a STRING setting holding ESC and BEL
+ *     reached the terminal raw.
+ *  9) The editor keeps only whole, well-formed UTF-8 characters, and says when it
+ *     left bytes out: a non-UTF-8 terminal's lone E7 ('c cedilla' in Latin-1) was
+ *     stored as a dangling lead byte and committed into the setting.
+ * 10) Windows: keys are told apart by their virtual-key code, so U+00E0 'a grave' is
+ *     a letter, not the extended-key prefix that swallowed the next key.
+ * 11) POSIX: the settings and detail panes render while another thread registers
+ *     and unregisters a task: they read only key_copy / desc_copy (ABI 2.8), never
+ *     the borrowed key an unregister frees (an ASan build would flag that).
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -28,6 +40,7 @@
 #include <stdio.h>
 #if !defined(_WIN32)
 #  include <fcntl.h>
+#  include <pthread.h>
 #  include <signal.h>
 #endif
 
@@ -263,6 +276,192 @@ static void test_editor_and_commit(void)
     gptps_tui_close(t);
 }
 
+/* a frame (lines of text) with nothing a terminal would execute: valid UTF-8, and no
+ * control character but the newline */
+static int frame_clean(const char *s)
+{
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0, n = strlen(s);
+    while (i < n) {
+        uint32_t cp = 0;
+        size_t len = u8_decode(u + i, n - i, &cp);
+        if (len == 0) return 0;
+        if ((cp < 0x20 && cp != '\n') || cp == 0x7f || (cp >= 0x80 && cp <= 0x9f)) return 0;
+        i += len;
+    }
+    return 1;
+}
+
+static const char *const EVIL_CHOICES[] = { "a\x1b[2Jb", "plain", NULL };
+static char evil_mode[64] = "a\x1b[2Jb";
+static size_t evil_rd(void *t, char *b, size_t c) { (void)t; return (size_t)snprintf(b, c, "%s", evil_mode); }
+static gptps_status evil_wr(void *t, const char *v) { (void)t; snprintf(evil_mode, sizeof evil_mode, "%s", v); return GPTPS_OK; }
+
+static void test_untrusted_settings(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; char frame[16384]; size_t i, n;
+    gptps_setting_def d;
+    if (!e) return;
+    deftask(e, "ev\x1b[2Jil", ok_task);
+    CHECK(gptps_define_task_setting(e, "label", GPTPS_SETTING_STRING, "x\x1b[31my", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_define_global(e, "app.label", GPTPS_SETTING_STRING, "d\x1b[1mef", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "app.label", "x\x1b]0;pwned\x07\x1b[2Jy") == GPTPS_OK);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.key = "app.mode"; d.type = GPTPS_SETTING_ENUM; d.hot = 1;
+    d.desc = "picks \x1b]0;title\x07 the mode \xc2\x9b" "31m"; d.choices = EVIL_CHOICES;
+    d.read = evil_rd; d.write = evil_wr;
+    CHECK(gptps_register_setting(e, &d) == GPTPS_OK);
+    t = install(e);
+    if (!t) { gptps_shutdown(e); return; }
+
+    CHECK(gptps_tui_press(t, 's') == 4);
+    CHECK(select_setting(t, "app.label"));
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "]0;pwned") != NULL);      /* shown ... */
+    CHECK(frame_clean(frame));                     /* ... and not executed (had a raw ESC) */
+    CHECK(gptps_tui_press(t, '\r') == 4);          /* edit, commit as it is: the value */
+    CHECK(gptps_tui_press(t, '\r') == 4);          /* lands in the status line */
+    CHECK(strstr(t->status, "app.label") != NULL);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "set app.label") != NULL);
+    CHECK(frame_clean(frame));
+    CHECK(select_setting(t, "app.mode"));          /* description, choices, default */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "the mode") != NULL);
+    CHECK(frame_clean(frame));
+    CHECK(select_setting(t, "tasks.ev\x1b[2Jil.label"));
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(frame_clean(frame));
+
+    CHECK(gptps_tui_press(t, 's') == 4);           /* back to the dashboard */
+    CHECK(gptps_tui_press(t, 't') == 4);           /* tasks pane: the name */
+    n = gptps_task_count(e);
+    for (i = 0; i < n; ++i) {
+        gptps_task_info ti; memset(&ti, 0, sizeof ti); ti.struct_size = sizeof ti;
+        if (gptps_task_get_info(e, i, &ti) == GPTPS_OK && strncmp(ti.name_copy, "ev", 2) == 0) t->task_sel = (int)i;
+    }
+    toast(t, "about ev\x1b[2Jil");                 /* a status naming a task */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "ev [2Jil") != NULL);
+    CHECK(frame_clean(frame));
+    CHECK(gptps_tui_press(t, '\r') == 4);          /* its detail pane */
+    CHECK(t->pane == TUI_PANE_DETAIL);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "label") != NULL);
+    CHECK(frame_clean(frame));
+
+    t->pane = TUI_PANE_DASH;                       /* the dashboard: label, legend, RECENT */
+    CHECK(gptps_tui_add_task(t, "ev\x1b[2Jil", "L\x1b]0;x\x07", 'e', NULL, 0) == GPTPS_OK);
+    CHECK(gptps_submit(e, "ev\x1b[2Jil", "p", 1, NULL) == GPTPS_OK);
+    drain(e);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "ev [2Jil") != NULL);
+    CHECK(strstr(frame, "L ]0;x") != NULL);
+    CHECK(frame_clean(frame));
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+static void test_editor_bytes(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; char v[GPTPS_SETTINGS_VALUE_MAX];
+    if (!e) return;
+    CHECK(gptps_define_global(e, "site.dir", GPTPS_SETTING_STRING, "", NULL, 0) == GPTPS_OK);
+    t = install(e);
+    if (!t) { gptps_shutdown(e); return; }
+    CHECK(gptps_tui_press(t, 's') == 4);
+    CHECK(select_setting(t, "site.dir"));
+    CHECK(gptps_tui_press(t, '\r') == 4);
+    t->status[0] = 0;
+    type(t, "a\xe7" "b");                          /* Latin-1 c-cedilla: a lone E7 */
+    CHECK(strcmp(t->editbuf, "ab") == 0);
+    CHECK(strstr(t->status, "not UTF-8") != NULL); /* and it says so */
+    type(t, "\x80");                               /* a stray continuation byte */
+    type(t, "\xc0\xaf");                           /* never a lead byte (overlong '/') */
+    type(t, "\xe0\x80\x80");                       /* overlong 3-byte NUL */
+    type(t, "\xed\xa0\x80");                       /* a surrogate */
+    type(t, "\xe2\x82\xac");                       /* the euro sign: kept */
+    CHECK(strcmp(t->editbuf, "ab\xe2\x82\xac") == 0);
+    type(t, "\xc3");                               /* a lead byte, then Enter */
+    CHECK(gptps_tui_press(t, '\r') == 4);
+    CHECK(gptps_settings_get(e, "site.dir", v, sizeof v) == GPTPS_OK);
+    CHECK(strcmp(v, "ab\xe2\x82\xac") == 0);       /* had a dangling C3 at the end */
+    CHECK(clean_utf8(v));
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+#if defined(_WIN32)
+static void test_windows_keys(void)
+{
+    KEY_EVENT_RECORD k;
+    memset(&k, 0, sizeof k);
+    k.bKeyDown = TRUE; k.wRepeatCount = 1;
+    k.wVirtualKeyCode = 'A'; k.uChar.UnicodeChar = 0x00E0;   /* a grave */
+    CHECK(tui_key_of(&k) == 0xC3);
+    CHECK(tui_kq_n == 2 && tui_kq[1] == 0xA0);
+    CHECK(term_poll_key(0) == 0xA0);               /* the queued byte, no wait */
+    k.wVirtualKeyCode = VK_UP; k.uChar.UnicodeChar = 0;
+    CHECK(tui_key_of(&k) == 'k');
+    k.wVirtualKeyCode = VK_LEFT;
+    CHECK(tui_key_of(&k) == '\t');
+    k.wVirtualKeyCode = VK_SHIFT;
+    CHECK(tui_key_of(&k) == -1);
+    k.wVirtualKeyCode = 0; k.uChar.UnicodeChar = 0xD83D;      /* U+1F600 as a pair */
+    CHECK(tui_key_of(&k) == -1);
+    k.uChar.UnicodeChar = 0xDE00;
+    CHECK(tui_key_of(&k) == 0xF0);
+    CHECK(tui_kq_n == 4 && tui_kq[1] == 0x9F && tui_kq[2] == 0x98 && tui_kq[3] == 0x80);
+    tui_kq_i = tui_kq_n;
+    k.uChar.UnicodeChar = 'q'; k.bKeyDown = FALSE;           /* a release is no key */
+    CHECK(tui_key_of(&k) == -1);
+}
+#else
+static volatile int churn_stop;
+static void *churn(void *arg)
+{
+    gptps *e = (gptps *)arg;
+    while (!churn_stop) {
+        gptps_task_def d;
+        memset(&d, 0, sizeof d);
+        d.struct_size = sizeof d; d.name = "churn"; d.run = ok_task; d.exec = GPTPS_EXEC_INPROC;
+        d.default_cost.struct_size = sizeof d.default_cost;
+        d.default_policy.struct_size = sizeof d.default_policy;
+        if (gptps_register_task(e, &d) == GPTPS_OK)
+            gptps_unregister_task(e, "churn", GPTPS_REMOVE_REJECT_IF_BUSY);
+    }
+    return NULL;
+}
+
+static void test_render_while_unregistering(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; char frame[16384]; int i; pthread_t th;
+    if (!e) return;
+    deftask(e, "steady", ok_task);
+    t = install(e);
+    if (!t) { gptps_shutdown(e); return; }
+    churn_stop = 0;
+    if (pthread_create(&th, NULL, churn, e) != 0) { gptps_shutdown(e); gptps_tui_close(t); return; }
+    CHECK(gptps_tui_press(t, 's') == 4);
+    for (i = 0; i < 3000; ++i) {
+        t->sel = i % 40;
+        gptps_tui_render(t, frame, sizeof frame);
+    }
+    t->pane = TUI_PANE_DETAIL;
+    snprintf(t->detail_task, sizeof t->detail_task, "churn");
+    for (i = 0; i < 3000; ++i) {
+        t->detail_sel = i % 8;
+        gptps_tui_render(t, frame, sizeof frame);
+        if (i % 7 == 0) { gptps_tui_press(t, '\r'); gptps_tui_press(t, 27); }   /* start and drop an edit */
+    }
+    churn_stop = 1;
+    pthread_join(th, NULL);
+    CHECK(frame_clean(frame));
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+#endif
+
 static void test_hotkey_refused(void)
 {
     gptps *e = open_manual(); gptps_tui *t; char frame[8192];
@@ -366,8 +565,13 @@ int main(void)
     test_editor_and_commit();
     test_hotkey_refused();
     test_dead_letters();
+    test_untrusted_settings();
+    test_editor_bytes();
 #if !defined(_WIN32)
     test_run_without_stdin();
+    test_render_while_unregistering();
+#else
+    test_windows_keys();
 #endif
     if (fails) { printf("%d tui unit check(s) FAILED\n", fails); return 1; }
     printf("all tui unit checks passed\n");

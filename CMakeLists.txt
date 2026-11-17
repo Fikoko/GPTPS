@@ -804,7 +804,7 @@ add_executable(test_orch_gc tests/test_orch_gc.c)
 target_include_directories(test_orch_gc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_orch_gc PRIVATE gptps)
 add_test(NAME orch_gc COMMAND test_orch_gc)
-set_tests_properties(orch PROPERTIES TIMEOUT 30)
+set_tests_properties(orch orch_gc PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_remote)

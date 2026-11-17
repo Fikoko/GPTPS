@@ -90,8 +90,9 @@ extern "C" {
  * `stop_grace_ms` and `stderr_tail_bytes` to gptps_task_def for GPTPS_EXEC_PROGRAM,
  * `stderr_tail` / `stderr_tail_len` to gptps_event and gptps_dead_letter, and adds
  * the exit.code / exit.signal measurements and their unit, GPTPS_UNIT_CODE; 2.8 appends
- * `measures` / `n_measures` to gptps_dead_letter and adds GPTPS_TASK_DIE_WITH_HOST and
- * the start.error measurement. Additive, and the loader compares
+ * `measures` / `n_measures` to gptps_dead_letter, `key_copy` / `desc_copy` to
+ * gptps_setting_info and `name_copy` to gptps_task_info, and adds GPTPS_TASK_DIE_WITH_HOST and the start.error
+ * measurement. Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 8u
@@ -798,6 +799,11 @@ typedef struct {
      * SERVICE, and the difference decides whether a handle ends once or once per
      * run; gptps_balance refuses a service for exactly that reason. */
     uint64_t             flags;
+    /* ABI 2.8: a COPY of `name`, taken under the engine's lock, so it stays valid after
+     * the call even if another thread unregisters the type meanwhile (which frees
+     * `name`). Filled only if your struct_size covers it. A reader that keeps the
+     * record, or runs while types come and go - a dashboard - uses this. */
+    char                 name_copy[GPTPS_TASK_NAME_MAX + 1];
 } gptps_task_info;
 
 /* Number of registered task types (includes types that are draining toward removal,
@@ -1335,6 +1341,17 @@ typedef struct {
     const char *const  *choices;       /* borrowed; NULL unless ENUM */
     char                value[GPTPS_SETTINGS_VALUE_MAX];   /* current, rendered */
     char                defval[GPTPS_SETTINGS_VALUE_MAX];  /* default at registration */
+    /* ABI 2.8 - COPIES of `key` and `desc`, taken under the registry's lock, so they
+     * stay valid after the call returns even if another thread unregisters the task
+     * (or the add-on) the setting belongs to. A reader that keeps the record past the
+     * call, or that runs while tasks come and go - a dashboard, a control plane - uses
+     * these, not the borrowed pointers above.
+     *   key_copy   the whole key, or "" when the key is GPTPS_SETTINGS_VALUE_MAX bytes
+     *              or longer (never a shortened key, which could name another setting).
+     *   desc_copy  the description, cut to fit at a UTF-8 character boundary - for
+     *              display. */
+    char                key_copy[GPTPS_SETTINGS_VALUE_MAX];
+    char                desc_copy[GPTPS_SETTINGS_VALUE_MAX];
 } gptps_setting_info;
 
 /* Register a setting into the engine's registry (GPTPS_E_DUP on a duplicate key). */
@@ -1402,7 +1419,9 @@ GPTPS_API gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gpt
 GPTPS_API gptps_status gptps_task_setting_int(gptps_ctx *ctx, const char *key, long *out);
 GPTPS_API gptps_status gptps_task_setting_str(gptps_ctx *ctx, const char *key, char *buf, size_t cap);
 
-/* Introspection (index-based; indices are stable until a new task/add-on registers). */
+/* Introspection (index-based; indices are stable until a new task/add-on registers).
+ * get_info accepts any struct_size from the 1.0 layout (ending at `defval`) up; the
+ * ABI 2.8 copies are filled only when struct_size covers them. */
 GPTPS_API size_t       gptps_settings_count(gptps *e);
 GPTPS_API gptps_status gptps_settings_get_info(gptps *e, size_t index, gptps_setting_info *out);
 
