@@ -132,7 +132,7 @@ static gptps *open_engine(gptps_run_mode mode, uint32_t conc, uint64_t mem, cons
 }
 
 /* --- the events, by task name --------------------------------------------------- */
-typedef struct { const char *name; int started, finished, failed, first_status, last_status, last_err_len; } tally;
+typedef struct { const char *name; int started, finished, failed, dead, first_status, last_status, last_err_len; } tally;
 static tally g_t[8];
 static int   g_nt;
 static tally *tally_of(const char *name)
@@ -153,6 +153,7 @@ static void on_ev(const gptps_event *ev, void *ud)
     switch (ev->kind) {
         case GPTPS_EV_STARTED:  inc(&t->started); break;
         case GPTPS_EV_FINISHED: inc(&t->finished); break;
+        case GPTPS_EV_DEAD_LETTERED: inc(&t->dead); break;
         case GPTPS_EV_FAILED:
             if (get(&t->failed) == 0) put(&t->first_status, (int)ev->status);
             put(&t->last_status, (int)ev->status);
@@ -485,7 +486,7 @@ static void test_dead_letter_tail(void)
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
     CHECK(gptps_submit(e, "erp", NULL, 0, NULL) == GPTPS_OK);
     CHECK(wait_for(&tally_of("erp")->failed, 2, 10000));
-    sleep_ms(100);                      /* the dead-lettering follows the second FAILED */
+    CHECK(wait_for(&tally_of("erp")->dead, 1, 10000));   /* filed after the second FAILED */
     g_dl_n = 0; g_dl_tail_len = -1; g_dl_start = g_dl_code = g_dl_first_tail = 0;
     CHECK(gptps_dead_letter_drain(e, on_dl, NULL) == 1);
     CHECK(g_dl_n == 1);

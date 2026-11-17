@@ -71,12 +71,13 @@ static void sleep_ms(unsigned ms)
 #define CLEAN_FILE "gptps_stop_cleaned.txt"
 #define PID_FILE   "gptps_stop_pid.txt"
 
-static int g_started, g_done, g_status;
+static int g_started, g_done, g_status, g_dead;
 static void on_ev(const gptps_event *ev, void *ud)
 {
     (void)ud;
     if (ev->kind == GPTPS_EV_STARTED) inc(&g_started);
     if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) { put(&g_status, (int)ev->status); inc(&g_done); }
+    if (ev->kind == GPTPS_EV_DEAD_LETTERED) inc(&g_dead);   /* the letter is filed: drainable */
 }
 
 static int g_warn_die, g_warn_grace, g_warn_out;
@@ -232,14 +233,16 @@ static void dead_letters(void)
     if (!e) return;
     reg(e, "three", a_exit3, 0, 0, 0);
     reg(e, "none", a_none, 0, 0, 0);
-    put(&g_done, 0);
+    /* FAILED comes first; the dispatcher files the dead letter after it and says so
+     * with DEAD_LETTERED - wait for that, not FAILED, before draining */
+    put(&g_done, 0); put(&g_dead, 0);
     CHECK(gptps_submit(e, "three", NULL, 0, NULL) == GPTPS_OK);
-    CHECK(wait_for(&g_done, 1, 10000));
+    CHECK(wait_for(&g_dead, 1, 10000));
     dl_seen = 0; dl_has_code = dl_has_start = 0;
     CHECK(gptps_dead_letter_drain(e, on_dl, NULL) == 1);
     CHECK(dl_has_code && dl_code == 3 && !dl_has_start && dl_n > 0);
     CHECK(gptps_submit(e, "none", NULL, 0, NULL) == GPTPS_OK);
-    CHECK(wait_for(&g_done, 2, 10000));
+    CHECK(wait_for(&g_dead, 2, 10000));
     dl_seen = 0; dl_has_code = dl_has_start = 0;
     CHECK(gptps_dead_letter_drain(e, on_dl, NULL) == 1);
     CHECK(dl_has_start && dl_start != 0 && !dl_has_code);
