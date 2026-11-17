@@ -1209,7 +1209,7 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
                  "volume - the smaller, so neither is exceeded",
                  item_name(it), (unsigned long long)it->io_rcap, (unsigned long long)it->io_wcap,
                  (unsigned long long)(it->io_rcap < it->io_wcap ? it->io_rcap : it->io_wcap));
-        gptps_log(NULL, GPTPS_LOG_INFO, msg);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);   /* one cap is held tighter than declared */
     }
     if (fresh & GPTPS_CAP_GRACE) {
         snprintf(msg, sizeof msg, "task '%s': stop_grace_ms=%lu could not be given here - the program "

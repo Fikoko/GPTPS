@@ -378,7 +378,7 @@ typedef struct {
      *     caps (ABI 2.8) through its I/O rate control, Windows 10 1607 / Server 2016
      *     and later. Windows limits reads and writes TOGETHER, per volume, so the
      *     figure set on every volume is the smaller of the two caps given - neither is
-     *     exceeded - and a type whose two caps differ logs one INFO line saying so.
+     *     exceeded - and a type whose two caps differ logs one WARN saying so.
      *   - Anywhere else, and wherever a controller is not delegated: NOT enforced.
      * A cap that is not enforced is never silent: the first attempt of a task type
      * that asked for one and did not get it logs a GPTPS_LOG_WARN naming the cap, once

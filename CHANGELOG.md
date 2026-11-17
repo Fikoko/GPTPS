@@ -23,7 +23,8 @@ Behaviour a host may notice:
   POSIX, and a bare name is looked up in the `PATH` that `env` sets, if it sets one.
   Give an absolute path if you relied on the host's directory.
 - Windows: the I/O caps are now enforced where the system can (Windows 10 1607 /
-  Server 2016 and later), as one read+write figure per volume - the smaller cap.
+  Server 2016 and later), as one read+write figure per volume - the smaller cap; a type
+  whose two caps differ logs one WARN saying so.
 
 ### Added
 
@@ -50,7 +51,8 @@ Behaviour a host may notice:
 - `start.error` measurement and a WARN with the OS's reason for programs that never
   started; a dead letter carries the last attempt's measurements (`exit.code`,
   `start.error`, ...).
-- Windows I/O caps through job-object I/O rate control.
+- Windows I/O caps through job-object I/O rate control (CI on Windows Server: 16 MiB
+  took 31 ms uncapped and 4 015 ms capped at 4 MiB/s).
 - The stderr tail crosses `gptps_xport` links, and the dashboard's recent list says
   why each job failed - exit code, signal or start error, and the last line of its
   stderr, with control bytes removed so a job's escape codes never reach the terminal.

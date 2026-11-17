@@ -25,7 +25,7 @@ static void sink(gptps_log_level lvl, const char *msg, void *ud)
 {
     (void)ud;
     if (lvl == GPTPS_LOG_WARN && strstr(msg, "io_max_read_bps") && strstr(msg, "not enforced")) g_not_enforced++;
-    if (lvl == GPTPS_LOG_INFO && strstr(msg, "hold as one limit")) g_combined++;
+    if (lvl == GPTPS_LOG_WARN && strstr(msg, "hold as one limit")) g_combined++;
     printf("log: %s\n", msg);
 }
 
