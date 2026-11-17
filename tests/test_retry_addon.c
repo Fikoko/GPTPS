@@ -12,6 +12,7 @@
  *     exit code (an in-process task).
  *  4) A task's own rule wins over an all-tasks rule.
  *  5) The counters, and argument checks.
+ *  6) A program that never started (start.error, ABI 2.8) has a rule of its own.
  *
  * MANUAL mode: the test steps the engine itself, waiting out held retries.
  */
@@ -27,11 +28,12 @@
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-enum { T_BAD, T_BAD2, T_LOCK, T_LIC, T_INPROC, T_N };
-static const char *const NAMES[T_N] = { "bad", "bad2", "lock", "lic", "inproc" };
+enum { T_BAD, T_BAD2, T_LOCK, T_LIC, T_INPROC, T_NOPROG, T_N };
+static const char *const NAMES[T_N] = { "bad", "bad2", "lock", "lic", "inproc", "noprog" };
 static int      g_runs[T_N], g_terminal;
 static uint64_t g_start[T_N][4];
 static gptps_status g_dl_status[T_N];
+static int g_dl_start[T_N];       /* the dead letter carries start.error (ABI 2.8) */
 
 static int idx(const char *name)
 {
@@ -57,7 +59,13 @@ static void on_dl(const gptps_dead_letter *dl, void *ud)
 {
     int i = idx(dl->task_name);
     (void)ud;
-    if (i >= 0) g_dl_status[i] = dl->status;
+    if (i >= 0) {
+        size_t k;
+        g_dl_status[i] = dl->status;
+        if (dl->struct_size >= sizeof *dl)
+            for (k = 0; k < dl->n_measures; ++k)
+                if (strcmp(dl->measures[k].name, GPTPS_M_START_ERROR) == 0) g_dl_start[i] = 1;
+    }
 }
 
 static gptps_status fail_body(gptps_ctx *ctx, void *ud) { (void)ctx; (void)ud; return GPTPS_E_TASK; }
@@ -98,6 +106,10 @@ int main(void)
     reg(e, "lock", a_exit1, 2);
     reg(e, "lic", a_exit3, 2);
     reg(e, "inproc", NULL, 1);
+    {
+        static const char *const a_none[] = { "gptps_retry_no_such_program_xyz", NULL };
+        reg(e, "noprog", a_none, 3);
+    }
 
     /* 5) argument checks */
     CHECK(gptps_retry_install(NULL, &r) == GPTPS_E_INVAL);
@@ -114,6 +126,8 @@ int main(void)
     CHECK(gptps_retry_on_exit(r, "bad2", 2, 0) == GPTPS_OK);                 /* 4) except here */
     CHECK(gptps_retry_on_exit(r, "lic", 3, 50) == GPTPS_OK);
     CHECK(gptps_retry_on_exit(r, "lic", 3, 300) == GPTPS_OK);                /* replaces */
+    CHECK(gptps_retry_on_start_error(r, NULL, GPTPS_RETRY_NEVER) == GPTPS_OK);
+    CHECK(gptps_retry_on_start_error(NULL, NULL, 0) == GPTPS_E_INVAL);
 
     for (i = 0; i < T_N; ++i) CHECK(gptps_submit(e, NAMES[i], NULL, 0, NULL) == GPTPS_OK);
     t0 = gptps_now_ms(NULL);
@@ -136,8 +150,11 @@ int main(void)
     CHECK(g_runs[T_LIC] == 3 && g_dl_status[T_LIC] == GPTPS_E_TASK);
     CHECK(g_start[T_LIC][1] - g_start[T_LIC][0] >= 300);
     CHECK(g_start[T_LIC][2] - g_start[T_LIC][1] >= 300);
+    /* 6) never started: refused at once, and the dead letter says why */
+    CHECK(g_runs[T_NOPROG] == 1 && g_dl_status[T_NOPROG] == GPTPS_E_DENIED && g_dl_start[T_NOPROG]);
     /* 5) the counters */
-    CHECK(gptps_retry_refused(r) == 1);
+    CHECK(gptps_retry_refused(r) == 2);
+    CHECK(gptps_retry_forgotten(r) == 0);
     CHECK(gptps_retry_delayed(r) == 2);
     CHECK(gptps_retry_refused(NULL) == 0 && gptps_retry_delayed(NULL) == 0);
 

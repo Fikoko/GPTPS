@@ -690,9 +690,12 @@ never silence. A CPU cap held by a cgroup reports `cpu.throttled_ms` on the job'
 `def.work_dir` (where it starts) and `def.env` (`"NAME=value"` laid over the host's
 environment; a bare `"NAME"` removes one), on POSIX and Windows alike; strings are UTF-8,
 so a Turkish path works on any Windows code page. `def.stop_grace_ms` lets a job GPTPS has
-to stop clean up first: SIGTERM (Ctrl+Break on Windows, where the host needs a console),
-up to that long, then the kill; where it can't be given, the stop is immediate and the log
-says so once. `def.stderr_tail_bytes` captures the job's stderr and hands its last
+to stop clean up first: SIGTERM (Ctrl+Break on Windows, service hosts included), up to
+that long for the whole job - launcher and workers - then the kill, its output read
+throughout. `GPTPS_TASK_DIE_WITH_HOST` kills a job when its host dies (Linux, FreeBSD;
+Windows always). A program that never started reports `start.error` with the OS's
+reason instead of an exit code, and a dead letter carries the last attempt's
+measurements, so a report can say why. `def.stderr_tail_bytes` captures the job's stderr and hands its last
 bytes back on the `FAILED` event and the dead letter, so forty jobs' errors stay apart.
 Every `FINISHED` / `FAILED` also carries `exit.code` (or `exit.signal`) when the program
 ended on its own. What happens to running jobs if the host itself dies is in
@@ -938,7 +941,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **59** public functions · **ABI 2.7** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **101** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **103** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass.
 
 **Liveness guarantees.** Because GPTPS runs *inside* your process, anything that can

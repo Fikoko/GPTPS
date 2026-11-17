@@ -69,12 +69,19 @@ If the host process crashes or is killed, what happens to the jobs it started?
 
 - **Windows:** every job is in a job object created with
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the jobs die with the host. Nothing to do.
-- **Linux, macOS:** they keep running. A restarted host can then start a second copy
-  next to the first - two MRP runs against one database. GPTPS does not change this
-  on its own, because a host may *want* a job to outlive it, and it has to be decided
-  in the child.
+- **Linux, macOS:** by default they keep running. A restarted host can then start a
+  second copy next to the first - two MRP runs against one database. GPTPS does not
+  change that default, because a host may *want* a job to outlive it.
 
-On **Linux**, ask the kernel to kill the job when its parent goes, from `child_setup`:
+**Since ABI 2.8 it is one flag:** set `GPTPS_TASK_DIE_WITH_HOST` in the task's
+`flags` and GPTPS arranges it in the child, correctly: `PR_SET_PDEATHSIG` on Linux,
+`PROC_PDEATHSIG_CTL` on FreeBSD, with the `getppid()` check below, for `OOP` and
+`PROGRAM` jobs. SIGKILL, not SIGTERM: the kernel sends one signal and never follows
+it up, so nothing may be left to linger. Where the OS has no such signal (macOS, other
+POSIX) the job runs anyway and the type's first attempt logs a WARN - use a supervisor
+there. `tests/test_program_stop.c` crashes a host on purpose and checks its job died.
+
+What the flag does, by hand - for a host that needs it in its own `child_setup`:
 
 ```c
 #include <stdint.h>

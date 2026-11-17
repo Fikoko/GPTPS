@@ -121,6 +121,12 @@ typedef struct {
     const gptps_measure *measures;      /* NULL / 0 when nothing was measured */
     size_t               n_measures;
     int                  measures_cut;  /* the worker left some out (see above) */
+    /* ABI 2.8: the stderr tail of the item's last FAILED attempt (see
+     * gptps_task_def.stderr_tail_bytes, at most 64 KiB), on a reply that is not a
+     * success; NULL / 0 otherwise. Owned like the measurements. A struct from before
+     * this field (ending at measures_cut) is still accepted, and gets none. */
+    const char          *stderr_tail;
+    size_t               stderr_tail_len;
 } gptps_xport_reply;
 
 typedef void (*gptps_xport_reply_ex_fn)(const gptps_xport_reply *reply, void *user_data);

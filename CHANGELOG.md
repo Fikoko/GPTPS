@@ -7,20 +7,71 @@ the release version and is documented in `include/gptps.h`.
 
 ## [Unreleased]
 
-No ABI change: 2.7, as in 1.9.0.
+### Upgrading from 1.9
+
+No API changed incompatibly. The ABI is 2.8, additive over 2.7: `gptps_dead_letter`
+appends `measures` / `n_measures`; `GPTPS_TASK_DIE_WITH_HOST` is a new task flag and
+`start.error` (`GPTPS_M_START_ERROR`) a new measurement name; `gptps_xport_reply`
+appends `stderr_tail` / `stderr_tail_len` (an older-sized struct is still accepted).
+Behaviour a host may notice:
+
+- A `PROGRAM` job that never starts - its `work_dir` cannot be entered, the program
+  is not found - now reports `start.error` with the OS error instead of an exit code
+  (POSIX used to show it as `exit.code` 127), and logs one WARN per task type with the
+  OS's reason. The status is still `GPTPS_E_TASK`.
+- Windows: a relative `argv[0]` with a separator is now found under `work_dir`, as on
+  POSIX, and a bare name is looked up in the `PATH` that `env` sets, if it sets one.
+  Give an absolute path if you relied on the host's directory.
+- Windows: the I/O caps are now enforced where the system can (Windows 10 1607 /
+  Server 2016 and later), as one read+write figure per volume - the smaller cap; a type
+  whose two caps differ logs one WARN saying so.
 
 ### Added
 
 - `gptps_retry`, a new add-on: retry rules by exit code, per task type or for every
   type. `GPTPS_RETRY_NEVER` dead-letters an item at once (`GPTPS_E_DENIED`) instead of
   spending its retries on a failure that cannot succeed; a wait holds the retry back
-  (a licence server, say); `0` opts one task out of an all-tasks rule. Built on the
-  observer and constraint seams, with no core change.
-- Windows: `stop_grace_ms` is now honoured when the host has a console. The program
-  shares it in its own process group, gets Ctrl+Break, and up to the grace to exit
-  before the job object is terminated. A host without a console (a service) still
-  stops at once, and the WARN now says why and that `AllocConsole()` in the host
-  enables it; GPTPS does not change the host process itself.
+  (a licence server, say); `0` opts one task out of an all-tasks rule. A rule of its
+  own for programs that never started (`gptps_retry_on_start_error`). Built on the
+  observer and constraint seams, with no core change; past its bound of 4096 pending
+  decisions it drops the oldest, counts it (`gptps_retry_forgotten`) and says so once.
+- Windows graceful stop: `stop_grace_ms` sends Ctrl+Break to the job's own process
+  group, with a host console or without one. A service host needs no setup: the job
+  gets a hidden console of its own, and GPTPS attaches to it only for the moment of
+  sending, under a lock, restoring the host's standard handles.
+- The grace period covers the whole job: GPTPS waits until every process of the
+  job's process group (Linux, macOS) or job object (Windows) has exited, so a launcher
+  that dies at once does not cost its workers their clean-up. The job's stdout and
+  stderr are read throughout, so cleaning up never blocks on a full pipe; its stdin
+  is closed.
+- `GPTPS_TASK_DIE_WITH_HOST`: a job is killed when its host process dies - crash or
+  not - so a restarted host cannot run beside yesterday's job. `PR_SET_PDEATHSIG` on
+  Linux, `PROC_PDEATHSIG_CTL` on FreeBSD (with the parent check), always on Windows;
+  elsewhere one WARN per task type.
+- `start.error` measurement and a WARN with the OS's reason for programs that never
+  started; a dead letter carries the last attempt's measurements (`exit.code`,
+  `start.error`, ...).
+- Windows I/O caps through job-object I/O rate control (CI on Windows Server: 16 MiB
+  took 31 ms uncapped and 4 015 ms capped at 4 MiB/s).
+- The stderr tail crosses `gptps_xport` links, and the dashboard's recent list says
+  why each job failed - exit code, signal or start error, and the last line of its
+  stderr, with control bytes removed so a job's escape codes never reach the terminal.
+- Tests: `test_program_stop` (graceful stop on timeout, cancel and shutdown; the
+  whole job; noisy clean-ups; Windows with and without a console; dead-letter
+  measurements; a host crashed on purpose), `test_io_cap_win`, `test_retry_forget`,
+  and new cases in `test_program_launch`, `test_retry_addon`, `test_xport_measure` and
+  `test_tui`.
+
+### Fixed
+
+- Windows: the environment block a program gets is now sorted, as Windows requires,
+  and variable names compare ordinally ignoring case, as Windows compares them.
+- Windows: one argument that is not valid UTF-8 no longer drags the rest of the
+  command line into the ANSI code page; each argument is converted on its own.
+- `gptps_xport_submit_ex` refused, and `gptps_xport_result_free` wrote past, a reply
+  struct smaller than the current one; both now honour the caller's `struct_size`.
+- The header now says what the POSIX environment read cannot protect against: a
+  host thread changing its own environment at the moment a job is started.
 
 ## [1.9.0] - 2026-11-16
 

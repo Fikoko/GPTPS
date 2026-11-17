@@ -33,6 +33,7 @@
 #include <string.h>
 #if defined(_WIN32)
 #  include <windows.h>
+#  include <direct.h>    /* _getcwd */
 #else
 #  include <sys/stat.h>
 #  include <unistd.h>
@@ -54,6 +55,9 @@ static gptps_status g_st;
 static char     g_res[512];
 static int      g_have_code, g_have_sig;
 static uint64_t g_code, g_sig;
+static int      g_have_start;
+static uint64_t g_start;
+static char     g_start_method[32];
 static char     g_tail[128];
 static size_t   g_tail_len;
 static int      g_has_tail;
@@ -71,6 +75,9 @@ static void on_ev(const gptps_event *ev, void *ud)
     if (m) CHECK(m->unit == GPTPS_UNIT_CODE);
     m = gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL);
     g_have_sig = m != NULL; g_sig = m ? m->value : 0;
+    m = gptps_event_measure(ev, GPTPS_M_START_ERROR);
+    g_have_start = m != NULL; g_start = m ? m->value : 0; g_start_method[0] = 0;
+    if (m) { CHECK(m->unit == GPTPS_UNIT_CODE); strncpy(g_start_method, m->method, sizeof g_start_method - 1); }
     g_has_tail = ev->stderr_tail != NULL; g_tail_len = ev->stderr_tail_len; g_tail[0] = 0;
     if (ev->stderr_tail && ev->stderr_tail_len < sizeof g_tail) {
         memcpy(g_tail, ev->stderr_tail, ev->stderr_tail_len); g_tail[ev->stderr_tail_len] = 0;
@@ -162,6 +169,60 @@ static void remove_dir(void)
     remove(DIR_U8 "/marker.txt"); rmdir(DIR_U8);
 #endif
 }
+/* Copy the helper to DIR_U8/bin/prog_helper_copy<exe>; `bin` gets that directory's
+ * absolute path. 1 on success. */
+static int copy_helper_into_bin(char *bin, size_t n, const char *exe)
+{
+    char cwd[700], dst[1200];
+    FILE *in, *out;
+    char buf[65536];
+    size_t got;
+    int ok = 1;
+#if defined(_WIN32)
+    wchar_t wd[1024];
+    if (!_getcwd(cwd, sizeof cwd)) return 0;
+    snprintf(bin, n, "%s\\" DIR_U8 "\\bin", cwd);
+    MultiByteToWideChar(CP_UTF8, 0, bin, -1, wd, 1024);
+    CreateDirectoryW(wd, NULL);
+    snprintf(dst, sizeof dst, "%s\\prog_helper_copy%s", bin, exe);
+    {
+        wchar_t wdst[1200], wsrc[1200];
+        MultiByteToWideChar(CP_UTF8, 0, dst, -1, wdst, 1200);
+        MultiByteToWideChar(CP_UTF8, 0, HELPER_PATH, -1, wsrc, 1200);
+        (void)in; (void)out; (void)buf; (void)got; (void)ok;
+        return CopyFileW(wsrc, wdst, FALSE) != 0;
+    }
+#else
+    if (!getcwd(cwd, sizeof cwd)) return 0;
+    snprintf(bin, n, "%s/" DIR_U8 "/bin", cwd);
+    mkdir(bin, 0700);
+    snprintf(dst, sizeof dst, "%s/prog_helper_copy%s", bin, exe);
+    in = fopen(HELPER_PATH, "rb");
+    out = fopen(dst, "wb");
+    if (!in || !out) ok = 0;
+    while (ok && (got = fread(buf, 1, sizeof buf, in)) > 0) if (fwrite(buf, 1, got, out) != got) ok = 0;
+    if (in) fclose(in);
+    if (out && fclose(out) != 0) ok = 0;
+    if (ok && chmod(dst, 0700) != 0) ok = 0;
+    return ok;
+#endif
+}
+static void remove_bin_copy(const char *exe)
+{
+#if defined(_WIN32)
+    wchar_t w[300];
+    char p[300];
+    snprintf(p, sizeof p, DIR_U8 "\\bin\\prog_helper_copy%s", exe);
+    MultiByteToWideChar(CP_UTF8, 0, p, -1, w, 300); DeleteFileW(w);
+    MultiByteToWideChar(CP_UTF8, 0, DIR_U8 "\\bin", -1, w, 300); RemoveDirectoryW(w);
+#else
+    char p[300];
+    snprintf(p, sizeof p, DIR_U8 "/bin/prog_helper_copy%s", exe);
+    remove(p);
+    rmdir(DIR_U8 "/bin");
+#endif
+}
+
 static void host_setenv(const char *k, const char *v)
 {
 #if defined(_WIN32)
@@ -197,9 +258,25 @@ int main(void)
     def_prog(&d, "nowd", a_cat); d.work_dir = "gptps_launch_no_such_dir";
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
     CHECK(run1(e, "nowd") && !g_ok && g_st == GPTPS_E_TASK);
+    /* ABI 2.8: never started - an OS error, not an exit code */
+    CHECK(g_have_start && !g_have_code);
 #if !defined(_WIN32)
-    CHECK(g_have_code && g_code == 127);   /* Windows: CreateProcessW itself refuses */
+    CHECK(g_start == 2 /* ENOENT */ && strcmp(g_start_method, "posix.chdir") == 0);
+#else
+    CHECK(strcmp(g_start_method, "win.createprocess") == 0);
 #endif
+    {   /* a program that does not exist: the same, from the exec step */
+        static const char *const a_none[] = { "gptps_launch_no_such_program_xyz", NULL };
+        def_prog(&d, "noprog", a_none);
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "noprog") && !g_ok && g_st == GPTPS_E_TASK);
+        CHECK(g_have_start && !g_have_code);
+#if !defined(_WIN32)
+        CHECK(g_start == 2 /* ENOENT */ && strcmp(g_start_method, "posix.exec") == 0);
+#else
+        CHECK(g_start == 2 /* ERROR_FILE_NOT_FOUND */);
+#endif
+    }
     /* 5) a clone keeps work_dir (and env) */
     CHECK(gptps_clone_task(e, "cwd", "cwd2") == GPTPS_OK);
     CHECK(run1(e, "cwd2") && g_ok && strcmp(g_res, "here") == 0);
@@ -229,6 +306,61 @@ int main(void)
         CHECK(gptps_register_task(e, &d) == GPTPS_E_INVAL);
         d.env = bad2;
         CHECK(gptps_register_task(e, &d) == GPTPS_E_INVAL);
+    }
+
+    /* E) the program is found the same way everywhere (ABI 2.8): a relative path is
+     * relative to work_dir, and a bare name is looked up in the PATH the program will
+     * see - here a copy of the helper in DIR_U8/bin */
+    {
+        char bin[1024], prog[1200], pathvar[1300];
+        static const char *a_rel[] = { NULL, "arg", "found", NULL };
+        static const char *a_bare[] = { NULL, "arg", "found", NULL };
+        static const char *env_path[] = { NULL, NULL };
+#if defined(_WIN32)
+        static const char *rel = "bin\\prog_helper_copy";            /* no .exe: Windows adds it */
+        const char *exe = ".exe";
+#else
+        static const char *rel = "bin/prog_helper_copy";
+        const char *exe = "";
+#endif
+        CHECK(copy_helper_into_bin(bin, sizeof bin, exe));
+        snprintf(prog, sizeof prog, "%s", rel);
+        a_rel[0] = prog;
+        def_prog(&d, "rel", a_rel); d.work_dir = DIR_U8;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "rel") && g_ok && strcmp(g_res, "found") == 0);
+        snprintf(pathvar, sizeof pathvar, "PATH=%s", bin);
+        env_path[0] = pathvar;
+        a_bare[0] = "prog_helper_copy";
+        def_prog(&d, "bare", a_bare); d.env = env_path;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "bare") && g_ok && strcmp(g_res, "found") == 0);
+        remove_bin_copy(exe);
+    }
+
+    /* D) one argument that is not UTF-8 does not drag the others into the ANSI code
+     * page with it (Windows; POSIX passes bytes as they are) */
+    {
+        static const char *const a_mixed[] = { HELPER_PATH, "arg", ARG_U8, "\xFE\xFF", NULL };
+        def_prog(&d, "mixed", a_mixed);
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "mixed") && g_ok && strcmp(g_res, ARG_U8) == 0);
+    }
+    /* D) Windows: the block the program gets is in Windows' order, overrides included */
+    {
+        static const char *const a_sorted[] = { HELPER_PATH, "envsorted", NULL };
+        static const char *const env_s[] = { "zzz_gptps_last=1", "AAA_GPTPS_FIRST=1", "mmm_gptps=1", NULL };
+        def_prog(&d, "sorted", a_sorted); d.env = env_s;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "sorted") && g_ok);
+#if defined(_WIN32)
+        /* Wine hands every program an environment of its own making, unsorted */
+        if (!GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version"))
+#endif
+        {
+            CHECK(strcmp(g_res, "sorted") == 0);
+            if (strcmp(g_res, "sorted") != 0) printf("envsorted: [%s]\n", g_res);
+        }
     }
 
     /* 3) a UTF-8 argument */
@@ -329,19 +461,24 @@ int main(void)
         FILE *f;
         gptps_set_log_sink(on_log, NULL);
 
-        /* a) no console (a service): stopped at once, said once per task type */
+        /* a) no console (a service), ABI 2.8: the job gets a hidden console of its own,
+         * and the host reaches it there - Ctrl+Break and the grace, with no setup */
         FreeConsole();
         remove("gptps_launch_cleaned.txt");
         def_prog(&d, "grace_nc", a_brk); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
         CHECK(gptps_register_task(e, &d) == GPTPS_OK);
         CHECK(run1(e, "grace_nc") && !g_ok && g_st == GPTPS_E_TIMEOUT);
-        CHECK(run1(e, "grace_nc") && !g_ok && g_st == GPTPS_E_TIMEOUT);
-        CHECK(g_grace_warns == 1);
+        CHECK(g_grace_warns == 0);
         f = fopen("gptps_launch_cleaned.txt", "rb");
-        CHECK(f == NULL);                                     /* no chance to clean up */
+        if (!wine) {
+            char got[16] = { 0 };
+            CHECK(f != NULL);
+            if (f) { CHECK(fread(got, 1, sizeof got - 1, f) == 7); }
+            CHECK(strcmp(got, "cleaned") == 0);
+        }
         if (f) fclose(f);
 
-        /* b) a host that gave itself a (hidden) console: Ctrl+Break, then the grace */
+        /* b) a host with a (hidden) console of its own: the job shares it */
         CHECK(AllocConsole());
         if (GetConsoleWindow()) ShowWindow(GetConsoleWindow(), SW_HIDE);
         remove("gptps_launch_cleaned.txt");

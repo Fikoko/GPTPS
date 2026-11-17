@@ -110,6 +110,11 @@ if (m) printf("%s: peak %llu bytes (%s)\n", ev->task_name,
 | `cpu.throttled_ms` | ms | total | time the job was held back by its CPU cap (`cpu_max_millicpus`, ABI 2.6). Present only where a cgroup held that cap - `cgroup.job`, from `cpu.stat`'s `throttled_usec` - so its presence is also the proof the cap was in force; 0 means it never bit |
 | `exit.code` | code | current | how a `GPTPS_EXEC_PROGRAM` job exited (ABI 2.7): 0-255 on POSIX (`posix.wait`), the full 32-bit exit code on Windows (`win.exitcode`), where a crash shows as an NTSTATUS such as `0xC0000005`. Reported on FINISHED and FAILED, only when the program ended on its own |
 | `exit.signal` | code | current | POSIX: the signal that ended a `GPTPS_EXEC_PROGRAM` job (`posix.wait`) - 9 when the OOM killer or anything else outside GPTPS killed it. Never with `exit.code` |
+| `start.error` | code | current | a `GPTPS_EXEC_PROGRAM` job that never started (ABI 2.8): the OS error - errno on POSIX, by step (`posix.chdir` for work_dir, `posix.exec` for the program, `posix.setup`), the Win32 error on Windows (`win.createprocess`). Never with `exit.code` or `exit.signal`: a POSIX exit status of 127 alone cannot tell "not found" from a program that returned 127 |
+
+A dead letter (ABI 2.8) carries the measurements of the item's last failed attempt,
+these among them, so a report can say why an item ended up there without having kept its
+events.
 
 Neither `exit.*` is reported when GPTPS ended the job itself - timeout, cancel, output
 over the cap - because the attempt's status already says why. Both are reports, never

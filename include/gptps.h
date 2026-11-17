@@ -89,10 +89,12 @@ extern "C" {
  * scheduler seam's GPTPS_SCHED_STABLE flag; 2.7 appends `work_dir`, `env`,
  * `stop_grace_ms` and `stderr_tail_bytes` to gptps_task_def for GPTPS_EXEC_PROGRAM,
  * `stderr_tail` / `stderr_tail_len` to gptps_event and gptps_dead_letter, and adds
- * the exit.code / exit.signal measurements and their unit, GPTPS_UNIT_CODE. Additive, and the loader compares
+ * the exit.code / exit.signal measurements and their unit, GPTPS_UNIT_CODE; 2.8 appends
+ * `measures` / `n_measures` to gptps_dead_letter and adds GPTPS_TASK_DIE_WITH_HOST and
+ * the start.error measurement. Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 7u
+#define GPTPS_ABI_VERSION_MINOR 8u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -279,6 +281,16 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * only, THREADED mode only (a service's infinite loop cannot be run to completion
  * by the MANUAL gptps_step pump), and no timeout_seconds. */
 #define GPTPS_TASK_SERVICE 0x1u
+/* ABI 2.8, OOP and PROGRAM: the job dies with the host. If the host process ends -
+ * crashes, is killed, exits without gptps_shutdown - the job is killed too, so a
+ * restarted host cannot find yesterday's run still going beside today's. Without the
+ * flag a POSIX job outlives a dead host, which some hosts want (a job that must finish
+ * whatever happens). Enforced by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on
+ * FreeBSD (SIGKILL: nothing may linger), and on Windows always, flag or not (the job
+ * object is killed on close). Where it cannot be enforced (macOS, other POSIX) the job
+ * runs anyway and the first attempt of the type logs a WARN. Ignored for INPROC, which
+ * is the host. */
+#define GPTPS_TASK_DIE_WITH_HOST 0x2u
 /* RETIRE_ON_OK (services only; ignored otherwise): by default a service is
  * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a
  * clean GPTPS_OK return. Set this to instead RESTART ONLY ON FAILURE: a run() that
@@ -362,8 +374,11 @@ typedef struct {
      *   - Linux in cgroup mode (GPTPS_CGROUP_PARENT, see the memory cap): cpu.max and
      *     io.max on the job's own cgroup. The parent must delegate the cpu / io
      *     controller (cgroup.subtree_control "+cpu +io").
-     *   - Windows: the CPU cap through the job object's hard CPU-rate limit. Windows
-     *     has no per-device read/write split, so the I/O caps are not enforced there.
+     *   - Windows: the CPU cap through the job object's hard CPU-rate limit; the I/O
+     *     caps (ABI 2.8) through its I/O rate control, Windows 10 1607 / Server 2016
+     *     and later. Windows limits reads and writes TOGETHER, per volume, so the
+     *     figure set on every volume is the smaller of the two caps given - neither is
+     *     exceeded - and a type whose two caps differ logs one WARN saying so.
      *   - Anywhere else, and wherever a controller is not delegated: NOT enforced.
      * A cap that is not enforced is never silent: the first attempt of a task type
      * that asked for one and did not get it logs a GPTPS_LOG_WARN naming the cap, once
@@ -384,17 +399,29 @@ typedef struct {
      *
      *   work_dir  the directory the program starts in; NULL or "" = the host's. A
      *             directory that cannot be entered fails the attempt as a program that
-     *             cannot be started does (GPTPS_E_TASK; POSIX: exit.code 127 and a
-     *             line on the program's stderr). argv[0] is resolved as before - a
-     *             bare name through PATH, a path relative to the HOST's directory on
-     *             Windows but to work_dir on POSIX - so give an absolute path when
-     *             setting both.
+     *             cannot be started does: GPTPS_E_TASK with the start.error measurement
+     *             (ABI 2.8), and one WARN per task type with the OS's reason.
      *   env       NULL-terminated "NAME=value" strings laid OVER the host's
      *             environment: a name already there is replaced, a new one added. A
      *             bare "NAME" (no '=') removes that variable. Names compare as the OS
-     *             does: exactly on POSIX, case-insensitively on Windows. A bare name
-     *             in argv[0] is looked up through the PATH the program will see. An
-     *             entry with an empty name ("=x", "") is refused at registration.
+     *             does: exactly on POSIX, ordinally ignoring case on Windows, where the
+     *             block is handed over sorted, as Windows requires. An entry with an
+     *             empty name ("=x", "") is refused at registration.
+     *
+     * HOW argv[0] IS FOUND - the same on every platform since ABI 2.8:
+     *   - an absolute path is used as it is;
+     *   - a RELATIVE path with a separator ("bin/tool") is relative to work_dir when
+     *     one is set, else to the host's current directory;
+     *   - a BARE NAME ("tool") is looked up in the PATH the program will see - the one
+     *     `env` sets, if it sets one, else the host's. On Windows, with no PATH in
+     *     `env`, CreateProcessW's own order applies, which also looks in the host's
+     *     executable directory and current directory first, and ".exe" may be left off.
+     *
+     * THREADS. Building a program's environment reads the host's (POSIX `environ`). A
+     * host thread calling setenv / putenv / unsetenv AT THE SAME MOMENT can make that
+     * read crash or see a half-made variable: POSIX gives no lock for it, and neither
+     * GPTPS nor any library can take one the host's other code honours. Set the host's
+     * environment before starting work, or use `env` instead of changing your own.
      *
      * Strings are UTF-8 (so are argv's, on Windows since 2.7: the program is started
      * with CreateProcessW). A string that is not valid UTF-8 is taken as the ANSI code
@@ -413,14 +440,19 @@ typedef struct {
      *                      GPTPS_E_CANCELLED), and so is the bound: the stop takes at
      *                      most this much longer. Capped at 300000 (5 min). Output the
      *                      program writes to stdout after the SIGTERM is not read.
-     *                      Windows (1.10): Ctrl+Break to the program's own process
-     *                      group in place of SIGTERM, then TerminateJobObject. Windows
-     *                      delivers Ctrl+Break only to a program sharing the sender's
-     *                      console, so this needs a HOST WITH A CONSOLE; the program
-     *                      then shares it. A host without one (a service) gets the
-     *                      immediate stop, and the first attempt of the type logs a
-     *                      WARN saying so - GPTPS does not give the host a console;
-     *                      one that wants the grace calls AllocConsole() itself.
+     *                      The grace is the WHOLE job's: it ends when every process
+     *                      of the program's group (POSIX: Linux and macOS; elsewhere
+     *                      the program itself) or of its job object (Windows) has
+     *                      exited - a launcher that dies at once does not cost its
+     *                      workers their clean-up - and its stdout and stderr are read
+     *                      throughout, so cleaning up cannot block on a full pipe.
+     *                      Windows: Ctrl+Break in place of SIGTERM, to the program's own
+     *                      process group, then TerminateJobObject. With a host console
+     *                      the program shares it; without one (a service) the program
+     *                      gets a hidden console of its own and the host attaches to it
+     *                      for the moment of sending (ABI 2.8) - no host setup either
+     *                      way. If the signal cannot be sent, the stop is immediate and
+     *                      the type's first such attempt logs a WARN.
      *   stderr_tail_bytes  0 = the program's stderr is the host's, as before. Above 0:
      *                      its stderr is captured instead, and the LAST this-many bytes
      *                      are handed back on the attempt's FAILED event and, when the
@@ -1112,6 +1144,13 @@ typedef struct {
  *                anything else outside GPTPS, killed it). */
 #define GPTPS_M_EXIT_CODE      "exit.code"       /* code, current */
 #define GPTPS_M_EXIT_SIGNAL    "exit.signal"     /* code, current */
+/* ABI 2.8: a GPTPS_EXEC_PROGRAM job that never started - its work_dir could not be
+ * entered, the program could not be found or run - carries the OS error instead of an
+ * exit code: errno on POSIX ("posix.chdir", "posix.exec", "posix.setup"), the Win32
+ * error on Windows ("win.createprocess"). The status is GPTPS_E_TASK as before; this
+ * says it was never the program's doing (a POSIX exit status 127 alone cannot), and
+ * the first such failure of a task type also logs a WARN with the error's text. */
+#define GPTPS_M_START_ERROR    "start.error"     /* code, current */
 
 typedef struct {
     size_t           struct_size;   /* = sizeof(gptps_event) */
@@ -1216,6 +1255,13 @@ typedef struct {
      * the callback. Read only if struct_size covers it. */
     const char          *stderr_tail;
     size_t               stderr_tail_len;
+    /* ABI 2.8: what the attempt that failed last measured - its exit.code or
+     * start.error among them - so a report can say why without having kept the
+     * events. NULL / 0 for an item that never ran, or one with nothing measured (an
+     * in-process task). Valid only for the callback. Read only if struct_size covers
+     * it. */
+    const gptps_measure *measures;
+    size_t               n_measures;
 } gptps_dead_letter;
 
 /* Current number of retained dead-lettered tasks (does not drain). */

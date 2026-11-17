@@ -34,7 +34,8 @@
  * give "retry much later" a max_retries of at least 1. A rule for one task wins over
  * one for every task (task_name NULL). An exit code with no rule changes nothing,
  * and so does a failure that has no exit code (a timeout, a cancel, an in-process
- * task).
+ * task). A program that never started has no exit code either; it has start.error,
+ * which gptps_retry_on_start_error gives a rule of its own.
  *
  * LIFETIME. Install at setup time, while the engine is quiescent, as the seams
  * require; rules may be added later. Close AFTER gptps_shutdown: the engine calls
@@ -65,9 +66,20 @@ gptps_status gptps_retry_install(gptps *e, gptps_retry **out);
 gptps_status gptps_retry_on_exit(gptps_retry *r, const char *task_name, uint32_t exit_code,
                                  uint32_t wait_ms);
 
+/* What a retry does after an attempt whose program NEVER STARTED - work_dir missing,
+ * program not found: the start.error measurement (ABI 2.8) - for `task_name` (NULL =
+ * every type). Usually GPTPS_RETRY_NEVER: a setup mistake does not fix itself. Same
+ * rules and precedence as gptps_retry_on_exit. */
+gptps_status gptps_retry_on_start_error(gptps_retry *r, const char *task_name, uint32_t wait_ms);
+
 /* How many retries it refused, and how many it held back. */
 uint64_t gptps_retry_refused(const gptps_retry *r);
 uint64_t gptps_retry_delayed(const gptps_retry *r);
+
+/* How many decisions it had to drop because more failed items were waiting for one
+ * than it keeps (4096): those items retried as their policy says. Never silent: the
+ * first one also logs a WARN. */
+uint64_t gptps_retry_forgotten(const gptps_retry *r);
 
 /* Free it. Call AFTER gptps_shutdown (see LIFETIME). NULL is a no-op. */
 void gptps_retry_close(gptps_retry *r);

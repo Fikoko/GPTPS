@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stddef.h>
 
 #ifndef HELPER_PATH
 #  error "HELPER_PATH must point at prog_helper"
@@ -40,6 +41,7 @@ static int fails = 0;
 static const char *const av_take[] = { HELPER_PATH, "mem", "128", "50", NULL };
 static char        g_step[64];        /* memstep's file: absent until the first attempt */
 static const char *av_fail[] = { HELPER_PATH, "memstep", g_step, "8", "128", "3", NULL };
+static const char *const av_err[] = { HELPER_PATH, "errout", "100000", "FATAL: across the link", "3", NULL };
 
 static gptps_status t_inproc(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 
@@ -81,7 +83,7 @@ static gptps_status h_echo(const char *task, const void *p, size_t n, void **out
 
 int main(void)
 {
-    gptps_task_def tasks[3];
+    gptps_task_def tasks[4];
     gptps_xport_config cfg;
     gptps_xport *xp;
     gptps_xport_reply r;
@@ -101,14 +103,16 @@ int main(void)
     tasks[1].default_policy.max_retries = 1;
     tasks[1].default_policy.on_failure = GPTPS_ON_FAILURE_DEAD_LETTER;
     tasks[2].struct_size = sizeof tasks[2]; tasks[2].name = "inproc"; tasks[2].run = t_inproc;
-    { size_t i; for (i = 0; i < 3; ++i) {
+    tasks[3].struct_size = sizeof tasks[3]; tasks[3].name = "err";     /* ABI 2.8: a stderr tail */
+    tasks[3].exec = GPTPS_EXEC_PROGRAM; tasks[3].argv = av_err; tasks[3].stderr_tail_bytes = 64;
+    { size_t i; for (i = 0; i < 4; ++i) {
         tasks[i].default_cost.struct_size = sizeof tasks[i].default_cost;
         if (!tasks[i].default_policy.struct_size) tasks[i].default_policy.struct_size = sizeof tasks[i].default_policy;
         tasks[i].default_policy.timeout_seconds = 30; } }
 
     memset(&cfg, 0, sizeof cfg);
     cfg.struct_size = sizeof cfg; cfg.nworkers = 2;
-    cfg.tasks = tasks; cfg.ntasks = 3;
+    cfg.tasks = tasks; cfg.ntasks = 4;
     xp = gptps_xport_open_ex(&cfg);
     CHECK(xp != NULL);
     if (!xp) return 1;
@@ -157,6 +161,38 @@ int main(void)
     CHECK(gptps_xport_submit_ex(xp, "inproc", NULL, 0, &r) == GPTPS_OK);
     CHECK(r.io == GPTPS_OK && r.task_status == GPTPS_OK && r.measures == NULL && r.n_measures == 0);
     gptps_xport_result_free(&r);
+
+    /* 4b) ABI 2.8: a failure's stderr tail crosses the link - 100 000 bytes through a
+     * 64-byte tail - and a success carries none */
+    memset(&r, 0, sizeof r); r.struct_size = sizeof r;
+    CHECK(gptps_xport_submit_ex(xp, "err", NULL, 0, &r) == GPTPS_OK);
+    CHECK(r.io == GPTPS_OK && r.task_status == GPTPS_E_TASK);
+    CHECK(r.stderr_tail != NULL && r.stderr_tail_len == 64);
+    CHECK(r.stderr_tail && memcmp(r.stderr_tail + 64 - 23, "FATAL: across the link\n", 23) == 0);
+    gptps_xport_result_free(&r);
+    CHECK(r.stderr_tail == NULL && r.stderr_tail_len == 0);
+    memset(&r, 0, sizeof r); r.struct_size = sizeof r;
+    CHECK(gptps_xport_submit_ex(xp, "take", NULL, 0, &r) == GPTPS_OK);
+    CHECK(r.task_status == GPTPS_OK && r.stderr_tail == NULL && r.stderr_tail_len == 0);
+    gptps_xport_result_free(&r);
+    {   /* a caller built before the tail: its struct ends at measures_cut - accepted, and
+         * nothing is written past its end */
+        struct { gptps_xport_reply r; unsigned char guard[32]; } old;
+        size_t old_size = offsetof(gptps_xport_reply, measures_cut) + sizeof old.r.measures_cut;
+        memset(&old, 0xAB, sizeof old);
+        old.r.struct_size = old_size;
+        CHECK(gptps_xport_submit_ex(xp, "err", NULL, 0, &old.r) == GPTPS_OK);
+        CHECK(old.r.struct_size == old_size && old.r.task_status == GPTPS_E_TASK);
+        {   const unsigned char *b = (const unsigned char *)&old.r + old_size;
+            size_t i, untouched = 1;
+            for (i = 0; i < sizeof old - old_size; ++i) if (b[i] != 0xAB) untouched = 0;
+            CHECK(untouched); }
+        gptps_xport_result_free(&old.r);
+        {   const unsigned char *b = (const unsigned char *)&old.r + old_size;
+            size_t i, untouched = 1;
+            for (i = 0; i < sizeof old - old_size; ++i) if (b[i] != 0xAB) untouched = 0;
+            CHECK(untouched); }
+    }
 
     /* 5) the plain submit, on the same links */
     CHECK(gptps_xport_submit(xp, "take", NULL, 0, &res, &rl, &ts) == GPTPS_OK && ts == GPTPS_OK);

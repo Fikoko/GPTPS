@@ -450,6 +450,31 @@ int main(void)
     /* quit key */
     CHECK(gptps_tui_press(t, 'q') == -1);
 
+    /* ABI 2.7 / 2.8: a failed job's line says why - its exit code and its stderr's last
+     * line - and an escape sequence in that output never reaches the terminal */
+#ifdef HELPER_PATH
+    {
+        static const char *const a_err[] = { HELPER_PATH, "errout", "10",
+                                             "\x1b[31mFATAL: bad input\x1b[0m", "3", NULL };
+        gptps_task_def pd;
+        memset(&pd, 0, sizeof pd);
+        pd.struct_size = sizeof pd; pd.name = "erp"; pd.exec = GPTPS_EXEC_PROGRAM; pd.argv = a_err;
+        pd.default_cost.struct_size = sizeof pd.default_cost;
+        pd.default_policy.struct_size = sizeof pd.default_policy;
+        pd.stderr_tail_bytes = 256;
+        CHECK(gptps_register_task(e, &pd) == GPTPS_OK);
+        CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK);   /* the recent list is shown */
+        CHECK(gptps_submit(e, "erp", NULL, 0, &h) == GPTPS_OK);
+        { uint64_t start = gptps_now_ms(NULL);
+          do gptps_tui_render(t, frame, sizeof frame);
+          while (!strstr(frame, "exit 3") && gptps_now_ms(NULL) - start < 10000); }
+        CHECK(strstr(frame, "exit 3") != NULL);
+        CHECK(strstr(frame, "FATAL: bad input") != NULL);
+        CHECK(strstr(frame, "\x1b[") == NULL);       /* the job's escapes were neutralised */
+        if (!strstr(frame, "FATAL: bad input")) printf("%s\n", frame);
+    }
+#endif
+
     gptps_shutdown(e);     /* close AFTER shutdown */
     gptps_tui_close(t);
     (void)i;

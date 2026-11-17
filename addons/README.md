@@ -485,8 +485,13 @@ dead-lettering the item at once with `GPTPS_E_DENIED` (the dead letter keeps its
 stderr tail); a wait holds it that much longer; `0` is an explicit "as the policy
 says", so one task can opt out of an all-tasks rule. It never adds a retry the policy
 does not allow, so "retry much later" needs `max_retries` of at least 1. Failures with
-no exit code (timeouts, cancels, in-process tasks) are untouched. No core change.
-Tested on POSIX and Windows by `test_retry_addon`.
+no exit code (timeouts, cancels, in-process tasks) are untouched. A program that never
+started has `start.error` instead (ABI 2.8), with a rule of its own:
+`gptps_retry_on_start_error(r, NULL, GPTPS_RETRY_NEVER)` - a setup mistake does not fix
+itself. It keeps at most 4096 pending decisions; past that it drops the oldest (that
+item retries as its policy says), counts it in `gptps_retry_forgotten`, and logs one
+WARN. No core change. Tested on POSIX and Windows by `test_retry_addon`, and its bound
+by `test_retry_forget`.
 
 ## sched — EDF, aging and fair-share orderings; shed late work
 
@@ -694,6 +699,10 @@ gptps_xport_close(xp);                                                          
   `gptps_xport_reply` (free it with `gptps_xport_result_free`);
   `gptps_xport_submit_async_ex` hands one to the callback. The plain calls are
   unchanged and ignore them.
+- **So does the failure's stderr tail** (ABI 2.8). A task with `stderr_tail_bytes`
+  set has the last bytes of its last failed attempt's stderr on the reply
+  (`stderr_tail` / `stderr_tail_len`), across the process boundary like the
+  measurements. A reply struct from before the field is still accepted and gets none.
 
 - **Multiplexed links.** Every request carries an id; a reader thread per link matches
   replies to waiters; up to `max_in_flight` requests (default 64) may be outstanding per
