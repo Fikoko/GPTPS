@@ -10,9 +10,21 @@ the release version and is documented in `include/gptps.h`.
 ### Upgrading from 1.9
 
 No API changed incompatibly. The ABI is 2.8, additive over 2.7: `gptps_dead_letter`
-appends `measures` / `n_measures`; `GPTPS_TASK_DIE_WITH_HOST` is a new task flag and
-`start.error` (`GPTPS_M_START_ERROR`) a new measurement name; `gptps_xport_reply`
-appends `stderr_tail` / `stderr_tail_len` (an older-sized struct is still accepted).
+appends `measures` / `n_measures`; `gptps_setting_info` appends `key_copy` /
+`desc_copy` and `gptps_task_info` appends `name_copy` (copies taken under the engine's
+lock, safe while another thread unregisters a task); the host table
+(`gptps_api_routines`) appends `task_flags` and `event_measure`;
+`GPTPS_TASK_DIE_WITH_HOST` (0x4) is a new task flag and `start.error`
+(`GPTPS_M_START_ERROR`) a new measurement name; `gptps_xport_reply` appends
+`stderr_tail` / `stderr_tail_len` (an older-sized struct is still accepted).
+`gptps_settings_get_info` now accepts any `struct_size` from the 1.0 layout up.
+
+HAL ports add two functions: `gptps_hal_open_private` (`return fopen(path, "wb");`
+is enough where files have no owners, `return NULL;` where there is no filesystem)
+and `gptps_dl_error` (returning 0 is a complete implementation). A port that also
+replaces the process executor now has a documented path: `-DGPTPS_EXEC_SOURCE`, and
+`-DGPTPS_EXTERNAL_HAL` / `-DGPTPS_EXTERNAL_EXEC` for the amalgamation (docs/HAL.md).
+
 Behaviour a host may notice:
 
 - A `PROGRAM` job that never starts - its `work_dir` cannot be entered, the program
@@ -25,6 +37,21 @@ Behaviour a host may notice:
 - Windows: the I/O caps are now enforced where the system can (Windows 10 1607 /
   Server 2016 and later), as one read+write figure per volume - the smaller cap; a type
   whose two caps differ logs one WARN saying so.
+- POSIX: a `PROGRAM` that closes or redirects its stdout (`exec >>job.log 2>&1`, a
+  daemon-style program) is no longer SIGKILLed 2 s after stdout EOF and reported as
+  `GPTPS_E_TIMEOUT`. It runs until it exits, its deadline passes or it is stopped, and
+  reports `exit.code` like any other program.
+- POSIX: programs start with no signal blocked and none ignored, whatever the host's
+  thread had - so a host that blocks SIGTERM for a `sigwait` thread no longer turns
+  every `stop_grace_ms` into a silent SIGKILL.
+- `GPTPS_SUBMIT_TIMEOUT_MS` now applies to `OOP` and `PROGRAM` jobs (it was dropped,
+  silently), and MANUAL mode honours deadlines: `gptps_is_cancelled()` turns true
+  once the deadline passes, and a body that returns late ends `GPTPS_E_TIMEOUT`.
+- POSIX `PROGRAM` with `GPTPS_TASK_DIE_WITH_HOST`: each such job has one more child
+  process of the host while it runs, a small watcher outside the job (GPTPS reaps it).
+  A host with a `SIGCHLD` handler or process accounting will see it.
+- Settings: `tasks.<name>.stop_grace_ms` and `tasks.<name>.stderr_tail_bytes` are now
+  live settings and config-file keys, so a config file can set them.
 
 ### Added
 
@@ -45,9 +72,16 @@ Behaviour a host may notice:
   stderr are read throughout, so cleaning up never blocks on a full pipe; its stdin
   is closed.
 - `GPTPS_TASK_DIE_WITH_HOST`: a job is killed when its host process dies - crash or
-  not - so a restarted host cannot run beside yesterday's job. `PR_SET_PDEATHSIG` on
-  Linux, `PROC_PDEATHSIG_CTL` on FreeBSD (with the parent check), always on Windows;
-  elsewhere one WARN per task type.
+  not - so a restarted host cannot run beside yesterday's job. A `PROGRAM` job is
+  killed whole - its process group, a launcher's workers too, and its cgroup in
+  cgroup mode - on every POSIX system, by a watcher process the job's leader reports
+  to before anything runs (the host never writes to it, so a lost watcher cannot
+  SIGPIPE the host; one lost while the job runs is said in one WARN per type). An
+  `OOP` job uses `PR_SET_PDEATHSIG` on Linux and `PROC_PDEATHSIG_CTL` on FreeBSD,
+  WARN elsewhere. Windows: always, through the kill-on-close job object - unless the
+  program could not be put in one, which a WARN then says. Tested with a host that
+  really crashes on Linux (`PROGRAM`, launcher, `OOP`) and Windows; FreeBSD shares
+  the code but has no CI runner.
 - `start.error` measurement and a WARN with the OS's reason for programs that never
   started; a dead letter carries the last attempt's measurements (`exit.code`,
   `start.error`, ...).
@@ -70,6 +104,112 @@ Behaviour a host may notice:
   command line into the ANSI code page; each argument is converted on its own.
 - `gptps_xport_submit_ex` refused, and `gptps_xport_result_free` wrote past, a reply
   struct smaller than the current one; both now honour the caller's `struct_size`.
+
+Found by a review of the whole project before 1.10.0, each with a test that fails
+without its fix:
+
+- Engine:
+  - The starvation guard no longer stops all admission, silently, when the budget a
+    waiting top item needs is held by running `GPTPS_TASK_SERVICE` instances, which
+    never drain. It does not reserve for an item that cannot fit beside them (one WARN
+    per task type says so). Every item a backfill passes is now charged a skip, not
+    just the head of the queue, and the guard reserves for the highest-ranked skipped
+    item that draining can make fit.
+  - A dead letter's `stderr_tail` always belongs to the attempt that failed last; an
+    attempt that wrote nothing leaves no tail, never an earlier attempt's.
+  - A cancel issued before a job's deadline is `GPTPS_E_CANCELLED` even when its
+    graceful stop ends after the deadline (it was reported `GPTPS_E_TIMEOUT`, then a
+    second `FAILED`). The engine records which raised the stop first.
+  - `GPTPS_TASK_DIE_WITH_HOST` was the same bit as `GPTPS_TASK_RETIRE_ON_OK` (0x2) in
+    the unreleased ABI 2.8; it is 0x4. `test_abi` now checks that every flag family
+    is disjoint and every appended block starts past the old struct's end.
+  - `gptps_clone_task` keeps CPU/I/O caps, `stop_grace_ms` and `stderr_tail_bytes`
+    set live on a type registered with an older, smaller `gptps_task_def`.
+  - Each task setting key is applied by its own table row, so a key cannot be
+    validated and accepted without taking effect.
+  - An add-on that fails to load logs an ERROR with the reason: the OS's own message
+    (dlerror, or the Windows error text and number) or the check that refused it.
+  - Docs: the `gptps_cancel` / `gptps_shutdown` bound counts `stop_grace_ms`; the I/O
+    cap help text (CONFIG.md, the dashboard, the example TOML) says Windows enforces
+    them as one per-volume limit.
+- POSIX executor and HAL:
+  - Job cgroups are cleaned up: a stopped job is killed whole through its cgroup
+    (`cgroup.kill`, or each listed process before Linux 5.14) before the cgroup is
+    removed; one still held by a process a finished job left running is no longer
+    leaked silently (one WARN; removed once empty).
+  - `stop_grace_ms` is measured by the clock, so its bound holds on a busy host.
+  - Auto-tune sizes to the cgroup the process is really in (`/proc/self/cgroup` and
+    `mountinfo`, the tightest limit up the tree, v1 and v2): a systemd `MemoryMax=`
+    or a container on a v1 host was sized from host RAM.
+  - Settings save is durable: the new file and its directory are fsynced around the
+    rename (F_FULLFSYNC on macOS).
+- Windows executor and HAL:
+  - Concurrent `PROGRAM` jobs no longer inherit each other's pipe ends: each child
+    gets only its own three handles (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). A job could
+    end 5-10 s late, or never see stdin EOF, while a sibling lived.
+  - The console probe, the launch and the read of the host's stderr take the same
+    lock as Ctrl+Break's `AttachConsole`: a job started while a service host stopped
+    another could inherit that job's console, or its stderr.
+  - If a stdin/stdout/stderr helper thread cannot start, the attempt fails
+    `GPTPS_E_NOMEM` before the program runs (it could be reported a success).
+  - The CPU cap and the CPU count cover every processor group: above 64 logical
+    processors the cap was about 2x too loose and auto-sizing saw half the CPUs.
+  - An unquoted argument ending in a backslash (`/out=D:\Reports\`) reaches the
+    program unchanged; its trailing backslashes were doubled.
+  - Paths are UTF-8 everywhere: the config file, settings save and reload, the save's
+    temporary file, add-on paths (`LoadLibraryW`); a string that is not valid UTF-8 is
+    still read in the ANSI code page. The save flushes the new file and renames with
+    `MOVEFILE_WRITE_THROUGH`, so a power loss cannot leave an empty config.
+- `PROGRAM` jobs: stdout past the 16 MiB result cap logs one WARN per task type
+  naming the cap, only when the cap ended the attempt. On Windows a job with
+  `stop_grace_ms` gets its Ctrl+Break and grace first.
+- Config files may start with a UTF-8 byte order mark (PowerShell 5, older Notepad);
+  the parser used to fail with "line 1: expected key = value". A save keeps the mark.
+- Security: `gptps_settings_save` creates its temporary file private from the start
+  (`O_EXCL`, mode 0600 whatever the umask; `CREATE_NEW` with no sharing on Windows).
+  Under a group-writable umask another user could read the settings while they were
+  written, or write into the file before it became the config, which can name
+  add-ons to load. The config keeps its own owner and mode.
+- Add-ons:
+  - durable_queue: journal offsets are 64-bit on Windows too; past 2 GiB a failed
+    fsync could truncate records that had already been acknowledged.
+  - xport: `gptps_xport_open_ex` returns NULL with an ERROR when a worker's setup
+    fails (it returned dead links); replies go out through an observer, so a
+    `child_init` that sets the event callback no longer hangs every submit.
+  - orch: a gate's task, payload and dependencies are freed once it is submitted;
+    new `gptps_orch_discard_stalled`.
+  - adapt: attempts that never started are not memory samples (they could shrink a
+    declaration to about 1 MiB).
+  - pool: `gptps_pool_close` is bounded by one shutdown grace, not one per shard, and
+    refuses safely from a shard callback; new `gptps_pool_closing`. balance: no
+    backlog is handed to a closing pool; it is DROPPED with `GPTPS_E_SHUTDOWN`.
+  - sched: tenants past `max_tenants` share an overflow share (one WARN,
+    `gptps_sched_fair_overflow`) instead of slot 0's; `gptps_sched_fair_weight`
+    returns `GPTPS_E_FULL`; new `gptps_sched_task_tenant`.
+  - tui (security): everything the dashboard shows but did not write - stderr,
+    setting keys, values, defaults, descriptions, enum choices, task names, labels,
+    the status line - is shown as printable, valid UTF-8 only. A fake UTF-8 lead byte
+    could carry an ESC through, and setting values were printed raw.
+  - tui: panes read the new copies in `gptps_setting_info` / `gptps_task_info`, so a
+    task unregistered on another thread cannot free text the dashboard is drawing; an
+    edit commits to the key it started on. The editors take whole UTF-8 characters
+    (Windows: `ReadConsoleInputW`, so typing `à` no longer swallows the next key).
+    The dead-letter view lists each letter's task, status and reason, and keeps the
+    ones whose re-submit is refused, with the reason. Lines fit the terminal; `run`
+    needs stdin on a terminal and never busy-spins.
+  - wasm_exec: new `gptps_wasm_install_ex` passes the ctx, so in-process modules can
+    be cancelled.
+- Build, CI and release: `release.yml` runs the whole of `ci.yml` at the tag and
+  publishes only when every job passed, Windows (mingw-w64, MSVC) and macOS
+  included. MSVC compiles with `/utf-8`. The documented porting path builds:
+  `-DGPTPS_EXEC_SOURCE`, no thread library or `-ldl` demanded of a port
+  (`-DGPTPS_PORT_LIBS`), CI builds it with the freestanding stubs.
+- Tests: on Windows, a program that ignores Ctrl+Break is ended when its grace runs
+  out, with and without a host console; `GPTPS_TASK_DIE_WITH_HOST` is tested end to
+  end for `OOP` jobs on Linux and with a really crashing host on Windows.
+- Docs: the Readme says ABI 2.8 and introduces `gptps_retry`; ARCHITECTURE.md and
+  the add-on README list every add-on; the xport and remote protocol descriptions
+  are corrected.
 - The header now says what the POSIX environment read cannot protect against: a
   host thread changing its own environment at the moment a job is started.
 

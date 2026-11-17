@@ -959,7 +959,7 @@ and an amalgamation pair, so you can take a subset without cloning.
 
 At a glance: **59** public functions · **ABI 2.8** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **103** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **108** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass - and a release tag publishes nothing until all of
 them have passed at that tag (`release.yml` runs `ci.yml` as its gate).
 

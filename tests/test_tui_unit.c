@@ -346,6 +346,7 @@ static void test_untrusted_settings(void)
     CHECK(frame_clean(frame));
     CHECK(gptps_tui_press(t, '\r') == 4);          /* its detail pane */
     CHECK(t->pane == TUI_PANE_DETAIL);
+    for (i = 0; i < 32; ++i) gptps_tui_press(t, 'j');   /* down to the last: its own "label" */
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(strstr(frame, "label") != NULL);
     CHECK(frame_clean(frame));
@@ -417,11 +418,11 @@ static void test_windows_keys(void)
     CHECK(tui_key_of(&k) == -1);
 }
 #else
-static volatile int churn_stop;
+static int churn_stop;                          /* atomic: __atomic_* (MSVC: test_atomic_compat.h) */
 static void *churn(void *arg)
 {
     gptps *e = (gptps *)arg;
-    while (!churn_stop) {
+    while (!__atomic_load_n(&churn_stop, __ATOMIC_SEQ_CST)) {
         gptps_task_def d;
         memset(&d, 0, sizeof d);
         d.struct_size = sizeof d; d.name = "churn"; d.run = ok_task; d.exec = GPTPS_EXEC_INPROC;
@@ -440,7 +441,7 @@ static void test_render_while_unregistering(void)
     deftask(e, "steady", ok_task);
     t = install(e);
     if (!t) { gptps_shutdown(e); return; }
-    churn_stop = 0;
+    __atomic_store_n(&churn_stop, 0, __ATOMIC_SEQ_CST);
     if (pthread_create(&th, NULL, churn, e) != 0) { gptps_shutdown(e); gptps_tui_close(t); return; }
     CHECK(gptps_tui_press(t, 's') == 4);
     for (i = 0; i < 3000; ++i) {
@@ -454,7 +455,7 @@ static void test_render_while_unregistering(void)
         gptps_tui_render(t, frame, sizeof frame);
         if (i % 7 == 0) { gptps_tui_press(t, '\r'); gptps_tui_press(t, 27); }   /* start and drop an edit */
     }
-    churn_stop = 1;
+    __atomic_store_n(&churn_stop, 1, __ATOMIC_SEQ_CST);
     pthread_join(th, NULL);
     CHECK(frame_clean(frame));
     gptps_shutdown(e);
