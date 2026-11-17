@@ -779,6 +779,13 @@ target_include_directories(test_durable_oom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_durable_oom PRIVATE gptps)
 add_test(NAME durable_oom COMMAND test_durable_oom)
 set_tests_properties(durable_oom PROPERTIES TIMEOUT 30)
+# 64-bit journal offsets: the helpers on a sparse 5 GiB file, and the group commit when
+# an offset cannot be read (the add-on compiled in, its offset reads redirected)
+add_executable(test_durable_offset tests/test_durable_offset.c)
+target_include_directories(test_durable_offset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_durable_offset PRIVATE gptps)
+add_test(NAME durable_offset COMMAND test_durable_offset)
+set_tests_properties(durable_offset PROPERTIES TIMEOUT 30)
 # Crashed at every I/O call it makes, and recovered after each: compiles the add-on in
 # with its file calls wrapped (GNU ld's --wrap, so Linux only) and forks a child per run.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -805,7 +812,12 @@ add_executable(test_orch tests/test_orch.c)           # run-after / fan-in orche
 target_include_directories(test_orch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_orch PRIVATE gptps_orch)
 add_test(NAME orch COMMAND test_orch)
-set_tests_properties(orch PROPERTIES TIMEOUT 30)
+# a submitted gate is freed (the add-on compiled in, so its gate table can be read)
+add_executable(test_orch_gc tests/test_orch_gc.c)
+target_include_directories(test_orch_gc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_orch_gc PRIVATE gptps)
+add_test(NAME orch_gc COMMAND test_orch_gc)
+set_tests_properties(orch orch_gc PROPERTIES TIMEOUT 30)
 endif()
 
 if(TARGET gptps_remote)
@@ -1162,6 +1174,13 @@ target_link_libraries(test_tui PRIVATE gptps_tui)
 target_compile_definitions(test_tui PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>")   # why a job failed
 add_dependencies(test_tui prog_helper)
 add_test(NAME tui COMMAND test_tui)
+# the dashboard's text sanitiser, line fitting, editors and dead-letter actions, with
+# the add-on compiled in (its static helpers and observer in reach)
+add_executable(test_tui_unit tests/test_tui_unit.c)
+target_include_directories(test_tui_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_tui_unit PRIVATE gptps)
+add_test(NAME tui_unit COMMAND test_tui_unit)
+set_tests_properties(tui_unit PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 endif()
 

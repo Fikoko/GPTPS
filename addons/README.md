@@ -29,6 +29,7 @@ calling everything an add-on.
 
 | Add-on | Tier | Seam(s) used | Platform | CMake target | pkg-config |
 |---|---|---|---|---|---|
+| `adapt` | module | observer (writes the `tasks.<name>.mem_bytes` setting) | all | `gptps::adapt` | `gptps-adapt` |
 | `await` | module | observer | all | `gptps::await` | `gptps-await` |
 | `balance` | *composition* | observer (on each shard) — routes above `pool` | all | `gptps::balance` | `gptps-balance` |
 | `durable_queue` | module | observer | all | `gptps::durable_queue` | `gptps-durable_queue` |
@@ -37,10 +38,12 @@ calling everything an add-on.
 | `orch` | module | observer | all | `gptps::orch` | `gptps-orch` |
 | `pool` | *composition* | none — public API only | all | `gptps::pool` | `gptps-pool` |
 | `remote` | module | none — wire codec | all | `gptps::remote` | `gptps-remote` |
+| `retry` | module | observer + constraint | all | `gptps::retry` | `gptps-retry` |
+| `sched` | module | scheduler (EDF, aging; fair share adds an observer) + constraint (shed late) | all | `gptps::sched` | `gptps-sched` |
 | `stats` | module | observer | all | `gptps::stats` | `gptps-stats` |
 | `tui` | module | observer + settings | all | `gptps::tui` | `gptps-tui` |
 | `wasm_exec` | module | task | all | `gptps::wasm_exec` | `gptps-wasm_exec` |
-| `xport` | *composition* | none — public API only (owns an engine per worker) | **POSIX** | `gptps::xport` | `gptps-xport` |
+| `xport` | *composition* | observer (on each worker's own engine) — owns an engine per worker | **POSIX** | `gptps::xport` | `gptps-xport` |
 
 ## Getting one
 
@@ -383,7 +386,12 @@ than in the dispatcher.
   above; a dependency handle of 0 is refused with `GPTPS_E_INVAL`), and also what would
   otherwise hide the failure. `gptps_orch_stalled()` counts the gates it gave up on,
   `gptps_orch_stalled_at()` names one and reports the status it was refused with, and
-  `gptps_orch_retry()` re-submits them all once you have fixed the cause.
+  `gptps_orch_retry()` re-submits them all once you have fixed the cause, or
+  `gptps_orch_discard_stalled()` frees them unrun.
+- **Memory follows the gates that are left.** A gate's task name, payload copy and
+  dependencies are freed when it is submitted; the orchestrator keeps only gates still
+  waiting and abandoned ones, so a long-running host gating thousands of jobs a night
+  does not keep their payloads, and a terminal event walks only what is left.
 
 ```c
 gptps_orch *o = gptps_orch_install(engine);
@@ -518,7 +526,10 @@ gptps_submit_ex(e, "frame", buf, len, &o, &h);
   of the item (default: the task name). Each item is tagged when first seen, so one pass
   that fills several slots still interleaves tenants; virtual time follows what starts,
   so a tenant that was idle comes back at par instead of with banked turns.
-  `gptps_sched_fair_weight` sets a tenant's share. A share of *admissions*, not CPU time.
+  `gptps_sched_fair_weight` sets a tenant's share (`gptps_sched_task_tenant(name)` is a
+  task type's id under the default tenant function). Past `max_tenants`, further tenants
+  share one extra share, warned of once and counted by `gptps_sched_fair_overflow`. A
+  share of *admissions*, not CPU time.
 - **Shed late** — a constraint: an item more than `grace_ms` past due when it comes up
   for admission is refused (dead-lettered, `GPTPS_E_DENIED`); items without a due time
   never are. `gptps_sched_shed_count` counts them.
@@ -622,8 +633,25 @@ enabled automatically). Panes/metrics:
   the blocking live loop (and self-skips without a TTY).
 - **Ordering:** `gptps_tui_close()` after `gptps_shutdown()`.
 
-Live keys: hotkeys submit their task · `k`/`j` scroll · `m` cycles KPI level ·
-`p` pauses/resumes · `q` quits.
+Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scroll ·
+`m` cycles KPI level · `p` pauses/resumes · `l` dead letters · `q` quits.
+
+- **Dead letters (`l`).** Draining is the only way to read the engine's dead letters, and
+  it takes them, so the view shows their number until you load them (`g`; `r`/`D` load
+  them too). Loaded, the dashboard holds them and shows each one's task, status and why
+  (exit code or start error, last stderr line): `r` re-submits all, `e` the selected one,
+  `x` discards it, `D` discards all. A re-submit the engine refuses (paused, gone, full,
+  denied) stays held with the reason instead of being lost.
+- **Untrusted text.** A job's stderr, a setting's key, value, default, description and
+  choices, task names and labels, and the status line (which repeats a value you
+  committed) are shown as printable, valid UTF-8 only — no control bytes, encoded C1
+  controls, malformed sequences or bidi overrides reach your terminal — and fitted to
+  the width, so a long line never wraps the frame. The editors take UTF-8 (non-ASCII
+  paths, argv, env) and backspace whole characters; bytes that are not UTF-8 (a
+  terminal set to Latin-1) are left out, and the status line says so. Setting keys and
+  task names are read from copies the engine takes under its lock (ABI 2.8), so a task
+  unregistered while the dashboard draws is safe. `gptps_tui_run` needs both stdin and
+  the output on a terminal.
 
 ```c
 gptps_tui_config cfg = { sizeof cfg };
@@ -649,8 +677,15 @@ drives wasm3 / wasmtime / WAMR / etc.
 - **Why pluggable:** keeps the core dependency-free and portable. (Zero-glue
   alternative: `GPTPS_EXEC_PROGRAM` with a runtime CLI, e.g.
   `argv = {"wasmtime", "module.wasm", NULL}`.)
-- **Modes:** in-process (cooperative cancel; all platforms) or OOP (forked, OS-capped,
-  hard-killed; POSIX only — the runtime must be fork-safe).
+- **Modes:** in-process (all platforms) or OOP (forked, OS-capped, hard-killed; POSIX
+  only — the runtime must be fork-safe).
+- **Cancel in-process is cooperative, and needs the ctx.** A `gptps_wasm_run_fn` is not
+  given one, so a module run in-process through it cannot be cancelled: a cancel, its
+  timeout or a draining shutdown waits until it returns. Install with
+  `gptps_wasm_install_ex` instead and the callback (`gptps_wasm_run_ex_fn`) gets the
+  item's `gptps_ctx`: poll `gptps_is_cancelled(ctx)` between epoch/fuel slices, in a host
+  import, or from a watchdog that interrupts the instance, and return
+  `GPTPS_E_CANCELLED`. On Windows in-process is the only mode, so use `_ex` there.
 - **Ordering:** `gptps_wasm_close()` after `gptps_shutdown()`.
 
 ```c
@@ -676,7 +711,12 @@ crash-isolated and independently capped. Two modes:
   reply carries the item's terminal status: `GPTPS_OK` + result on `FINISHED`, the
   failure status on `DEAD_LETTERED` / `DROPPED`, `E_CANCELLED`. A `child_init` hook runs
   in each worker between open and the first request — define resources, register
-  constraints, install `stats` or `durable_queue` there. This is the mode that makes
+  constraints, install `stats` or `durable_queue`, even set the engine's event callback
+  there (replies go out through an observer); `child_init_ex` does the same and can
+  fail. Each worker reports its setup before `gptps_xport_open_ex` returns: one that
+  fails (a duplicate task, an `engine_cfg` the engine rejects, `child_init_ex` refusing)
+  fails the open with an ERROR naming the step, instead of leaving a dead link. A link
+  that breaks later, and a worker that does not exit cleanly, are logged. This is the mode that makes
   scale-out *keep* what GPTPS is for; `pool` and `xport` are now the same pattern at two
   levels (engines behind a router; engines behind a link).
 - **Handler mode** (`gptps_xport_open`, unchanged): a bare handler per request, no engine.

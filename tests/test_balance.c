@@ -183,10 +183,9 @@ static void test_dispatched_cancel_and_close(void)
     CHECK(gptps_balance_submit(b, "block", NULL, 0, &hb) == GPTPS_OK);
     for (i = 0; i < 4; ++i) CHECK(gptps_balance_submit(b, "short", NULL, 0, &hs[i]) == GPTPS_OK);
     CHECK(gptps_balance_queued(b) == 4);
-    gptps_pool_close(p);       /* grace 500ms cancels block -> its terminal frees room -> the
-                                * router tries to hand over -> the shard refuses (shutting down)
-                                * -> DEAD_LETTERED/E_SHUTDOWN here; anything else still queued
-                                * is DROPPED/E_SHUTDOWN at balance_close */
+    gptps_pool_close(p);       /* grace 500ms cancels block -> its terminal frees room, but the
+                                * pool is closing, so the router hands nothing over: all four
+                                * are DROPPED/E_SHUTDOWN at balance_close */
     gptps_balance_close(b);
     CHECK(terminal_total() == 5);
     CHECK(get(&dead_shutdown) + get(&dropped_shutdown) == 4);
@@ -329,6 +328,45 @@ static void test_submit_and_cancel_read_nothing_freed(void)
     gptps_pool_close(p); gptps_balance_close(b);    /* the documented order */
 }
 
+/* 7) close hands out no more backlog. Shard 0 holds work only a cancel ends; shard 1
+ *    holds a 150 ms item; three more wait in the router. Shards close one after
+ *    another, so shard 1 finishes its item while shard 0 is still in its grace - and
+ *    the router used to hand the backlog to shard 1, still open, which STARTED it
+ *    after close had been asked for (whether an item ran or was dead-lettered
+ *    depended on which shard was least loaded). Now none starts: all three are
+ *    DROPPED with GPTPS_E_SHUTDOWN at balance_close. */
+static int started_after_close;
+static int closing_flag;
+static void on_ev_close(const gptps_event *ev, void *u)
+{
+    on_ev(ev, u);
+    if (ev->kind == GPTPS_EV_STARTED && get(&closing_flag) && ev->task_name && strcmp(ev->task_name, "short") == 0)
+        __atomic_add_fetch(&started_after_close, 1, __ATOMIC_SEQ_CST);
+}
+static gptps_status t_150(gptps_ctx *c, void *u) { (void)u; spin_ms(c, 150); return GPTPS_OK; }
+static void test_close_hands_out_nothing(void)
+{
+    gptps_pool *p = open_pool(2); gptps_balance *b; gptps_balance_handle h; int go = 0, i;
+    gptps_balance_config bc; memset(&bc, 0, sizeof bc); bc.struct_size = sizeof bc; bc.shard_depth = 1;
+    reset_log();
+    reg(p, "block", t_block, &go); reg(p, "brief", t_150, NULL); reg(p, "short", t_short, NULL);
+    b = gptps_balance_open(p, &bc);
+    CHECK(b != NULL);
+    if (!b) { gptps_pool_close(p); return; }
+    gptps_balance_set_event_cb(b, on_ev_close, NULL);
+    CHECK(gptps_balance_submit(b, "block", NULL, 0, &h) == GPTPS_OK);   /* shard 0 (ties: lowest) */
+    CHECK(gptps_balance_submit(b, "brief", NULL, 0, &h) == GPTPS_OK);   /* shard 1 */
+    for (i = 0; i < 3; ++i) CHECK(gptps_balance_submit(b, "short", NULL, 0, &h) == GPTPS_OK);
+    CHECK(gptps_balance_queued(b) == 3);
+    __atomic_store_n(&closing_flag, 1, __ATOMIC_SEQ_CST);
+    gptps_pool_close(p);
+    gptps_balance_close(b);
+    __atomic_store_n(&closing_flag, 0, __ATOMIC_SEQ_CST);
+    CHECK(get(&started_after_close) == 0);      /* was 1 or more */
+    CHECK(get(&dropped_shutdown) == 3);
+    CHECK(terminal_total() == 5);
+}
+
 int main(void)
 {
     test_distribution();
@@ -337,6 +375,7 @@ int main(void)
     test_service_is_refused();
     test_service_check_vs_unregister();
     test_submit_and_cancel_read_nothing_freed();
+    test_close_hands_out_nothing();
     if (fails) { printf("%d balance check(s) FAILED\n", fails); return 1; }
     printf("all balance checks passed\n");
     return 0;

@@ -12,8 +12,17 @@
  *            olen is 0, or sizeof(gptps_submit_options): the same binary's struct, as
  *            gptps_xport_submit_opts was given it (see there).
  *   reply    [u64 id][i32 status][u64 rlen][result][u32 mlen][measurements]
+ *            [u32 tlen][stderr tail]
  * The measurements (docs/MEASUREMENTS.md) are those of the item's last attempt, as
- * meas_encode lays them out; mlen is 0 when there are none, as in handler mode.
+ * meas_encode lays them out; mlen is 0 when there are none, as in handler mode. The
+ * tail (ABI 2.8) is that attempt's stderr tail (gptps_event.stderr_tail); tlen is 0
+ * when there is none, as in handler mode.
+ *
+ * Before any of that, each worker sends ONE hello frame, [u32 magic][i32 status]
+ * [u32 step][u32 index], once its setup is done (status GPTPS_OK, step XP_STEP_READY)
+ * or as it fails (the step that failed, and for a task the index of its def); then
+ * it exits. open_ex reads every hello before it starts a reader or returns, so a
+ * worker whose setup failed fails the open instead of leaving a dead link behind.
  *
  * PARENT: submit() registers a pending record under the link's pmu (bounded by
  * max_in_flight -> E_FULL), writes the frame under the link's wmu, and either waits
@@ -27,8 +36,10 @@
  * either. The reader takes pmu only. A callback runs with no lock held.
  *
  * WORKER, engine mode: the main thread reads requests and gptps_submit()s them to
- * the worker's own engine, recording handle -> request id. The engine's event
- * callback (dispatcher thread) writes the reply on the item's terminal event. EOF on
+ * the worker's own engine, recording handle -> request id. An OBSERVER on that
+ * engine writes the reply on the item's terminal event. Not the event callback: that
+ * slot is the host's (gptps_set_event_cb is single-slot), and a child_init that set
+ * one used to replace the reply path, so every submit then waited forever. EOF on
  * the link => gptps_shutdown (bounded drain; remaining replies are sent) => _exit.
  *
  * WORKER, handler mode: the main thread reads a request, runs the handler, writes
@@ -55,6 +66,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>    /* snprintf: what a failed worker is reported with */
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
@@ -216,6 +228,57 @@ static int write_reply(int fd, uint64_t id, int32_t st, const void *res, uint64_
     return 0;
 }
 
+/* ---- the hello: a worker's setup, reported once before the first request ---- */
+#define XP_HELLO_MAGIC  0x47585031u   /* "GXP1" */
+#define XP_STEP_READY    0u           /* set up; the link is open for requests */
+#define XP_STEP_OPEN     1u           /* gptps_open_ex(engine_cfg) */
+#define XP_STEP_TASK     2u           /* gptps_register_task(tasks[index]) */
+#define XP_STEP_OBSERVER 3u           /* registering the reply observer */
+#define XP_STEP_INIT     4u           /* child_init_ex */
+
+static int send_hello(int fd, gptps_status st, uint32_t step, uint32_t index)
+{
+    uint32_t f[4];
+    f[0] = XP_HELLO_MAGIC; f[1] = (uint32_t)(int32_t)st; f[2] = step; f[3] = index;
+    return sock_write_all(fd, f, sizeof f);
+}
+
+/* Read worker `i`'s hello. 0: ready. -1: not, with why in msg. */
+static int read_hello(int fd, size_t i, const gptps_xport_config *cfg, char *msg, size_t cap)
+{
+    uint32_t f[4];
+    const char *what;
+    char task[160];
+    gptps_status st;
+    if (sock_read_all(fd, f, sizeof f) != 0) {
+        snprintf(msg, cap, "gptps_xport: worker %lu exited before it was set up "
+                 "(gptps_xport_close reports how); the transport was not opened",
+                 (unsigned long)i);
+        return -1;
+    }
+    if (f[0] != XP_HELLO_MAGIC) {
+        snprintf(msg, cap, "gptps_xport: worker %lu sent no hello; the transport was not opened",
+                 (unsigned long)i);
+        return -1;
+    }
+    st = (gptps_status)(int32_t)f[1];
+    if (f[2] == XP_STEP_READY && st == GPTPS_OK) return 0;
+    task[0] = 0;
+    switch (f[2]) {
+    case XP_STEP_OPEN:     what = "gptps_open_ex(engine_cfg)"; break;
+    case XP_STEP_TASK:
+        snprintf(task, sizeof task, "gptps_register_task(tasks[%lu] \"%.100s\")", (unsigned long)f[3],
+                 (cfg->tasks && f[3] < cfg->ntasks && cfg->tasks[f[3]].name) ? cfg->tasks[f[3]].name : "?");
+        what = task; break;
+    case XP_STEP_OBSERVER: what = "registering its reply observer"; break;
+    case XP_STEP_INIT:     what = "child_init_ex"; break;
+    default:               what = "its setup"; break;
+    }
+    snprintf(msg, cap, "gptps_xport: worker %lu could not be set up: %s returned %s (%d); "
+             "the transport was not opened", (unsigned long)i, what, gptps_strerror(st), (int)st);
+    return -1;
+}
+
 /* Read one request. Returns 0 with malloc'd task and payload, -1 on EOF/error/bad
  * length (the caller drops the link: a stream cannot resynchronise mid-frame). */
 static int read_request(int fd, uint64_t *id, char **task, void **payload, uint64_t *plen,
@@ -250,6 +313,7 @@ static int read_request(int fd, uint64_t *id, char **task, void **payload, uint6
  * ==========================================================================*/
 static void worker_handler_main(int fd, gptps_xport_run_fn run, void *ud)
 {
+    if (send_hello(fd, GPTPS_OK, XP_STEP_READY, 0) != 0) { close(fd); _exit(0); }
     for (;;) {
         uint64_t id, plen, rl;
         char *task; void *payload, *res = NULL; size_t rlen = 0;
@@ -312,7 +376,7 @@ static int is_terminal(const gptps_event *ev)
     return ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED;
 }
 
-/* Dispatcher thread. The table lookup can block briefly on mmu while the main
+/* The reply observer (dispatcher thread). The table lookup can block briefly on mmu while the main
  * thread is inside gptps_submit + insert; that is deliberate (see the main loop) and
  * safe because the core emits events with its own lock released. */
 static void worker_engine_ev(const gptps_event *ev, void *ud)
@@ -393,6 +457,7 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
     worker_engine_ctx c;
     gptps *e = NULL;
     size_t i;
+    gptps_status st0;
 
     memset(&c, 0, sizeof c);
     c.fd = fd;
@@ -401,11 +466,28 @@ static void worker_engine_main(int fd, const gptps_xport_config *cfg)
 
     /* A FRESH engine, in this process, after the fork. The parent's engines (if any)
      * are never touched from here. */
-    if (gptps_open_ex(cfg->engine_cfg, &e) != GPTPS_OK || !e) { close(fd); _exit(2); }
+    /* Every step that can fail says so in the hello, and the parent's open fails. */
+    if ((st0 = gptps_open_ex(cfg->engine_cfg, &e)) != GPTPS_OK || !e) {
+        send_hello(fd, st0 != GPTPS_OK ? st0 : GPTPS_E_NOMEM, XP_STEP_OPEN, 0);
+        close(fd); _exit(2);
+    }
     for (i = 0; i < cfg->ntasks; ++i)
-        if (gptps_register_task(e, &cfg->tasks[i]) != GPTPS_OK) { gptps_shutdown(e); close(fd); _exit(3); }
-    if (gptps_set_event_cb(e, worker_engine_ev, &c) != GPTPS_OK) { gptps_shutdown(e); close(fd); _exit(4); }
+        if ((st0 = gptps_register_task(e, &cfg->tasks[i])) != GPTPS_OK) {
+            send_hello(fd, st0, XP_STEP_TASK, (uint32_t)i);
+            gptps_shutdown(e); close(fd); _exit(3);
+        }
+    /* An observer, not the event callback: the callback slot is the host's, and
+     * child_init may well set it (see the file comment). */
+    if ((st0 = gptps_register_observer(e, worker_engine_ev, &c)) != GPTPS_OK) {
+        send_hello(fd, st0, XP_STEP_OBSERVER, 0);
+        gptps_shutdown(e); close(fd); _exit(4);
+    }
     if (cfg->child_init) cfg->child_init(e, cfg->child_init_ud);
+    if (cfg->child_init_ex && (st0 = cfg->child_init_ex(e, cfg->child_init_ud)) != GPTPS_OK) {
+        send_hello(fd, st0, XP_STEP_INIT, 0);
+        gptps_shutdown(e); close(fd); _exit(5);
+    }
+    if (send_hello(fd, GPTPS_OK, XP_STEP_READY, 0) != 0) { gptps_shutdown(e); close(fd); _exit(0); }
 
     for (;;) {
         uint64_t id, plen;
@@ -512,6 +594,7 @@ typedef struct {
     pending    *pend;
     uint32_t    npend;
     int         dead;            /* link retired: reader has failed everything outstanding */
+    int         closing;         /* under pmu: gptps_xport_close has begun; an EOF is expected */
     int         reader_started;
     pthread_t   reader;
 } xport_worker;
@@ -576,8 +659,12 @@ static void fail_all(gptps_xport *xp, size_t idx)
 {
     xport_worker *w = &xp->w[idx];
     pending *p, *async_list = NULL;
+    uint32_t lost;
+    int expected;
     apx_mutex_lock(&w->pmu);
     w->dead = 1;
+    lost = w->npend;
+    expected = w->closing;
     /* Publish retirement before a blocking submitter can observe completion.
      * cursor_lock is never held while acquiring pmu, so this order is safe. */
     mark_dead(xp, idx);
@@ -592,6 +679,14 @@ static void fail_all(gptps_xport *xp, size_t idx)
     w->npend = 0;
     apx_cond_broadcast(&w->pcv);
     apx_mutex_unlock(&w->pmu);
+    if (!expected) {                                /* never silent: a link that died */
+        char msg[256];
+        snprintf(msg, sizeof msg, "gptps_xport: worker %lu (pid %ld) broke its link; it is "
+                 "retired, not respawned, and the %lu request(s) outstanding on it failed with "
+                 "GPTPS_E_IO (gptps_xport_close reports how it exited)",
+                 (unsigned long)idx, (long)w->pid, (unsigned long)lost);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
     while (async_list) {                            /* callbacks, no lock held */
         pending *n = async_list->next;
         complete_async(async_list, GPTPS_E_IO, GPTPS_E_IO, NULL, 0, NULL, 0, 0, NULL, 0);
@@ -662,13 +757,21 @@ static void *reader_main(void *arg)
     return NULL;
 }
 
-gptps_xport *gptps_xport_open_ex(const gptps_xport_config *cfg)
+/* The config as this build knows it: a caller's older, shorter struct (one ending at
+ * child_init_ud, from before child_init_ex) gets the fields it lacks zeroed. */
+#define XP_CFG_MIN (offsetof(gptps_xport_config, child_init_ud) + sizeof(void *))
+
+gptps_xport *gptps_xport_open_ex(const gptps_xport_config *ucfg)
 {
     gptps_xport *xp;
+    gptps_xport_config cfgv, *cfg = &cfgv;
     size_t i;
     int engine_mode;
 
-    if (!cfg || cfg->struct_size < sizeof(gptps_xport_config) || cfg->nworkers < 1) return NULL;
+    if (!ucfg || ucfg->struct_size < XP_CFG_MIN) return NULL;
+    memset(&cfgv, 0, sizeof cfgv);
+    memcpy(&cfgv, ucfg, ucfg->struct_size < sizeof cfgv ? ucfg->struct_size : sizeof cfgv);
+    if (cfg->nworkers < 1) return NULL;
     if (cfg->run && cfg->tasks) return NULL;            /* pick a mode */
     if (!cfg->run && !cfg->tasks) return NULL;
     engine_mode = (cfg->tasks != NULL);
@@ -709,7 +812,19 @@ gptps_xport *gptps_xport_open_ex(const gptps_xport_config *cfg)
         xp->n = i + 1;                                   /* keep n consistent for a partial teardown */
     }
 
-    /* Phase 2: one reader per link. */
+    /* Phase 2: each worker's hello. Still no thread of ours, and every worker forked:
+     * one whose setup failed fails the open, with the reason, and close() reaps the
+     * rest (they see EOF and exit). */
+    for (i = 0; i < xp->n; ++i) {
+        char msg[512];
+        if (read_hello(xp->w[i].fd, i, cfg, msg, sizeof msg) != 0) {
+            gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+            gptps_xport_close(xp);
+            return NULL;
+        }
+    }
+
+    /* Phase 3: one reader per link. */
     for (i = 0; i < xp->n; ++i) {
         reader_arg *ra = (reader_arg *)malloc(sizeof *ra);
         if (!ra) { gptps_xport_close(xp); return NULL; }
@@ -1027,6 +1142,9 @@ void gptps_xport_close(gptps_xport *xp)
      * (engine mode: gptps_shutdown, bounded by its grace), sends what it still owes,
      * and exits. Retired links are already shut. */
     for (i = 0; i < xp->n; ++i) {
+        apx_mutex_lock(&xp->w[i].pmu);
+        xp->w[i].closing = 1;                    /* the EOF that follows is expected */
+        apx_mutex_unlock(&xp->w[i].pmu);
         apx_mutex_lock(&xp->w[i].wmu);
         if (xp->w[i].fd >= 0) shutdown(xp->w[i].fd, SHUT_WR);
         apx_mutex_unlock(&xp->w[i].wmu);
@@ -1036,9 +1154,20 @@ void gptps_xport_close(gptps_xport *xp)
         if (xp->w[i].reader_started) pthread_join(xp->w[i].reader, NULL);
     /* Phase 3: reap and free. */
     for (i = 0; i < xp->n; ++i) {
-        int st;
+        int st = 0;
+        pid_t r;
         if (xp->w[i].fd >= 0) close(xp->w[i].fd);
-        while (waitpid(xp->w[i].pid, &st, 0) < 0 && errno == EINTR) { }
+        while ((r = waitpid(xp->w[i].pid, &st, 0)) < 0 && errno == EINTR) { }
+        if (r == xp->w[i].pid && !(WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+            char msg[200];                       /* never silent: how a worker ended */
+            if (WIFSIGNALED(st))
+                snprintf(msg, sizeof msg, "gptps_xport: worker %lu (pid %ld) was killed by signal %d",
+                         (unsigned long)i, (long)xp->w[i].pid, WTERMSIG(st));
+            else
+                snprintf(msg, sizeof msg, "gptps_xport: worker %lu (pid %ld) exited with status %d",
+                         (unsigned long)i, (long)xp->w[i].pid, WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+            gptps_log(NULL, GPTPS_LOG_WARN, msg);
+        }
         apx_mutex_destroy(&xp->w[i].wmu);
         apx_mutex_destroy(&xp->w[i].pmu);
         apx_cond_destroy(&xp->w[i].pcv);

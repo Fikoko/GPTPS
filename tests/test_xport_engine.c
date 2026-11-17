@@ -13,6 +13,13 @@
  *   - link death: outstanding requests fail with E_IO, the worker is retired, the
  *     rest of the pool keeps answering
  *   - graceful close: an async request in flight at close still gets its reply
+ *   - never silent: a link that breaks, and a worker that did not exit cleanly, are
+ *     logged
+ *   - a worker whose setup fails (a duplicate task, child_init_ex refusing, a config
+ *     the engine rejects) fails the open, with an ERROR naming the step - it used to
+ *     return a transport whose every submit came back GPTPS_E_IO, with nothing logged
+ *   - a child_init that sets the engine's event callback does not take the reply path
+ *     away (replies used to stop, and every blocking submit waited forever)
  * POSIX only (fork + socketpair).
  */
 #define _POSIX_C_SOURCE 200809L
@@ -22,7 +29,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -67,6 +76,35 @@ static void child_init(gptps *e, void *u)
     gptps_set_task_resource_cost(e, "seat", "seats", 1);
 }
 
+/* What the add-on logs (process-wide sink; the readers log from their threads). */
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_log[8192];
+static void log_sink(gptps_log_level lvl, const char *msg, void *u)
+{
+    size_t n;
+    (void)u;
+    pthread_mutex_lock(&g_log_mu);
+    n = strlen(g_log);
+    snprintf(g_log + n, sizeof g_log - n, "[%d] %s\n", (int)lvl, msg);
+    pthread_mutex_unlock(&g_log_mu);
+}
+static int logged(const char *needle)
+{
+    int r;
+    pthread_mutex_lock(&g_log_mu);
+    r = strstr(g_log, needle) != NULL;
+    pthread_mutex_unlock(&g_log_mu);
+    return r;
+}
+static void log_clear(void) { pthread_mutex_lock(&g_log_mu); g_log[0] = 0; pthread_mutex_unlock(&g_log_mu); }
+
+/* child_init hooks for the setup cases */
+static void ev_noop(const gptps_event *ev, void *u) { (void)ev; (void)u; }
+static void init_sets_event_cb(gptps *e, void *u)
+{   (void)u; gptps_set_event_cb(e, ev_noop, NULL); }   /* the host's slot: allowed */
+static gptps_status init_ex_refuses(gptps *e, void *u)
+{   (void)e; (void)u; return GPTPS_E_INVAL; }
+
 /* async bookkeeping (parent side) */
 /* Replies arrive on the links' reader threads (one per worker), so every field is
  * touched atomically and each test block uses a fresh, zero-initialised acc. */
@@ -107,6 +145,8 @@ int main(void)
     deftask(&tasks[4], "die",   t_die,   0, 0);
     deftask(&tasks[5], "seat",  t_seat,  0, 0);
     deftask(&tasks[6], "nores", t_pid,   0, 0);
+    gptps_set_log_sink(log_sink, NULL);
+    alarm(120);   /* a hang (a reply path lost) fails the test instead of blocking it */
 
     /* misconfiguration: both modes, or neither */
     {   gptps_xport_config bad; memset(&bad, 0, sizeof bad);
@@ -198,6 +238,7 @@ int main(void)
         wait_replies(&a, 1);
         CHECK(get(&a.replies) == 1 && get(&a.io_errs) == 1);
         CHECK(gptps_xport_live(xp) == 1);
+        CHECK(logged("broke its link"));             /* never silent */
         for (i = 0; i < 3; ++i) {                    /* the rotation skips the dead one */
             CHECK(gptps_xport_submit(xp, "pid", NULL, 0, &res, &rlen, &ts) == GPTPS_OK);
             CHECK(ts == GPTPS_OK); free(res);
@@ -207,7 +248,65 @@ int main(void)
     {   acc a = {0, 0, 0};
         CHECK(gptps_xport_submit_async(xp, "sleep", NULL, 0, on_reply, &a, NULL) == GPTPS_OK);
         gptps_xport_close(xp);
-        CHECK(get(&a.replies) == 1 && get(&a.ok) == 1 && get(&a.io_errs) == 0); }
+        CHECK(get(&a.replies) == 1 && get(&a.ok) == 1 && get(&a.io_errs) == 0);
+        CHECK(logged("exited with status 1")); }     /* the "die" worker, reaped */
+
+    /* 10) a worker whose setup fails fails the open, and says why */
+    {   gptps_task_def dup[2];
+        gptps_xport_config c; gptps_config ec;
+        deftask(&dup[0], "a", t_pid, 0, 0);
+        deftask(&dup[1], "a", t_pid, 0, 0);          /* E_DUP in every worker */
+        memset(&ec, 0, sizeof ec);
+        ec.struct_size = sizeof ec; ec.limits.struct_size = sizeof ec.limits;
+        ec.limits.max_concurrent_tasks = 2; ec.limits.max_memory_bytes = 1024;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.nworkers = 2; c.engine_cfg = &ec; c.tasks = dup; c.ntasks = 2;
+        log_clear();
+        CHECK(gptps_xport_open_ex(&c) == NULL);      /* was a transport of dead links */
+        CHECK(logged("gptps_register_task(tasks[1] \"a\")"));
+        CHECK(logged("could not be set up"));
+        /* child_init_ex refusing */
+        c.tasks = tasks; c.ntasks = 1; c.child_init_ex = init_ex_refuses;
+        log_clear();
+        CHECK(gptps_xport_open_ex(&c) == NULL);
+        CHECK(logged("child_init_ex returned"));
+        /* an engine config the engine rejects */
+        ec.struct_size = 1;
+        c.child_init_ex = NULL;
+        log_clear();
+        CHECK(gptps_xport_open_ex(&c) == NULL);
+        CHECK(logged("gptps_open_ex(engine_cfg)"));
+        /* a config struct from before child_init_ex is still accepted */
+        ec.struct_size = sizeof ec;
+        c.struct_size = offsetof(gptps_xport_config, child_init_ud) + sizeof(void *);
+        c.child_init_ex = init_ex_refuses;           /* past its struct_size: not read */
+        xp = gptps_xport_open_ex(&c);
+        CHECK(xp != NULL);
+        if (xp) {
+            CHECK(gptps_xport_submit(xp, "pid", NULL, 0, &res, &rlen, &ts) == GPTPS_OK && ts == GPTPS_OK);
+            free(res);
+            gptps_xport_close(xp);
+        } }
+
+    /* 11) a child_init that sets the engine's event callback keeps the replies coming */
+    {   gptps_xport_config c; gptps_config ec;
+        memset(&ec, 0, sizeof ec);
+        ec.struct_size = sizeof ec; ec.limits.struct_size = sizeof ec.limits;
+        ec.limits.max_concurrent_tasks = 2; ec.limits.max_memory_bytes = 1024;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.nworkers = 1; c.engine_cfg = &ec; c.tasks = tasks; c.ntasks = 1;
+        c.child_init = init_sets_event_cb;
+        xp = gptps_xport_open_ex(&c);
+        CHECK(xp != NULL);
+        if (xp) {
+            res = NULL;
+            CHECK(gptps_xport_submit(xp, "pid", NULL, 0, &res, &rlen, &ts) == GPTPS_OK);   /* hung */
+            CHECK(ts == GPTPS_OK && rlen == sizeof(int32_t));
+            free(res);
+            gptps_xport_close(xp);
+        } }
+    alarm(0);
+    gptps_set_log_sink(NULL, NULL);
 
     if (fails) { printf("%d xport-engine check(s) FAILED\n", fails); return 1; }
     printf("all xport (engine mode) checks passed\n");

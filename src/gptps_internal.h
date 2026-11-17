@@ -68,10 +68,15 @@ typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flag
  * the trap, and would have started returning E_INVAL to every caller already compiled.
  * Retrofitting the floor is strictly more permissive (anyone passing sizeof still
  * passes), so it breaks nobody and unblocks the append. Its floor is frozen at the
- * 1.0.0 layout, which ends at `dead`. gptps_setting_info still carries the old check;
- * it can be retrofitted the same way the day something needs to grow it. */
+ * 1.0.0 layout, which ends at `dead`. gptps_setting_info had the old check too, until
+ * ABI 2.8 appended `key_copy` / `desc_copy`; its floor is frozen at the 1.0.0 layout,
+ * which ends at `defval`. The copies are filled only when struct_size reaches the END
+ * of `desc_copy`, so an old struct_size that includes trailing padding past `defval`
+ * is never mistaken for one that has them. */
 #define GPTPS_ADDON_INFO_MIN_SIZE     GPTPS_LAST_FIELD_END(gptps_addon_info, enabled)
 #define GPTPS_TASK_INFO_MIN_SIZE      GPTPS_LAST_FIELD_END(gptps_task_info, dead)
+#define GPTPS_SETTING_INFO_MIN_SIZE   GPTPS_LAST_FIELD_END(gptps_setting_info, defval)
+#define GPTPS_SETTING_INFO_COPY_SIZE  GPTPS_LAST_FIELD_END(gptps_setting_info, desc_copy)
 /* Same tail-padding hazard as gptps_task_def above, same remedy: `flags` must stay the
  * widest member so offsetof(flags) lands exactly on the pre-2.2 padded sizeof and can
  * never hide inside old trailing padding - otherwise a 1.0.0 struct_size could be

@@ -91,8 +91,22 @@ gptps_status gptps_pool_cancel(gptps_pool *p, gptps_pool_handle h);
 /* Aggregate: total retained dead-lettered items across all shards. */
 size_t gptps_pool_dead_letter_count(gptps_pool *p);
 
-/* Shut down (drain + join) and free every shard, then the pool. */
+/* Shut down (drain + join) and free every shard, then the pool.
+ *
+ * BOUNDED BY ONE GRACE, not N: each shard's limits.shutdown_grace_ms counts from the
+ * moment close begins, so the whole close takes at most the largest shard grace plus
+ * a ~200 ms hard-kill slice per shard. The shards are shut down one after another on
+ * the calling thread; a shard not reached yet keeps running its own queue meanwhile,
+ * as it would in its own drain, with what is left of its grace. gptps_balance stops
+ * handing its backlog to shards as soon as close begins (gptps_pool_closing).
+ * Like gptps_shutdown, not from a callback: a shard called from its own callback
+ * refuses (GPTPS_E_BUSY), and then this returns with that shard and the pool left
+ * in place, logged as an ERROR - call it again from your own thread. */
 void gptps_pool_close(gptps_pool *p);
+
+/* Nonzero once gptps_pool_close has begun on `p`. For a router above the pool
+ * (gptps_balance) that must stop handing out work. */
+int gptps_pool_closing(gptps_pool *p);
 
 #ifdef __cplusplus
 }

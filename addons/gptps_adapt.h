@@ -34,7 +34,9 @@
  * WHAT IT COUNTS. A cap hit is a mem.cap_hit of 1, or a process job that FAILED with
  * GPTPS_E_NOMEM (how RLIMIT_AS and a task that ran out report it). Only events that
  * carry measurements count, so an in-process task - which has none - is never
- * adapted. MEASUREMENTS.md rule 4: never mix methods. The first mem.peak method seen
+ * adapted; nor do cancelled, timed-out or shut-down attempts, nor one whose program
+ * never started (a start.error measurement, ABI 2.8): what was measured then is the
+ * forked child before its exec, not the program. MEASUREMENTS.md rule 4: never mix methods. The first mem.peak method seen
  * for a task is the one its evidence is kept in; a peak measured another way (the
  * job moved into cgroup mode, say) is counted in `other_method` and not folded in.
  *

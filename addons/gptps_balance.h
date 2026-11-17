@@ -29,6 +29,10 @@
  *   gptps_balance_submit(b, "resize", buf, len, &h);
  *   ... gptps_pool_close(p); gptps_balance_close(b);   // close AFTER the pool
  *
+ * Close: once gptps_pool_close begins, nothing more is handed to a shard. Work still
+ * queued here then ends DROPPED with GPTPS_E_SHUTDOWN at gptps_balance_close, and
+ * work a shard already holds drains as that shard's own.
+ *
  * Events: the host's callback sees the engine's lifecycle events for balanced work
  * with `handle` rewritten to the balance handle - plus a QUEUED emitted by this
  * module at submit time (the item queued HERE), and a terminal DEAD_LETTERED /

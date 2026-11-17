@@ -17,6 +17,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>    /* snprintf: the grace setting, and what close reports */
 
 /* pool handle layout: [ 16-bit shard | 48-bit engine handle ]. Engine handles start
  * at 1 and increment, so 48 bits (2.8e14) is far more than any real run submits. */
@@ -28,8 +29,9 @@
 struct gptps_pool {
     gptps    **shards;
     size_t     n;
-    apx_mutex  cursor_lock;   /* guards `cursor` (round-robin only) */
+    apx_mutex  cursor_lock;   /* guards `cursor` (round-robin only), and `closing` */
     uint64_t   cursor;
+    int        closing;       /* gptps_pool_close has begun (gptps_pool_closing) */
 };
 
 static gptps_pool_handle pool_pack(size_t shard, gptps_handle h)
@@ -162,11 +164,71 @@ size_t gptps_pool_dead_letter_count(gptps_pool *p)
     return total;
 }
 
+int gptps_pool_closing(gptps_pool *p)
+{
+    int c;
+    if (!p) return 0;
+    apx_mutex_lock(&p->cursor_lock);
+    c = p->closing;
+    apx_mutex_unlock(&p->cursor_lock);
+    return c;
+}
+
+/* A shard's limits.shutdown_grace_ms; 0 means "wait forever", as the engine reads it. */
+static uint64_t shard_grace(gptps *e)
+{
+    char buf[32];
+    if (gptps_settings_get(e, "limits.shutdown_grace_ms", buf, sizeof buf) != GPTPS_OK) return 30000u;
+    return strtoull(buf, NULL, 10);
+}
+
+/* ONE grace for the whole pool. gptps_shutdown is bounded per engine, and shards are
+ * shut down one after another on the calling thread (it is the thread gptps_shutdown
+ * checks for a callback - a helper thread would not be refused, and would join the very
+ * thread waiting for it). So each shard's grace is counted from the moment close
+ * began, not from its own turn: before shard k is shut down, what is left of its
+ * grace is written to its live limits.shutdown_grace_ms (at least 1 ms - 0 would mean
+ * forever). A pool's close took up to N x shutdown_grace_ms; now it takes at most the
+ * largest grace plus each shard's ~200 ms hard-kill slice, and a shard left waiting
+ * for its turn ran its own work in the meantime, as it would during its own drain.
+ *
+ * A shard that refuses (GPTPS_E_BUSY: close was called from one of its callbacks) is
+ * left running, and so is the pool: it is reported, not freed, and a later call from
+ * the host's own thread finishes it - freeing the shards under a running engine was a
+ * use-after-free. */
 void gptps_pool_close(gptps_pool *p)
 {
-    size_t i;
+    size_t i, busy = 0;
+    uint64_t start;
     if (!p) return;
-    for (i = 0; i < p->n; ++i) gptps_shutdown(p->shards[i]);
+    apx_mutex_lock(&p->cursor_lock);
+    p->closing = 1;              /* gptps_balance stops handing out its backlog */
+    apx_mutex_unlock(&p->cursor_lock);
+    start = gptps_now_ms(NULL);
+    for (i = 0; i < p->n; ++i) {
+        uint64_t grace, used;
+        gptps_status st;
+        if (!p->shards[i]) continue;                 /* shut down by an earlier call */
+        grace = shard_grace(p->shards[i]);
+        used = gptps_now_ms(NULL) - start;
+        if (grace && used > 0) {                     /* 0: this shard waits forever */
+            char v[32];
+            snprintf(v, sizeof v, "%llu", (unsigned long long)(used < grace ? grace - used : 1u));
+            (void)gptps_settings_set(p->shards[i], "limits.shutdown_grace_ms", v);
+        }
+        st = gptps_shutdown(p->shards[i]);
+        if (st == GPTPS_E_BUSY) { ++busy; continue; }
+        p->shards[i] = NULL;
+    }
+    if (busy) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "gptps_pool_close: called from a callback of %lu of its shards, "
+                 "which cannot shut down from there (GPTPS_E_BUSY); they and the pool are left "
+                 "as they are - call gptps_pool_close again from the host's own thread",
+                 (unsigned long)busy);
+        gptps_log(NULL, GPTPS_LOG_ERROR, msg);
+        return;
+    }
     apx_mutex_destroy(&p->cursor_lock);
     free(p->shards);
     free(p);
