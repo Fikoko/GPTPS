@@ -1871,7 +1871,9 @@ GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, vo
  * The dispatcher's mechanism is fixed and general: it admits the best-ordered
  * pending item that fits the live budget, skips a too-large item to backfill
  * smaller work behind it (no head-of-line blocking), and reserves for a
- * repeatedly-skipped top item so it cannot starve - unless what it lacks is held by
+ * repeatedly-skipped item so it cannot starve (every item a backfill passes is
+ * charged a skip, the highest-ranked one that has used up its skips is reserved
+ * for) - unless what it lacks is held by
  * running GPTPS_TASK_SERVICE instances, which do not drain: then it waits for a
  * service to stop, other work goes on, and a WARN says so once per task type
  * (reserving would stop all admission for as long as the services live). What
@@ -1891,8 +1893,8 @@ GPTPS_API gptps_status gptps_unregister_observer(gptps *e, gptps_event_cb fn, vo
  * table); check in->struct_size before reading fields appended in a later minor.
  *
  * NOTE: a score should be a reasonably STABLE ordering key for a given item across
- * passes. The starvation guard charges "skips" to whichever item is currently
- * top-of-order, so a scheduler that returns wildly fluctuating scores for the same
+ * passes. The starvation guard charges "skips" to the items a backfill passes in the
+ * current order, so a scheduler that returns wildly fluctuating scores for the same
  * item can spread those skips across different items and weaken the per-item
  * anti-starvation bound. Age-based aging is fine (it is monotonic); prefer a key
  * that only moves an item UP over time (e.g. -deadline, or priority + age).

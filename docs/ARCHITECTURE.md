@@ -255,22 +255,24 @@ Step 4 of the dispatch loop does more than FIFO. Each admission pass scans
 Then:
 
 - If `best == top`, admit it (the normal case).
-- If `best != top`, admitting `best` **skips** the higher-priority `top` because
-  `top` doesn't fit the budget yet. This is **skip-to-fit backfill**: a too-large
-  task does not head-of-line-block smaller work behind it. Each skip charges
-  `top` a counter.
-- Once `top` has been skipped `reserve_after_skips` times (default 8, configurable),
-  the dispatcher **reserves** for it: backfill is suspended and the engine drains
-  running tasks until `top` fits. This bounds starvation to at most
-  `reserve_after_skips` backfills. Over-budget submits are rejected up front, and
+- If `best != top`, admitting `best` **skips** `top` and every other higher-priority
+  item queued ahead of `best`, because none of them fits the budget yet. This is
+  **skip-to-fit backfill**: a too-large task does not head-of-line-block smaller work
+  behind it. Each skip charges every item it passes a counter.
+- Once such an item has been skipped `reserve_after_skips` times (default 8,
+  configurable), the dispatcher **reserves** for it - for the highest-priority one,
+  when several have: backfill is suspended and the engine drains running tasks until
+  it fits. This bounds starvation to at most `reserve_after_skips` backfills per item.
+  Over-budget submits are rejected up front, and
   a queued item that a live budget cut or cost raise leaves unable ever to fit is
   dead-lettered with `GPTPS_E_BUDGET` when the scan reaches it. Running
   `GPTPS_TASK_SERVICE` instances do not drain - each keeps its reservation while it is
-  up - so when `top` cannot fit beside what services hold, the dispatcher does not
+  up - so when an item cannot fit beside what services hold, the dispatcher does not
   reserve for it (that would stop all admission for as long as the services live):
-  other work keeps being admitted past it, `top` starts once enough budget is free,
-  and one WARN per task type says so. A reservation therefore only ever waits for
-  work that drains; it cannot wait forever.
+  it reserves for the next skipped item that draining can make fit, if any, or else
+  other work keeps being admitted past it; the item starts once enough budget is
+  free, and one WARN per task type says so. A reservation therefore only ever waits
+  for work that drains; it cannot wait forever.
 - **A due retry announced this pass** (step 2b, zero backoff) is not in `intake` yet.
   Work at or above its priority is admitted as usual; lower work only while it still
   fits beside every due retry, a slot and its declared memory each. MANUAL mode admits

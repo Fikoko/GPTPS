@@ -955,10 +955,22 @@ static int bounded_sealed(const gptps *e)
 { return e->max_items && gptps_hal_load_acquire_u32(&e->sealed); }
 
 /* The cancel word (gptps_item.cancel): raised by a cancel, a deadline or a removal,
- * polled by the body through gptps_is_cancelled and by the process executors. */
-static void cancel_raise(gptps_item *it)        { gptps_hal_store_release_u32(&it->cancel, 1u); }
-static void cancel_clear(gptps_item *it)        { gptps_hal_store_release_u32(&it->cancel, 0u); }
+ * polled by the body through gptps_is_cancelled and by the process executors, which
+ * test it for non-zero only. Its value says WHY it went up, so execute() can tell a
+ * timeout from a stop by what raised the flag - not by the clock when the attempt
+ * returned, which misreports a cancel issued before the deadline whose graceful stop
+ * (stop_grace_ms) ended after it. The first raise wins and later ones leave it as it
+ * is. Every raise but the two deadline ones a running body or a MANUAL execute() makes
+ * is under e->m, so the check-then-store races only with those - an explicit stop and
+ * a deadline at the same instant, where either reading is true. */
+#define CANCEL_STOP     1u   /* gptps_cancel, task removal, shutdown */
+#define CANCEL_DEADLINE 2u   /* the attempt's deadline passed */
 static int  cancel_raised(const gptps_item *it) { return gptps_hal_load_acquire_u32(&it->cancel) != 0; }
+static void cancel_raise_why(gptps_item *it, uint32_t why)
+{ if (!cancel_raised(it)) gptps_hal_store_release_u32(&it->cancel, why); }
+static void cancel_raise(gptps_item *it)        { cancel_raise_why(it, CANCEL_STOP); }
+static void deadline_raise(gptps_item *it)      { cancel_raise_why(it, CANCEL_DEADLINE); }
+static void cancel_clear(gptps_item *it)        { gptps_hal_store_release_u32(&it->cancel, 0u); }
 
 static void item_free(gptps *e, gptps_item *it)
 {
@@ -1062,7 +1074,7 @@ bool gptps_is_cancelled(const gptps_ctx *ctx)
     if (!ctx || !ctx->cancel) return false;
     if (gptps_hal_load_acquire_u32(ctx->cancel) != 0) return true;
     if (ctx->deadline_ms && gptps_hal_monotonic_ms() >= ctx->deadline_ms) {
-        gptps_hal_store_release_u32(ctx->cancel, 1u);
+        gptps_hal_store_release_u32(ctx->cancel, CANCEL_DEADLINE);   /* was 0 just above */
         return true;
     }
     return false;
@@ -1286,6 +1298,7 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
     size_t oop_len = 0;
     bool inproc = (it->def->exec == GPTPS_EXEC_INPROC);
     bool raised = false;           /* the cancel flag, read ONCE after the attempt */
+    uint32_t why = 0;              /* ...and what raised it (CANCEL_STOP / CANCEL_DEADLINE) */
     exec_sampler sp;               /* a process job's measurements (docs/MEASUREMENTS.md) */
     gptps_exec_caps caps;          /* what a process job may use; the executor says what held */
 
@@ -1324,18 +1337,13 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
          * have done for a body still running past it, so a late return is a
          * GPTPS_E_TIMEOUT in both modes, not a FINISHED here and a timeout there. */
         if (e->manual && ctx.deadline_ms && gptps_hal_monotonic_ms() >= ctx.deadline_ms)
-            cancel_raise(it);
-        raised = cancel_raised(it);
-        if (raised) {
-            /* Tell a deadline breach apart from an explicit stop. The dispatcher's
-             * watchdog raises this flag only once the deadline has passed, so a flag
-             * raised with no deadline at all - or before it - came from gptps_cancel,
-             * shutdown, or task removal. Inferred from the deadline rather than read
-             * from it->cancelled, which the engine writes under e->m while this runs
-             * with the lock RELEASED (reading it here would be a data race). */
-            st = (ctx.deadline_ms && gptps_hal_monotonic_ms() >= ctx.deadline_ms)
-               ? GPTPS_E_TIMEOUT : GPTPS_E_CANCELLED;
-        }
+            deadline_raise(it);
+        why = gptps_hal_load_acquire_u32(&it->cancel);
+        raised = (why != 0);
+        /* Tell a deadline breach apart from an explicit stop by what raised the flag
+         * (the cancel word's value), not from it->cancelled, which the engine writes
+         * under e->m while this runs with the lock RELEASED. */
+        if (raised) st = (why == CANCEL_DEADLINE) ? GPTPS_E_TIMEOUT : GPTPS_E_CANCELLED;
     } else if (it->def->exec == GPTPS_EXEC_OOP) {
         /* enforced path: run the in-process fn in a forked child, OS-capped, hard-killed.
          * it->cancel lets gptps_cancel / shutdown / removal hard-kill the child. */
@@ -1373,14 +1381,15 @@ static gptps_status execute(gptps *e, gptps_item *it, gptps_event_cb cb, void *u
      * after the body returned counts as a stop, the conservative reading for a
      * consumer that keeps stopped work. */
     if (!inproc) {
-        raised = cancel_raised(it);
+        why = gptps_hal_load_acquire_u32(&it->cancel);
+        raised = (why != 0);
         /* A process job stopped through its flag because a per-submit deadline
          * passed (attempt_deadline) timed out; it was not cancelled. Told apart from
-         * a stop as the in-process path does, by the deadline - and before the
-         * event is filled in, so the event and the outcome agree. */
-        if (raised && st == GPTPS_E_CANCELLED && it->deadline_ms &&
-            gptps_hal_monotonic_ms() >= it->deadline_ms)
-            st = GPTPS_E_TIMEOUT;
+         * a stop as the in-process path does, by what raised the flag - so a cancel
+         * issued before the deadline stays a cancel however long its graceful stop
+         * takes - and before the event is filled in, so the event and the outcome
+         * agree. */
+        if (why == CANCEL_DEADLINE && st == GPTPS_E_CANCELLED) st = GPTPS_E_TIMEOUT;
     }
     p.kind = (st == GPTPS_OK) ? GPTPS_EV_FINISHED : GPTPS_EV_FAILED; p.status = st;
     if (st == GPTPS_E_CANCELLED && !raised)
@@ -2074,7 +2083,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
         /* 3) enforce deadlines on running tasks (cooperative cancel) */
         for (it = e->running_items.head; it; it = it->next) {
             if (it->deadline_ms) {
-                if (now >= it->deadline_ms) cancel_raise(it);
+                if (now >= it->deadline_ms) deadline_raise(it);
                 else next_wake = min_nonzero(next_wake, it->deadline_ms);
             }
         }
@@ -2143,9 +2152,10 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
          *    - the highest-score item overall - is simply the head, and `best` - the
          *    highest-score item that FITS the live budget - is the first item from
          *    the head that fits. Ties resolved to the older item, so FIFO holds
-         *    within a score. When `best != top` we are about to skip the higher-score
-         *    `top` because it does not fit yet: allowed (backfill) until `top` has
-         *    been skipped reserve_after_skips times, after which we reserve for it -
+         *    within a score. When `best != top` we are about to skip every
+         *    higher-score item ahead of it because none fits yet: allowed (backfill)
+         *    until one of them has been skipped reserve_after_skips times, after which
+         *    we reserve for the highest-ranked such item that draining can make fit -
          *    admit nothing and let running tasks drain until it fits (bounded). The
          *    ORDERING KEY (sched_score) is the one swappable policy: priority by
          *    default, or a scheduler hook's score; the skip-to-fit / budget /
@@ -2227,16 +2237,28 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                 (e->manual || held >= e->limits.max_concurrent_tasks - e->running ||
                  held_mem > e->limits.max_memory_bytes - e->reserved_mem - best->cost.mem_bytes))
                 break;
-            if (best != top && top->skips >= e->reserve_after_skips) {
-                /* Reserve for `top`: drain, admit nothing - but only while draining CAN
-                 * make it fit. What running SERVICE instances hold is not drained: a
-                 * service keeps its reservation for as long as it is up. If `top` does
-                 * not fit beside that, reserving would stop all admission for as long
-                 * as those services live, so `top` waits for a service to stop instead,
-                 * other work keeps being admitted past it, and that is said once per
-                 * task type (guard_log_flush). */
-                if (guard_can_drain_to_fit(e, top)) break;
-                guard_note_unreservable(e, top);
+            if (best != top) {
+                /* Starvation guard. Every item ahead of `best` is skipped by admitting
+                 * it, and each is charged for that below - not only `top`: a second
+                 * large item behind an unreservable `top` must be protected as well,
+                 * or it starves for as long as `top` cannot be reserved for. Reserve
+                 * (drain, admit nothing) for the highest-ranked skipped item that has
+                 * used up its skips - but only one that draining CAN make fit. What
+                 * running SERVICE instances hold is not drained: a service keeps its
+                 * reservation for as long as it is up. Reserving for an item that
+                 * does not fit beside that would stop all admission for as long as
+                 * those services live, so such an item waits for a service to stop
+                 * instead, the guard looks further down for one it can reserve for,
+                 * other work keeps being admitted, and that is said once per task
+                 * type (guard_log_flush). The walk covers only the items the scan
+                 * above already passed. */
+                gptps_item *reserve_for = NULL;
+                for (cur = top; cur != best; cur = cur->next) {
+                    if (cur->skips < e->reserve_after_skips) continue;
+                    if (guard_can_drain_to_fit(e, cur)) { reserve_for = cur; break; }
+                    guard_note_unreservable(e, cur);
+                }
+                if (reserve_for) break;
             }
 
             dec = run_constraints(e, best, &retry_after); /* consulted only on the chosen item */
@@ -2277,7 +2299,8 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                     if (!snap) { next_wake = min_nonzero(next_wake, now + 50); break; }
                 }
             }
-            if (best != top && top->skips != UINT32_MAX) top->skips += 1;   /* charge the skipped higher-priority task */
+            for (cur = top; cur != best; cur = cur->next)   /* charge every skipped higher-ranked item */
+                if (cur->skips != UINT32_MAX) cur->skips += 1;
             intake_unlink(e, best);
             e->reserved_mem += best->cost.mem_bytes;
             e->running      += 1;

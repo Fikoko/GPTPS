@@ -6,12 +6,14 @@
  *  1) The starvation guard does not reserve for a top item that cannot fit beside
  *     what running SERVICES hold - they never drain, so that reservation stopped all
  *     admission for as long as they lived, silently. Now other work goes on, one
- *     WARN says why, and the top item starts once the service stops.
+ *     WARN says why, and the top item starts once the service stops. A second large
+ *     item behind it is protected as well: every item a backfill passes is charged.
  *  2) MANUAL mode: gptps_is_cancelled() turns true at the deadline (no watchdog runs
  *     beside an inline body), and a body that returns after its deadline is
  *     GPTPS_E_TIMEOUT, as in THREADED mode - not FINISHED.
  *  3) GPTPS_SUBMIT_TIMEOUT_MS reaches PROGRAM jobs: threaded to the slice, MANUAL to
- *     the second rounded up. It used to be dropped without a word.
+ *     the second rounded up. It used to be dropped without a word. A cancel issued
+ *     before that deadline stays a cancel, however long its graceful stop takes.
  *  4) A dead letter's stderr tail is its last failed attempt's own: an attempt that
  *     wrote nothing leaves none, not an earlier attempt's.
  *  5) Every per-task key goes from the config file into the def (a walk over all of
@@ -130,7 +132,7 @@ static gptps *open_engine(gptps_run_mode mode, uint32_t conc, uint64_t mem, cons
 }
 
 /* --- the events, by task name --------------------------------------------------- */
-typedef struct { const char *name; int started, finished, failed, last_status, last_err_len; } tally;
+typedef struct { const char *name; int started, finished, failed, first_status, last_status, last_err_len; } tally;
 static tally g_t[8];
 static int   g_nt;
 static tally *tally_of(const char *name)
@@ -152,6 +154,7 @@ static void on_ev(const gptps_event *ev, void *ud)
         case GPTPS_EV_STARTED:  inc(&t->started); break;
         case GPTPS_EV_FINISHED: inc(&t->finished); break;
         case GPTPS_EV_FAILED:
+            if (get(&t->failed) == 0) put(&t->first_status, (int)ev->status);
             put(&t->last_status, (int)ev->status);
             put(&t->last_err_len, (int)ev->stderr_tail_len);
             if (g_on_first_fail && ev->attempt == 1) g_on_first_fail();
@@ -203,6 +206,72 @@ static void test_guard_beside_services(void)
     CHECK(gptps_cancel(e, svc) == GPTPS_OK);
     CHECK(wait_for(&tally_of("big")->finished, 1, 5000));
     if (fails) log_dump();
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+}
+
+/* 1b) A second large item behind an unreservable top is protected too. `big` cannot
+ * fit beside the service; `mid` (300) can once the running non-service work drains,
+ * but a steady stream of `chunk` (110 each, so 3 at a time, and 600 + 110 + 300 > 1000)
+ * keeps it from fitting on its own: one chunk running is enough to block it, and the
+ * chunks' staggered lengths keep them from all ending between two passes. Skips used to be charged to the head of the queue
+ * only, so `mid` was never reserved for: it waited for the whole stream to drain,
+ * with no line naming it. Now every item a backfill passes is charged, and the guard
+ * reserves for the highest-ranked one it can - `mid`, after its 8 skips. */
+static int g_chunks_at_mid = -1;
+static gptps_status run_mid(gptps_ctx *c, void *ud)
+{
+    (void)c; (void)ud;
+    put(&g_chunks_at_mid, get(&tally_of("chunk")->started));
+    return GPTPS_OK;
+}
+static int g_chunk_n;
+static gptps_status run_chunk(gptps_ctx *c, void *ud)
+{
+    int n = inc(&g_chunk_n);
+    (void)c; (void)ud;
+    sleep_ms((unsigned)(4 + (n * 7) % 13));
+    return GPTPS_OK;
+}
+static void test_guard_second_item(void)
+{
+    gptps *e = open_engine(GPTPS_RUN_THREADED, 8, 1000, NULL);
+    gptps_task_def d;
+    gptps_handle svc = 0;
+    int i;
+    if (!e) return;
+    tally_reset(); track("svc"); track("big"); track("mid"); track("chunk"); log_reset();
+    put(&g_chunks_at_mid, -1);
+    CHECK(gptps_set_event_cb(e, on_ev, NULL) == GPTPS_OK);
+    base_def(&d, "svc", GPTPS_EXEC_INPROC); d.run = run_service; d.flags = GPTPS_TASK_SERVICE;
+    d.default_cost.mem_bytes = 600;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    base_def(&d, "big", GPTPS_EXEC_INPROC); d.run = run_short; d.default_cost.mem_bytes = 500;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    base_def(&d, "mid", GPTPS_EXEC_INPROC); d.run = run_mid; d.default_cost.mem_bytes = 300;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    base_def(&d, "chunk", GPTPS_EXEC_INPROC); d.run = run_chunk; d.default_cost.mem_bytes = 110;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    CHECK(gptps_set_task_priority(e, "big", 10) == GPTPS_OK);
+    CHECK(gptps_set_task_priority(e, "mid", 5) == GPTPS_OK);
+
+    CHECK(gptps_submit(e, "svc", NULL, 0, &svc) == GPTPS_OK);
+    CHECK(wait_for(&tally_of("svc")->started, 1, 5000));
+    /* the stream first, so chunks are running when `mid` arrives and it does not fit */
+    for (i = 0; i < 60; ++i) CHECK(gptps_submit(e, "chunk", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_for(&tally_of("chunk")->started, 1, 5000));
+    CHECK(gptps_submit(e, "big", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(gptps_submit(e, "mid", NULL, 0, NULL) == GPTPS_OK);
+
+    CHECK(wait_for(&tally_of("chunk")->finished, 60, 15000));
+    CHECK(get(&tally_of("mid")->finished) == 1);
+    /* `mid` ran once it had been passed 8 times and the 3 running chunks drained -
+     * not after all 60 (a generous bound: well short of the whole stream) */
+    CHECK(get(&g_chunks_at_mid) >= 0 && get(&g_chunks_at_mid) <= 30);
+    CHECK(get(&tally_of("big")->started) == 0);
+    CHECK(logged("task 'big'", "services") == 1);
+    CHECK(gptps_cancel(e, svc) == GPTPS_OK);
+    CHECK(wait_for(&tally_of("big")->finished, 1, 5000));
+    if (fails) { printf("  chunks started when mid ran: %d\n", get(&g_chunks_at_mid)); log_dump(); }
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
 
@@ -288,6 +357,50 @@ static void test_program_timeout_ms(gptps_run_mode mode)
     CHECK(secs <= 5.0);                  /* 300 ms - or 1 s in MANUAL - not "never" */
     CHECK(gptps_shutdown(e) == GPTPS_OK);
 }
+
+#if !defined(_WIN32)
+/* 3b) A cancel issued before the per-submit deadline stays a cancel even when the
+ * job's graceful stop (stop_grace_ms) ends after that deadline. execute() used to
+ * decide by the clock when the executor returned, and called it GPTPS_E_TIMEOUT -
+ * which gptps.h says a cancel never is. POSIX: SIGTERM is the graceful stop. */
+#define TERM_FILE "gptps_fix_term.out"
+static const char *const TERM_ARGV[] = { HELPER_PATH, "term", TERM_FILE, "700", 0 };
+static void test_cancel_before_deadline(void)
+{
+    gptps *e = open_engine(GPTPS_RUN_THREADED, 1, 1u << 30, NULL);
+    gptps_task_def d;
+    gptps_submit_options o;
+    gptps_handle h = 0;
+    if (!e) return;
+    (void)remove(TERM_FILE);
+    tally_reset(); track("slowstop");
+    CHECK(gptps_set_event_cb(e, on_ev, NULL) == GPTPS_OK);
+    base_def(&d, "slowstop", GPTPS_EXEC_PROGRAM); d.argv = TERM_ARGV;
+    d.default_policy.on_failure = GPTPS_ON_FAILURE_DROP;
+    d.stop_grace_ms = 5000;              /* it cleans up in 700 ms: well inside */
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    memset(&o, 0, sizeof o);
+    o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_TIMEOUT_MS; o.timeout_ms = 400;
+    CHECK(gptps_submit_ex(e, "slowstop", NULL, 0, &o, &h) == GPTPS_OK);
+    CHECK(wait_for(&tally_of("slowstop")->started, 1, 5000));
+    sleep_ms(100);                       /* the job is up; the deadline is ~300 ms away */
+    CHECK(gptps_cancel(e, h) == GPTPS_OK);
+    CHECK(wait_for(&tally_of("slowstop")->failed, 1, 10000));
+    /* it ended ~800 ms in, past its 400 ms deadline - but it was cancelled first. Its
+     * one FAILED says so: it used to say GPTPS_E_TIMEOUT, and a second FAILED with
+     * GPTPS_E_CANCELLED then closed the handle the cancel had asked to end. */
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    e = NULL;
+    CHECK(get(&tally_of("slowstop")->first_status) == (int)GPTPS_E_CANCELLED);
+    CHECK(get(&tally_of("slowstop")->failed) == 1);
+    {
+        FILE *f = fopen(TERM_FILE, "r");
+        CHECK(f != NULL);                /* the graceful stop did run */
+        if (f) fclose(f);
+    }
+    (void)remove(TERM_FILE);
+}
+#endif
 
 /* ======================================================= 4) the dead letter's tail */
 #define WD "gptps_fix_wd"
@@ -530,9 +643,13 @@ int main(void)
 {
     gptps_set_log_sink(on_log, NULL);
     test_guard_beside_services();
+    test_guard_second_item();
     test_manual_deadline();
     test_program_timeout_ms(GPTPS_RUN_THREADED);
     test_program_timeout_ms(GPTPS_RUN_MANUAL);
+#if !defined(_WIN32)
+    test_cancel_before_deadline();
+#endif
     test_dead_letter_tail();
     test_keys_from_file();
     test_flag_bits();
