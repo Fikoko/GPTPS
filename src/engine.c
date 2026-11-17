@@ -1222,6 +1222,7 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
     if ((caps->applied & GPTPS_CAP_IO_ONE) && it->io_rcap && it->io_wcap && it->io_rcap != it->io_wcap)
         want |= GPTPS_CAP_IO_ONE;
     if (caps->start_what) want |= GPTPS_CAP_START;
+    if (caps->out_capped) want |= GPTPS_CAP_OUTCAP;
     if (!want || !it->reg) return;
     gptps_mutex_lock(e->m);
     fresh = want & ~it->reg->cap_warned;
@@ -1256,6 +1257,16 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_DIE) {
+#if defined(_WIN32)
+        /* Windows holds it with a kill-on-close job object; withheld only when the
+         * program could not be put in one (the executor's own WARN names the step and
+         * the Windows error) */
+        snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST is not enforced for this job - "
+                 "its program could not be put in a kill-on-close job object (the executor's own WARN names "
+                 "the step and the Windows error; a host already in a job that allows no nested one, "
+                 "as before Windows 8, is the usual cause); a job may outlive a host that dies. Start "
+                 "the host outside such a job", item_name(it));
+#else
         if (it->def->exec == GPTPS_EXEC_PROGRAM)   /* held by a watcher process on every OS */
             snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST was not held for a whole "
                      "job - the watcher process that kills the job if the host dies ended before "
@@ -1269,6 +1280,7 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
                      "FreeBSD do); a job may outlive a host that dies. Run the host under a "
                      "supervisor that kills its process group (launchd, systemd's "
                      "KillMode=control-group)", item_name(it));
+#endif
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_START) {
@@ -1283,6 +1295,14 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
         else
             snprintf(msg, sizeof msg, "task '%s': could not set up the process for '%s': %s (error %d)",
                      item_name(it), a0, caps->start_msg, caps->start_err);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    if (fresh & GPTPS_CAP_OUTCAP) {
+        snprintf(msg, sizeof msg, "task '%s': its program wrote more than %lu bytes (%lu MiB) to "
+                 "stdout, the most a result may be; the job was stopped and the attempt fails with "
+                 "GPTPS_E_IO and no exit.code. A program that logs to stdout should log to stderr "
+                 "or a file. Said once for this task type", item_name(it),
+                 (unsigned long)caps->out_capped, (unsigned long)(caps->out_capped >> 20));
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
 }

@@ -300,9 +300,10 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * A process that leaves the job's process group
  * (setsid) outside cgroup mode is no longer the job. An OOP job, the host's own forked
  * copy, is killed by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on FreeBSD; on
- * Windows every job, flag or not (the job object is killed on close). Where it cannot
- * be enforced (an OOP job on macOS or other POSIX) the job runs anyway and the first
- * attempt of the type logs a WARN. Ignored for INPROC, which is the host. */
+ * Windows every job, flag or not (the job object is killed on close) - unless the
+ * program could not be put in a kill-on-close job object (a host in a job that allows
+ * no nested one). Where it cannot be enforced (an OOP job on macOS or other POSIX, that
+ * Windows case) the job runs anyway and the first attempt of the type logs a WARN. Ignored for INPROC, which is the host. */
 #define GPTPS_TASK_DIE_WITH_HOST 0x4u
 /* RETIRE_ON_OK (services only; ignored otherwise): by default a service is
  * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a

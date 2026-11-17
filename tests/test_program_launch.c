@@ -375,6 +375,23 @@ int main(void)
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
     CHECK(run1(e, "arg") && g_ok && strcmp(g_res, ARG_U8) == 0);
     if (strcmp(g_res, ARG_U8) != 0) printf("arg result: [%s]\n", g_res);
+    {   /* backslashes reach the program as they were given - Windows quotes the command
+         * line, and a run of them is literal unless a quote follows: one that ends an
+         * unquoted argument was doubled */
+        static const char *const cases[] = { "/out=D:\\Reports\\", "D:\\a\\\\", "a b\\", "a\\\"b\\",
+                                              "\\\\server\\share\\", "\\", "x\"", NULL };
+        size_t i;
+        for (i = 0; cases[i]; ++i) {
+            const char *a_bs[] = { HELPER_PATH, "arg", NULL, NULL };
+            char name[16];
+            a_bs[2] = cases[i];
+            snprintf(name, sizeof name, "bs%u", (unsigned)i);
+            def_prog(&d, name, a_bs);
+            CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+            CHECK(run1(e, name) && g_ok && strcmp(g_res, cases[i]) == 0);
+            if (strcmp(g_res, cases[i]) != 0) printf("arg [%s] arrived as [%s]\n", cases[i], g_res);
+        }
+    }
 
     /* 4) how it ended */
     def_prog(&d, "exit7", a_exit);

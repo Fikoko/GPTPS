@@ -67,8 +67,13 @@ boundary a determined attacker respects.
 
 If the host process crashes or is killed, what happens to the jobs it started?
 
-- **Windows:** every job is in a job object created with
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the jobs die with the host. Nothing to do.
+- **Windows:** every job is put in a job object created with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the jobs die with the host. Nothing to do -
+  as long as the job object can be made and the program put in it. A host that is itself
+  in a job that allows no nested one (Windows 7, Server 2008 R2) or that a job object is
+  refused to cannot: its jobs may then outlive it, as on Linux by default. GPTPS says so
+  with a WARN that names the step and the Windows error, and a task with
+  `GPTPS_TASK_DIE_WITH_HOST` gets its own WARN that the flag is not in force.
 - **Linux, macOS:** by default they keep running. A restarted host can then start a
   second copy next to the first - two MRP runs against one database. GPTPS does not
   change that default, because a host may *want* a job to outlive it.

@@ -696,7 +696,7 @@ so a Turkish path works on any Windows code page. `def.stop_grace_ms` lets a job
 to stop clean up first: SIGTERM (Ctrl+Break on Windows, service hosts included), up to
 that long for the whole job - launcher and workers - then the kill, its output read
 throughout. `GPTPS_TASK_DIE_WITH_HOST` kills a job when its host dies (Linux, FreeBSD;
-Windows always). A program that never started reports `start.error` with the OS's
+Windows always, unless the host's own job allows no nested one - then a WARN). A program that never started reports `start.error` with the OS's
 reason instead of an exit code, and a dead letter carries the last attempt's
 measurements, so a report can say why. `def.stderr_tail_bytes` captures the job's stderr and hands its last
 bytes back on the `FAILED` event and the dead letter, so forty jobs' errors stay apart.

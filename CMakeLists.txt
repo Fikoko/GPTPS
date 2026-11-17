@@ -1011,6 +1011,20 @@ target_compile_definitions(test_io_cap_win PRIVATE HELPER_PATH="$<TARGET_FILE:pr
 add_dependencies(test_io_cap_win prog_helper)
 add_test(NAME io_cap_win COMMAND test_io_cap_win)
 set_tests_properties(io_cap_win PROPERTIES TIMEOUT 120)
+# The Windows executor and HAL where the system misbehaves or races: the test compiles
+# src/exec_win.c and src/hal_win.c itself, with Win32 calls it can fail or delay -
+# pipe ends kept to their job, the console probe against a stop, die-with-host only
+# when it holds, thread failures, processor groups, argv quoting, UTF-8 and durable
+# save paths.
+add_executable(test_exec_win_faults tests/test_exec_win_faults.c)
+target_include_directories(test_exec_win_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_exec_win_faults PRIVATE gptps)
+target_compile_definitions(test_exec_win_faults PRIVATE HELPER_PATH="$<TARGET_FILE:prog_helper>"
+                           ADDON_PATH="$<TARGET_FILE:addon_demo>")
+add_dependencies(test_exec_win_faults prog_helper addon_demo)
+add_test(NAME exec_win_faults COMMAND test_exec_win_faults)
+set_tests_properties(exec_win_faults PROPERTIES TIMEOUT 120)
 endif()
 
 # gptps_adapt with PROGRAM jobs - every platform, Windows included. It includes the

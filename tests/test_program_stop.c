@@ -17,6 +17,8 @@
  *     the flag a POSIX job outlives it; a job that ends leaves no watcher behind;
  *     where it cannot be enforced (an OOP job off Linux / FreeBSD), or a job's
  *     watcher was killed from outside while it ran, one WARN per task type.
+ *  7) stdout past the 16 MiB result cap: E_IO, one WARN per task type; on Windows the
+ *     job's stop grace is given first.
  *
  * A threaded engine: the stops come from another thread, as they do in a host.
  */
@@ -73,13 +75,14 @@ static void on_ev(const gptps_event *ev, void *ud)
     if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) { put(&g_status, (int)ev->status); inc(&g_done); }
 }
 
-static int g_warn_die, g_warn_grace;
+static int g_warn_die, g_warn_grace, g_warn_out;
 static void on_log(gptps_log_level lvl, const char *msg, void *ud)
 {
     (void)ud;
     if (lvl != GPTPS_LOG_WARN || !msg) return;
     if (strstr(msg, "DIE_WITH_HOST")) inc(&g_warn_die);
     if (strstr(msg, "stop_grace_ms")) inc(&g_warn_grace);
+    if (strstr(msg, "to stdout, the most a result may be")) inc(&g_warn_out);
 }
 
 static int wait_for(int *p, int want, unsigned ms)
@@ -174,6 +177,34 @@ static void stops(int check_delivery)
     r = stop_case(a_noisy, BY_CANCEL, 5000);    if (check_delivery) CHECK(r);
     /* 1) no grace: no clean-up */
     CHECK(!stop_case(a_clean, BY_CANCEL, 0));
+}
+
+/* 7) more than the 16 MiB result on stdout: the attempt fails with GPTPS_E_IO, said
+ * once per task type - and on Windows, with a stop grace, the program gets its
+ * Ctrl+Break and clean-up as on a timeout (it may be in the middle of its work) */
+static void flood(int check_delivery)
+{
+    static const char *const a_flood[] = { HELPER_PATH, "flood", CLEAN_FILE, "17000000", NULL };
+    gptps *e = open_engine(0);
+    if (!e) return;
+    remove(CLEAN_FILE);
+    put(&g_warn_out, 0); put(&g_done, 0); put(&g_status, 0);
+    reg(e, "flood", a_flood, 60, 5000, 0);
+    CHECK(gptps_submit(e, "flood", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_for(&g_done, 1, 30000));
+    CHECK(get(&g_status) == (int)GPTPS_E_IO);
+#if defined(_WIN32)
+    if (check_delivery) CHECK(cleaned());
+#else
+    (void)check_delivery;
+#endif
+    remove(CLEAN_FILE);
+    CHECK(gptps_submit(e, "flood", NULL, 0, NULL) == GPTPS_OK);
+    CHECK(wait_for(&g_done, 2, 30000));
+    CHECK(get(&g_status) == (int)GPTPS_E_IO);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    CHECK(get(&g_warn_out) == 1);                /* once for the type, not per attempt */
+    remove(CLEAN_FILE);
 }
 
 /* 5) the dead letter says why */
@@ -388,6 +419,7 @@ int main(void)
         FreeConsole();
         put(&g_warn_grace, 0);
         stops(!wine);
+        flood(!wine);
         CHECK(get(&g_warn_grace) == 0);          /* the grace was given, not refused */
         CHECK(AllocConsole());
         if (GetConsoleWindow()) ShowWindow(GetConsoleWindow(), SW_HIDE);
@@ -397,6 +429,7 @@ int main(void)
     }
 #else
     stops(1);
+    flood(1);
 #endif
     dead_letters();
     die_with_host();
