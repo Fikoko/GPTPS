@@ -408,10 +408,23 @@ static const char *const ERR_ARGV[] = { HELPER_PATH, "errout", "0", "licence ser
 static int    g_dl_n, g_dl_tail_len, g_dl_start, g_dl_code, g_dl_first_tail;
 #if !defined(_WIN32)
 /* POSIX: the job's argv[0] is "./job" in its work_dir - first the helper, which
- * writes the line to stderr and fails, then /bin/false, which fails writing nothing. */
+ * writes the line to stderr and fails, then a script of our own that fails writing
+ * nothing. Not /bin/false: macOS has it only in /usr/bin, and a multi-call coreutils
+ * (uutils, Ubuntu 25.10+) run through a symlink named "job" says on stderr that it
+ * has no such utility. */
 #define JOB WD "/job"
 static const char *const JOB_ARGV[] = { "./job", "errout", "0", "licence server unreachable", "3", 0 };
-static void swap_job(void) { (void)unlink(JOB); CHECK(symlink("/bin/false", JOB) == 0); }
+static void swap_job(void)
+{
+    FILE *f;
+    (void)unlink(JOB);
+    f = fopen(JOB, "w");
+    CHECK(f != NULL);
+    if (!f) return;
+    fputs("#!/bin/sh\nexit 1\n", f);
+    CHECK(fclose(f) == 0);
+    CHECK(chmod(JOB, 0755) == 0);
+}
 #else
 /* Windows: the work_dir goes, so attempt 2 cannot start - start.error, no stderr. */
 static void swap_job(void) { (void)remove_dir(WD); }
@@ -463,7 +476,7 @@ static void test_dead_letter_tail(void)
     CHECK(gptps_dead_letter_drain(e, on_dl, NULL) == 1);
     CHECK(g_dl_n == 1);
 #if !defined(_WIN32)
-    CHECK(g_dl_code == 1 && g_dl_start == 0);   /* attempt 2's measurements (/bin/false's exit) ... */
+    CHECK(g_dl_code == 1 && g_dl_start == 0);   /* attempt 2's measurements (the script's exit) ... */
     CHECK(g_dl_tail_len == 0);                  /* ... and its stderr: none, not attempt 1's */
 #else
     CHECK(g_dl_start == 1 && g_dl_code == 0);

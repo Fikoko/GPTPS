@@ -458,13 +458,13 @@ jobs:
             export GPTPS_STRESS_SEED=$GPTPS_SIM_SEED
             echo "sim seed $GPTPS_SIM_SEED (replay: GPTPS_SIM_SEED=$GPTPS_SIM_SEED GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$GPTPS_SIM_SEED GPTPS_STRESS_MS=1500)"
             ctest --test-dir build-sim --output-on-failure --no-tests=error \
-              -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui)$'
+              -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui)$'
           done
       - name: The tests on real processes, paced to real time
         run: |
           export GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 GPTPS_SIM_SEED=$(( ${{ github.run_number }} * 3 ))
           ctest --test-dir build-sim --output-on-failure --no-tests=error \
-            -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui)$'
+            -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui)$'
 
   # Exercise the two most fragile portability axes the native x86_64 + arm64
   # matrix never hits: WORD SIZE (i386, 32-bit, run natively) and BYTE ORDER

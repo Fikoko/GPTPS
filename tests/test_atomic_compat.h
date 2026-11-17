@@ -47,6 +47,9 @@
 /* *p = v */
 #define __atomic_store_n(p, v, mo) \
     ((void)InterlockedExchange((volatile LONG *)(p), (LONG)(v)))
+/* *p = v, return OLD value */
+#define __atomic_exchange_n(p, v, mo) \
+    ((int)InterlockedExchange((volatile LONG *)(p), (LONG)(v)))
 
 /* bool CAS: if *p==*expp -> *p=des, return 1; else *expp=*p, return 0 */
 static __inline int gptps_test_cas_int(volatile LONG *p, LONG *expp, LONG des)

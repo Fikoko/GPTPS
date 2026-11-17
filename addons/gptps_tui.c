@@ -215,8 +215,11 @@ static const char *tui_cl(const char *s, char *out, size_t cap)
 static const char *tui_cell(const char *s, char *out, size_t cap, int cols)
 {
     int used = 0;
-    size_t pos = tui_clean(s ? s : "", s ? strlen(s) : 0, out, cap, cols, &used);
-    while (used < cols && pos + 1 < cap) { out[pos++] = ' '; ++used; }
+    size_t pos;
+    if (!cap) return "";
+    pos = tui_clean(s ? s : "", s ? strlen(s) : 0, out, cap, cols, &used);
+    if (pos >= cap) pos = cap - 1;           /* never past the buffer, whatever came back */
+    for (; used < cols && pos + 1 < cap; ++pos, ++used) out[pos] = ' ';
     out[pos] = 0;
     return out;
 }
