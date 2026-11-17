@@ -245,11 +245,19 @@ static void check_saved(const gptps_toml *before, const char *text, const char *
         free(d);
     }
 
-    /* every line that held no changed value is still there, in order */
+    /* every line that held no changed value is still there, in order. A byte order
+     * mark opening the file belongs to the file, not to its line 1: it opens the saved
+     * file too, and the lines are compared after it - an addition before the comment
+     * over the first table goes after the mark, not before it. */
     {
         const char *out = saved;
         int line, lines = 1;
         const char *c;
+        if (!strncmp(text, GPTPS_UTF8_BOM, 3)) {
+            if (strncmp(saved, GPTPS_UTF8_BOM, 3)) fprintf(stderr, "the byte order mark is gone from:\n---\n%s---\n", saved);
+            FZ_ASSERT(!strncmp(saved, GPTPS_UTF8_BOM, 3), "a save moved or dropped the file's byte order mark");
+            text += 3; out += 3;
+        }
         for (c = text; *c; ++c) if (*c == '\n') ++lines;
         for (line = 1; line <= lines; ++line) {
             size_t len = 0, olen;

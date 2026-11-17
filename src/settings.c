@@ -1015,7 +1015,7 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
      * was read and logs: a return in between would leave r->m held, and the next save
      * would wait for it forever. */
     gptps_mutex_lock(r->m);
-    f = fopen(path, "rb");
+    f = gptps_fopen_path(path, "rb");
     if (!f && errno == ENOENT && base && strcmp(base, path) != 0) {
         /* A new file starts as a copy of the config file the engine loaded - its
          * add-ons, [task_defaults], comments and all - with the live changes made
@@ -1059,20 +1059,25 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
     if (!tmp) { st = GPTPS_E_NOMEM; goto out; }
     snprintf(tmp, tn, "%s.tmp", path);
 
-    f = fopen(tmp, "wb");
+    f = gptps_fopen_path(tmp, "wb");
     if (!f) st = GPTPS_E_IO;
     else {
+        const char *body = text ? text : "";
         made = 1;
         if (!text)
             fputs("# GPTPS settings, written by gptps_settings_save: the values changed live and\n"
                   "# the ones the config file set. Edit freely - a later save updates the values\n"
                   "# you change and keeps the rest, comments included. Every key: docs/CONFIG.md.\n\n", f);
-        if (write_settings(r, f, text ? text : "", t, in_file, copy ? refused : NULL, ud) != 0) st = GPTPS_E_NOMEM;
+        /* A byte order mark the file opens with stays where it is - the tool that wrote
+         * it may need it to read the file as UTF-8 - and the lines are edited after it,
+         * so line 1 is read (a comment, a key to rewrite) as the parser read it. */
+        if (!strncmp(body, GPTPS_UTF8_BOM, 3)) { fputs(GPTPS_UTF8_BOM, f); body += 3; }
+        if (write_settings(r, f, body, t, in_file, copy ? refused : NULL, ud) != 0) st = GPTPS_E_NOMEM;
         if (fflush(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
         if (fclose(f) != 0 && st == GPTPS_OK) st = GPTPS_E_IO;
     }
     if (st == GPTPS_OK) st = gptps_hal_atomic_replace(tmp, path);
-    if (st != GPTPS_OK && made) remove(tmp);
+    if (st != GPTPS_OK && made) gptps_remove_path(tmp);
 out:
     gptps_mutex_unlock(r->m);
     gptps_toml_free(t);

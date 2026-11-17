@@ -1705,6 +1705,50 @@ static void test_set_ex(void)
     gptps_shutdown(e);
 }
 
+/* A file that opens with a UTF-8 byte order mark (PowerShell 5's -Encoding UTF8,
+ * older Notepad) opens, and a save keeps the mark where it is and edits line 1 as
+ * the parser read it - a rewrite of the line used to start it afresh, mark lost. A
+ * second mark further in is named. */
+static void test_bom(void)
+{
+    static const char hand[] = "\xEF\xBB\xBF# nightly config\r\n[limits]\r\nmax_concurrent_tasks = 4\r\n";
+    static const char GBX[] = "\xEF\xBB\xBFlimits.max_memory_bytes = 18014398509481985   # one GiB\n";
+    gptps *e = NULL;
+    const char *out;
+
+    put(CFG, hand);
+    clear_log();
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (!e) { printf("%s", g_log); return; }
+    CHECK(has_value(e, "limits.max_concurrent_tasks", "4"));
+    CHECK(gptps_settings_save(e, NULL) == GPTPS_OK);
+    CHECK(strcmp(slurp(CFG), hand) == 0);                  /* byte for byte, mark and all */
+    CHECK(gptps_settings_set(e, "limits.max_concurrent_tasks", "6") == GPTPS_OK);
+    CHECK(gptps_settings_save(e, NULL) == GPTPS_OK);
+    CHECK(strcmp(slurp(CFG), "\xEF\xBB\xBF# nightly config\r\n[limits]\r\nmax_concurrent_tasks = 6\r\n") == 0);
+    CHECK(gptps_settings_reload(e, NULL) == GPTPS_OK);
+    gptps_shutdown(e); e = NULL;
+
+    /* the key on line 1, rewritten under another name: max_memory_gb past what a
+     * double holds exactly is written as max_memory_bytes */
+    put(CFG, "\xEF\xBB\xBF\"limits.max_memory_gb\" = 1   # one GiB\n");
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    if (!e) return;
+    CHECK(gptps_settings_set(e, "limits.max_memory_bytes", "18014398509481985") == GPTPS_OK);
+    CHECK(gptps_settings_save(e, NULL) == GPTPS_OK);
+    out = slurp(CFG);
+    if (strncmp(out, GBX, strlen(GBX)) != 0) printf("  saved:\n%s\n", out);
+    CHECK(strncmp(out, GBX, strlen(GBX)) == 0);
+    gptps_shutdown(e); e = NULL;
+    CHECK(gptps_open(CFG, &e) == GPTPS_OK);
+    CHECK(e && has_value(e, "limits.max_memory_bytes", "18014398509481985"));
+    if (e) { gptps_shutdown(e); e = NULL; }
+
+    /* two files joined, each with its mark */
+    refused("\xEF\xBB\xBF[limits]\nmax_concurrent_tasks = 4\n\xEF\xBB\xBF[scheduler]\nreserve_after_skips = 2\n",
+            CFG ":3: a UTF-8 byte order mark (EF BB BF) at the start of the line - only the file's first line may carry one");
+}
+
 int main(void)
 {
     g_logm = gptps_mutex_create();
@@ -1731,6 +1775,7 @@ int main(void)
     test_save_placement();
     test_save_refused();
     test_parser_edges();
+    test_bom();
     gptps_set_log_sink(NULL, NULL);
     remove(CFG);
     if (fails) { printf("%d config check(s) FAILED\n", fails); return 1; }

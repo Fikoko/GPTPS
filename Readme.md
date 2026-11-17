@@ -278,7 +278,10 @@ auto-tune. `gptps_open_ex` reads the same file when `cfg.config_path` is set, an
 explicit value in `cfg.limits`, `cfg.max_dead_letters` or `cfg.shutdown_grace_ms` wins
 over the file's. A subset of TOML is supported
 (tables, `int`/`float`/`bool`/`"string"` and single-line string arrays, `"quoted"` parts in
-keys and table names such as `[tasks."resize v2"]`, `#` comments). **[docs/CONFIG.md](docs/CONFIG.md) lists every key** with its type,
+keys and table names such as `[tasks."resize v2"]`, `#` comments). The file is UTF-8 and
+may open with a byte order mark, as Windows tools often write it; a save keeps the mark.
+Its path, a save path and the paths in `addons` are UTF-8 as well - on Windows too, so
+a Turkish directory name works on any code page. **[docs/CONFIG.md](docs/CONFIG.md) lists every key** with its type,
 range, default and when a change applies; it is generated from the code, and a test
 fails when the two disagree.
 
