@@ -1571,6 +1571,7 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             if (why != GPTPS_OK) { killed = 1; kill_st = why; }
         }
 
+        if (oversize) caps->out_capped = GPTPS_PROG_RESULT_CAP;   /* the engine says why, once */
         if (killed)                  eff = kill_st;
         else if (oversize)           eff = GPTPS_E_IO;
         else if (nomem)              eff = GPTPS_E_NOMEM;

@@ -155,6 +155,7 @@ void gptps_meter_put(gptps_exec_meter *mt, const char *name, uint64_t value,
 #define GPTPS_CAP_DIE    0x10u  /* ABI 2.8: GPTPS_TASK_DIE_WITH_HOST is in force */
 #define GPTPS_CAP_IO_ONE 0x20u  /* ABI 2.8: the I/O caps hold as ONE read+write figure (Windows) */
 #define GPTPS_CAP_START  0x40u  /* engine-side only: a start failure was reported (WARN once) */
+#define GPTPS_CAP_OUTCAP 0x80u  /* engine-side only: stdout passed the result cap (WARN once) */
 /* ABI 2.8: which step of starting a program failed (gptps_exec_caps.start_what) */
 #define GPTPS_START_WORKDIR 1u  /* work_dir could not be entered */
 #define GPTPS_START_EXEC    2u  /* the program could not be run (not found, not executable, ...) */
@@ -167,6 +168,8 @@ typedef struct {
     unsigned start_what;       /* OUT ABI 2.8: 0, or the GPTPS_START_* step that failed */
     int      start_err;        /* OUT: its OS error (errno / GetLastError) */
     char     start_msg[160];   /* OUT: that error as text */
+    uint32_t out_capped;       /* OUT: 0, or the result cap (bytes) the program's stdout
+                                * ran past - the job was stopped, the attempt is E_IO */
     unsigned applied;          /* OUT: GPTPS_CAP_*; the engine sets it 0 */
 } gptps_exec_caps;
 

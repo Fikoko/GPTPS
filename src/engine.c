@@ -1184,6 +1184,7 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
     if ((caps->applied & GPTPS_CAP_IO_ONE) && it->io_rcap && it->io_wcap && it->io_rcap != it->io_wcap)
         want |= GPTPS_CAP_IO_ONE;
     if (caps->start_what) want |= GPTPS_CAP_START;
+    if (caps->out_capped) want |= GPTPS_CAP_OUTCAP;
     if (!want || !it->reg) return;
     gptps_mutex_lock(e->m);
     fresh = want & ~it->reg->cap_warned;
@@ -1236,6 +1237,14 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
         else
             snprintf(msg, sizeof msg, "task '%s': could not set up the process for '%s': %s (error %d)",
                      item_name(it), a0, caps->start_msg, caps->start_err);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
+    if (fresh & GPTPS_CAP_OUTCAP) {
+        snprintf(msg, sizeof msg, "task '%s': its program wrote more than %lu bytes (%lu MiB) to "
+                 "stdout, the most a result may be; the job was stopped and the attempt fails with "
+                 "GPTPS_E_IO and no exit.code. A program that logs to stdout should log to stderr "
+                 "or a file. Said once for this task type", item_name(it),
+                 (unsigned long)caps->out_capped, (unsigned long)(caps->out_capped >> 20));
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
 }

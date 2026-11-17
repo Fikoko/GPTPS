@@ -46,6 +46,9 @@
  *             "diskwrite": write argv[3] MiB to the file argv[2] past the cache
  *                       (Windows: unbuffered, write-through; POSIX: fsync), then
  *                       delete it - I/O that a bandwidth cap has to slow down.
+ *             "flood" : the stop handler of "term" ("brk" on Windows) for the file
+ *                       argv[2], then argv[3] bytes on stdout, then sleep - a program
+ *                       that logs to stdout past the 16 MiB result cap.
  *             "envsorted": Windows: print "sorted" if this process's environment
  *                       block is in Windows' order (names, ordinal, ignoring case),
  *                       else "unsorted at NAME". Elsewhere: "sorted".
@@ -248,6 +251,27 @@ int main(int argc, char **argv)
         for (;;) sleep_ms(10);
     }
 #endif
+    if (strcmp(mode, "flood") == 0 && argc > 3) {
+        /* the stop handler of "term" / "brk" for the file argv[2], then argv[3] bytes of
+         * 'y' on stdout, then sleep - a program that logs to stdout, past the result cap */
+        static char ys[65536];
+        unsigned long left = strtoul(argv[3], NULL, 10);
+#if defined(_WIN32)
+        g_brk_file = argv[2];
+        SetConsoleCtrlHandler(on_brk, TRUE);
+#else
+        g_term_file = argv[2];
+        signal(SIGTERM, on_term);
+#endif
+        memset(ys, 'y', sizeof ys);
+        while (left) {
+            size_t n = (left < sizeof ys) ? (size_t)left : sizeof ys;
+            if (fwrite(ys, 1, n, stdout) != n) break;
+            left -= (unsigned long)n;
+        }
+        fflush(stdout);
+        for (;;) sleep_ms(10);
+    }
 #if defined(_WIN32)
     if (strcmp(mode, "brk") == 0) {
         g_brk_file = (argc > 2) ? argv[2] : NULL;
