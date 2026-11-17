@@ -15,8 +15,8 @@
  *  6) GPTPS_TASK_DIE_WITH_HOST: a host that dies takes its jobs with it - the WHOLE
  *     job, a launcher's workers too (every POSIX system; Windows always); without
  *     the flag a POSIX job outlives it; a job that ends leaves no watcher behind;
- *     where it cannot be enforced (an OOP job off Linux / FreeBSD), one WARN per
- *     task type.
+ *     where it cannot be enforced (an OOP job off Linux / FreeBSD), or a job's
+ *     watcher was killed from outside while it ran, one WARN per task type.
  *
  * A threaded engine: the stops come from another thread, as they do in a host.
  */
@@ -35,6 +35,9 @@
 #  include <sys/types.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
+#endif
+#if defined(__linux__)
+#  include <dirent.h>
 #endif
 
 #ifndef HELPER_PATH
@@ -253,6 +256,31 @@ static int alive_after(long pid, unsigned ms)
 }
 #endif
 
+#if defined(__linux__)
+/* The host's children but `not`: the job's watcher, while one job runs. */
+static long other_child(long not)
+{
+    long found = 0, me = (long)getpid();
+    DIR *d = opendir("/proc");
+    struct dirent *de;
+    if (!d) return 0;
+    while (!found && (de = readdir(d)) != NULL) {
+        char path[300], buf[512], *rp;
+        long pid = atol(de->d_name), ppid = 0;
+        FILE *f;
+        if (pid <= 1 || pid == not || pid == me) continue;
+        snprintf(path, sizeof path, "/proc/%ld/stat", pid);
+        if (!(f = fopen(path, "r"))) continue;
+        if (!fgets(buf, sizeof buf, f)) buf[0] = 0;
+        fclose(f);
+        rp = strrchr(buf, ')');                  /* the name may hold spaces */
+        if (rp && sscanf(rp + 1, " %*c %ld", &ppid) == 1 && ppid == me) found = pid;
+    }
+    closedir(d);
+    return found;
+}
+#endif
+
 #if !defined(_WIN32) && !defined(__linux__) && !defined(__FreeBSD__)
 static gptps_status oop_ok(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
 #endif
@@ -300,6 +328,33 @@ static void die_with_host(void)
         }
 #endif
     }
+#if defined(__linux__)
+    {   /* a watcher lost while its job runs - an administrator's or the OOM killer's
+         * SIGKILL - is not reported as held: one WARN, and the host lives on */
+        static const char *const a_pid[] = { HELPER_PATH, "pidsleep", PID_FILE, NULL };
+        gptps *e = open_engine(0);
+        long job, w = 0;
+        int i;
+        if (!e) return;
+        put(&g_warn_die, 0); put(&g_done, 0);
+        remove(PID_FILE);
+        reg(e, "lose", a_pid, 2, 0, GPTPS_TASK_DIE_WITH_HOST);
+        CHECK(gptps_submit(e, "lose", NULL, 0, NULL) == GPTPS_OK);
+        for (i = 0; i < 1000 && !(job = read_pid()); ++i) sleep_ms(10);
+        CHECK(job > 0);
+        if (job > 0) w = other_child(job);
+        CHECK(w > 0);
+        if (w > 0) CHECK(kill((pid_t)w, SIGKILL) == 0);
+        CHECK(wait_for(&g_done, 1, 10000));       /* its deadline ends it */
+        CHECK(get(&g_warn_die) == 1);
+        put(&g_done, 0);
+        CHECK(gptps_submit(e, "lose", NULL, 0, NULL) == GPTPS_OK);   /* said once */
+        CHECK(wait_for(&g_done, 1, 10000));
+        CHECK(get(&g_warn_die) == 1);
+        CHECK(gptps_shutdown(e) == GPTPS_OK);
+        remove(PID_FILE);
+    }
+#endif
 #if !defined(_WIN32) && !defined(__linux__) && !defined(__FreeBSD__)
     {   /* an OOP job is the host's own forked copy: only a parent-death signal holds it */
         gptps *e = open_engine(0);

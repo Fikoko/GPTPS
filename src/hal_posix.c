@@ -610,9 +610,13 @@ void  gptps_dl_release(gptps_dl *h) { free(h); }
  * target (umask): a descriptor opened on it while it was written keeps that access,
  * and after the rename that inode IS the config. So then the content goes into a new
  * inode, created private (mkstemp) and given the target's owner and mode, and the
- * temp file is unlinked: a descriptor anyone holds on it reaches nothing that is
- * read. (The caller writes the temp file, so its content was readable under the umask
- * while it was written; only the caller can create it private.) */
+ * temp file is unlinked: a descriptor anyone holds on it AFTER the replace reaches
+ * nothing that is read. That is not enough on its own: what someone wrote into the
+ * temp file BEFORE the replace is copied with it. So the temp file must be private
+ * from its creation - gptps_hal_open_private, which settings save uses: O_EXCL, mode
+ * 0600, whatever the umask, so nobody but its owner can open it at all. The new-inode
+ * copy then only matters when the owner differs (root saving a user's file), and for
+ * a temp file a caller made some other way. */
 static int gptps__cannot_sync(int err)
 {
     switch (err) {
@@ -713,6 +717,21 @@ static char *gptps__fresh_copy(const char *tmp_path, const char *final_path, con
     if (close(out) != 0) ok = 0;
     if (!ok) { unlink(name); free(name); return NULL; }
     return name;
+}
+
+FILE *gptps_hal_open_private(const char *path)
+{
+    int fd;
+    FILE *f;
+    if (unlink(path) != 0 && errno != ENOENT) return NULL;
+    /* O_EXCL: a file - or a symlink - someone put there in between is refused, never
+     * written through; 0600 whatever the umask; close-on-exec, as another thread may
+     * fork and exec while the save writes it */
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) return NULL;
+    f = fdopen(fd, "wb");
+    if (!f) { close(fd); (void)unlink(path); }
+    return f;
 }
 
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)

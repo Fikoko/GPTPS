@@ -288,7 +288,10 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * whatever happens). SIGKILL: nothing may linger. A PROGRAM job is killed whole, on
  * every POSIX system: every process in its process group - a launcher's workers too -
  * and in cgroup mode everything in its cgroup (Linux 5.14+), by a small watcher process
- * GPTPS keeps beside each such job. A process that leaves the job's process group
+ * GPTPS keeps beside each such job (one more child process of the host while the job
+ * runs; a watcher that cannot be had fails the attempt before the program runs, and
+ * one lost while the job runs - killed from outside - is said in one WARN per type).
+ * A process that leaves the job's process group
  * (setsid) outside cgroup mode is no longer the job. An OOP job, the host's own forked
  * copy, is killed by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on FreeBSD; on
  * Windows every job, flag or not (the job object is killed on close). Where it cannot

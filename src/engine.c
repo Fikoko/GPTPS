@@ -1218,10 +1218,19 @@ static void caps_report(gptps *e, gptps_item *it, const gptps_exec_caps *caps)
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_DIE) {
-        snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST is not enforced here - this OS "
-                 "has no parent-death signal (it is Linux, FreeBSD and Windows); a job may outlive a "
-                 "host that dies. Run the host under a supervisor that kills its process group "
-                 "(launchd, systemd's KillMode=control-group)", item_name(it));
+        if (it->def->exec == GPTPS_EXEC_PROGRAM)   /* held by a watcher process on every OS */
+            snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST was not held for a whole "
+                     "job - the watcher process that kills the job if the host dies ended before "
+                     "the job did (killed from outside, by the OOM killer, or out of descriptors), "
+                     "so that job could have outlived a host that died. Run the host under a "
+                     "supervisor that kills its process group (launchd, systemd's "
+                     "KillMode=control-group) if that matters", item_name(it));
+        else
+            snprintf(msg, sizeof msg, "task '%s': GPTPS_TASK_DIE_WITH_HOST is not enforced here - an "
+                     "OOP job needs a parent-death signal, which this OS does not have (Linux and "
+                     "FreeBSD do); a job may outlive a host that dies. Run the host under a "
+                     "supervisor that kills its process group (launchd, systemd's "
+                     "KillMode=control-group)", item_name(it));
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (fresh & GPTPS_CAP_START) {

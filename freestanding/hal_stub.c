@@ -84,3 +84,4 @@ void      gptps_dl_release(gptps_dl *h) { (void)h; }
 /* --- atomic file replace: no filesystem ----------------------------------- */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
 { (void)tmp_path; (void)final_path; return GPTPS_E_IO; }
+FILE *gptps_hal_open_private(const char *path) { (void)path; return 0; }

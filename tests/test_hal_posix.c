@@ -14,6 +14,9 @@
  *     target, under the umask - does not reach the new config.
  *  3) Linux: the replace is durable - the new file and its directory are synced
  *     (fsync is interposed here and counted).
+ *  4) The temp file is private from its creation (gptps_hal_open_private), whatever
+ *     the umask: nobody else can open it to read the settings or to write into it
+ *     before the replace copies it - and gptps_settings_save writes through it.
  *
  * Built only with the bundled HAL (not with -DGPTPS_HAL_SOURCE).
  */
@@ -246,12 +249,90 @@ static void replace(void)
     umask(old);
 }
 
+/* ---- 4) a private temp file ------------------------------------------------ */
+#define PRIV_CFG "gptps_hal_posix_save.toml"
+static int g_seen_tmp = -1;               /* the temp file's mode while it is written */
+static long g_knob = 7;
+static size_t knob_read(void *t, char *buf, size_t cap)
+{
+    struct stat st;
+    if (stat(PRIV_CFG ".tmp", &st) == 0) g_seen_tmp = (int)(st.st_mode & 07777);
+    return (size_t)snprintf(buf, cap, "%ld", *(long *)t);
+}
+static gptps_status knob_write(void *t, const char *v) { *(long *)t = atol(v); return GPTPS_OK; }
+
+static void private_tmp(void)
+{
+    const char *p = "gptps_hal_posix_priv.tmp", *other = "gptps_hal_posix_other.tmp";
+    struct stat st, so;
+    FILE *f;
+    int held;
+    mode_t old = umask(002);              /* a group-writable umask, as on many desktops */
+    remove(p); remove(other);
+
+    f = gptps_hal_open_private(p);
+    CHECK(f != NULL);
+    if (f) { CHECK(fputs("x", f) >= 0); CHECK(fclose(f) == 0); }
+    CHECK(stat(p, &st) == 0 && (st.st_mode & 07777) == 0600);
+
+    /* one already there, held open by someone: the new file is a new inode */
+    held = open(p, O_RDWR);
+    CHECK(held >= 0);
+    f = gptps_hal_open_private(p);
+    CHECK(f != NULL);
+    if (f) { CHECK(fputs("new", f) >= 0); CHECK(fclose(f) == 0); }
+    if (held >= 0) {
+        CHECK(fstat(held, &so) == 0 && stat(p, &st) == 0 && so.st_ino != st.st_ino);
+        CHECK(write(held, "EVIL", 4) == 4);
+        close(held);
+    }
+    CHECK(is(p, "new"));
+
+    /* a symlink put there is removed, never written through */
+    remove(p);
+    CHECK(put(other, "theirs"));
+    CHECK(symlink(other, p) == 0);
+    f = gptps_hal_open_private(p);
+    CHECK(f != NULL);
+    if (f) { CHECK(fputs("ours", f) >= 0); CHECK(fclose(f) == 0); }
+    CHECK(is(other, "theirs") && is(p, "ours"));
+    CHECK(lstat(p, &st) == 0 && S_ISREG(st.st_mode));
+    remove(p); remove(other);
+
+    /* and the settings save writes through it */
+    {
+        gptps *e = NULL;
+        gptps_config cfg;
+        gptps_setting_def d;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+        cfg.mode = GPTPS_RUN_MANUAL;
+        CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+        if (e) {
+            memset(&d, 0, sizeof d);
+            d.struct_size = sizeof d; d.key = "host.privknob"; d.type = GPTPS_SETTING_INT;
+            d.desc = "test"; d.hot = 1; d.target = &g_knob; d.read = knob_read; d.write = knob_write;
+            CHECK(gptps_register_setting(e, &d) == GPTPS_OK);
+            CHECK(gptps_settings_set(e, "host.privknob", "9") == GPTPS_OK);
+            remove(PRIV_CFG);
+            g_seen_tmp = -1;
+            CHECK(gptps_settings_save(e, PRIV_CFG) == GPTPS_OK);
+            CHECK(g_seen_tmp == 0600);    /* never 0664, not even while it was written */
+            CHECK(stat(PRIV_CFG, &st) == 0);
+            CHECK(gptps_shutdown(e) == GPTPS_OK);
+        }
+        remove(PRIV_CFG); remove(PRIV_CFG ".tmp");
+    }
+    umask(old);
+}
+
 int main(void)
 {
 #if defined(__linux__)
     cgroup_clamp();
 #endif
     replace();
+    private_tmp();
     if (fails) { printf("%d POSIX HAL check(s) FAILED\n", fails); return 1; }
     printf("POSIX HAL: all checks passed\n");
     return 0;

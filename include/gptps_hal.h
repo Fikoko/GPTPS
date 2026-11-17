@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>  /* FILE: gptps_hal_open_private */
 #include "gptps.h" /* gptps_status */
 
 #ifdef __cplusplus
@@ -168,6 +169,13 @@ void      gptps_dl_release(gptps_dl *h);
  * unavailable. Recommended, not required: keep the replaced file's permissions, as
  * the bundled POSIX HAL does - save edits an operator's config file in place. */
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path);
+/* The temp file for atomic_replace, created anew (any file at `path` is removed
+ * first; one that cannot be is a failure) and open for writing in binary mode, with
+ * access for its owner only: nobody else can open it to read the settings as they
+ * are written, nor to write into it before the replace - the file can name add-ons to
+ * load. NULL on failure. A HAL without a filesystem returns NULL; a port with no
+ * notion of file ownership may return fopen(path, "wb"). (ABI 2.8) */
+FILE        *gptps_hal_open_private(const char *path);
 
 /* --- still pending (later increment): OS memory cap (out-of-process
  * executor: setrlimit / cgroups / Job Objects).

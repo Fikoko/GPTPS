@@ -77,14 +77,21 @@ If the host process crashes or is killed, what happens to the jobs it started?
 `flags`. SIGKILL, not SIGTERM: nothing may be left to linger.
 
 - A **`PROGRAM`** job dies whole, on every POSIX system (macOS included): GPTPS keeps a
-  small watcher process beside the job, outside it, holding a pipe whose only write end
-  the host holds. When the host ends, however it ends, the pipe closes and the watcher
-  SIGKILLs the job's process group - a launcher's workers too - and, in cgroup mode,
+  small watcher process beside the job, outside it - one more child process of the
+  host, which a host with a `SIGCHLD` handler or process accounting will see. It holds
+  a pipe whose write end the host holds; the job's leader tells it the job's process
+  group before anything runs, so the host never writes to it (a watcher that is gone
+  cannot raise `SIGPIPE` in the host), and a host that dies at any moment after the
+  job's fork still takes the job. When the host ends, however it ends, the pipe closes
+  and the watcher SIGKILLs the job's process group - a launcher's workers too - and, in cgroup mode,
   everything in the job's cgroup (`cgroup.kill`, Linux 5.14+). A parent-death signal
   alone would not do: the kernel clears it in the job's own children, so it reaches
   only the process it was set in. A process that leaves the job's process group
   (`setsid`) is no longer the job, unless cgroup mode holds it. The program itself
-  also gets `PR_SET_PDEATHSIG` (Linux) / `PROC_PDEATHSIG_CTL` (FreeBSD).
+  also gets `PR_SET_PDEATHSIG` (Linux) / `PROC_PDEATHSIG_CTL` (FreeBSD). A watcher that
+  is already gone when the job starts fails the attempt (`start.error`) before the
+  program runs; one lost while the job runs (an administrator's or the OOM killer's
+  SIGKILL) is seen when the job ends and logged once per task type as a WARN.
 - An **`OOP`** job, the host's own forked copy, gets `PR_SET_PDEATHSIG` on Linux and
   `PROC_PDEATHSIG_CTL` on FreeBSD, with the `getppid()` check below. Elsewhere (macOS,
   other POSIX) it runs anyway and the type's first attempt logs a WARN - use a

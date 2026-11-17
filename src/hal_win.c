@@ -22,6 +22,8 @@
 
 #include <windows.h>
 #include <process.h>   /* _beginthreadex */
+#include <io.h>        /* _open_osfhandle, _close: gptps_hal_open_private */
+#include <fcntl.h>     /* _O_WRONLY, _O_BINARY */
 #include <stdlib.h>
 
 /* --- hardware detection -------------------------------------------------- */
@@ -156,5 +158,22 @@ void      gptps_dl_release(gptps_dl *h) { (void)h; }
 
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
 { return MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING) ? GPTPS_OK : GPTPS_E_IO; }
+
+/* A new file inherits its directory's ACL, as the target did; opened with no
+ * sharing, so no other handle - anyone's - can be had on it until it is closed. */
+FILE *gptps_hal_open_private(const char *path)
+{
+    HANDLE h;
+    int fd;
+    FILE *f;
+    if (!DeleteFileA(path) && GetLastError() != ERROR_FILE_NOT_FOUND) return NULL;
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); DeleteFileA(path); return NULL; }
+    f = _fdopen(fd, "wb");
+    if (!f) { _close(fd); DeleteFileA(path); }
+    return f;
+}
 
 #endif /* _WIN32 */

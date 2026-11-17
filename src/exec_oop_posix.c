@@ -760,8 +760,21 @@ static void child_signals_default(void)
  * nothing. It runs nothing of the host's: it ignores the signals a terminal or a kill
  * of the host's group sends, leaves the host's process group, and keeps no descriptor
  * of the host's but /dev/null. Only system calls, as in any child of a threaded
- * process. The job's own leader keeps PR_SET_PDEATHSIG where there is one: it covers
- * the moment between its fork and the watcher learning its group. */
+ * process.
+ *
+ * The watcher learns the job's group from the job itself: the leader, in its own
+ * group, writes its pid down the pipe before it runs anything of the host's or the
+ * program's, then closes its copy of the write end (close-on-exec would too). So
+ *   - the HOST never writes to the watcher: a watcher that is gone (killed from
+ *     outside, crashed, or out of descriptors at its start) can never raise SIGPIPE
+ *     in the host - SIGPIPE is the host's to set, and it may be at its default;
+ *   - a host that dies between the leader's fork and that write leaves no gap, on
+ *     any POSIX system: the leader's own write end keeps the pipe open, the watcher
+ *     still learns the group, then sees EOF and kills it;
+ *   - a watcher already gone fails the attempt before the program runs (the
+ *     leader's write fails: GPTPS_START_SETUP), as one that cannot be forked does;
+ *   - a watcher lost while the job runs is seen when the job ends (it ended by
+ *     itself), and the attempt does not report DIE_WITH_HOST as held: one WARN. */
 static void sentinel_close_from(int lo)
 {
     struct rlimit rl;
@@ -829,15 +842,24 @@ static void sentinel_run(int lfd, const char *cgdir)   /* in the watcher; never 
     _exit(0);
 }
 
-/* The watcher is done with: the job ended while the host lives. */
-static void sentinel_end(pid_t spid, int wfd)
+/* The watcher is done with: the job ended while the host lives. Returns 1 when it
+ * was still there to the end, 0 when it had gone by itself first (killed from
+ * outside, crashed, or out of descriptors at its start): the job then ran for a while
+ * with nothing to take it down with the host. */
+static int sentinel_end(pid_t spid, int wfd)
 {
-    int st;
+    int st, held = 0;
     if (spid > 0) {
-        kill(spid, SIGKILL);                       /* it ignores everything else */
-        while (waitpid(spid, &st, 0) < 0 && errno == EINTR) { }
+        pid_t r;
+        while ((r = waitpid(spid, &st, WNOHANG)) < 0 && errno == EINTR) { }
+        if (r == 0) {                              /* still waiting for the host's end */
+            held = 1;
+            kill(spid, SIGKILL);                   /* it ignores everything else */
+            while (waitpid(spid, &st, 0) < 0 && errno == EINTR) { }
+        }
     }
     if (wfd >= 0) exec_close(wfd);
+    return held;
 }
 
 /* What the parent knows about the job it waits for. */
@@ -1639,15 +1661,16 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     }
 
     {
-        int keep[8], nk = 6;
+        int keep[9], nk = 6;
         keep[0] = inp[0]; keep[1] = inp[1]; keep[2] = outp[0]; keep[3] = outp[1];
         keep[4] = rp[0]; keep[5] = rp[1];
         if (errp[0] >= 0) { keep[6] = errp[0]; keep[7] = errp[1]; nk = 8; }
+        if (life[1] >= 0) keep[nk++] = life[1];   /* the leader tells the watcher its group */
         pid = exec_fork_sweep(keep, nk);
     }
     if (pid != 0) gptps_free(envm);   /* the parent's copy; the child has its own */
     if (pid < 0) {
-        sentinel_end(spid, life[1]);      /* EOF before a group: it just goes */
+        (void)sentinel_end(spid, life[1]); /* EOF before a group: it just goes */
         gptps_free(et.buf);
         if (errp[0] >= 0) { exec_close(errp[0]); exec_close(errp[1]); }
         exec_close(inp[0]); exec_close(inp[1]); exec_close(outp[0]); exec_close(outp[1]);
@@ -1691,6 +1714,20 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         }
         close(inp[0]); close(inp[1]); close(outp[0]); close(outp[1]); close(rp[0]);
         setpgid(0, 0); /* own process group: a timeout kill takes down the program AND its children */
+        if (life[1] >= 0) {
+            /* DIE_WITH_HOST: the watcher learns the group from us, before anything
+             * runs. SIGPIPE ignored for this one write - a watcher that is gone is
+             * an EPIPE we report, not a death by signal; child_signals_default puts
+             * it back, and an ignored signal leaves nothing pending. */
+            struct sigaction ign;
+            int32_t pg = (int32_t)getpid();
+            memset(&ign, 0, sizeof ign);
+            ign.sa_handler = SIG_IGN;
+            sigemptyset(&ign.sa_mask);
+            (void)sigaction(SIGPIPE, &ign, NULL);
+            if (write_all(life[1], &pg, sizeof pg) != 0) { report_fail(rp[1], GPTPS_START_SETUP, errno); _exit(127); }
+            close(life[1]);   /* only the host's end holds the pipe open now */
+        }
         child_signals_default();   /* not the worker thread's blocked / ignored signals */
         if (die) die_with_host(host_pid);
 #if defined(__linux__)
@@ -1761,10 +1798,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
             (void)fcntl(et.fd, F_SETFL, fcntl(et.fd, F_GETFL) | O_NONBLOCK);
         }
         setpgid(pid, pid);                         /* idempotent with the child: race-free group setup */
-        if (spid > 0) {                            /* the watcher learns the job's group */
-            int32_t pg = (int32_t)pid;
-            if (write_all(life[1], &pg, sizeof pg) != 0) { sentinel_end(spid, life[1]); spid = -1; life[1] = -1; }
-        }
+        /* The watcher learns the job's group from the leader (sentinel_run): the
+         * host never writes to it, so a watcher that is gone cannot SIGPIPE us. */
         /* A write to the child's closed stdin must EPIPE, not kill us - but suppress
          * SIGPIPE WITHOUT mutating the host's process-wide disposition: per-fd on
          * macOS/BSD (F_SETNOSIGPIPE), else per-THREAD (block SIGPIPE now; drain any it
@@ -1932,8 +1967,8 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
         if (jw.started && !jw.joined) caps->applied = 0;
         /* POSIX always has SIGTERM, and the program gets it unblocked (child_signals_default) */
         if (caps->stop_grace_ms) caps->applied |= GPTPS_CAP_GRACE;
-        if (die && spid > 0) caps->applied |= GPTPS_CAP_DIE;   /* the watcher held the whole job */
-        sentinel_end(spid, life[1]);
+        /* the watcher held the whole job - unless it went first, which is said once */
+        if (sentinel_end(spid, life[1]) && die) caps->applied |= GPTPS_CAP_DIE;
 #if defined(__linux__)
         cgroup_destroy(cgdir, killed || oversize || nomem);
 #endif
