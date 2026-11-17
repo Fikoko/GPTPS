@@ -285,11 +285,15 @@ typedef gptps_status (*gptps_cost_fn)(const void *payload, size_t len,
  * crashes, is killed, exits without gptps_shutdown - the job is killed too, so a
  * restarted host cannot find yesterday's run still going beside today's. Without the
  * flag a POSIX job outlives a dead host, which some hosts want (a job that must finish
- * whatever happens). Enforced by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on
- * FreeBSD (SIGKILL: nothing may linger), and on Windows always, flag or not (the job
- * object is killed on close). Where it cannot be enforced (macOS, other POSIX) the job
- * runs anyway and the first attempt of the type logs a WARN. Ignored for INPROC, which
- * is the host. */
+ * whatever happens). SIGKILL: nothing may linger. A PROGRAM job is killed whole, on
+ * every POSIX system: every process in its process group - a launcher's workers too -
+ * and in cgroup mode everything in its cgroup (Linux 5.14+), by a small watcher process
+ * GPTPS keeps beside each such job. A process that leaves the job's process group
+ * (setsid) outside cgroup mode is no longer the job. An OOP job, the host's own forked
+ * copy, is killed by PR_SET_PDEATHSIG on Linux and PROC_PDEATHSIG_CTL on FreeBSD; on
+ * Windows every job, flag or not (the job object is killed on close). Where it cannot
+ * be enforced (an OOP job on macOS or other POSIX) the job runs anyway and the first
+ * attempt of the type logs a WARN. Ignored for INPROC, which is the host. */
 #define GPTPS_TASK_DIE_WITH_HOST 0x2u
 /* RETIRE_ON_OK (services only; ignored otherwise): by default a service is
  * "always up" - it restarts on ANY exit that was not an external stop, INCLUDING a

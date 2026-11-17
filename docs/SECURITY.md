@@ -74,14 +74,27 @@ If the host process crashes or is killed, what happens to the jobs it started?
   change that default, because a host may *want* a job to outlive it.
 
 **Since ABI 2.8 it is one flag:** set `GPTPS_TASK_DIE_WITH_HOST` in the task's
-`flags` and GPTPS arranges it in the child, correctly: `PR_SET_PDEATHSIG` on Linux,
-`PROC_PDEATHSIG_CTL` on FreeBSD, with the `getppid()` check below, for `OOP` and
-`PROGRAM` jobs. SIGKILL, not SIGTERM: the kernel sends one signal and never follows
-it up, so nothing may be left to linger. Where the OS has no such signal (macOS, other
-POSIX) the job runs anyway and the type's first attempt logs a WARN - use a supervisor
-there. `tests/test_program_stop.c` crashes a host on purpose and checks its job died.
+`flags`. SIGKILL, not SIGTERM: nothing may be left to linger.
 
-What the flag does, by hand - for a host that needs it in its own `child_setup`:
+- A **`PROGRAM`** job dies whole, on every POSIX system (macOS included): GPTPS keeps a
+  small watcher process beside the job, outside it, holding a pipe whose only write end
+  the host holds. When the host ends, however it ends, the pipe closes and the watcher
+  SIGKILLs the job's process group - a launcher's workers too - and, in cgroup mode,
+  everything in the job's cgroup (`cgroup.kill`, Linux 5.14+). A parent-death signal
+  alone would not do: the kernel clears it in the job's own children, so it reaches
+  only the process it was set in. A process that leaves the job's process group
+  (`setsid`) is no longer the job, unless cgroup mode holds it. The program itself
+  also gets `PR_SET_PDEATHSIG` (Linux) / `PROC_PDEATHSIG_CTL` (FreeBSD).
+- An **`OOP`** job, the host's own forked copy, gets `PR_SET_PDEATHSIG` on Linux and
+  `PROC_PDEATHSIG_CTL` on FreeBSD, with the `getppid()` check below. Elsewhere (macOS,
+  other POSIX) it runs anyway and the type's first attempt logs a WARN - use a
+  supervisor there.
+
+`tests/test_program_stop.c` crashes a host on purpose and checks its job died, a
+launcher's worker included.
+
+What the flag does for one process, by hand - for a host that needs it in its own
+`child_setup`:
 
 ```c
 #include <stdint.h>
@@ -112,9 +125,9 @@ Two things to know:
 
 `prctl` and `getppid` are system calls, so this is async-signal-safe. Under systemd
 the service's `KillMode=control-group` (the default) also kills every job when the
-service stops, crash or not. On **macOS** there is no `PR_SET_PDEATHSIG`; run the
-host under `launchd` with `AbandonProcessGroup` left false, or have each program
-watch its parent.
+service stops, crash or not. On **macOS** there is no `PR_SET_PDEATHSIG`: a `PROGRAM`
+job has the flag's watcher; otherwise run the host under `launchd` with
+`AbandonProcessGroup` left false, or have each program watch its parent.
 
 ## Fork safety
 

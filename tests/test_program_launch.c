@@ -20,6 +20,12 @@
  *  7) stop_grace_ms (POSIX): a stopped program gets SIGTERM and time to clean up;
  *     one that ignores it is SIGKILLed when the grace runs out. Windows: stopped at
  *     once, and the first attempt logs that the grace is not in force.
+ *  8) Stdout EOF is not the end: a program that points its stdout elsewhere and runs
+ *     on (`exec >>job.log 2>&1`) runs to its own exit, with no deadline, and is
+ *     reported by its exit code; a deadline still ends it.
+ *  9) POSIX: the program starts with no signal blocked and none ignored, whatever
+ *     the host's thread had - so a host that blocks SIGTERM for a sigwait thread
+ *     still gets its programs a working stop_grace_ms.
  *
  * MANUAL mode: gptps_step runs each job to completion on this thread.
  */
@@ -35,6 +41,7 @@
 #  include <windows.h>
 #  include <direct.h>    /* _getcwd */
 #else
+#  include <signal.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
 #endif
@@ -500,6 +507,70 @@ int main(void)
         remove("gptps_launch_cleaned.txt");
         FreeConsole();
         gptps_set_log_sink(NULL, NULL);
+    }
+#endif
+
+    /* 8) stdout EOF, and the program runs on: no deadline, so it ends when it exits -
+     * up to 1.9 POSIX SIGKILLed it 2 s after the EOF and reported a timeout */
+    {
+        static const char *const a_eof0[] = { HELPER_PATH, "eofsleep", "3000", "0", NULL };
+        static const char *const a_eof5[] = { HELPER_PATH, "eofsleep", "2500", "5", NULL };
+        static const char *const a_eofd[] = { HELPER_PATH, "eofsleep", "30000", "0", NULL };
+        uint64_t t0;
+        def_prog(&d, "eof0", a_eof0); d.stderr_tail_bytes = 16;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        t0 = gptps_now_ms(NULL);
+        CHECK(run1(e, "eof0") && g_ok && g_st == GPTPS_OK && strcmp(g_res, "x") == 0);
+        CHECK(g_have_code && g_code == 0);
+        CHECK(gptps_now_ms(NULL) - t0 >= 2900);               /* it ran its course */
+        /* its exit code says how it went, and what it wrote after the EOF is kept */
+        def_prog(&d, "eof5", a_eof5); d.stderr_tail_bytes = 16;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "eof5") && !g_ok && g_st == GPTPS_E_TASK);
+        CHECK(g_have_code && g_code == 5);
+        CHECK(g_has_tail && strstr(g_tail, "late") != NULL);
+        gptps_dead_letter_drain(e, NULL, NULL);
+        /* a deadline still ends it, and cancel / shutdown still do (test_exec_faults,
+         * test_hang: "eofhang") */
+        def_prog(&d, "eofd", a_eofd); d.default_policy.timeout_seconds = 1; d.stderr_tail_bytes = 16;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        t0 = gptps_now_ms(NULL);
+        CHECK(run1(e, "eofd") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        CHECK(gptps_now_ms(NULL) - t0 < 5000);
+        gptps_dead_letter_drain(e, NULL, NULL);
+    }
+
+#if !defined(_WIN32)
+    /* 9) the host's signal state does not reach the program. MANUAL mode runs the
+     * job on this thread, so this thread's mask is the one a worker would have. */
+    {
+        static const char *const a_sig[]  = { HELPER_PATH, "sigstate", NULL };
+        static const char *const a_term[] = { HELPER_PATH, "term", "gptps_launch_cleaned.txt", NULL };
+        sigset_t block, old;
+        struct sigaction ign, oldpipe;
+        FILE *f;
+        char got[16] = { 0 };
+        sigemptyset(&block); sigaddset(&block, SIGTERM); sigaddset(&block, SIGINT);
+        CHECK(sigprocmask(SIG_BLOCK, &block, &old) == 0);    /* the sigwait-thread pattern */
+        memset(&ign, 0, sizeof ign); ign.sa_handler = SIG_IGN; sigemptyset(&ign.sa_mask);
+        CHECK(sigaction(SIGPIPE, &ign, &oldpipe) == 0);       /* a server's usual setup */
+        def_prog(&d, "sigstate", a_sig);
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "sigstate") && g_ok && strcmp(g_res, "term=0 pipe=0") == 0);
+        if (strcmp(g_res, "term=0 pipe=0") != 0) printf("sigstate: [%s]\n", g_res);
+        /* and so its SIGTERM arrives: the grace is used, not waited out */
+        remove("gptps_launch_cleaned.txt");
+        def_prog(&d, "termblk", a_term); d.default_policy.timeout_seconds = 1; d.stop_grace_ms = 5000;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(run1(e, "termblk") && !g_ok && g_st == GPTPS_E_TIMEOUT);
+        f = fopen("gptps_launch_cleaned.txt", "rb");
+        CHECK(f != NULL);
+        if (f) { CHECK(fread(got, 1, sizeof got - 1, f) == 7); fclose(f); }
+        CHECK(strcmp(got, "cleaned") == 0);
+        remove("gptps_launch_cleaned.txt");
+        gptps_dead_letter_drain(e, NULL, NULL);
+        CHECK(sigaction(SIGPIPE, &oldpipe, NULL) == 0);
+        CHECK(sigprocmask(SIG_SETMASK, &old, NULL) == 0);
     }
 #endif
 

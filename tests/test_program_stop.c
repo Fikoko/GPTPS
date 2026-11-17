@@ -12,9 +12,11 @@
  *  3) A program that writes a lot while cleaning up is still read, so it cannot block.
  *  4) Windows: all of it with and without a console in the host - a service has none.
  *  5) A dead letter carries the last attempt's measurements: exit.code, start.error.
- *  6) GPTPS_TASK_DIE_WITH_HOST: a host that dies takes its jobs with it (Linux,
- *     FreeBSD; Windows always); without the flag a POSIX job outlives it; where it
- *     cannot be enforced, one WARN per task type.
+ *  6) GPTPS_TASK_DIE_WITH_HOST: a host that dies takes its jobs with it - the WHOLE
+ *     job, a launcher's workers too (every POSIX system; Windows always); without
+ *     the flag a POSIX job outlives it; a job that ends leaves no watcher behind;
+ *     where it cannot be enforced (an OOP job off Linux / FreeBSD), one WARN per
+ *     task type.
  *
  * A threaded engine: the stops come from another thread, as they do in a host.
  */
@@ -217,8 +219,9 @@ static long read_pid(void)
     fclose(f);
     return pid;
 }
-/* A host that starts a job and is then killed outright. Returns the job's pid. */
-static long crash_host(int die_flag)
+/* A host that starts a job and is then killed outright. Returns the pid the job
+ * wrote: its leader's, or with `launcher` the pid of the worker the leader started. */
+static long crash_host(int die_flag, int launcher)
 {
     pid_t host;
     int st;
@@ -227,9 +230,10 @@ static long crash_host(int die_flag)
     if (host < 0) return 0;
     if (host == 0) {
         static const char *const a_pid[] = { HELPER_PATH, "pidsleep", PID_FILE, NULL };
+        static const char *const a_spawn[] = { HELPER_PATH, "spawn", "pidsleep", PID_FILE, NULL };
         gptps *e = open_engine(0);
         if (!e) _exit(2);
-        reg(e, "victim", a_pid, 0, 0, die_flag ? GPTPS_TASK_DIE_WITH_HOST : 0u);
+        reg(e, "victim", launcher ? a_spawn : a_pid, 0, 0, die_flag ? GPTPS_TASK_DIE_WITH_HOST : 0u);
         if (gptps_submit(e, "victim", NULL, 0, NULL) != GPTPS_OK) _exit(3);
         { int i; for (i = 0; i < 1000 && !read_pid(); ++i) sleep_ms(10); }
         kill(getpid(), SIGKILL);                 /* a crash: no shutdown, no cleanup */
@@ -249,23 +253,34 @@ static int alive_after(long pid, unsigned ms)
 }
 #endif
 
+#if !defined(_WIN32) && !defined(__linux__) && !defined(__FreeBSD__)
+static gptps_status oop_ok(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
+#endif
+
 static void die_with_host(void)
 {
 #if !defined(_WIN32)
     long pid;
     /* without the flag the job outlives its host - which some hosts want */
-    pid = crash_host(0);
+    pid = crash_host(0, 0);
     CHECK(pid > 0);
     if (pid > 0) { CHECK(alive_after(pid, 500)); kill((pid_t)pid, SIGKILL); }
-#  if defined(__linux__) || defined(__FreeBSD__)
-    pid = crash_host(1);
+    pid = crash_host(1, 0);
     CHECK(pid > 0);
     if (pid > 0) {
         int alive = alive_after(pid, 3000);
         CHECK(!alive);                           /* killed with its host */
         if (alive) kill((pid_t)pid, SIGKILL);
     }
-#  endif
+    /* the whole job: a launcher's worker - which a parent-death signal, cleared at
+     * fork, never reaches - goes with the host too */
+    pid = crash_host(1, 1);
+    CHECK(pid > 0);
+    if (pid > 0) {
+        int alive = alive_after(pid, 3000);
+        CHECK(!alive);
+        if (alive) { pid_t g = getpgid((pid_t)pid); if (g > 1) kill(-g, SIGKILL); }
+    }
 #endif
     {   /* where it cannot be enforced, the first attempt of the type says so - once */
         static const char *const a_exit0[] = { HELPER_PATH, "exit", "0", NULL };
@@ -277,12 +292,33 @@ static void die_with_host(void)
         CHECK(gptps_submit(e, "die", NULL, 0, NULL) == GPTPS_OK);
         CHECK(wait_for(&g_done, 2, 10000));
         CHECK(gptps_shutdown(e) == GPTPS_OK);
-#if defined(__linux__) || defined(__FreeBSD__) || defined(_WIN32)
-        CHECK(get(&g_warn_die) == 0);
-#else
-        CHECK(get(&g_warn_die) == 1);
+        CHECK(get(&g_warn_die) == 0);            /* PROGRAM: enforced everywhere */
+#if !defined(_WIN32)
+        {   /* and the jobs' watchers are gone with them: this process has no child left */
+            int st;
+            CHECK(waitpid(-1, &st, WNOHANG) < 0);
+        }
 #endif
     }
+#if !defined(_WIN32) && !defined(__linux__) && !defined(__FreeBSD__)
+    {   /* an OOP job is the host's own forked copy: only a parent-death signal holds it */
+        gptps *e = open_engine(0);
+        gptps_task_def d;
+        if (!e) return;
+        put(&g_warn_die, 0); put(&g_done, 0);
+        memset(&d, 0, sizeof d);
+        d.struct_size = sizeof d; d.name = "dieoop"; d.exec = GPTPS_EXEC_OOP; d.run = oop_ok;
+        d.default_cost.struct_size = sizeof d.default_cost;
+        d.default_policy.struct_size = sizeof d.default_policy;
+        d.flags = GPTPS_TASK_DIE_WITH_HOST;
+        CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+        CHECK(gptps_submit(e, "dieoop", NULL, 0, NULL) == GPTPS_OK);
+        CHECK(gptps_submit(e, "dieoop", NULL, 0, NULL) == GPTPS_OK);
+        CHECK(wait_for(&g_done, 2, 10000));
+        CHECK(gptps_shutdown(e) == GPTPS_OK);
+        CHECK(get(&g_warn_die) == 1);
+    }
+#endif
 }
 
 int main(void)
