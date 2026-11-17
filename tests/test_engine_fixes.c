@@ -364,35 +364,49 @@ static void test_program_timeout_ms(gptps_run_mode mode)
  * decide by the clock when the executor returned, and called it GPTPS_E_TIMEOUT -
  * which gptps.h says a cancel never is. POSIX: SIGTERM is the graceful stop. */
 #define TERM_FILE "gptps_fix_term.out"
-static const char *const TERM_ARGV[] = { HELPER_PATH, "term", TERM_FILE, "700", 0 };
+static const char *const TERM_ARGV[] = { HELPER_PATH, "term", TERM_FILE, "2500", 0 };
 static void test_cancel_before_deadline(void)
 {
     gptps *e = open_engine(GPTPS_RUN_THREADED, 1, 1u << 30, NULL);
     gptps_task_def d;
     gptps_submit_options o;
     gptps_handle h = 0;
+    uint64_t t_sub, t_cancel;
     if (!e) return;
     (void)remove(TERM_FILE);
     tally_reset(); track("slowstop");
     CHECK(gptps_set_event_cb(e, on_ev, NULL) == GPTPS_OK);
     base_def(&d, "slowstop", GPTPS_EXEC_PROGRAM); d.argv = TERM_ARGV;
     d.default_policy.on_failure = GPTPS_ON_FAILURE_DROP;
-    d.stop_grace_ms = 5000;              /* it cleans up in 700 ms: well inside */
+    d.stop_grace_ms = 5000;              /* it cleans up in 2.5 s: well inside */
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
     memset(&o, 0, sizeof o);
-    o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_TIMEOUT_MS; o.timeout_ms = 400;
+    o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_TIMEOUT_MS; o.timeout_ms = 2000;
+    t_sub = gptps_now_ms(NULL);
     CHECK(gptps_submit_ex(e, "slowstop", NULL, 0, &o, &h) == GPTPS_OK);
     CHECK(wait_for(&tally_of("slowstop")->started, 1, 5000));
-    sleep_ms(100);                       /* the job is up; the deadline is ~300 ms away */
+    sleep_ms(200);                       /* the job has its SIGTERM handler up */
+    t_cancel = gptps_now_ms(NULL);       /* the deadline is ~1.8 s away */
     CHECK(gptps_cancel(e, h) == GPTPS_OK);
     CHECK(wait_for(&tally_of("slowstop")->failed, 1, 10000));
-    /* it ended ~800 ms in, past its 400 ms deadline - but it was cancelled first. Its
-     * one FAILED says so: it used to say GPTPS_E_TIMEOUT, and a second FAILED with
-     * GPTPS_E_CANCELLED then closed the handle the cancel had asked to end. */
+    /* it ends ~2.5 s in, past its 2 s deadline - but it was cancelled first. Its one
+     * FAILED says so: it used to say GPTPS_E_TIMEOUT, and a second FAILED with
+     * GPTPS_E_CANCELLED then closed the handle the cancel had asked to end.
+     * The precondition is checked, not assumed: a cancel that lands AFTER the
+     * deadline (a host too loaded to send it within 2 s) rightly gets TIMEOUT for
+     * the attempt and then a terminal CANCELLED - the documented contract, not this
+     * bug - so it is reported as a test that could not run, never as a pass. */
     CHECK(gptps_shutdown(e) == GPTPS_OK);
     e = NULL;
-    CHECK(get(&tally_of("slowstop")->first_status) == (int)GPTPS_E_CANCELLED);
-    CHECK(get(&tally_of("slowstop")->failed) == 1);
+    if (t_cancel - t_sub >= 2000) {
+        printf("FAIL cancel_before_deadline could not run: the cancel was sent %llu ms "
+               "after the submit, past the 2000 ms deadline\n",
+               (unsigned long long)(t_cancel - t_sub));
+        ++fails;
+    } else {
+        CHECK(get(&tally_of("slowstop")->first_status) == (int)GPTPS_E_CANCELLED);
+        CHECK(get(&tally_of("slowstop")->failed) == 1);
+    }
     {
         FILE *f = fopen(TERM_FILE, "r");
         CHECK(f != NULL);                /* the graceful stop did run */
