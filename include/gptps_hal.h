@@ -160,6 +160,14 @@ void      gptps_dl_close(gptps_dl *h);
  * failed. Separating the two makes the intent exact and keeps the failure path
  * leak-free under LeakSanitizer. */
 void      gptps_dl_release(gptps_dl *h);
+/* Why the last gptps_dl_open or gptps_dl_sym on the CALLING thread failed, in the
+ * OS's words (dlerror, or the Windows message for GetLastError): a library or a
+ * dependency that is missing, the wrong architecture, an unresolved symbol. Writes
+ * a NUL-terminated line into buf and returns its length, or writes "" and returns 0
+ * when it has nothing to say. The add-on loader calls it straight after the failure
+ * and logs the line, so an operator sees the cause and not just "I/O error". Since
+ * 1.10: a port that predates it adds it - returning 0 is a complete implementation. */
+size_t    gptps_dl_error(char *buf, size_t cap);
 
 /* --- atomic file replace (settings save: temp -> final) - OPTIONAL -------- *
  * Atomically replace `final_path` with `tmp_path` (rename on POSIX, MoveFileEx

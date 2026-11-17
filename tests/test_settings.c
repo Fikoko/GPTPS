@@ -307,16 +307,26 @@ int main(void)
     CHECK(has_key(e, "stats.dead_letters_evicted"));
     CHECK(has_key(e, "scheduler.reserve_after_skips"));
 
-    /* a task adds its nine knobs: six, and the three process caps of ABI 2.6 */
+    /* a task adds its eleven knobs: six, the three process caps of ABI 2.6, and
+     * (1.10) the two PROGRAM numbers of ABI 2.7 */
     reg(e, "work");
-    CHECK(gptps_settings_count(e) == core_n + 9);
+    CHECK(gptps_settings_count(e) == core_n + 11);
     CHECK(has_key(e, "tasks.work.timeout_seconds"));
     CHECK(has_key(e, "tasks.work.on_failure"));
     CHECK(has_key(e, "tasks.work.cpu_max_millicpus"));
     CHECK(has_key(e, "tasks.work.io_max_read_bps"));
     CHECK(has_key(e, "tasks.work.io_max_write_bps"));
+    CHECK(has_key(e, "tasks.work.stop_grace_ms"));
+    CHECK(has_key(e, "tasks.work.stderr_tail_bytes"));
     reg(e, "bulk");
-    CHECK(gptps_settings_count(e) == core_n + 18);
+    CHECK(gptps_settings_count(e) == core_n + 22);
+    /* their ranges are the executor's caps: past them a value is refused, not clamped */
+    CHECK(gptps_settings_set(e, "tasks.work.stop_grace_ms", "300000") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.work.stop_grace_ms", "300001") != GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.work.stderr_tail_bytes", "65536") == GPTPS_OK);
+    CHECK(gptps_settings_set(e, "tasks.work.stderr_tail_bytes", "65537") != GPTPS_OK);
+    CHECK(gptps_settings_get(e, "tasks.work.stop_grace_ms", buf, sizeof buf) == GPTPS_OK && strcmp(buf, "300000") == 0);
+    CHECK(gptps_settings_get(e, "tasks.work.stderr_tail_bytes", buf, sizeof buf) == GPTPS_OK && strcmp(buf, "65536") == 0);
 
     /* get a default */
     CHECK(gptps_settings_get(e, "scheduler.reserve_after_skips", buf, sizeof buf) == GPTPS_OK);

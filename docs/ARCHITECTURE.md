@@ -264,8 +264,13 @@ Then:
   running tasks until `top` fits. This bounds starvation to at most
   `reserve_after_skips` backfills. Over-budget submits are rejected up front, and
   a queued item that a live budget cut or cost raise leaves unable ever to fit is
-  dead-lettered with `GPTPS_E_BUDGET` when the scan reaches it, so a reserved task
-  is always eventually admitted or ended: the reservation cannot wait forever.
+  dead-lettered with `GPTPS_E_BUDGET` when the scan reaches it. Running
+  `GPTPS_TASK_SERVICE` instances do not drain - each keeps its reservation while it is
+  up - so when `top` cannot fit beside what services hold, the dispatcher does not
+  reserve for it (that would stop all admission for as long as the services live):
+  other work keeps being admitted past it, `top` starts once enough budget is free,
+  and one WARN per task type says so. A reservation therefore only ever waits for
+  work that drains; it cannot wait forever.
 - **A due retry announced this pass** (step 2b, zero backoff) is not in `intake` yet.
   Work at or above its priority is admitted as usual; lower work only while it still
   fits beside every due retry, a slot and its declared memory each. MANUAL mode admits

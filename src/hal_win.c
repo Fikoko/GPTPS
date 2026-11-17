@@ -153,6 +153,33 @@ void      gptps_dl_close(gptps_dl *h) { if (h) FreeLibrary((HMODULE)h); }
 /* The handle IS the HMODULE here - nothing was allocated to wrap it - so keeping
  * the mapping and dropping the bookkeeping is simply doing nothing. */
 void      gptps_dl_release(gptps_dl *h) { (void)h; }
+/* The system's message for the thread's last error, which a failed LoadLibrary /
+ * GetProcAddress just set: a dependent DLL that is missing, a 32/64-bit mismatch,
+ * a procedure that was not found. Read before anything else can overwrite it. */
+size_t gptps_dl_error(char *buf, size_t cap)
+{
+    DWORD err = GetLastError();
+    char sys[256];
+    DWORD n;
+    size_t i = 0;
+    const char *p;
+    char num[16];
+    int k = 0;
+    if (!buf || !cap) return 0;
+    buf[0] = 0;
+    if (!err) return 0;
+    n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err,
+                       0, sys, (DWORD)sizeof sys, NULL);
+    while (n && (sys[n - 1] == '\r' || sys[n - 1] == '\n' || sys[n - 1] == ' ' || sys[n - 1] == '.')) --n;
+    sys[n < sizeof sys ? n : sizeof sys - 1] = 0;
+    for (p = n ? sys : "Windows error"; *p && i + 1 < cap; ++p) buf[i++] = *p;
+    for (p = " (error "; *p && i + 1 < cap; ++p) buf[i++] = *p;
+    do { num[k++] = (char)('0' + err % 10u); err /= 10u; } while (err && k < (int)sizeof num);
+    while (k > 0 && i + 1 < cap) buf[i++] = num[--k];
+    if (i + 1 < cap) buf[i++] = ')';
+    buf[i] = 0;
+    return i;
+}
 
 gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_path)
 { return MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING) ? GPTPS_OK : GPTPS_E_IO; }

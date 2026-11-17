@@ -380,6 +380,19 @@ void *gptps_dl_sym(gptps_dl *h, const char *symbol) { return h ? dlsym(h->handle
 void  gptps_dl_close(gptps_dl *h) { if (h) { dlclose(h->handle); free(h); } }
 /* Drop the wrapper, keep the mapping (see gptps_hal.h). */
 void  gptps_dl_release(gptps_dl *h) { free(h); }
+/* dlerror(): the reason of the last failed dlopen / dlsym, on this thread - which
+ * library or symbol was missing, a wrong architecture, ... */
+size_t gptps_dl_error(char *buf, size_t cap)
+{
+    const char *m = dlerror();
+    int n;
+    if (!buf || !cap) return 0;
+    buf[0] = 0;
+    if (!m) return 0;
+    n = snprintf(buf, cap, "%s", m);
+    if (n < 0) { buf[0] = 0; return 0; }
+    return (size_t)n < cap ? (size_t)n : cap - 1;
+}
 
 /* The replaced file's permission bits carry over to its replacement. A save edits
  * the operator's config file: one they kept to themselves must not come back

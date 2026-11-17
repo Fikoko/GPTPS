@@ -90,8 +90,9 @@ uint32_t fl = (ev->struct_size >= offsetof(gptps_event, flags) + sizeof ev->flag
 ```
 
 `measures` and `n_measures` (ABI 2.5, [MEASUREMENTS.md](MEASUREMENTS.md)) are guarded
-the same way. `gptps_event_measure()` does it for you, but it is a core function and a
-plug-in links no core symbol, so a plug-in reads the array itself:
+the same way. `gptps_event_measure()` does it for you; a plug-in links no core symbol,
+so it calls it through the host table, `api->event_measure` (ABI 2.8 - check
+`api->struct_size` first), or, on an older core, reads the array itself:
 
 ```c
 size_t i, n = (ev->struct_size >= offsetof(gptps_event, n_measures) + sizeof ev->n_measures)
@@ -113,7 +114,8 @@ v1.4 `register_setting` · v1.8 `unregister_task`, `task_exists`, `define_global
 `resource_usage` · v1.12 `set_scheduler` · **2.1** `is_cancelled`, `deadline_ms`,
 `now_ms`, `result_set_nocopy`, `task_setting_int`, `task_setting_str`, `submit`,
 `submit_ex`, `settings_get`, `settings_set`, `settings_watch`, `set_task_priority`,
-`strerror`, `version`, `set_scheduler_ex`.
+`strerror`, `version`, `set_scheduler_ex` · **2.8** `task_flags` (is a type a
+`GPTPS_TASK_SERVICE`, whose handle has a terminal event per run?), `event_measure`.
 
 Deliberately absent, with reasons in the header: engine lifecycle
 (`open`/`shutdown`/`step`), the process-wide `set_allocator`/`set_log_sink`,

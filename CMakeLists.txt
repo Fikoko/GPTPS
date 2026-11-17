@@ -967,6 +967,24 @@ add_dependencies(test_program_stop prog_helper)
 add_test(NAME program_stop COMMAND test_program_stop)
 set_tests_properties(program_stop PROPERTIES TIMEOUT 120)
 
+# The core's fixes before 1.10.0: the starvation guard beside services, MANUAL
+# deadlines, TIMEOUT_MS on PROGRAM jobs, a dead letter's own stderr tail, every
+# per-task key from the file, distinct task flags, clone of an older def, the host
+# table's 2.8 routines, and why an add-on did not load.
+add_library(addon_hostapi MODULE tests/addon_hostapi.c)
+target_include_directories(addon_hostapi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_hostapi PROPERTIES PREFIX "")
+add_executable(test_engine_fixes tests/test_engine_fixes.c)
+target_include_directories(test_engine_fixes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_engine_fixes PRIVATE gptps)
+target_compile_definitions(test_engine_fixes PRIVATE
+    HELPER_PATH="$<TARGET_FILE:prog_helper>"
+    ADDON_HOSTAPI_PATH="$<TARGET_FILE:addon_hostapi>"
+    ADDON_BAD_PATH="$<TARGET_FILE:addon_bad>")
+add_dependencies(test_engine_fixes prog_helper addon_hostapi addon_bad)
+add_test(NAME engine_fixes COMMAND test_engine_fixes)
+set_tests_properties(engine_fixes PROPERTIES TIMEOUT 120)
+
 # The CPU cap on Windows: a job object throttles a capped PROGRAM job (ABI 2.6). Linux's
 # is a cgroup's and is tested in test_cgroup; nothing else could vouch for this one.
 if(WIN32)

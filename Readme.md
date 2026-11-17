@@ -681,7 +681,10 @@ device), or live as `tasks.<name>.cpu_max_millicpus` etc. These bound what a job
 started may *use*; what may *start* is still admission's business (a CPU budget for that is
 a named resource: `gptps_define_resource(e, "cpu", 8000)`). They are enforced as `cpu.max`
 / `io.max` on the job's cgroup in cgroup mode (the parent must delegate `+cpu` / `+io`),
-and the CPU cap through the job object's hard CPU-rate limit on Windows. Where nothing can
+and on Windows through the job object: the CPU cap as its hard CPU-rate limit, the I/O
+caps (ABI 2.8, Windows 10 1607 / Server 2016 and later) as its I/O rate control, which
+holds reads and writes together per volume - two different I/O caps hold as one, the
+smaller, and that is warned once. Where nothing can
 hold one, the job still runs and the log sink gets **one** `WARN` per cap per task type —
 never silence. A CPU cap held by a cgroup reports `cpu.throttled_ms` on the job's
 `FINISHED` / `FAILED`: the evidence that the cap is why it was slow.
