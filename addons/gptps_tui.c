@@ -48,6 +48,10 @@ static int  fd_is_tty(FILE *f)       { return isatty(fileno(f)); }
 #endif
 
 #define TUI_MAX_TASKS 64
+/* Latency ring: how many slots past a live head a new entry may look for room in, and
+ * how many skipped terminal events are remembered (see lat_slot, lat_memo). */
+#define TUI_LAT_PROBE 16
+#define TUI_LAT_MEMO  8
 /* A row and a RECENT record hold the FULL task name: the lookup (task_for) compares
  * whole names, so a shorter copy made every 64..127-byte name a new row on every
  * event, and one such task used up all 64 rows. The label is display only. */
@@ -360,7 +364,12 @@ struct gptps_tui {
     int              lat_tomb;      /* tombstones in the ring */
     int              lat_live;      /* live entries in the ring */
     uint64_t         lat_evicted;   /* live entries overwritten before their terminal event: samples lost */
-    uint64_t         lat_skipped;   /* tombstones not planted, because the slot held a live entry */
+    uint64_t         lat_skipped;   /* terminal events with no entry and no room for a tombstone */
+    /* The handles of the last TUI_LAT_MEMO terminal events that were skipped: their late
+     * QUEUED must not start a clock (the item has ended), which would leave an entry no
+     * terminal event will ever release - and evict a live one to make room for it. */
+    gptps_handle     lat_memo[TUI_LAT_MEMO];
+    int              lat_nmemo, lat_memo_head;
     int              lat_warned;    /* the window size the eviction WARN was given for (0: none) */
     int              scroll;        /* recent-log scroll offset (lines back) */
     int              kpi;           /* effective gptps_tui_kpi (never DEFAULT) */
@@ -447,8 +456,12 @@ static int note_untracked(gptps_tui *t, const char *name)
     return 0;
 }
 
-/* The row of task type `name`, made on first sight. NULL when the table is full; then
- * the type is counted as left out, and *left_out (may be NULL) is set for the first one. */
+/* The row of task type `name`, made on first sight. NULL when the table is full. On the
+ * event path (left_out not NULL) the type is then counted as left out, and *left_out is
+ * set for the first one, which the caller WARNs about. gptps_tui_add_task passes NULL:
+ * it reports the full table as GPTPS_E_FULL, and a name it was given has no events yet -
+ * counting it used up the one WARN, so the first type whose events really got no row
+ * was never logged, and the "+N types not shown" footer counted a type with none. */
 static tui_task *task_for(gptps_tui *t, const char *name, int *left_out)
 {
     int i;
@@ -462,7 +475,7 @@ static tui_task *task_for(gptps_tui *t, const char *name, int *left_out)
         copy_u8(tk->label, sizeof tk->label, name);
         return tk;
     }
-    if (note_untracked(t, name) && left_out) *left_out = 1;
+    if (left_out && note_untracked(t, name)) *left_out = 1;
     return NULL;
 }
 
@@ -475,18 +488,35 @@ static void lat_sample(tui_task *tk, uint64_t from, uint64_t to)
     if (l > tk->lat_max_ms) tk->lat_max_ms = l;
 }
 
-/* Write an entry (done: 0 live, 1 or 2 a tombstone) at the ring's head, over what is
- * there. Returns 1 when that was a LIVE entry: its sample is lost, and counted. */
-static int lat_put(gptps_tui *t, gptps_handle h, uint64_t ts, int done)
+/* The slot a new entry goes in: the head, or - when the head holds a live entry (an
+ * item that is still queued or running when the ring comes round to it, a long-running
+ * one, say) - the first of the next TUI_LAT_PROBE slots that holds none. Writing over
+ * the live head while slots behind it were free evicted that item for nothing: its
+ * sample was lost and counted as the window being too small when it was not. -1 when
+ * every probed slot is live (the ring is, as near as the probe can tell, full). */
+static int lat_slot(const gptps_tui *t)
+{
+    int i, j;
+    for (i = 0; i < TUI_LAT_PROBE && i < t->lat_cap; ++i) {
+        j = (t->lat_head + i) % t->lat_cap;
+        if (!t->lat[j].h || t->lat[j].done) return j;
+    }
+    return -1;
+}
+
+/* Write an entry (done: 0 live, 1 or 2 a tombstone) at slot j, over what is there; the
+ * head moves past it when `advance`. Returns 1 when that was a LIVE entry: its sample
+ * is lost, and counted. */
+static int lat_put(gptps_tui *t, int j, int advance, gptps_handle h, uint64_t ts, int done)
 {
     int evicted = 0;
-    if (t->lat[t->lat_head].h) {
-        if (t->lat[t->lat_head].done) --t->lat_tomb;
+    if (t->lat[j].h) {
+        if (t->lat[j].done) --t->lat_tomb;
         else { --t->lat_live; ++t->lat_evicted; evicted = 1; }
     }
-    t->lat[t->lat_head].h = h; t->lat[t->lat_head].ts = ts; t->lat[t->lat_head].done = done;
+    t->lat[j].h = h; t->lat[j].ts = ts; t->lat[j].done = done;
     if (done) ++t->lat_tomb; else ++t->lat_live;
-    t->lat_head = (t->lat_head + 1) % t->lat_cap;
+    if (advance) t->lat_head = (j + 1) % t->lat_cap;
     return evicted;
 }
 
@@ -503,7 +533,14 @@ static int lat_queued(gptps_tui *t, const gptps_event *ev, tui_task *tk)
                 return 0;
             }
     }
-    return lat_put(t, ev->handle, ev->ts_ms, 0);
+    for (j = 0; j < t->lat_nmemo; ++j)                    /* ...and found no room: it ended */
+        if (t->lat_memo[j] == ev->handle) {
+            t->lat_memo[j] = t->lat_memo[--t->lat_nmemo]; /* already counted in lat_skipped */
+            return 0;
+        }
+    j = lat_slot(t);
+    return j >= 0 ? lat_put(t, j, 1, ev->handle, ev->ts_ms, 0)
+                  : lat_put(t, t->lat_head, 1, ev->handle, ev->ts_ms, 0);   /* full: evict the oldest */
 }
 
 /* The item's life ends with this event (gptps.h, EVENTS): FINISHED, DEAD_LETTERED,
@@ -519,15 +556,17 @@ static int ev_terminal(const gptps_event *ev)
  * avg ms covers finished items. Every terminal event releases it: only FINISHED used
  * to, and an item that was dead-lettered, dropped or cancelled kept its entry until
  * the ring came round, so the window tracked fewer items than it was sized for. */
-static void lat_terminal(gptps_tui *t, const gptps_event *ev, tui_task *tk)
+static int lat_terminal(gptps_tui *t, const gptps_event *ev, tui_task *tk)
 {
-    int j, fin = (ev->kind == GPTPS_EV_FINISHED);
-    for (j = 0; j < t->lat_cap; ++j)
+    int j, fin = (ev->kind == GPTPS_EV_FINISHED), free_j = -1;
+    for (j = 0; j < t->lat_cap; ++j) {
         if (t->lat[j].h == ev->handle && !t->lat[j].done) {
             if (fin) lat_sample(tk, t->lat[j].ts, ev->ts_ms);
             t->lat[j].h = 0; --t->lat_live;
-            return;
+            return 0;
         }
+        if (free_j < 0 && !t->lat[j].h) free_j = j;
+    }
     /* No live entry: this event outran its own QUEUED - leave a tombstone for it (these
      * are the FASTEST items; dropping them would skew avg ms up) - or its entry was
      * evicted because the window is smaller than the depth. The two cannot be told
@@ -535,9 +574,16 @@ static void lat_terminal(gptps_tui *t, const gptps_event *ev, tui_task *tk)
      * over a live one, it evicted a second item, whose terminal event then missed and
      * evicted a third: at depth >= window that cascade left 0 samples and a ring full
      * of tombstones nothing would claim, each one turning on the scan above for every
-     * QUEUED. Skipped, the loss stops at the items already evicted (counted). */
-    if (t->lat[t->lat_head].h && !t->lat[t->lat_head].done) { ++t->lat_skipped; return; }
-    lat_put(t, ev->handle, ev->ts_ms, fin ? 1 : 2);
+     * QUEUED. So it goes in a slot near the head that holds none (lat_slot), else in
+     * any free slot the scan above passed, and only when there is neither is it skipped
+     * (counted, and remembered so its late QUEUED starts no clock for an ended item).
+     * Returns 1 when skipped. */
+    if ((j = lat_slot(t)) >= 0) { lat_put(t, j, 1, ev->handle, ev->ts_ms, fin ? 1 : 2); return 0; }
+    if (free_j >= 0)            { lat_put(t, free_j, 0, ev->handle, ev->ts_ms, fin ? 1 : 2); return 0; }
+    ++t->lat_skipped;
+    if (t->lat_nmemo < TUI_LAT_MEMO) t->lat_memo[t->lat_nmemo++] = ev->handle;
+    else { t->lat_memo[t->lat_memo_head] = ev->handle; t->lat_memo_head = (t->lat_memo_head + 1) % TUI_LAT_MEMO; }
+    return 1;
 }
 
 static void tui_on_event(const gptps_event *ev, void *ud)
@@ -598,12 +644,13 @@ static void tui_on_event(const gptps_event *ev, void *ud)
      * entry lives from QUEUED to its terminal event, so a burst that backs up past
      * lat_cap items overwrites the oldest live entries before they resolve. Those
      * samples are lost - the longest waits, so avg ms then reads LOW - and counted
-     * (lat_evicted, shown under the table), with a WARN once per window size. The
+     * (lat_evicted, and lat_skipped for the ends that found no entry, both shown under
+     * the table), with a WARN once per window size. The
      * window is the caller's to size (cfg.latency_window, or tui.latency_window at
      * runtime), which is why it is a knob and not a guess. */
     if (t->lat) {
         if (ev->kind == GPTPS_EV_QUEUED) evicted = lat_queued(t, ev, tk);
-        else if (ev_terminal(ev))        lat_terminal(t, ev, tk);
+        else if (ev_terminal(ev))        evicted = lat_terminal(t, ev, tk);
         if (evicted && t->lat_warned != t->lat_cap) {    /* once per window size */
             t->lat_warned = win = t->lat_cap;
             depth = t->q > t->term ? t->q - t->term : 0;
@@ -651,11 +698,16 @@ static void tui_on_event(const gptps_event *ev, void *ud)
     }
     if (win) {
         char msg[512];
-        snprintf(msg, sizeof msg, "gptps_tui: latency samples are being lost: about %llu items are queued or "
-                 "running at once (%llu running), more than tui.latency_window = %d tracks, so the oldest "
-                 "entries are evicted without a sample and avg ms covers only the shorter waits; raise "
-                 "tui.latency_window (cfg.latency_window) to the in-flight depth",
-                 (unsigned long long)depth, (unsigned long long)running, win);
+        /* Not "the depth exceeds the window": an entry lives from QUEUED to the item's
+         * end, so long-lived items can fill the ring at a modest depth. Say what was
+         * measured - the depth when the loss began - and what to change. */
+        snprintf(msg, sizeof msg, "gptps_tui: latency samples are being lost: the ring of tui.latency_window = "
+                 "%d entries has no room left - an entry lives from an item's QUEUED to its end, and the "
+                 "entries have outlived the window (about %llu items were queued or running when this "
+                 "began, %llu running) - so entries are evicted, or an end finds no entry, without a "
+                 "sample, and avg ms leans to the shorter waits; raise tui.latency_window "
+                 "(cfg.latency_window) to cover the items in flight, long-running ones included",
+                 win, (unsigned long long)depth, (unsigned long long)running);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
 }
@@ -693,12 +745,29 @@ static size_t appendf(char *buf, size_t cap, size_t pos, const char *fmt, ...)
     return pos > cap ? cap : pos;
 }
 
+#define TUI_TRUNC_MARK "[frame truncated]\n"
+/* Where a frame cut at `cut` (exclusive) may end: not inside a UTF-8 character, and
+ * not inside an escape sequence - a CSI left open makes the terminal swallow whatever
+ * is printed next. */
+static size_t frame_cut(const char *buf, size_t cut)
+{
+    size_t e;
+    while (cut && ((unsigned char)buf[cut] & 0xc0u) == 0x80u) --cut;
+    for (e = cut; e && cut - e < 32; --e)
+        if (buf[e - 1] == '\x1b') {
+            size_t z = e;                                    /* ESC [ params final(0x40..0x7e) complete? */
+            if (z < cut && buf[z] == '[') { ++z; while (z < cut && (unsigned char)buf[z] < 0x40) ++z; }
+            if (z >= cut) cut = e - 1;
+            break;
+        }
+    return cut;
+}
+
 /* End a frame built with appendf: NUL-terminate it and return its length. A frame
  * that did not fit (appendf clamps pos to cap) used to be cut wherever the buffer
  * ended - inside a character, inside an escape sequence, with the colour left on and
  * no sign anything was missing. Now the last whole line that fits is kept, the
  * attributes are reset when colour is on, and a visible marker line says so. */
-#define TUI_TRUNC_MARK "[frame truncated]\n"
 static size_t frame_finish(int color, char *buf, size_t cap, size_t pos)
 {
     const char *reset = color ? "\x1b[0m" : "";
@@ -706,26 +775,14 @@ static size_t frame_finish(int color, char *buf, size_t cap, size_t pos)
     if (!cap) return 0;
     if (pos < cap) { buf[pos] = 0; return pos; }             /* it fit */
     if (cap < rl + 1 + ml + 1 + 1) {                         /* no room even for the marker */
-        cut = cap - 1;
-        while (cut && ((unsigned char)buf[cut] & 0xc0u) == 0x80u) --cut;
+        cut = frame_cut(buf, cap - 1);                       /* still a whole character and escape */
         buf[cut] = 0;
         return cut;
     }
     cut = cap - (rl + 1 + ml + 1);                           /* room for reset, '\n', marker, NUL */
     for (k = cut; k && buf[k - 1] != '\n'; --k) { }
-    if (k) {
-        cut = k;                                             /* after the last whole line */
-    } else {                                                 /* one long line: cut it, at a character */
-        size_t e;
-        while (cut && ((unsigned char)buf[cut] & 0xc0u) == 0x80u) --cut;
-        for (e = cut; e && cut - e < 32; --e)                /* ...and never inside an escape sequence */
-            if (buf[e - 1] == '\x1b') {
-                size_t z = e;                                /* ESC [ params final(0x40..0x7e) complete? */
-                if (z < cut && buf[z] == '[') { ++z; while (z < cut && (unsigned char)buf[z] < 0x40) ++z; }
-                if (z >= cut) cut = e - 1;
-                break;
-            }
-    }
+    cut = k ? k                                              /* after the last whole line */
+            : frame_cut(buf, cut);                           /* one long line: cut it, whole */
     k = (cut && buf[cut - 1] != '\n');                       /* a line left open */
     pos = cut;
     memcpy(buf + pos, reset, rl); pos += rl;
@@ -1356,9 +1413,9 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         if (t->nover)
             pos = appendf(buf, cap, pos, "  %s+%d%s types not shown (the table holds %d)%s\n", R, t->nover,
                           t->over_more ? " or more" : "", TUI_MAX_TASKS, X);
-        if (t->lat && t->lat_evicted)
-            pos = appendf(buf, cap, pos, "  %slatency: %llu not sampled (window %d too small)%s\n",
-                          D, (unsigned long long)t->lat_evicted, t->lat_cap, X);
+        if (t->lat && (t->lat_evicted || t->lat_skipped))
+            pos = appendf(buf, cap, pos, "  %slatency: %llu not sampled, %llu ends unmatched (window %d too small)%s\n",
+                          D, (unsigned long long)t->lat_evicted, (unsigned long long)t->lat_skipped, t->lat_cap, X);
     }
 
     if (t->show_recent && t->rcap > 0 && t->recent && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
@@ -2329,7 +2386,7 @@ static gptps_status lat_apply(gptps_tui *t, char *msg, size_t cap)
     if (t->kpi == GPTPS_TUI_KPI_FULL) {
         if (!t->lat) {
             t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
-            t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0;
+            t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0; t->lat_nmemo = 0; t->lat_memo_head = 0;
             if (!t->lat) {
                 st = GPTPS_E_NOMEM;
                 pos += (size_t)snprintf(msg + pos, cap - pos, "the latency ring (%lu bytes; avg ms is off)",
@@ -2337,7 +2394,7 @@ static gptps_status lat_apply(gptps_tui *t, char *msg, size_t cap)
             }
         }
     } else if (t->lat) {
-        free(t->lat); t->lat = NULL; t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0;   /* reclaim the RAM */
+        free(t->lat); t->lat = NULL; t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0; t->lat_nmemo = 0; t->lat_memo_head = 0;   /* reclaim the RAM */
     }
     if (t->kpi == GPTPS_TUI_KPI_OFF) {
         if (t->recent) { free(t->recent); t->recent = NULL; t->rn = t->rhead = 0; }
@@ -2380,7 +2437,7 @@ gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
         if (t->lat || t->kpi == GPTPS_TUI_KPI_FULL) {   /* rebuild at the new size; FULL only */
             free(t->lat);
             t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
-            t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0;
+            t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0; t->lat_nmemo = 0; t->lat_memo_head = 0;
             if (!t->lat) {
                 st = GPTPS_E_NOMEM;
                 snprintf(msg, sizeof msg, "gptps_tui_set_latency_window: no memory for the latency ring (%lu bytes "

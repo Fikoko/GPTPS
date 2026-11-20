@@ -54,6 +54,12 @@
  *     when it expires.
  * 21) install reads cfg->struct_size bytes, zeroes the rest, and refuses a struct too
  *     short to be a config (it copied sizeof, reading past an older caller's struct).
+ * 22) Latency, below the window: a terminal event that outruns its QUEUED while the
+ *     head holds a long-running item still leaves a tombstone (in a free slot) and
+ *     gives its sample, and a QUEUED does not evict that item while slots are free;
+ *     an end with no room at all is counted, and its late QUEUED starts no clock.
+ * 23) Without memory for the frame buffer, snapshot and run say so; an engine that
+ *     refuses the observer makes install return NULL with an ERROR.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -71,9 +77,18 @@ static void *tui_test_calloc(size_t n, size_t s)
     }
     return calloc(n, s);
 }
+/* 23): the same for malloc - the next `tui_malloc_fail` calls return NULL */
+static int tui_malloc_fail;
+static void *tui_test_malloc(size_t n)
+{
+    if (tui_malloc_fail > 0) { --tui_malloc_fail; return NULL; }
+    return malloc(n);
+}
 #define calloc(n, s) tui_test_calloc((n), (s))
+#define malloc(n) tui_test_malloc((n))
 #include "../addons/gptps_tui.c"
 #undef calloc
+#undef malloc
 #include <stdio.h>
 #if !defined(_WIN32)
 #  include <fcntl.h>
@@ -829,15 +844,116 @@ static void test_latency_overflow(void)
     CHECK(maxtomb <= 64 && t->lat_tomb == 0);              /* bounded; none left to scan for */
     CHECK(t->lat_evicted == 272 && t->lat_live == 0);      /* the loss, counted: 136 a round */
     CHECK(log_count("tui.latency_window = 64") == 1);      /* WARNed, once for this window */
-    CHECK(log_count("about 65 items are queued or running") == 1);   /* the depth when it began */
+    CHECK(log_count("about 65 items were queued or running") == 1);  /* the depth when it began */
+    CHECK(t->lat_skipped == 272);                          /* the ends of the evicted: no room, counted */
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "latency: 272 not sampled (window 64 too small)") != NULL);
+    CHECK(strstr(frame, "latency: 272 not sampled, 272 ends unmatched (window 64 too small)") != NULL);
     CHECK(gptps_tui_set_latency_window(t, 32) == GPTPS_OK);   /* a new window: counted afresh, WARNed again */
     for (h = 5000; h < 5040; ++h) emit(t, GPTPS_EV_QUEUED, "deep", h, GPTPS_OK, 1);
     CHECK(t->lat_evicted == 8 && log_count("tui.latency_window = 32") == 1);
     log_end();
     gptps_shutdown(e);
     gptps_tui_close(t);
+}
+
+/* 22) */
+static void test_latency_below_window(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; tui_task *k; static char frame[16384]; gptps_handle h;
+    if (!e) return;
+    log_begin();
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 4, 0);
+    CHECK(t != NULL && t->lat != NULL);
+    if (!t || !t->lat) { log_end(); gptps_shutdown(e); gptps_tui_close(t); return; }
+    emit(t, GPTPS_EV_QUEUED, "x", 1, GPTPS_OK, 100);       /* long-running: stays live, at slot 0 */
+    for (h = 2; h <= 4; ++h) { emit(t, GPTPS_EV_QUEUED, "x", h, GPTPS_OK, 200); emit(t, GPTPS_EV_FINISHED, "x", h, GPTPS_OK, 210); }
+    CHECK(t->lat_head == 0 && live_entries(t, 1) == 1);    /* the ring came round to it; 3 slots free */
+    emit(t, GPTPS_EV_FINISHED, "x", 5, GPTPS_OK, 305);     /* outruns its QUEUED */
+    emit(t, GPTPS_EV_QUEUED, "x", 5, GPTPS_OK, 300);
+    k = row(t, "x");
+    CHECK(k != NULL && k->lat_n == 4 && k->lat_sum_ms == 35);   /* the fast one is sampled */
+    CHECK(live_entries(t, 5) == 0 && live_entries(t, 1) == 1 && t->lat_tomb == 0);   /* no zombie */
+    for (h = 6; h <= 12; ++h) { emit(t, GPTPS_EV_QUEUED, "x", h, GPTPS_OK, 400); emit(t, GPTPS_EV_FINISHED, "x", h, GPTPS_OK, 401); }
+    CHECK(live_entries(t, 1) == 1);                        /* a QUEUED does not evict it either */
+    emit(t, GPTPS_EV_FINISHED, "x", 1, GPTPS_OK, 1100);
+    CHECK(k != NULL && k->lat_n == 12 && k->lat_max_ms == 1000);
+    CHECK(t->lat_evicted == 0 && t->lat_skipped == 0 && t->lat_live == 0 && log_count("latency samples") == 0);
+    /* no room at all: four live, and an end with no entry - counted, WARNed, and its
+     * late QUEUED starts no clock (it would evict a live entry for an ended item) */
+    for (h = 20; h < 24; ++h) emit(t, GPTPS_EV_QUEUED, "x", h, GPTPS_OK, 500);
+    emit(t, GPTPS_EV_FINISHED, "x", 30, GPTPS_OK, 505);
+    emit(t, GPTPS_EV_QUEUED, "x", 30, GPTPS_OK, 501);
+    CHECK(t->lat_skipped == 1 && t->lat_evicted == 0 && live_entries(t, 30) == 0 && t->lat_live == 4);
+    for (h = 20; h < 24; ++h) CHECK(live_entries(t, h) == 1);
+    CHECK(log_count("tui.latency_window = 4 entries has no room left") == 1);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "latency: 0 not sampled, 1 ends unmatched (window 4 too small)") != NULL);
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 23) */
+static void test_no_memory_frames(void)
+{
+    gptps *e; gptps_tui *t; gptps_tui_config c; FILE *out;
+    log_begin();
+    if ((e = open_manual()) != NULL) {
+        out = tmpfile();
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.max_recent = 4; c.out = out;
+        t = out ? gptps_tui_install(e, &c) : NULL;
+        CHECK(t != NULL);
+        if (t) {
+            tui_malloc_fail = 1;
+            gptps_tui_snapshot(t);
+            tui_malloc_fail = 0;
+            CHECK(log_count("gptps_tui_snapshot: no memory for the 16 KiB frame buffer") == 1);
+            CHECK(ftell(out) == 0);                        /* and no frame */
+#if !defined(_WIN32)
+            {   /* run needs a terminal both ways before it allocates: a pty on stdin and out */
+                int m = posix_openpt(O_RDWR | O_NOCTTY);
+                FILE *tty = NULL;
+                if (m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0 && freopen(ptsname(m), "r", stdin) &&
+                    (tty = fopen(ptsname(m), "w")) != NULL) {
+                    t->cfg.out = tty; t->cfg.interactive = 1;
+                    tui_malloc_fail = 1;
+                    alarm(10);
+                    gptps_tui_run(t);                      /* returns: no buffer to paint into */
+                    alarm(0);
+                    tui_malloc_fail = 0;
+                    CHECK(log_count("gptps_tui_run: no memory for the 16 KiB frame buffer") == 1);
+                    t->cfg.out = out; t->cfg.interactive = 0;
+                    CHECK(freopen("/dev/null", "r", stdin) != NULL);
+                } else printf("note: no pty here; run() no-memory check skipped\n");
+                if (tty) fclose(tty);
+                if (m >= 0) close(m);
+            }
+#endif
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+        if (out) fclose(out);
+    }
+    /* a bounded engine ends setup at its first submit: the observer is refused */
+    {
+        gptps_config cfg; gptps_handle h;
+        e = NULL;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+        cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 1u << 20;
+        cfg.mode = GPTPS_RUN_MANUAL; cfg.max_items = 4; cfg.max_payload_bytes = 16; cfg.max_result_bytes = 16;
+        CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+        if (e) {
+            deftask(e, "b_ok", ok_task);
+            CHECK(gptps_submit(e, "b_ok", NULL, 0, &h) == GPTPS_OK);
+            CHECK(install(e) == NULL);
+            CHECK(log_count("the engine refused the dashboard's observer") == 1);
+            drain(e);
+            gptps_shutdown(e);
+        }
+    }
+    log_end();
 }
 
 /* 17) */
@@ -901,6 +1017,10 @@ static void test_clamps_logged(void)
     if (t2) {
         for (i = 0; i < TUI_MAX_TASKS + 2; ++i) {          /* 66 types: two get no row */
             char nm[32];
+            if (i == TUI_MAX_TASKS) {                      /* the table is full: add_task says so, */
+                CHECK(gptps_tui_add_task(t2, "hostkey", "h", 'z', NULL, 0) == GPTPS_E_FULL);
+                CHECK(t2->nover == 0 && log_count("gets no row") == 0);   /* without using up the WARN */
+            }
             snprintf(nm, sizeof nm, "type_%02d", i);
             emit(t2, GPTPS_EV_QUEUED, nm, (gptps_handle)(i + 1), GPTPS_OK, 1);
             emit(t2, GPTPS_EV_QUEUED, nm, (gptps_handle)(i + 100), GPTPS_OK, 1);
@@ -945,6 +1065,30 @@ static void test_frame_truncated(void)
     t->pane = TUI_PANE_DASH;
     n = gptps_tui_render(t, small, 8);                     /* no room for the marker: still a string */
     CHECK(n < 8 && small[n] == 0);
+    /* one line, no newline to cut at: frame_finish itself. cap 40 with colour leaves
+     * cut = 40 - 24 = 16 for the text */
+    {
+        char b[64];
+        memset(b, 'b', sizeof b);
+        memcpy(b, "aaaaaaaaaaaaa\x1b[31m", 18);           /* ESC at 13: cut 16 is inside "\x1b[3" */
+        n = frame_finish(1, b, 40, 40);
+        CHECK(strcmp(b, "aaaaaaaaaaaaa\x1b[0m\n[frame truncated]\n") == 0 && n == strlen(b));
+        CHECK(escapes_whole(b) && valid_utf8(b));
+        memset(b, 'b', sizeof b);
+        memcpy(b, "aaaaaaaaaaaaaaa\xc3\xa9", 17);          /* U+00E9 at 15..16: cut 16 is inside it */
+        n = frame_finish(1, b, 40, 40);
+        CHECK(strcmp(b, "aaaaaaaaaaaaaaa\x1b[0m\n[frame truncated]\n") == 0 && n == strlen(b));
+        CHECK(valid_utf8(b));
+        /* cap too small for the marker: the cut (cap - 1 = 7) still keeps whole ones */
+        memset(b, 'b', sizeof b);
+        memcpy(b, "aaaaa\xe2\x82\xac", 8);                /* U+20AC at 5..7 */
+        n = frame_finish(1, b, 8, 8);
+        CHECK(n == 5 && strcmp(b, "aaaaa") == 0 && valid_utf8(b));
+        memset(b, 'z', sizeof b);
+        memcpy(b, "aaaa\x1b[31m", 9);                       /* "\x1b[3" at 4..6 */
+        n = frame_finish(1, b, 8, 8);
+        CHECK(n == 4 && strcmp(b, "aaaa") == 0 && escapes_whole(b));
+    }
     gptps_shutdown(e);
     gptps_tui_close(t);
 }
@@ -1053,6 +1197,8 @@ int main(void)
     test_legend_full();
     test_latency_release();
     test_latency_overflow();
+    test_latency_below_window();
+    test_no_memory_frames();
     test_counters_64();
     test_clamps_logged();
     test_frame_truncated();
