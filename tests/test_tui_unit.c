@@ -32,11 +32,48 @@
  * 11) POSIX: the settings and detail panes render while another thread registers
  *     and unregisters a task: they read only key_copy / desc_copy (ABI 2.8), never
  *     the borrowed key an unregister frees (an ASan build would flag that).
+ * 1.10.1:
+ * 12) A 64..127-byte task name is ONE row (each event made a new one, so one such task
+ *     used up all 64 rows), its RECENT record keeps the whole name, and a label cut to
+ *     fit ends on a whole UTF-8 character.
+ * 13) No unchecked allocation: without memory for the recent log or the latency ring
+ *     the dashboard installs and runs without them, WARNs, and the setters say
+ *     GPTPS_E_NOMEM (install used to fail, and FULL silently became NORMAL).
+ * 14) The legend with 64 printable hotkeys fits its item array (it wrote one past it)
+ *     and its buffer (it was cut, losing the global keys).
+ * 15) Every terminal event releases its latency entry - DEAD_LETTERED, DROPPED and
+ *     FAILED/E_CANCELLED too, without a sample; a retried FAILED keeps it.
+ * 16) Latency past the window: depth 200 at window 64 still gives samples, tombstones
+ *     stay bounded, and the loss is counted and WARNed once (it cascaded to 0 samples).
+ * 17) Counters are 64-bit (they wrapped at 2^32) and print in the table's widths.
+ * 18) Clamps and drops are logged: max_recent, kpi, mode, latency_window, the 65th
+ *     task type (and "+N types not shown"), a setting that cannot be registered.
+ * 19) A frame that does not fit ends on a whole line, with the colour reset and a
+ *     "[frame truncated]" line (it was cut mid-character / mid-escape, silently).
+ * 20) The status / toast fades after 3 s on every pane, and ON_DEMAND repaints once
+ *     when it expires.
+ * 21) install reads cfg->struct_size bytes, zeroes the rest, and refuses a struct too
+ *     short to be a config (it copied sizeof, reading past an older caller's struct).
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
 #endif
+/* 1.10.1 13): the add-on's calloc, made to fail on demand - after `tui_calloc_skip`
+ * more calls succeed, the next `tui_calloc_fail` calls return NULL. Defined before
+ * the macro, so it reaches the real calloc. */
+#include <stdlib.h>
+static int tui_calloc_skip, tui_calloc_fail;
+static void *tui_test_calloc(size_t n, size_t s)
+{
+    if (tui_calloc_fail > 0) {
+        if (tui_calloc_skip > 0) --tui_calloc_skip;
+        else { --tui_calloc_fail; return NULL; }
+    }
+    return calloc(n, s);
+}
+#define calloc(n, s) tui_test_calloc((n), (s))
 #include "../addons/gptps_tui.c"
+#undef calloc
 #include <stdio.h>
 #if !defined(_WIN32)
 #  include <fcntl.h>
@@ -559,6 +596,449 @@ static void test_run_without_stdin(void)
 }
 #endif
 
+/* ---- 1.10.1 ------------------------------------------------------------------ */
+
+/* WARN and above, as the process-wide log sink delivers them */
+static char logbuf[32768];
+static size_t loglen;
+static void cap_sink(gptps_log_level lvl, const char *msg, void *u)
+{
+    size_t n = strlen(msg);
+    (void)u;
+    if (lvl < GPTPS_LOG_WARN) return;
+    if (loglen + n + 2 < sizeof logbuf) { memcpy(logbuf + loglen, msg, n); loglen += n; logbuf[loglen++] = '\n'; logbuf[loglen] = 0; }
+}
+static void log_begin(void) { loglen = 0; logbuf[0] = 0; gptps_set_log_sink(cap_sink, NULL); }
+static void log_end(void)   { gptps_set_log_sink(NULL, NULL); }
+static int log_count(const char *needle)
+{
+    int c = 0;
+    const char *p = logbuf;
+    while ((p = strstr(p, needle)) != NULL) { ++c; p += strlen(needle); }
+    return c;
+}
+
+static void emit(gptps_tui *t, int kind, const char *task, gptps_handle h, gptps_status st, uint64_t ts)
+{
+    gptps_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.struct_size = sizeof ev; ev.kind = (gptps_event_kind)kind; ev.task_name = task; ev.handle = h;
+    ev.status = st; ev.ts_ms = ts;
+    tui_on_event(&ev, t);
+}
+
+static gptps_tui *install_cfg(gptps *e, int kpi, int latency_window, int color)
+{
+    gptps_tui_config c;
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.color = color; c.interactive = 0; c.unicode = 0; c.max_recent = 16;
+    c.kpi = kpi; c.latency_window = latency_window;
+    return gptps_tui_install(e, &c);
+}
+
+static tui_task *row(gptps_tui *t, const char *name)
+{
+    int i;
+    for (i = 0; i < t->ntasks; ++i) if (strcmp(t->tasks[i].name, name) == 0) return &t->tasks[i];
+    return NULL;
+}
+
+/* whether s decodes as UTF-8 throughout (controls allowed) */
+static int valid_utf8(const char *s)
+{
+    const unsigned char *u = (const unsigned char *)s;
+    size_t i = 0, n = strlen(s);
+    while (i < n) {
+        uint32_t cp;
+        size_t len = u8_decode(u + i, n - i, &cp);
+        if (len == 0) return 0;
+        i += len;
+    }
+    return 1;
+}
+
+/* every ESC starts a whole CSI sequence: ESC [ params final */
+static int escapes_whole(const char *s)
+{
+    for (; *s; ++s) {
+        if (*s != '\x1b') continue;
+        if (s[1] != '[') return 0;
+        s += 2;
+        while (*s && (unsigned char)*s < 0x40) ++s;
+        if (!*s || (unsigned char)*s > 0x7e) return 0;
+    }
+    return 1;
+}
+
+/* 12) */
+static void test_long_names(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; char name[160], big[200]; int i; size_t k;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    memset(name, 'n', 100); name[100] = 0;                 /* 100 bytes: over the old 63 */
+    for (i = 0; i < 5; ++i) emit(t, GPTPS_EV_QUEUED, name, (gptps_handle)(10 + i), GPTPS_OK, gptps_now_ms(NULL));
+    CHECK(t->ntasks == 1);                                 /* one row, not five */
+    CHECK(strcmp(t->recent[(t->rhead + t->rcap - 1) % t->rcap].name, name) == 0);   /* the whole name */
+    for (k = 0; k < 63; ++k) { name[2 * k] = '\xc3'; name[2 * k + 1] = '\xa9'; }    /* 63 x U+00E9 */
+    name[126] = 'x'; name[127] = 0;                        /* 127 bytes: GPTPS_TASK_NAME_MAX */
+    emit(t, GPTPS_EV_QUEUED, name, 20, GPTPS_OK, gptps_now_ms(NULL));
+    emit(t, GPTPS_EV_STARTED, name, 20, GPTPS_OK, gptps_now_ms(NULL));
+    CHECK(t->ntasks == 2);
+    CHECK(row(t, name) != NULL && row(t, name)->started == 1);
+    CHECK(strlen(t->tasks[1].label) == 62);                /* cut at a character: 31 whole ones */
+    CHECK(valid_utf8(t->tasks[1].label));
+    CHECK(gptps_tui_add_task(t, name, NULL, 'z', NULL, 0) == GPTPS_OK && t->ntasks == 2);   /* the same row */
+    memset(big, 'b', sizeof big - 1); big[sizeof big - 1] = 0;
+    CHECK(gptps_tui_add_task(t, big, NULL, 0, NULL, 0) == GPTPS_E_INVAL);   /* never a task's name */
+    CHECK(t->ntasks == 2);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 13) */
+static void test_no_memory(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[16384];
+    if (!e) return;
+    log_begin();
+    tui_calloc_skip = 1; tui_calloc_fail = 2;              /* the dashboard; then the recent log and the ring */
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 64, 0);
+    tui_calloc_skip = 0; tui_calloc_fail = 0;
+    CHECK(t != NULL);                                      /* it installs anyway */
+    if (!t) { log_end(); gptps_shutdown(e); return; }
+    CHECK(t->recent == NULL && t->lat == NULL);
+    CHECK(log_count("no memory for the recent-events log") == 1);
+    CHECK(log_count("no memory for the latency ring") == 1);
+    emit(t, GPTPS_EV_QUEUED, "job", 1, GPTPS_OK, 1);       /* and runs without them */
+    emit(t, GPTPS_EV_STARTED, "job", 1, GPTPS_OK, 2);
+    emit(t, GPTPS_EV_FINISHED, "job", 1, GPTPS_OK, 3);
+    CHECK(t->fin == 1 && row(t, "job") != NULL && row(t, "job")->finished == 1);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "latency off: no memory") != NULL);
+    tui_calloc_fail = 1;                                   /* the ring again: the setter says so */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_E_NOMEM);
+    CHECK(t->lat == NULL && t->recent != NULL);            /* the log's allocation went through */
+    tui_calloc_fail = 1;
+    CHECK(gptps_tui_set_latency_window(t, 128) == GPTPS_E_NOMEM && t->lat == NULL);
+    CHECK(gptps_tui_set_latency_window(t, 128) == GPTPS_OK && t->lat != NULL);   /* retried */
+    tui_calloc_fail = 1;                                   /* below FULL first, then up: the ring fails */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_OK && t->lat == NULL);
+    CHECK(gptps_tui_press(t, 'm') == 3 && t->kpi == GPTPS_TUI_KPI_FULL && t->lat == NULL);
+    CHECK(strstr(t->status, "no memory") != NULL);         /* the 'm' toast says so */
+    CHECK(log_count("gptps_tui_set_kpi(full): no memory") == 2);
+    CHECK(log_count("gptps_tui_set_latency_window: no memory") == 1);
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 14) */
+static void test_legend_full(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[65536]; int i;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    for (i = 0; i < TUI_MAX_TASKS; ++i) {                  /* 64 printable hotkeys, '!' to '`' */
+        char nm[32], lb[64];
+        snprintf(nm, sizeof nm, "task_%02d", i);
+        snprintf(lb, sizeof lb, "a label long enough to wrap the legend %02d", i);
+        CHECK(gptps_tui_add_task(t, nm, lb, 33 + i, NULL, 0) == GPTPS_OK);
+    }
+    t->cols = 200; t->rows = 400;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "[!] a label long enough to wrap the legend 00") != NULL);
+    CHECK(strstr(frame, "[`] a label long enough to wrap the legend 63") != NULL);
+    CHECK(strstr(frame, "? help") != NULL && strstr(frame, "q quit") != NULL);   /* the global keys survive */
+    CHECK(strstr(frame, "[frame truncated]") == NULL);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+static int live_entries(gptps_tui *t, gptps_handle h)
+{
+    int j, c = 0;
+    for (j = 0; j < t->lat_cap; ++j) if (t->lat[j].h == h && !t->lat[j].done) ++c;
+    return c;
+}
+
+/* 15) */
+static void test_latency_release(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; tui_task *k;
+    if (!e) return;
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 16, 0);
+    CHECK(t != NULL && t->lat != NULL);
+    if (!t || !t->lat) { gptps_shutdown(e); gptps_tui_close(t); return; }
+    emit(t, GPTPS_EV_QUEUED, "rel", 1, GPTPS_OK, 100);
+    emit(t, GPTPS_EV_STARTED, "rel", 1, GPTPS_OK, 101);
+    emit(t, GPTPS_EV_FAILED, "rel", 1, GPTPS_E_TASK, 102);
+    CHECK(live_entries(t, 1) == 1);                        /* an attempt failed: not the end */
+    emit(t, GPTPS_EV_DEAD_LETTERED, "rel", 1, GPTPS_E_TASK, 103);
+    CHECK(live_entries(t, 1) == 0);                        /* the end: released */
+    emit(t, GPTPS_EV_QUEUED, "rel", 2, GPTPS_OK, 110);
+    emit(t, GPTPS_EV_FAILED, "rel", 2, GPTPS_E_CANCELLED, 111);   /* cancelled while queued */
+    CHECK(live_entries(t, 2) == 0);
+    emit(t, GPTPS_EV_QUEUED, "rel", 3, GPTPS_OK, 120);
+    emit(t, GPTPS_EV_DROPPED, "rel", 3, GPTPS_E_TASK, 121);
+    CHECK(live_entries(t, 3) == 0);
+    k = row(t, "rel");
+    CHECK(k != NULL && k->lat_n == 0);                     /* no sample: avg ms is finished items */
+    /* a retried attempt keeps its entry: the sample spans queue to the final finish */
+    emit(t, GPTPS_EV_QUEUED, "rel", 4, GPTPS_OK, 200);
+    emit(t, GPTPS_EV_STARTED, "rel", 4, GPTPS_OK, 201);
+    emit(t, GPTPS_EV_FAILED, "rel", 4, GPTPS_E_TASK, 202);
+    emit(t, GPTPS_EV_RETRIED, "rel", 4, GPTPS_E_TASK, 203);
+    emit(t, GPTPS_EV_STARTED, "rel", 4, GPTPS_OK, 204);
+    emit(t, GPTPS_EV_FINISHED, "rel", 4, GPTPS_OK, 230);
+    CHECK(k != NULL && k->lat_n == 1 && k->lat_sum_ms == 30);
+    /* a cancel that outruns its own QUEUED: the late QUEUED clears it, no sample, no entry */
+    emit(t, GPTPS_EV_FAILED, "rel", 5, GPTPS_E_CANCELLED, 300);
+    emit(t, GPTPS_EV_QUEUED, "rel", 5, GPTPS_OK, 299);
+    CHECK(live_entries(t, 5) == 0 && t->lat_tomb == 0 && k != NULL && k->lat_n == 1);
+    CHECK(t->lat_live == 0);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 16) */
+static void test_latency_overflow(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; tui_task *k; static char frame[16384];
+    gptps_handle h;
+    int maxtomb = 0, round;
+    if (!e) return;
+    log_begin();
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 64, 0);
+    CHECK(t != NULL && t->lat != NULL);
+    if (!t || !t->lat) { log_end(); gptps_shutdown(e); gptps_tui_close(t); return; }
+    for (round = 0; round < 2; ++round) {                  /* depth 200 at window 64, twice */
+        gptps_handle base = (gptps_handle)(1 + round * 1000);
+        for (h = base; h < base + 200; ++h) emit(t, GPTPS_EV_QUEUED, "deep", h, GPTPS_OK, 1000 + h);
+        for (h = base; h < base + 200; ++h) {
+            emit(t, GPTPS_EV_FINISHED, "deep", h, GPTPS_OK, 5000 + h);
+            if (t->lat_tomb > maxtomb) maxtomb = t->lat_tomb;
+        }
+    }
+    k = row(t, "deep");
+    CHECK(k != NULL && k->lat_n == 128);                   /* the 64 still tracked, each round */
+    CHECK(maxtomb <= 64 && t->lat_tomb == 0);              /* bounded; none left to scan for */
+    CHECK(t->lat_evicted == 272 && t->lat_live == 0);      /* the loss, counted: 136 a round */
+    CHECK(log_count("tui.latency_window = 64") == 1);      /* WARNed, once for this window */
+    CHECK(log_count("about 65 items are queued or running") == 1);   /* the depth when it began */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "latency: 272 not sampled (window 64 too small)") != NULL);
+    CHECK(gptps_tui_set_latency_window(t, 32) == GPTPS_OK);   /* a new window: counted afresh, WARNed again */
+    for (h = 5000; h < 5040; ++h) emit(t, GPTPS_EV_QUEUED, "deep", h, GPTPS_OK, 1);
+    CHECK(t->lat_evicted == 8 && log_count("tui.latency_window = 32") == 1);
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 17) */
+static void test_counters_64(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; tui_task *k; static char frame[16384]; char b[16];
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    emit(t, GPTPS_EV_QUEUED, "big", 1, GPTPS_OK, 1);
+    k = row(t, "big");
+    CHECK(k != NULL);
+    if (k) {
+        t->q = 6000000000ULL; t->fin = 5000000000ULL;      /* past 2^32, where 32 bits wrapped */
+        k->started = 5000000000ULL; k->finished = 5000000000ULL;
+        k->lat_n = 5000000000ULL; k->lat_sum_ms = 10000000000ULL;   /* avg 2.0 ms */
+        t->cols = 80; t->rows = 24;
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "queued 6000000000") != NULL);
+        CHECK(strstr(frame, "finished 5000000000") != NULL);
+        CHECK(strstr(frame, "  5.0G  5.0G") != NULL);      /* run and ok, in 5 columns */
+        CHECK(strstr(frame, "100%      2.0") != NULL);
+        CHECK(widest(frame) <= 80);
+    }
+    CHECK(strcmp(fmt_count(b, sizeof b, 99999u), "99999") == 0);
+    CHECK(strcmp(fmt_count(b, sizeof b, 100000u), "100k") == 0);
+    CHECK(strcmp(fmt_count(b, sizeof b, 999499u), "999k") == 0);
+    CHECK(strcmp(fmt_count(b, sizeof b, 999500u), "1.0M") == 0);
+    CHECK(strcmp(fmt_count(b, sizeof b, 1234567u), "1.2M") == 0);
+    CHECK(strcmp(fmt_count(b, sizeof b, UINT64_MAX), "18E") == 0);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 18) */
+static void test_clamps_logged(void)
+{
+    gptps *e = open_manual(); gptps_tui *t1, *t2; gptps_tui_config c; static char frame[32768]; int i;
+    if (!e) return;
+    log_begin();
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.max_recent = 100; c.kpi = 9; c.mode = 7; c.latency_window = (1 << 20) + 1;
+    t1 = gptps_tui_install(e, &c);
+    CHECK(t1 != NULL);
+    CHECK(log_count("cfg.max_recent 100 is above the cap of 64") == 1);
+    CHECK(log_count("cfg.kpi 9 is not a gptps_tui_kpi") == 1);
+    CHECK(log_count("cfg.mode 7 is not a gptps_tui_mode") == 1);
+    CHECK(log_count("cfg.latency_window 1048577 is above the cap") == 1);
+    if (t1) {
+        CHECK(t1->cfg.max_recent == 64 && t1->kpi == GPTPS_TUI_KPI_FULL && t1->mode == GPTPS_TUI_CONTINUOUS &&
+              t1->lat_cap == (1 << 20));
+        CHECK(gptps_tui_set_latency_window(t1, (1 << 20) + 5) == GPTPS_OK);
+        CHECK(log_count("gptps_tui_set_latency_window: 1048581 is above the cap") == 1);
+        CHECK(gptps_tui_set_kpi(t1, GPTPS_TUI_KPI_MINIMAL) == GPTPS_OK);   /* give back the 24 MiB */
+    }
+    t2 = install(e);                                       /* a second dashboard: its tui.* keys are taken */
+    CHECK(t2 != NULL);
+    CHECK(log_count("setting tui.kpi was not registered") == 1);
+    CHECK(log_count("setting tui.latency_window was not registered") == 1);
+    if (t2) {
+        for (i = 0; i < TUI_MAX_TASKS + 2; ++i) {          /* 66 types: two get no row */
+            char nm[32];
+            snprintf(nm, sizeof nm, "type_%02d", i);
+            emit(t2, GPTPS_EV_QUEUED, nm, (gptps_handle)(i + 1), GPTPS_OK, 1);
+            emit(t2, GPTPS_EV_QUEUED, nm, (gptps_handle)(i + 100), GPTPS_OK, 1);
+        }
+        CHECK(t2->ntasks == TUI_MAX_TASKS && t2->nover == 2);
+        CHECK(log_count("task type 'type_64' gets no row") == 1);   /* once, for the first */
+        CHECK(log_count("gets no row") == 1);
+        t2->rows = 200;
+        gptps_tui_render(t2, frame, sizeof frame);
+        CHECK(strstr(frame, "+2 types not shown (the table holds 64)") != NULL);
+    }
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t1);
+    gptps_tui_close(t2);
+}
+
+/* 19) */
+static void test_frame_truncated(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; char small[400]; static char frame[16384]; size_t n; int i;
+    if (!e) return;
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 64, 1);         /* colour on: escapes to cut through */
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    t->cfg.unicode = 1;
+    for (i = 0; i < 12; ++i) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "t\xc3\xa9l\xc3\xa9_%02d", i);
+        emit(t, GPTPS_EV_QUEUED, nm, (gptps_handle)(i + 1), GPTPS_OK, 1);
+    }
+    n = gptps_tui_render(t, frame, sizeof frame);
+    CHECK(n < sizeof frame && strstr(frame, "[frame truncated]") == NULL);   /* it fits: no marker */
+    n = gptps_tui_render(t, small, sizeof small);
+    CHECK(n < sizeof small && small[n] == 0 && strlen(small) == n);
+    CHECK(n >= 18 && strcmp(small + n - 18, "[frame truncated]\n") == 0);
+    CHECK(strstr(small, "\n\x1b[0m[frame truncated]\n") != NULL);   /* after a whole line, colour reset */
+    CHECK(valid_utf8(small) && escapes_whole(small));
+    t->pane = TUI_PANE_HELP;                               /* every pane ends the same way */
+    n = gptps_tui_render(t, small, sizeof small);
+    CHECK(n >= 18 && strcmp(small + n - 18, "[frame truncated]\n") == 0 && valid_utf8(small) && escapes_whole(small));
+    t->pane = TUI_PANE_DASH;
+    n = gptps_tui_render(t, small, 8);                     /* no room for the marker: still a string */
+    CHECK(n < 8 && small[n] == 0);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 20) */
+static void test_toast_fades(void)
+{
+    static const int panes[] = { TUI_PANE_SETTINGS, TUI_PANE_TASKS, TUI_PANE_DL, TUI_PANE_DASH };
+    gptps *e = open_manual(); gptps_tui *t; static char frame[16384]; size_t i; uint64_t now;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    for (i = 0; i < sizeof panes / sizeof panes[0]; ++i) {
+        t->pane = panes[i];
+        snprintf(t->status, sizeof t->status, "toast-%d-here", panes[i]);
+        t->status_ms = gptps_now_ms(NULL);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, t->status) != NULL);          /* shown while fresh */
+        t->status_ms = gptps_now_ms(NULL) - 4000;
+        gptps_tui_render(t, frame, sizeof frame);
+        if (strstr(frame, t->status)) printf("pane %d kept its toast\n", panes[i]);
+        CHECK(strstr(frame, t->status) == NULL);          /* gone after 3 s, on every pane */
+    }
+    t->pane = TUI_PANE_DASH;
+    now = gptps_now_ms(NULL);
+    t->status_ms = now;
+    CHECK(toast_until(t, now) == now + TUI_TOAST_MS);
+    t->status_ms = now - 4000;
+    CHECK(toast_until(t, now) == 0);
+    /* ON_DEMAND repaints once when the toast it showed expires; not before, not after */
+    CHECK(paint_due(0, 0, GPTPS_TUI_ON_DEMAND, 0, 1000, 999) == 0);
+    CHECK(paint_due(0, 0, GPTPS_TUI_ON_DEMAND, 0, 1000, 1000) == 1);
+    CHECK(paint_due(0, 0, GPTPS_TUI_ON_DEMAND, 0, 0, 5000) == 0);
+    CHECK(paint_due(0, 0, GPTPS_TUI_ON_DEMAND, 1, 0, 5000) == 1);
+    CHECK(paint_due(0, 0, GPTPS_TUI_PAUSED, 1, 1000, 5000) == 0);   /* PAUSED stays frozen */
+    CHECK(paint_due(0, 1, GPTPS_TUI_PAUSED, 0, 0, 5000) == 1);
+    CHECK(paint_due(0, 0, GPTPS_TUI_CONTINUOUS, 0, 0, 5000) == 1);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 21) - one engine per dashboard: each registers its observer and settings there */
+static void test_struct_size(void)
+{
+    union { gptps_tui_config c; unsigned char b[sizeof(gptps_tui_config) + 64]; } u;
+    gptps_tui_config c0;
+    gptps *e; gptps_tui *t;
+    log_begin();
+    memset(&c0, 0, sizeof c0);
+    c0.color = 0; c0.interactive = 0; c0.max_recent = 4; c0.title = "old caller";
+    /* an older caller's struct, ending at `title`, and garbage after it */
+    memset(&u, 0xab, sizeof u);
+    memcpy(&u, &c0, TUI_CFG_MIN);
+    u.c.struct_size = TUI_CFG_MIN;
+    if ((e = open_manual()) != NULL) {
+        t = gptps_tui_install(e, &u.c);
+        CHECK(t != NULL);
+        if (t) {
+            CHECK(t->cfg.out == stdout && t->cfg.settings_path == NULL && t->cfg.unicode == 0);
+            CHECK(strcmp(t->cfg.title, "old caller") == 0 && t->cfg.max_recent == 4);
+            CHECK(t->cfg.struct_size == sizeof t->cfg);
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    /* a newer caller's bigger struct: only what this build knows is read */
+    memset(&u, 0xab, sizeof u);
+    memcpy(&u, &c0, sizeof c0);
+    u.c.struct_size = sizeof u;
+    if ((e = open_manual()) != NULL) {
+        t = gptps_tui_install(e, &u.c);
+        CHECK(t != NULL && t->cfg.unicode == 0 && t->cfg.out == stdout && t->cfg.struct_size == sizeof t->cfg);
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    /* too short to be a config: refused, and said */
+    u.c.struct_size = 8;
+    if ((e = open_manual()) != NULL) {
+        CHECK(gptps_tui_install(e, &u.c) == NULL);
+        CHECK(log_count("cfg.struct_size 8 is smaller than any gptps_tui_config") == 1);
+        gptps_shutdown(e);
+    }
+    /* 0: the whole struct, as before */
+    c0.struct_size = 0;
+    if ((e = open_manual()) != NULL) {
+        t = gptps_tui_install(e, &c0);
+        CHECK(t != NULL && t->cfg.max_recent == 4);
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    log_end();
+}
+
 int main(void)
 {
     test_sanitiser();
@@ -568,6 +1048,16 @@ int main(void)
     test_dead_letters();
     test_untrusted_settings();
     test_editor_bytes();
+    test_long_names();
+    test_no_memory();
+    test_legend_full();
+    test_latency_release();
+    test_latency_overflow();
+    test_counters_64();
+    test_clamps_logged();
+    test_frame_truncated();
+    test_toast_fades();
+    test_struct_size();
 #if !defined(_WIN32)
     test_run_without_stdin();
     test_render_while_unregistering();

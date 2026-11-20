@@ -74,18 +74,28 @@ typedef struct {
     uint32_t    refresh_ms;    /* redraw interval in the live loop (0 => 250) */
     int         color;         /* -1 = auto (TTY), 0 = off, 1 = on */
     int         interactive;   /* -1 = auto (TTY), 0 = off, 1 = on (read hotkeys) */
-    int         max_recent;    /* recent-event lines to keep/show (0 => 8, cap 64) */
+    int         max_recent;    /* recent-event lines to keep/show (0 => 8, cap 64; more is clamped, with a WARN) */
     int         show_tasks;    /* per-task table: >=0 show (default), <0 hide */
     int         show_recent;   /* recent-events log: >=0 show (default), <0 hide */
-    int         kpi;           /* gptps_tui_kpi: how much to compute (0 => FULL) */
-    int         mode;          /* gptps_tui_mode: live-loop cadence (0 => CONTINUOUS) */
-    int         latency_window;/* handles tracked for latency at FULL (0 => 1024). Size it to your
-                                * in-flight DEPTH, not your throughput: an entry is written at
-                                * QUEUED and consumed at FINISHED, so a burst that backs up past
-                                * this many items overwrites live entries before their latency is
-                                * resolved and those samples are lost. The loss is not neutral -
-                                * it drops the shortest waits first, so avg ms reads HIGH. Also
-                                * settable at runtime as `tui.latency_window`. */
+    int         kpi;           /* gptps_tui_kpi: how much to compute (0 => FULL; out of range is
+                                * clamped to OFF or FULL, with a WARN) */
+    int         mode;          /* gptps_tui_mode: live-loop cadence (0 => CONTINUOUS; out of range
+                                * => CONTINUOUS, with a WARN) */
+    int         latency_window;/* handles tracked for latency at FULL (0 => 1024, cap 1<<20 - more
+                                * is clamped, with a WARN). 24 bytes each on 64-bit targets: 24 KiB
+                                * by default, 24 MiB at the cap. Size it to your in-flight DEPTH,
+                                * not your throughput:
+                                * an entry is written at QUEUED and released at the item's terminal
+                                * event (FINISHED, DEAD_LETTERED, DROPPED, or FAILED with
+                                * GPTPS_E_CANCELLED), so a burst that backs up past this many items
+                                * overwrites the oldest live entries before they resolve and those
+                                * samples are lost. The loss is not neutral - it drops the longest
+                                * waits, so avg ms reads LOW. It is counted, shown under the TASKS
+                                * table, and logged (a WARN once per window size, naming the depth
+                                * reached); the items still tracked keep giving samples. avg ms is
+                                * queue-to-finish of FINISHED items only: an item that ends any other
+                                * way releases its entry without a sample. Also settable at runtime as
+                                * `tui.latency_window`. */
     const char *title;         /* dashboard title (default "tasks") */
     FILE       *out;           /* output stream (NULL => stdout) */
     const char *settings_path; /* where the Settings pane's 'w' (save) writes (NULL => engine's open path) */
@@ -93,7 +103,13 @@ typedef struct {
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
- * defaults. Returns NULL on allocation failure. */
+ * defaults. cfg->struct_size: the fields it covers are read and the rest are taken as
+ * 0 (their defaults); 0 means the whole current struct. Returns NULL - logged - on
+ * allocation failure; when the engine refuses the observer (e.g. GPTPS_E_BUSY on a
+ * bounded engine once work has been submitted: install before the first submit); or
+ * when cfg->struct_size is nonzero but smaller than a config through `title`. Without
+ * the memory for the recent-events log or the latency ring it installs anyway, runs
+ * without that buffer and logs a WARN. */
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 
 /* LOCAL per-task settings. `label` (NULL => task name) is shown in the table;
@@ -127,10 +143,14 @@ int gptps_tui_press(gptps_tui *t, int key);
 
 /* Runtime reconfiguration (thread-safe; the live loop picks changes up next frame).
  * Lowering the KPI level frees the latency ring and stops the per-event work;
- * raising it to FULL re-allocates it. */
+ * raising it to FULL re-allocates it. GPTPS_E_NOMEM when a buffer the level needs
+ * cannot be allocated: the level is set, the dashboard runs without that buffer
+ * (the recent-events log, or the latency ring and so avg ms), and a WARN says so. */
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level);
-/* Resize the FULL-tier latency ring (0 => 1024, capped at 1<<20). Size it to the
- * in-flight DEPTH you expect; see cfg.latency_window. Drops the entries in flight. */
+/* Resize the FULL-tier latency ring (0 => 1024, capped at 1<<20 with a WARN). Size it
+ * to the in-flight DEPTH you expect; see cfg.latency_window. Drops the entries in flight
+ * and the count of samples lost. GPTPS_E_NOMEM (with a WARN) when the new ring cannot be
+ * allocated: the dashboard runs without avg ms until a later resize or set_kpi succeeds. */
 gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles);
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode);
 gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms);
