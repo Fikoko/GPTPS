@@ -617,9 +617,9 @@ finished 4  failed 0  retried 0  dead 0  dropped 0
 kpi:full mode:realtime refresh:250ms
 
 TASKS
-  label              run    ok  fail  dead  drop   ok%   avg ms  key
-  Resize               8     4     0     0     0  100%     81.0  [r]
-  Thumbnail            0     0     0     0     0    --       --  [t]
+  label              run    ok  fail  dead  drop   ok%   avg ms  peak MB  key
+  Resize               8     4     0     0     0  100%     81.0       --  [r]
+  Thumbnail            0     0     0     0     0    --       --       --  [t]
 
 RECENT
      0.1 FINISHED resize         #4

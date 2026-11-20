@@ -620,12 +620,16 @@ enabled automatically). Panes/metrics:
     a ring; **freed when you drop below FULL**). `m` cycles `MINIMAL`→`NORMAL`→`FULL`
     and never *into* `OFF`, so a stray keypress cannot blind the dashboard.
   - **Latency window** (`gptps_tui_set_latency_window`, or `tui.latency_window`): size
-    it to your in-flight **depth**, not your throughput. An entry lives from `QUEUED`
-    to `FINISHED`, so a burst deeper than the window overwrites live entries before
-    they resolve — and because the entries lost that way are the ones that waited
-    least, `avg ms` reads **high**. This is the one distortion the add-on cannot fix
-    for you; the ordering inversion (a `FINISHED` that outruns its own `QUEUED`) is
-    handled internally with a tombstone, the same way `gptps_stats` handles it.
+    it to your in-flight **depth**, not your throughput (24 bytes a handle: 24 KiB at
+    the default 1024, 24 MiB at the 1<<20 cap). An entry lives from `QUEUED` to the
+    item's terminal event (`FINISHED`, `DEAD_LETTERED`, `DROPPED`, or `FAILED` with
+    `GPTPS_E_CANCELLED`), so a burst deeper than the window overwrites the oldest live
+    entries before they resolve — the longest waits, so `avg ms` reads **low**. The
+    loss is counted under the TASKS table and logged (a WARN once per window size,
+    naming the depth reached), and the items still tracked keep giving samples. `avg
+    ms` covers `FINISHED` items only. The ordering inversion (a terminal event that
+    outruns its own `QUEUED`) is handled internally with a tombstone, the same way
+    `gptps_stats` handles it.
   - **Cadence** (`gptps_tui_set_mode`, or `p` live): `CONTINUOUS`, `ON_DEMAND`,
     `PAUSED`. `gptps_tui_snapshot()` renders one frame on demand.
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and
@@ -656,6 +660,9 @@ Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scro
 ```c
 gptps_tui_config cfg = { sizeof cfg };
 cfg.title = "image pipeline";
+cfg.color = cfg.interactive = cfg.unicode = -1;   /* auto: on when stdout is a terminal.
+                                                     0 (as zero-init leaves them) means OFF:
+                                                     no colour, and gptps_tui_run returns at once */
 gptps_tui *ui = gptps_tui_install(engine, &cfg);
 gptps_tui_add_task(ui, "resize", "Resize", 'r', NULL, 0);  /* [r] submits resize */
 gptps_tui_run(ui);          /* live dashboard until 'q' (no-op without a TTY) */

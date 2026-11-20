@@ -5,6 +5,64 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+A dashboard (`addons/gptps_tui`) correctness patch. No API or ABI change: the ABI stays
+2.8, and `gptps_tui.h` changes only in its comments. Behaviour a host may notice:
+`gptps_tui_add_task` now refuses a name longer than `GPTPS_TASK_NAME_MAX`
+(`GPTPS_E_INVAL`), where it used to accept one that could never match; and
+`gptps_tui_install` now installs without a buffer it has no memory for, with a WARN,
+where it used to return NULL.
+
+### Fixed
+
+- A task name of 64 to 127 bytes no longer creates a new TASKS row on every event
+  (one such task used up all 64 rows and pushed every other type out). Rows and
+  RECENT records keep the whole name; labels cut to fit end on a whole UTF-8
+  character.
+- The key legend no longer writes past its item array when 64 tasks have printable
+  hotkeys (ASan-confirmed), and the global keys are no longer cut off by a fixed
+  2 KiB buffer.
+- No unchecked allocation is left. Without memory for the recent-events log or the
+  latency ring the dashboard runs without that buffer and says so (WARN, and
+  `latency off: no memory` on the frame); `gptps_tui_set_kpi` and
+  `gptps_tui_set_latency_window` return `GPTPS_E_NOMEM`.
+- Latency: every terminal event now releases its entry - DEAD_LETTERED, DROPPED and
+  a cancelled FAILED, as well as FINISHED - instead of holding it until overwritten,
+  which shrank the effective window. Only FINISHED gives a sample, so `avg ms`
+  covers finished items; a failed attempt that is retried keeps its entry.
+- Latency: in-flight depth at or past `tui.latency_window` no longer collapses
+  `avg ms` to zero samples (measured before: window 1024 at depth 1024 gave none,
+  and the ring filled with tombstones that turned on a full scan per QUEUED). A new
+  entry takes a free slot rather than evicting a long-running item, a tombstone
+  never overwrites a live entry, and the items still tracked keep giving samples.
+  What is lost is counted under the TASKS table and logged once per window size,
+  naming the depth and `tui.latency_window`.
+- Counters are 64-bit; the 32-bit ones wrapped after about 12 h at 100k events/s.
+  Table columns keep their width (123k, 1.2M, ...).
+- Clamps and drops now log a WARN: `max_recent` over 64, an out-of-range `kpi` or
+  `mode`, `latency_window` over 1<<20 (at install and at runtime), the first task
+  type that gets no TASKS row (and "+N types not shown" under the table), and a
+  `tui.*` setting that cannot be registered. An observer the engine refuses at
+  install is logged at ERROR.
+- A frame that does not fit the 16 KiB buffer ends on a whole line, outside any
+  escape sequence, with the colour reset and a visible `[frame truncated]` line;
+  it used to be cut silently, possibly inside a character or an escape sequence.
+- The status line and toast fade after 3 s on every pane and in every mode; in
+  ON_DEMAND the loop repaints once when a toast expires.
+- `gptps_tui_install` honours `cfg->struct_size`: it reads what the caller's struct
+  covers and takes the rest as 0 (0 still means the whole struct); a struct too
+  short to reach `title` is refused with an ERROR.
+- Docs: the install NULL cases (including an observer refused on a bounded engine
+  after the first submit); latency entries are 24 bytes (24 KiB by default, 24 MiB
+  at the cap - the comment said 16 KB / 16 MB); the add-ons README snippet sets
+  `color` / `interactive` to -1 so it really starts a live dashboard; the Readme
+  sample frame shows the `peak MB` column.
+
+Known and left for 1.11 (the tier redesign): an always-up service's terminal cancel
+can leave one latency tombstone that only the ring's next pass clears, and in-flight
+still undercounts when an item is cancelled while queued.
+
 ## [1.10.0] - 2026-11-17
 
 ### Upgrading from 1.9
