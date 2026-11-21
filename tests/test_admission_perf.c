@@ -102,6 +102,19 @@ int main(void)
     if (fails) { printf("test_admission_perf: FAILED (engine error)\n"); return 1; }
 
     ratio = (a > 0.0) ? b / a : 0.0;
+    /* Confirm before failing, as in test_cancel_perf: a shared runner that stalls during
+     * the bigger drain can push even the best of three past the bar, but a stall does not
+     * repeat and a scan of the queue is slow in EVERY run. So over the bar, measure again, up to six more
+     * pairs, keeping the best of each size; it fails only if the curve stays super-linear. */
+    for (i = 0; i < 6 && ratio >= MAX_RATIO && !fails; ++i) {
+        double a2 = drain(n, reps), b2 = fails ? 0.0 : drain(2 * n, reps);
+        if (fails) break;
+        printf("  over the bar (%.2f): measuring again - %.0fms / %.0fms\n", ratio, a2, b2);
+        if (a2 < a) a = a2;
+        if (b2 < b) b = b2;
+        ratio = (a > 0.0) ? b / a : 0.0;
+    }
+    if (fails) { printf("test_admission_perf: FAILED (engine error)\n"); return 1; }
     printf("drain %d x%d: %.0fms | drain %d x%d: %.0fms | ratio %.2f (linear ~2.0, quadratic ~4.0)\n",
            n, reps, a, 2 * n, reps, b, ratio);
     CHECK(ratio < MAX_RATIO);

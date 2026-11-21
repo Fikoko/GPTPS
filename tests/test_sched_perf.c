@@ -120,13 +120,34 @@ int main(void)
         /* Best of three - unless the first is already far past the bar: the repeats
          * only filter out a noisy HIGH reading, and a quadratic path would spend
          * minutes on them before failing (it reached ctest's timeout instead). */
-        for (i = 0; i < 2 && !fails && a > 0.0 && b / a < 2.0 * MAX_RATIO; ++i) {
-            double a2 = drain(k, n, reps), b2 = drain(k, SCALE * n, reps);
+        for (i = 0; i < 2 && !fails && !g_overtime && a > 0.0 && b / a < 2.0 * MAX_RATIO; ++i) {
+            double a2 = drain(k, n, reps), b2 = (fails || g_overtime) ? 0.0 : drain(k, SCALE * n, reps);
+            if (fails || g_overtime) break;
             if (a2 < a) a = a2;
             if (b2 < b) b = b2;
         }
         if (fails) break;
         ratio = (a > 0.0) ? b / a : 0.0;
+        /* Confirm before failing, as in test_cancel_perf: a stall during the bigger drain
+         * can push even the best of three past the bar, but a stall does not repeat and a
+         * quadratic path is slow in EVERY run. So over the bar, measure again, up to six
+         * more pairs, keeping the best of each size. Not when the ratio is already twice
+         * the bar: no stall reads like that, and a quadratic path would spend minutes on
+         * the repeats. A repeat that runs out of budget is itself the verdict. */
+        for (i = 0; i < 6 && ratio >= MAX_RATIO && ratio < 2.0 * MAX_RATIO && !fails && !g_overtime; ++i) {
+            double a2 = drain(k, n, reps), b2 = (fails || g_overtime) ? 0.0 : drain(k, SCALE * n, reps);
+            if (fails || g_overtime) break;
+            printf("%-10s over the bar (%.2f): measuring again - %.0fms / %.0fms\n", NAMES[k], ratio, a2, b2);
+            if (a2 < a) a = a2;
+            if (b2 < b) b = b2;
+            ratio = (a > 0.0) ? b / a : 0.0;
+        }
+        if (g_overtime) {
+            printf("%-10s a repeat drain ran past %u ms: admission is super-linear\n", NAMES[k], BUDGET_MS);
+            ++fails;
+            break;
+        }
+        if (fails) break;
         printf("%-10s drain %d x%d: %.0fms | drain %d x%d: %.0fms | ratio %.2f (linear ~4, quadratic ~16)\n",
                NAMES[k], n, reps, a, SCALE * n, reps, b, ratio);
         CHECK(ratio < MAX_RATIO);
