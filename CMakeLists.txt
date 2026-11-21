@@ -1235,6 +1235,12 @@ add_test(NAME tui COMMAND test_tui)
 add_executable(test_tui_unit tests/test_tui_unit.c)
 target_include_directories(test_tui_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_tui_unit PRIVATE gptps)
+# On the simulation HAL (tests/hal_sim.c) the live-loop check on a pseudo-terminal is
+# skipped, saying so: the loop waits in poll(), a real block the simulation does not
+# see, holding its baton (docs/HAL.md). Every other check runs, and replays by seed.
+if(GPTPS_HAL_SOURCE MATCHES "hal_sim\\.c$")
+    target_compile_definitions(test_tui_unit PRIVATE GPTPS_TEST_HAL_SIM=1)
+endif()
 add_test(NAME tui_unit COMMAND test_tui_unit)
 set_tests_properties(tui_unit PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)

@@ -1726,6 +1726,11 @@ static void *st_emitter(void *arg)
     char nm[16];
     while (!__atomic_load_n(&st_stop, __ATOMIC_ACQUIRE)) {
         gptps_handle h = (gptps_handle)(id * 100000000L + (++n));
+        /* At OFF the observer returns before its lock, so this loop would make no call a
+         * cooperative scheduler sees: the simulation HAL (tests/hal_sim.c) runs one thread
+         * at a time and switches only at HAL / pthread calls, and called it a stall. The
+         * engine clock is one such call - as an engine's own emitting thread makes. */
+        (void)gptps_now_ms(NULL);
         snprintf(nm, sizeof nm, "s%ld", n % 13);
         emit(st_t, GPTPS_EV_QUEUED, nm, h, GPTPS_OK, (uint64_t)n);
         emit_a(st_t, GPTPS_EV_STARTED, nm, h, GPTPS_OK, (uint64_t)n, 1);
@@ -3328,9 +3333,14 @@ static void test_live_idle_win(const char *self)
                 HRESULT hr;
                 sz.X = 100; sz.Y = 24;
                 hr = rpc(pc, sz);
-                if (FAILED(hr)) {                         /* Wine 9: not implemented - say so, not fail */
-                    printf("note: ResizePseudoConsole failed (0x%08lx); the resize repaint check is skipped\n",
-                           (unsigned long)hr);
+                if (FAILED(hr)) {
+                    /* Wine (9) does not implement it: say so and skip. On Windows itself it
+                     * is a failure - so a green Windows CI run means the check ran. */
+                    HMODULE nt = GetModuleHandleA("ntdll.dll");
+                    int wine = nt && GetProcAddress(nt, "wine_get_version") != NULL;
+                    if (wine) printf("note: ResizePseudoConsole is not implemented on Wine (0x%08lx); the resize "
+                                     "repaint check is skipped\n", (unsigned long)hr);
+                    else { printf("FAIL: ResizePseudoConsole: 0x%08lx\n", (unsigned long)hr); ++fails; }
                     SetEvent(norz);
                 }
                 SetEvent(done);
@@ -3415,7 +3425,12 @@ int main(int argc, char **argv)
     test_pane_cache();
 #if !defined(_WIN32)
     test_format_unlocked();
+#if defined(GPTPS_TEST_HAL_SIM)
+    printf("note: on the simulation HAL the live loop on a pseudo-terminal is not run: it waits in "
+           "poll(), which the simulation does not see (docs/HAL.md); the native legs run it\n");
+#else
     test_live_idle();
+#endif
     test_health_vs_dead_letters();
     test_storage_storm();
     test_run_without_stdin();

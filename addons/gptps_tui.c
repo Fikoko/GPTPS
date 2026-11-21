@@ -1497,9 +1497,11 @@ static const char *hist_pct(const uint64_t *hb, unsigned p, char *out, size_t ca
     r = n / 100 * p + (n % 100 * p + 99) / 100;     /* ceil(n * p / 100), without overflow */
     if (r < 1) r = 1;
     for (b = 0; b < TUI_HIST_B - 1; ++b) { c += hb[b]; if (c >= r) break; }
+    /* %.8s: fmt_count writes at most 5 characters ("99999", "1.1G"); the bound lets the
+     * compiler see the result fits a 16-byte cell (gcc -O3 -Wformat-truncation) */
     if (b == 0) snprintf(out, cap, "0");
-    else if (b == TUI_HIST_B - 1) snprintf(out, cap, ">=%s", fmt_count(v, sizeof v, (uint64_t)1 << (TUI_HIST_B - 2)));
-    else snprintf(out, cap, "<%s", fmt_count(v, sizeof v, (uint64_t)1 << b));
+    else if (b == TUI_HIST_B - 1) snprintf(out, cap, ">=%.8s", fmt_count(v, sizeof v, (uint64_t)1 << (TUI_HIST_B - 2)));
+    else snprintf(out, cap, "<%.8s", fmt_count(v, sizeof v, (uint64_t)1 << b));
     return out;
 }
 

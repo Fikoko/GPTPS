@@ -145,11 +145,11 @@ CI's two commands, for each seed in turn:
 for s in $(seq 1 500); do
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$s GPTPS_STRESS_MS=1500 \
     ctest --test-dir build-sim -j4 --no-tests=error \
-    -E '_perf$|^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance)$' \
+    -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui)$' \
     > sim-$s.log 2>&1 || echo "seed $s failed: see sim-$s.log"
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 \
     ctest --test-dir build-sim --no-tests=error \
-    -R '^(hal_conformance|oop|program|program_helper|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program)$' \
+    -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui)$' \
     > sim-paced-$s.log 2>&1 || echo "seed $s failed paced: see sim-paced-$s.log"
 done
 ```
@@ -161,10 +161,13 @@ The tests the first command leaves out, and why:
 | `*_perf` | They time a curve on the HAL clock, which is virtual here. |
 | `gptps_bench_pool`, `gptps_bench_balance` | They time throughput on the same clock, and assert nothing. On a seed that switches at every point, `gptps_bench_pool` makes 5.4 million real thread switches and took 71 to 87 s, against its 60 s CTest timeout. |
 | `hal_conformance` | Its real-time rate check, above. The second command runs it paced. |
-| `oop`, `program`, `program_helper`, `exec_faults`, `durable_crash`, `hang`, `example_program`, `example_wasm` | They are about child processes, which live in real time: the executor polls a child in real 200 ms slices and holds it to deadlines and shutdown graces. Every run of them forks, so none replays, and the second command runs them once, paced from the start. Before a run was paced from its first fork they failed unpaced: `exec_faults` with every undisturbed run timed out, `example_program` in 18 of 400 runs under load. The seed still draws every switch, but real time moves the clock. (`example_wasm` runs a child only where a wasm runtime is installed; without one it skips. `durable_crash` forks a child for each of its about 11,800 crash and power-cut runs; it passes unpaced too, in 37-41 s on three seeds that switch at every point, but runs once, paced.) |
+| `oop`, `program`, `program_helper`, `program_launch`, `program_stop`, `retry_addon`, `exec_faults`, `durable_crash`, `hang`, `example_program`, `example_wasm` | They are about child processes, which live in real time: the executor polls a child in real 200 ms slices and holds it to deadlines and shutdown graces. Every run of them forks, so none replays, and the second command runs them once, paced from the start. Before a run was paced from its first fork they failed unpaced: `exec_faults` with every undisturbed run timed out, `example_program` in 18 of 400 runs under load. The seed still draws every switch, but real time moves the clock. (`example_wasm` runs a child only where a wasm runtime is installed; without one it skips. `durable_crash` forks a child for each of its about 11,800 crash and power-cut runs; it passes unpaced too, in 37-41 s on three seeds that switch at every point, but runs once, paced.) |
 | `example_edge_ai` | Its jobs are child processes as well: `fake_infer`, which takes its memory and holds it for real milliseconds, under the cap the executor sets. So it runs with the tests above, once, paced. It also passed unpaced, on seeds 1-40, but a run that forks does not replay. |
 | `measure` | Its jobs are child processes too, measured as they end and sampled while they run on the executor's clock, so it runs paced, with the tests above. |
 | `caps`, `adapt`, `adapt_program` | Their jobs are child processes (`GPTPS_EXEC_OOP`): the CPU / I/O caps are a process executor's, and adapt learns from what process jobs measure. Paced, with the tests above. |
+| `engine_fixes` | Its cancel-before-deadline and grace checks race a PROGRAM job against real deadlines (a job whose TERM handler sleeps 2.5 s, a 2 s timeout). On the virtual clock the deadline can pass before the cancel lands. Paced, with the tests above. |
+| `tui` | Its failure-why checks run PROGRAM jobs and read their exit code and stderr tail. Paced, with the tests above. |
+| `tui_unit` | Not left out: it runs on every seed. Built on this HAL (CMake defines `GPTPS_TEST_HAL_SIM`), it leaves out one check, saying so - the live loop on a pseudo-terminal, which waits in `poll()`, a real block the simulation does not see, while it holds the baton (seed 780 stopped there as a stall). The native legs run it. Its storm test's emitters read the engine clock each round: at `off` the observer returns before its lock, and a loop with no HAL or pthread call is one the simulation cannot switch away from. |
 | `xport`, `xport_engine`, `xport_opts`, `xport_measure` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
 
 `stress_api` runs in the first command, shortened to one round of 1.5 s by
