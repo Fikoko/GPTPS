@@ -5,7 +5,7 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.11.0] - 2026-11-21
 
 The dashboard (`addons/gptps_tui`) as a ladder of cost tiers, with idle that costs
 nothing. The core is unchanged: the ABI stays 2.8. The add-on gains API (new enum values,
