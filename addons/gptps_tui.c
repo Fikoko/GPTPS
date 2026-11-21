@@ -585,7 +585,7 @@ static const char *const TUI_LEGEND_KEYS[] = {
 typedef struct {
     char     label[TUI_NAME_CAP];      /* the row's label (or name), raw: cleaned when shown */
     int      hotkey, has_mem;
-    uint64_t started, finished, failed, dead, dropped, lat_sum, lat_n, mem_peak;
+    uint64_t started, finished, failed, dead, dropped, lat_sum, lat_max, lat_n, mem_peak;
     char     pq[3][16];                /* p50 / p95 / p99 (FULL, a wide terminal) */
 } tui_vrow;
 typedef struct { uint64_t ms, fin; } tui_rs;   /* a done/s snapshot: when, and the finished count */
@@ -599,7 +599,7 @@ typedef struct {
     int      exact, lb, miss;          /* miss: the parts the tier runs without (bits, see dash_format) */
     uint64_t l_folded, l_untracked, l_plost, l_trunc, l_nomem;
     /* TASKS */
-    int      has_tasks, pcols, nrows, more, nfold, fold_more, max_tasks, lat_cap, has_tab;
+    int      has_tasks, pcols, mcols, nrows, more, nfold, fold_more, max_tasks, lat_cap, has_tab;
     uint64_t lat_untracked, lat_unmatched;
     /* RECENT */
     int      has_rec, act_on, scroll, nrec;
@@ -2347,7 +2347,10 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     v->l_folded = t->h_folded; v->l_untracked = t->h_untracked; v->l_plost = t->p_lost;
     v->l_trunc = t->h_trunc; v->l_nomem = t->h_nomem; v->fold_more = t->fold_more;
     v->has_tasks = t->tasks != NULL; v->has_tab = t->tab != NULL;
-    v->pcols = t->hist && W >= 100;               /* the percentiles when the width has room: 21 columns */
+    /* the columns past the 80-wide row (77 + key), each only when the width has room for it:
+     * max ms (9 columns, LATENCY and up) from 88, then the percentiles (21, FULL) */
+    v->mcols = t->tab != NULL && W >= 88;
+    v->pcols = t->hist && W >= (v->mcols ? 109 : 100);
     v->nfold = t->nfold; v->max_tasks = t->max_tasks; v->lat_cap = t->lat_cap;
     v->lat_untracked = t->lat_untracked; v->lat_unmatched = t->lat_unmatched;
     v->has_rec = t->prob || t->act; v->act_on = t->act != NULL;
@@ -2388,7 +2391,7 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
                 copy_u8(o->label, sizeof o->label, u ? u->label : src->name);
                 o->hotkey = u ? u->hotkey : 0;
                 o->started = src->started; o->finished = src->finished; o->failed = src->failed;
-                o->dead = src->dead; o->dropped = src->dropped; o->lat_sum = src->lat_sum_ms; o->lat_n = src->lat_n;
+                o->dead = src->dead; o->dropped = src->dropped; o->lat_sum = src->lat_sum_ms; o->lat_max = src->lat_max_ms; o->lat_n = src->lat_n;
                 o->mem_peak = src->mem_peak; o->has_mem = src->mem_method[0] != 0;
                 if (v->pcols) {
                     const uint64_t *hb = &t->hist[(size_t)(src - t->tasks) * TUI_HIST_B];
@@ -2571,13 +2574,15 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
 
     if (v->has_tasks) {                  /* the TASKS tier and up, and shown (else not built) */
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
-        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s%s %8s  key%s\n",
+        /* max ms beside avg ms once the handle table is on (LATENCY and up) and the width has
+         * room: the slowest queue->finish a FINISHED item of the type took since install */
+        pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s%s%s %8s  key%s\n",
                       D, "label", "run", "ok", "fail", "dead", "drop", "ok%", "avg ms",
-                      v->pcols ? "    p50    p95    p99" : "", "peak MB", X);
+                      v->mcols ? "   max ms" : "", v->pcols ? "    p50    p95    p99" : "", "peak MB", X);
         /* the types in the order first seen, then '(other)' once anything was folded there */
         for (i = 0; i < v->nrows; ++i) {
             const tui_vrow *k = &v->rows[i];
-            char key[8], pct[8], lat[24], peak[32], lb[TUI_NAME_CAP * 2], c[5][16], pcs[64];
+            char key[8], pct[8], lat[24], mx[24], peak[32], lb[TUI_NAME_CAP * 2], c[5][16], pcs[64];
             uint64_t terminal = k->finished + k->dead + k->dropped;
             const char *pc = "";
             if (k->hotkey > 32 && k->hotkey < 127) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
@@ -2595,17 +2600,22 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
              * way releases its latency entry without a sample) */
             if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum / (double)k->lat_n);
             else          strcpy(lat, "      --");
+            mx[0] = 0;
+            if (v->mcols) {
+                if (k->lat_n) snprintf(mx, sizeof mx, " %8llu", (unsigned long long)k->lat_max);
+                else          strcpy(mx, "       --");
+            }
             /* What a process job's attempts measured at their peak (docs/MEASUREMENTS.md);
              * "--" for an in-process task, which is never measured. */
             if (k->has_mem) snprintf(peak, sizeof peak, "%8.1f", (double)k->mem_peak / 1048576.0);
             else            strcpy(peak, "      --");
             pcs[0] = 0;
             if (v->pcols) snprintf(pcs, sizeof pcs, " %6s %6s %6s", k->pq[0], k->pq[1], k->pq[2]);
-            pos = appendf(buf, cap, pos, "  %s %5s %5s %5s %5s %5s %s%5s%s %8s%s %8s  %s\n",
+            pos = appendf(buf, cap, pos, "  %s %5s %5s %5s %5s %5s %s%5s%s %8s%s%s %8s  %s\n",
                           tui_cell(k->label, lb, sizeof lb, 16), fmt_count(c[0], sizeof c[0], k->started),
                           fmt_count(c[1], sizeof c[1], k->finished), fmt_count(c[2], sizeof c[2], k->failed),
                           fmt_count(c[3], sizeof c[3], k->dead), fmt_count(c[4], sizeof c[4], k->dropped),
-                          pc, pct, color ? X : "", lat, pcs, peak, key);
+                          pc, pct, color ? X : "", lat, mx, pcs, peak, key);
         }
         if (v->more)                     /* fitted to the terminal: the rows it has no room for */
             pos = appendf(buf, cap, pos, "  %s+%d more (a taller terminal shows them)%s\n", D, v->more, X);
@@ -3727,7 +3737,8 @@ static int paint_due(int first, int kp, int mode, int dirty, uint64_t vis, uint6
  * deadline of what it shows, and with none, for good (1.10 woke every refresh_ms in every
  * mode, PAUSED included, and repainted the whole frame in CONTINUOUS). The deadlines:
  *   - refresh_ms after the last frame, when state changed since (the rate limit);
- *   - a toast's expiry, in every pane;
+ *   - a toast's expiry, in every pane (CONTINUOUS and ON_DEMAND: PAUSED is frozen - a
+ *     repaint would also move the numbers it holds - so its toast stays until the next key);
  *   - the clock's next visible tick, when the header shows it;
  *   - done/s and peak settling, while they are not yet what an idle engine shows;
  *   - CONTINUOUS: every refresh_ms - and then, when the state's generation, the clock and

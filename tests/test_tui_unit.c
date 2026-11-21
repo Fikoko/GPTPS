@@ -119,6 +119,12 @@
  *     its cost, a cheap one too), a frame due when the hold ends, install / a tier change /
  *     health not held; the detail pane shows all 11 of a task's settings at 24 rows and
  *     fits them in 24 rows while editing; a pass with no memory says so, not "none".
+ * 49) Windows, on a pseudo console (ConPTY; the test re-runs itself as the child attached
+ *     to it): PAUSED and ON_DEMAND idle 3 s - no wake, no frame, no write (health's
+ *     counters); gptps_tui_wake wakes it once and writes nothing; ResizePseudoConsole
+ *     repaints once at the new width (skipped, saying so, where the resize itself is not
+ *     implemented - Wine 9 - or there is no ConPTY).
+ * 37) also: max ms beside avg ms from LATENCY up, only when the width has room for it.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -1637,7 +1643,29 @@ TUI_STATIC_ASSERT(mode_paused, GPTPS_TUI_PAUSED == 2);
 /* the 1.10 struct's size on this target: through `unicode`, rounded to its alignment */
 #define TUI_V110_SIZE ((offsetof(gptps_tui_config, unicode) + sizeof(int) + sizeof(void *) - 1) / sizeof(void *) * sizeof(void *))
 TUI_STATIC_ASSERT(new_fields_past_110, offsetof(gptps_tui_config, max_tasks) >= TUI_V110_SIZE);
+/* every released field in its 1.10 order, on every target */
+TUI_STATIC_ASSERT(f110_order, offsetof(gptps_tui_config, struct_size) == 0 &&
+                  offsetof(gptps_tui_config, refresh_ms) >= sizeof(size_t) &&
+                  offsetof(gptps_tui_config, color) == offsetof(gptps_tui_config, refresh_ms) + 4 &&
+                  offsetof(gptps_tui_config, interactive) == offsetof(gptps_tui_config, color) + 4 &&
+                  offsetof(gptps_tui_config, max_recent) == offsetof(gptps_tui_config, interactive) + 4 &&
+                  offsetof(gptps_tui_config, show_tasks) == offsetof(gptps_tui_config, max_recent) + 4 &&
+                  offsetof(gptps_tui_config, show_recent) == offsetof(gptps_tui_config, show_tasks) + 4 &&
+                  offsetof(gptps_tui_config, kpi) == offsetof(gptps_tui_config, show_recent) + 4 &&
+                  offsetof(gptps_tui_config, mode) == offsetof(gptps_tui_config, kpi) + 4 &&
+                  offsetof(gptps_tui_config, latency_window) == offsetof(gptps_tui_config, mode) + 4 &&
+                  offsetof(gptps_tui_config, title) > offsetof(gptps_tui_config, latency_window) &&
+                  offsetof(gptps_tui_config, out) == offsetof(gptps_tui_config, title) + sizeof(void *) &&
+                  offsetof(gptps_tui_config, settings_path) == offsetof(gptps_tui_config, out) + sizeof(void *) &&
+                  offsetof(gptps_tui_config, unicode) == offsetof(gptps_tui_config, settings_path) + sizeof(void *));
 #if UINTPTR_MAX > 0xffffffffu
+TUI_STATIC_ASSERT(lp64_struct_size, offsetof(gptps_tui_config, struct_size) == 0);
+TUI_STATIC_ASSERT(lp64_refresh_ms, offsetof(gptps_tui_config, refresh_ms) == 8);
+TUI_STATIC_ASSERT(lp64_color, offsetof(gptps_tui_config, color) == 12);
+TUI_STATIC_ASSERT(lp64_interactive, offsetof(gptps_tui_config, interactive) == 16);
+TUI_STATIC_ASSERT(lp64_max_recent, offsetof(gptps_tui_config, max_recent) == 20);
+TUI_STATIC_ASSERT(lp64_show_tasks, offsetof(gptps_tui_config, show_tasks) == 24);
+TUI_STATIC_ASSERT(lp64_show_recent, offsetof(gptps_tui_config, show_recent) == 28);
 TUI_STATIC_ASSERT(lp64_kpi, offsetof(gptps_tui_config, kpi) == 32);
 TUI_STATIC_ASSERT(lp64_mode, offsetof(gptps_tui_config, mode) == 36);
 TUI_STATIC_ASSERT(lp64_latwin, offsetof(gptps_tui_config, latency_window) == 40);
@@ -2226,13 +2254,20 @@ static void test_percentiles(void)
     CHECK(strstr(frame, "    p50    p95    p99") != NULL);
     CHECK(strstr(frame, "     <8   <128  <8192") != NULL);   /* 0,5 -> <8; 95th: 100 -> <128; 99th: 5000 -> <8192 */
     CHECK(widest(frame) <= 120);
+    CHECK(strstr(frame, "   max ms") != NULL && strstr(frame, "     5000") != NULL);   /* the slowest: 5000 ms */
+    t->cols = 100;                                       /* room for max ms, not the percentiles too */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "max ms") != NULL && strstr(frame, "p50") == NULL && widest(frame) <= 100);
     t->cols = 80;                                        /* no room: not shown, the table stays in the width */
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "p50") == NULL && widest(frame) <= 80);
+    CHECK(strstr(frame, "p50") == NULL && strstr(frame, "max ms") == NULL && widest(frame) <= 80);
     CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_LATENCY) == GPTPS_OK && t->hist == NULL);
     t->cols = 120;
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "p50") == NULL && strstr(frame, "avg ms") != NULL);
+    CHECK(strstr(frame, "p50") == NULL && strstr(frame, "avg ms") != NULL && strstr(frame, "max ms") != NULL);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_TASKS) == GPTPS_OK && t->tab == NULL);   /* below LATENCY: none */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "max ms") == NULL && strstr(frame, "avg ms") != NULL);
     gptps_shutdown(e);
     gptps_tui_close(t);
 }
@@ -3121,8 +3156,223 @@ static void test_live_idle(void)
 }
 #endif
 
-int main(void)
+#if defined(_WIN32)
+/* 49) Windows: the live loop on a pseudo console (ConPTY), as test_live_idle on a pty.
+ * ctest gives a test no console, so the test runs itself as a child attached to one it
+ * makes: the child runs gptps_tui_run and checks, through gptps_tui_health, that an idle
+ * ON_DEMAND / PAUSED loop makes no wake, no frame and no write; that gptps_tui_wake makes
+ * one wake and no write; and that a resize (ResizePseudoConsole: the console's
+ * WINDOW_BUFFER_SIZE_EVENT) repaints once at the new width. The parent drains the console's
+ * output (or the child would block writing) and resizes when the child asks. Skipped,
+ * saying so, where there is no ConPTY (before Windows 10 1809). */
+typedef HRESULT (WINAPI *cpc_fn)(COORD, HANDLE, HANDLE, DWORD, void **);
+typedef HRESULT (WINAPI *rpc_fn)(void *, COORD);
+typedef void (WINAPI *clpc_fn)(void *);
+typedef BOOL (WINAPI *ipal_fn)(void *, DWORD, DWORD, SIZE_T *);
+typedef BOOL (WINAPI *upal_fn)(void *, DWORD, DWORD_PTR, void *, SIZE_T, void *, SIZE_T *);
+typedef void (WINAPI *dpal_fn)(void *);
+#define TUI_PTA_PSEUDOCONSOLE ((DWORD_PTR)0x00020016)
+static HANDLE wc_rd;
+static volatile LONG wc_got;
+static DWORD WINAPI wc_drain(void *p)
 {
+    char b[4096]; DWORD n;
+    (void)p;
+    while (ReadFile(wc_rd, b, sizeof b, &n, NULL) && n) InterlockedExchangeAdd(&wc_got, (LONG)n);
+    return 0;
+}
+static void wc_name(char *b, size_t cap, unsigned long pid, const char *what)
+{ snprintf(b, cap, "Local\\gptps_tui_unit_%lu_%s", pid, what); }
+/* where the child's printf (CHECK's FAIL lines) goes: the parent prints it on a failure */
+static void wc_log(char *b, size_t cap, unsigned long pid)
+{
+    char d[MAX_PATH];
+    DWORD n = GetTempPathA(sizeof d, d);
+    snprintf(b, cap, "%sgptps_tui_unit_%lu.log", (n && n < sizeof d) ? d : ".\\", pid);
+}
+/* the child: on the console it was started on */
+static gptps_tui *wc_t;
+static DWORD WINAPI wc_run(void *p) { (void)p; gptps_tui_run(wc_t); return 0; }
+static int wc_until_painted(uint64_t n)
+{
+    int i;
+    for (i = 0; i < 300 && health(wc_t).frames_painted < n; ++i) Sleep(10);
+    return health(wc_t).frames_painted >= n;
+}
+static int win_conpty_child(unsigned long ppid)
+{
+    static const int modes[] = { GPTPS_TUI_ON_DEMAND, GPTPS_TUI_PAUSED };
+    char na[96], nb[96], nc[96], lg[MAX_PATH + 64];
+    HANDLE ask, done, norz;
+    FILE *con;
+    size_t i;
+    wc_name(na, sizeof na, ppid, "ask"); wc_name(nb, sizeof nb, ppid, "done"); wc_log(lg, sizeof lg, ppid);
+    ask = OpenEventA(EVENT_MODIFY_STATE, FALSE, na);
+    done = OpenEventA(SYNCHRONIZE, FALSE, nb);
+    wc_name(nc, sizeof nc, ppid, "norz");
+    norz = OpenEventA(SYNCHRONIZE, FALSE, nc);
+    /* frames to the console, diagnostics to the log; then the console's own handles as
+     * the std handles the add-on asks for (GetStdHandle), whatever the CRT left there */
+    if (!freopen(lg, "w", stdout) || !freopen("CONIN$", "r", stdin) || (con = fopen("CONOUT$", "w")) == NULL ||
+        !ask || !done || !norz) return 90;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    SetStdHandle(STD_OUTPUT_HANDLE, CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                                NULL, OPEN_EXISTING, 0, NULL));
+    SetStdHandle(STD_INPUT_HANDLE, CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                               NULL, OPEN_EXISTING, 0, NULL));
+    for (i = 0; i < sizeof modes / sizeof modes[0]; ++i) {
+        gptps_tui_config c;
+        gptps_tui_health_info h0, h1;
+        gptps *e = open_manual();
+        HANDLE th;
+        int k;
+        if (!e) return 91;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.color = 0; c.unicode = 0; c.interactive = 1; c.out = con;
+        c.mode = modes[i]; c.refresh_ms = 50;
+        wc_t = gptps_tui_install(e, &c);
+        if (!wc_t) { gptps_shutdown(e); return 92; }
+        th = CreateThread(NULL, 0, wc_run, NULL, 0, NULL);
+        if (!th) { gptps_shutdown(e); gptps_tui_close(wc_t); return 93; }
+        CHECK(wc_until_painted(1));
+        CHECK(sc_get(&wc_t->wake_h) != 0);                    /* the event exists while it runs */
+        Sleep(300);                                           /* settled */
+        h0 = health(wc_t);
+        Sleep(3000);
+        h1 = health(wc_t);
+        if (h1.wakes != h0.wakes || h1.frames_painted != h0.frames_painted)
+            printf("mode %d idle: %llu wakes, %llu frames\n", modes[i], (unsigned long long)(h1.wakes - h0.wakes),
+                   (unsigned long long)(h1.frames_painted - h0.frames_painted));
+        CHECK(h1.frames_painted == h0.frames_painted && h1.bytes_written == h0.bytes_written);
+        CHECK(h1.wakes == h0.wakes);                          /* blocked, no timeout */
+        if (modes[i] == GPTPS_TUI_ON_DEMAND) {
+            gptps_tui_wake(wc_t);                             /* one wake, a frame made, nothing written */
+            Sleep(300);
+            h0 = health(wc_t);
+            CHECK(h0.wakes == h1.wakes + 1 && h0.bytes_written == h1.bytes_written && h0.frames_skipped == h1.frames_skipped + 1);
+            SetEvent(ask);                                    /* the parent resizes the console to 100 x 24 */
+            CHECK(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
+            if (WaitForSingleObject(norz, 0) == WAIT_OBJECT_0) goto stop;   /* the parent could not resize */
+            for (k = 0; k < 300 && health(wc_t).frames_painted < h0.frames_painted + 1; ++k) Sleep(10);
+            Sleep(300);
+            h1 = health(wc_t);
+            mu_lock(&wc_t->rmu); k = wc_t->cols; mu_unlock(&wc_t->rmu);
+            if (h1.frames_painted != h0.frames_painted + 1 || k != 100)
+                printf("resize: %llu frames, cols %d\n", (unsigned long long)(h1.frames_painted - h0.frames_painted), k);
+            CHECK(h1.frames_painted == h0.frames_painted + 1 && k == 100);
+        }
+    stop:
+        tui_quit(wc_t);
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+        CHECK(sc_get(&wc_t->wake_h) == 0);                    /* gone with the loop */
+        gptps_shutdown(e);
+        gptps_tui_close(wc_t);
+        wc_t = NULL;
+    }
+    return fails > 80 ? 80 : fails;
+}
+static void test_live_idle_win(const char *self)
+{
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    cpc_fn cpc = k32 ? (cpc_fn)(void (*)(void))GetProcAddress(k32, "CreatePseudoConsole") : NULL;
+    rpc_fn rpc = k32 ? (rpc_fn)(void (*)(void))GetProcAddress(k32, "ResizePseudoConsole") : NULL;
+    clpc_fn clpc = k32 ? (clpc_fn)(void (*)(void))GetProcAddress(k32, "ClosePseudoConsole") : NULL;
+    ipal_fn ipal = k32 ? (ipal_fn)(void (*)(void))GetProcAddress(k32, "InitializeProcThreadAttributeList") : NULL;
+    upal_fn upal = k32 ? (upal_fn)(void (*)(void))GetProcAddress(k32, "UpdateProcThreadAttribute") : NULL;
+    dpal_fn dpal = k32 ? (dpal_fn)(void (*)(void))GetProcAddress(k32, "DeleteProcThreadAttributeList") : NULL;
+    HANDLE in_r = NULL, in_w = NULL, out_r = NULL, out_w = NULL, ask, done, drain, hs[2];
+    void *pc = NULL, *al = NULL;
+    SIZE_T asz = 0;
+    STARTUPINFOEXA si;
+    PROCESS_INFORMATION pi;
+    COORD sz;
+    char cmd[MAX_PATH + 64], na[96], nb[96], nc[96];
+    HANDLE norz;
+    DWORD code = 99, r;
+    if (!cpc || !rpc || !clpc || !ipal || !upal || !dpal) {
+        printf("note: no ConPTY here (Windows 10 1809+); the Windows live loop checks are skipped\n");
+        return;
+    }
+    wc_name(na, sizeof na, (unsigned long)GetCurrentProcessId(), "ask");
+    wc_name(nb, sizeof nb, (unsigned long)GetCurrentProcessId(), "done");
+    ask = CreateEventA(NULL, FALSE, FALSE, na);
+    done = CreateEventA(NULL, FALSE, FALSE, nb);
+    wc_name(nc, sizeof nc, (unsigned long)GetCurrentProcessId(), "norz");
+    norz = CreateEventA(NULL, TRUE, FALSE, nc);           /* manual reset: set = no resize was made */
+    sz.X = 80; sz.Y = 24;
+    if (!ask || !done || !norz || !CreatePipe(&in_r, &in_w, NULL, 0) || !CreatePipe(&out_r, &out_w, NULL, 0) ||
+        FAILED(cpc(sz, in_r, out_w, 0, &pc))) {
+        printf("note: cannot make a pseudo console here; the Windows live loop checks are skipped\n");
+        return;
+    }
+    CloseHandle(in_r); CloseHandle(out_w);                /* the console holds its own */
+    wc_rd = out_r;
+    drain = CreateThread(NULL, 0, wc_drain, NULL, 0, NULL);
+    ipal(NULL, 1, 0, &asz);
+    al = malloc(asz);
+    memset(&si, 0, sizeof si);
+    si.StartupInfo.cb = sizeof si;
+    CHECK(al && drain && ipal(al, 1, 0, &asz) && upal(al, 0, TUI_PTA_PSEUDOCONSOLE, pc, sizeof pc, NULL, NULL));
+    si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)al;
+    snprintf(cmd, sizeof cmd, "\"%s\" --conpty-child %lu", self, (unsigned long)GetCurrentProcessId());
+    memset(&pi, 0, sizeof pi);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &si.StartupInfo, &pi)) {
+        printf("FAIL: CreateProcess on the pseudo console: error %lu\n", (unsigned long)GetLastError());
+        ++fails;
+    } else {
+        hs[0] = pi.hProcess; hs[1] = ask;
+        for (;;) {
+            r = WaitForMultipleObjects(2, hs, FALSE, 60000);
+            if (r == WAIT_OBJECT_0 + 1) {                 /* the child asks for a resize */
+                HRESULT hr;
+                sz.X = 100; sz.Y = 24;
+                hr = rpc(pc, sz);
+                if (FAILED(hr)) {                         /* Wine 9: not implemented - say so, not fail */
+                    printf("note: ResizePseudoConsole failed (0x%08lx); the resize repaint check is skipped\n",
+                           (unsigned long)hr);
+                    SetEvent(norz);
+                }
+                SetEvent(done);
+                continue;
+            }
+            break;
+        }
+        if (r != WAIT_OBJECT_0) { printf("FAIL: the pseudo-console child did not finish in 60 s\n"); ++fails;
+                                  TerminateProcess(pi.hProcess, 98); WaitForSingleObject(pi.hProcess, 5000); }
+        GetExitCodeProcess(pi.hProcess, &code);
+        if (code) {
+            char lg[MAX_PATH + 64], ln[512];
+            FILE *f;
+            wc_log(lg, sizeof lg, (unsigned long)GetCurrentProcessId());
+            printf("FAIL: the pseudo-console child failed %lu check(s) (90+: it could not set up); its log:\n",
+                   (unsigned long)code);
+            ++fails;
+            if ((f = fopen(lg, "r")) != NULL) { while (fgets(ln, sizeof ln, f)) printf("  child: %s", ln); fclose(f); }
+        }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        CHECK(InterlockedExchangeAdd(&wc_got, 0) > 0);    /* it did paint on that console */
+    }
+    {
+        char lg[MAX_PATH + 64];
+        wc_log(lg, sizeof lg, (unsigned long)GetCurrentProcessId());
+        remove(lg);
+    }
+    clpc(pc);                                             /* ends the drain thread's ReadFile */
+    if (drain) { WaitForSingleObject(drain, 10000); CloseHandle(drain); }
+    CloseHandle(out_r); CloseHandle(in_w);
+    if (al) { dpal(al); free(al); }
+    CloseHandle(ask); CloseHandle(done); CloseHandle(norz);
+}
+#endif
+
+int main(int argc, char **argv)
+{
+#if defined(_WIN32)
+    if (argc == 3 && strcmp(argv[1], "--conpty-child") == 0) return win_conpty_child(strtoul(argv[2], NULL, 10));
+#else
+    (void)argc; (void)argv;
+#endif
     test_sanitiser();
     test_recent_fits();
     test_editor_and_commit();
@@ -3172,6 +3422,7 @@ int main(void)
     test_render_while_unregistering();
 #else
     test_windows_keys();
+    test_live_idle_win(argv[0]);
 #endif
     if (fails) { printf("%d tui unit check(s) FAILED\n", fails); return 1; }
     printf("all tui unit checks passed\n");

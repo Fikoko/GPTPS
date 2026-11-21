@@ -48,29 +48,33 @@ typedef struct gptps_tui gptps_tui;
  * (gptps_tui_set_kpi, `tui.kpi`, the 'm' key).
  *
  *   tier  enum (tui.kpi)          adds                                 per event         measured  memory it adds
- *   0     OFF      ("off")        leaves the event path: one flag      ~1 ns, no lock    2 ns      -
+ *   0     OFF      ("off")        leaves the event path: one flag      ~1 ns, no lock    2-3 ns    -
  *                                 read, no lock
- *   1     MINIMAL  ("minimal",    totals: queued, started, finished,   one lock +        7 ns      -
+ *   1     MINIMAL  ("minimal",    totals: queued, started, finished,   one lock +        7-9 ns    -
  *                   or "count")   failed, retried, dead, dropped,      increments
  *                                 cancelled
- *   2     GAUGE    ("gauge")      the in-flight gauge (and pending     + ~0-2 ns         9 ns      -
+ *   2     GAUGE    ("gauge")      the in-flight gauge (and pending     + ~0-2 ns         9-10 ns   -
  *                                 beside it), its bar and peak
  *   3     PROBLEMS ("problems")   the PROBLEMS journal: FAILED,        0 on a success;   10 ns     recent_lines x ~300 B
  *                                 RETRIED, DEAD_LETTERED, DROPPED      with a failure: a           (2.4 KiB)
  *                                 with why (exit code / signal /       copy + a <= 512 B
  *                                 start error + stderr's last line)    scan
- *   4     TASKS    ("tasks")      the per-task TASKS rows ('(other)'   one hash probe    18 ns     (max_tasks + 1) x ~250 B
+ *   4     TASKS    ("tasks")      the per-task TASKS rows ('(other)'   one hash probe    18-21 ns  (max_tasks + 1) x ~250 B
  *                                 row past max_tasks) and mem.peak                                 + index (~19 KiB)
- *   5     NORMAL   ("normal",     the ACTIVITY journal: QUEUED,        one 24 B store    18 ns     activity_lines x 24 B
+ *   5     NORMAL   ("normal",     the ACTIVITY journal: QUEUED,        one 24 B store    18-24 ns  activity_lines x 24 B
  *                   or "activity") STARTED, FINISHED
- *   6     LATENCY  ("latency")    the handle table: avg ms queue to    one hash op       23 ns     32 B x next_pow2(4/3 x
+ *   6     LATENCY  ("latency")    the handle table: avg ms queue to    one hash op       23-38 ns  32 B x next_pow2(4/3 x
  *                                 finish, EXACT pending / in-flight                                (window + 64)) (64 KiB)
- *   7     FULL     ("full")       latency percentiles p50/p95/p99      one increment     23 ns     256 B a row (16 KiB)
+ *   7     FULL     ("full")       latency percentiles p50/p95/p99      one increment     23-38 ns  256 B a row (16 KiB)
  *                                 (a log2-ms histogram per row)
  *
  * "measured": a QUEUED, STARTED, FINISHED mix of one task type, the observer called on
  * one thread (gcc -O2, x86-64 Linux, 4 cores), the defaults; memory in brackets at the
- * defaults. With several threads emitting, MINIMAL and up also wait for one another on
+ * defaults. The low end is nothing in flight; the high end of LATENCY and FULL is 512
+ * items in flight (the handle table no longer fits a cache line's reach). Cache misses,
+ * not an algorithmic term, add more: ~50-70 ns at 500k in flight in a 1<<20 window, and
+ * ~50-60 ns at 1000 task types. A FAILED event with a stderr tail at PROBLEMS and up costs
+ * ~90-170 ns (the why copy and its bounded scan). With several threads emitting, MINIMAL and up also wait for one another on
  * the dashboard's one lock - the price of no atomics in the drop-in build; OFF never does.
  * No tier has a per-event term that grows with the window, the task types or a stderr
  * tail (tests/test_tui_perf.c gates each, as a ratio). A layer's memory exists only at its
@@ -427,7 +431,7 @@ void gptps_tui_snapshot(gptps_tui *t);
  * until the earliest deadline of what it shows, and with none, for good - PAUSED and an idle
  * ON_DEMAND make no wake, no frame and no write (1.10 woke every refresh_ms in every mode).
  * The deadlines: refresh_ms after the last frame when state changed since (the rate limit);
- * a toast's expiry (in every pane); the clock's next visible tick (cfg.clock: once a minute
+ * a toast's expiry (in every pane; PAUSED is frozen, so its toast stays until the next key); the clock's next visible tick (cfg.clock: once a minute
  * by default, never with OFF); done/s and peak settling after activity. CONTINUOUS looks
  * every refresh_ms and, when the dashboard's state, clock and toast are as painted, makes no
  * frame at all (frames_skipped: no render, no write - one size ioctl); the other panes read the
@@ -476,8 +480,8 @@ void gptps_tui_snapshot(gptps_tui *t);
  *     done/s, peak and the clock advance inside render. Pick the tier by what you can
  *     spare per event - MINIMAL (totals) or GAUGE (+ in-flight and peak), which hold no
  *     per-event memory; with the stub HAL's clock, cfg.clock = OFF.
- *   - A server at 100k events/s: every tier is O(1) an event (23 ns at FULL on one
- *     thread: ~0.2% of a core), but MINIMAL and up take one mutex an event on every thread
+ *   - A server at 100k events/s: every tier is O(1) an event (23-38 ns at FULL on one
+ *     thread: ~0.2-0.4% of a core), but MINIMAL and up take one mutex an event on every thread
  *     that emits. Prefer ON_DEMAND (at most one wake a frame interval); size
  *     latency_window to the in-flight depth, not the rate; activity_lines = -1 (or
  *     tui.activity = 0) when the lifecycle log is not read - failures stay in PROBLEMS.

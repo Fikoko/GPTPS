@@ -628,19 +628,22 @@ enabled automatically). Panes/metrics:
 
     | tier | `tui.kpi` | adds | per event | measured | memory it adds (default) |
     |---|---|---|---|---|---|
-    | 0 | `off` | leaves the event path: the observer returns *before* the lock, every part is freed | ~1 ns | 2 ns | — |
-    | 1 | `minimal` (or `count`) | totals: queued, started, finished, failed, retried, dead, dropped, cancelled | one mutex + increments | 7 ns | — |
-    | 2 | `gauge` | the in-flight / pending gauges (`~`), bar and peak | ~0-2 ns more | 9 ns | — |
+    | 0 | `off` | leaves the event path: the observer returns *before* the lock, every part is freed | ~1 ns | 2-3 ns | — |
+    | 1 | `minimal` (or `count`) | totals: queued, started, finished, failed, retried, dead, dropped, cancelled | one mutex + increments | 7-9 ns | — |
+    | 2 | `gauge` | the in-flight / pending gauges (`~`), bar and peak | ~0-2 ns more | 9-10 ns | — |
     | 3 | `problems` | the PROBLEMS journal, with why (≤ 512 B scanned) | 0 on a success | 10 ns | `recent_lines` × ~300 B (2.4 KiB) |
-    | 4 | `tasks` | the per-task TASKS table (`(other)` row) and `peak MB` | one hash probe | 18 ns | (`max_tasks` + 1) × ~250 B + index (~19 KiB) |
-    | 5 | `normal` (or `activity`) | the ACTIVITY journal | one 24 B store | 18 ns | `activity_lines` × 24 B |
-    | 6 | `latency` | the handle table: avg ms, **exact** gauges | one hash op | 23 ns | 32 B a slot, ~4/3 × (window + 64) rounded up to a power of two (64 KiB) |
-    | 7 | `full` (the default) | latency percentiles p50/p95/p99 (log2-ms buckets, shown when the terminal is 100+ columns wide) | one increment | 23 ns | 256 B a row (16 KiB) |
+    | 4 | `tasks` | the per-task TASKS table (`(other)` row) and `peak MB` | one hash probe | 18-21 ns | (`max_tasks` + 1) × ~250 B + index (~19 KiB) |
+    | 5 | `normal` (or `activity`) | the ACTIVITY journal | one 24 B store | 18-24 ns | `activity_lines` × 24 B |
+    | 6 | `latency` | the handle table: avg ms and max ms (shown 88+ columns wide), **exact** gauges | one hash op | 23-38 ns | 32 B a slot, ~4/3 × (window + 64) rounded up to a power of two (64 KiB) |
+    | 7 | `full` (the default) | latency percentiles p50/p95/p99 (log2-ms buckets, shown when the terminal is 109+ columns wide) | one increment | 23-38 ns | 256 B a row (16 KiB) |
 
     *Measured*: a `QUEUED`/`STARTED`/`FINISHED` mix of one task type, the observer called
-    on one thread (gcc -O2, x86-64 Linux), the defaults. No tier costs more per event as
-    the window, the task types or a stderr tail grow (`tests/test_tui_perf.c` gates each
-    as a ratio, label `perf`). With several threads emitting, `minimal` and up also wait
+    on one thread (gcc -O2, x86-64 Linux), the defaults; the low end is nothing in flight,
+    the high end of `latency`/`full` is 512 in flight. No tier has a per-event term that
+    grows with the window, the task types or a stderr tail (`tests/test_tui_perf.c` gates
+    each as a ratio, label `perf`), but cache misses still show: ~50-70 ns at 500k in
+    flight in a 1<<20 window, ~50-60 ns at 1000 task types, ~90-170 ns for a FAILED
+    event with a stderr tail. With several threads emitting, `minimal` and up also wait
     for one another on the dashboard's one lock (no atomics in the drop-in build).
     `off` is the tier for leaving the dashboard in place after you have stopped looking
     at it (counters do not advance while off); `minimal` and up still take one mutex per
@@ -715,7 +718,7 @@ enabled automatically). Panes/metrics:
   | host | suggested | why |
   |---|---|---|
   | embedded / `GPTPS_RUN_MANUAL` (render or snapshot only) | `minimal` or `gauge`, `cfg.clock = OFF` with the stub HAL's clock | no thread, no pipe, no timer — `done/s`, `peak` and the clock advance inside render; neither tier holds per-event memory |
-  | a server at 100k events/s | `ON_DEMAND`; `latency_window` = the in-flight depth; `activity_lines = -1` when the lifecycle log is not read | every tier is O(1) an event (23 ns at `full`: ~0.2% of a core at 100k/s), but `minimal` and up take one mutex an event on every emitting thread; `ON_DEMAND` wakes at most once a frame interval; failures stay in PROBLEMS; the tasks pane is safe to leave open |
+  | a server at 100k events/s | `ON_DEMAND`; `latency_window` = the in-flight depth; `activity_lines = -1` when the lifecycle log is not read | every tier is O(1) an event (23-38 ns at `full`: ~0.2-0.4% of a core at 100k/s), but `minimal` and up take one mutex an event on every emitting thread; `ON_DEMAND` wakes at most once a frame interval; failures stay in PROBLEMS; the tasks pane is safe to leave open |
   | Task Scheduler / a service / headless | `off`, or what `gptps_tui_snapshot` needs | `run` returns at once (no console) and makes no pipe; `off` costs ~2 ns an event and no lock — raise it when someone looks |
   | an operator's console | the defaults (`full`, `CONTINUOUS`, clock in minutes), or `ON_DEMAND` | idle, it writes nothing and repaints the header once a minute; `ON_DEMAND` makes no frame between changes |
 

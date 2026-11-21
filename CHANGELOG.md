@@ -5,6 +5,116 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+The dashboard (`addons/gptps_tui`) as a ladder of cost tiers, with idle that costs
+nothing. The core is unchanged: the ABI stays 2.8. The add-on gains API (new enum values,
+appended config fields, new functions); every released name, value and field keeps its
+place, `cfg.struct_size` 0 still means the 1.10 layout, and a 1.10 caller's config is
+read as before.
+
+### Added
+
+- **KPI tiers** (`gptps_tui_kpi`, `tui.kpi`, the `m` key). Each tier is the one below it
+  plus exactly one layer, in the order of what that layer costs per event: `off`,
+  `minimal` (totals; alias `count`), `gauge` (pending / in-flight, bar, peak),
+  `problems` (the failures journal), `tasks` (per-type rows), `normal` (the activity
+  journal; alias `activity`), `latency` (handle table: avg / max ms, exact gauges),
+  `full` (p50/p95/p99). The released values 0..4 are kept; `GAUGE` = 5, `PROBLEMS` = 6,
+  `TASKS` = 7, `ACTIVITY` = 8 (= NORMAL's tier), `LATENCY` = 9 are appended. A layer's
+  memory exists only at its tier and up: it is allocated with the lock released and
+  freed when you drop below it. `m` steps through every tier and wraps; it never enters
+  `off`. The cost and memory of each tier are in `gptps_tui.h` and `addons/README.md`.
+- **Two journals instead of one recent ring**: PROBLEMS (FAILED, RETRIED,
+  DEAD_LETTERED, DROPPED, each with its why) and ACTIVITY (QUEUED, STARTED, FINISHED, 24
+  B a record). RECENT merges them by time; lifecycle noise can no longer push failures
+  out. Every record that leaves a journal before a frame shows it is counted ("N not
+  shown", the `lost:` line, `gptps_tui_health`), with one WARN for lost problems.
+  `gptps_tui_set_recent(t, problems, activity)`, `tui.recent`, `tui.activity` (0 = off
+  and freed); `cfg.recent_lines`, `cfg.activity_lines` (0 = default, -1 = off).
+- **Exact pending / in-flight** from the `latency` tier up, from a hash table of handles
+  (O(1) an event; past `latency_window` a new item is not tracked, counted, and no
+  tracked item is evicted). Below it the gauges are marked `~` (from the counters);
+  `minimal` shows one sum, `pending+in-flight ~N`. A new table, or one that refused a
+  handle, shows `>=` until the engine is idle with nothing live in the table.
+- **max ms** beside avg ms from the `latency` tier up (when the terminal is 88+ columns
+  wide); percentiles at `full` move to 109+ columns when it shows.
+- An `(other)` TASKS row for the types past `cfg.max_tasks` (new: 0 => 64, up to 4096),
+  counted and WARNed once, instead of dropping them.
+- `gptps_tui_health(t, gptps_tui_health_info *)`: losses, bytes per part, frames
+  painted / skipped, bytes written, wakes, pane reads, the tier and how exact the gauges
+  are (`gptps_tui_gauges`). `struct_size` is honoured.
+- `gptps_tui_wake(t)`, async-signal-safe, for a host's own SIGWINCH handler; the add-on
+  installs no signal handler.
+- The header clock as a setting: `gptps_tui_set_clock`, `tui.clock`, `cfg.clock` (`off`,
+  `minutes` - the default, `seconds`).
+- Config fields appended after `unicode` (with a never-read `reserved` pad that fills the
+  1.10 struct's 64-bit tail padding): `max_tasks`, `recent_lines`, `activity_lines`,
+  `clock`, `rate_window_s`, `pane_refresh_ms`. 0 means the default; out of range makes
+  install return NULL with an ERROR.
+- `R` in the tasks, settings and detail panes reads the engine again now.
+- Tests: `tests/test_tui_order.c` (the handle table against every order one handle's
+  events can arrive in, beside `gptps_stats`) and `tests/test_tui_perf.c` (label `perf`:
+  per-event cost against the window, the task types and a stderr tail, and the tasks
+  pane's share of the engine's lock, as ratios). The live loop's idle is tested on a
+  POSIX pseudo-terminal and on a Windows pseudo console (ConPTY).
+
+### Changed
+
+- **Idle costs nothing.** The live loop blocks until the earliest deadline of what it
+  shows (the rate limit after a change, a toast's expiry, the clock's next visible tick,
+  done/s and peak settling), and with none, for good: PAUSED and an idle ON_DEMAND make
+  no wake, no frame and no write (1.10 woke every `refresh_ms` in every mode).
+  CONTINUOUS still looks every `refresh_ms` - one size check, no render, no write when
+  nothing changed - and so follows a resize without a SIGWINCH handler. An idle
+  ON_DEMAND or PAUSED loop notices a resize at its next frame, or at once when the host
+  calls `gptps_tui_wake`. In PAUSED a toast stays until the next key (it is frozen).
+- **Only what changed is written**: one write a frame, the changed lines only, a full
+  repaint on a resize, a pane switch or when more than half the lines changed; an
+  identical frame is 0 bytes.
+- **The engine-reading panes** (tasks, settings, detail) read the engine once a pass
+  into a cache: on open, after a change made from them, on `R`, and every
+  `cfg.pane_refresh_ms` (2 s), stretched to 100x a slow pass's cost, so they hold the
+  engine's lock at most ~1% of the time. They end with an age line (`core counts: ...`).
+  A value changed elsewhere shows at the next pass. (1.10's tasks pane read every row on
+  every frame: 116 ms a frame at 64 types and 100k queued.)
+- Render copies the state out under the lock and formats it with the lock released.
+- The header: uptime as `up <1m` / `up 42m` / `up 3h07m` by default (it was seconds on
+  every frame); done/s over `cfg.rate_window_s` (10 s) instead of since install, `-`
+  before there is a sample and `n/a` at `off`; peak over the last one to two windows; a
+  title that starts with `GPTPS` is not prefixed with a second one.
+- `show_tasks < 0` and `show_recent < 0` also stop collecting what they hide.
+- `cfg.max_recent`'s cap rose from 64 to 4096 (past it: clamped, with a WARN).
+- The frame buffer of run and snapshot grows from 16 KiB to 256 KiB; past that the frame
+  is cut with a visible, counted marker.
+- The TASKS table and the tasks pane fit the terminal's height, with `+N more`; narrow
+  terminals cut the gauge and totals lines to the width instead of wrapping.
+- The latency window is a hash table: 64 KiB by default (the 1.10 ring was 24 KiB),
+  64 MiB at its 1<<20 cap.
+- A part running without memory is named on a line of its own (`no memory for: ...`).
+
+### Fixed
+
+- Per-event cost no longer grows with the latency window (it was O(window) per
+  FINISHED), the number of task types (O(types)) or a stderr tail's length (O(tail));
+  the event path allocates nothing at any tier.
+- In-flight was undercounted when an item was cancelled while queued (exact now from
+  the `latency` tier up), and gauges read as exact while they undercounted after an
+  always-up service's restarts, a resize or tier raise while work waited, or a late
+  install.
+- A Windows console resize repaints: the loop sets `ENABLE_WINDOW_INPUT` while it runs
+  (restored after), so `WINDOW_BUFFER_SIZE_EVENT` arrives; it was never requested.
+- The live loop waits with `poll()`, so a host with more than `FD_SETSIZE` descriptors
+  open no longer corrupts its stack; the wake pipe is close-on-exec atomically where
+  the OS has `pipe2`.
+- The terminal size is read from the output stream, not `STDOUT_FILENO`.
+- If stdin closes, the loop warns once and stops reading keys instead of spinning.
+- Keys typed after `q` in the same burst are no longer applied.
+- `gptps_tui_health` and the dead-letter pane's array growth no longer race.
+- The settings and detail panes no longer walk the settings registry two or three times
+  a frame; an edit started from the cached list checks its key, so it lands on the
+  setting chosen even when the registry moved.
+
 ## [1.10.1] - 2026-11-20
 
 A dashboard (`addons/gptps_tui`) correctness patch. No API or ABI change: the ABI stays
