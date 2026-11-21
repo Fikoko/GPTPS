@@ -38,6 +38,7 @@ static int  fd_is_tty(FILE *f)       { return _isatty(_fileno(f)); }
 #  include <termios.h>
 #  include <sys/select.h>
 #  include <sys/ioctl.h>
+#  include <fcntl.h>    /* the live loop's self-pipe: O_NONBLOCK, FD_CLOEXEC */
 #  include <pthread.h>
 typedef pthread_mutex_t tui_mutex;
 static void mu_init(tui_mutex *m)    { pthread_mutex_init(m, NULL); }
@@ -55,6 +56,25 @@ static int  fd_is_tty(FILE *f)       { return isatty(fileno(f)); }
 #else
 #  define TUI_FLAG_GET(p)    (*(p))
 #  define TUI_FLAG_SET(p, v) (*(p) = (v))
+#endif
+/* The live loop's wake handle is read with no lock (tui_kick, gptps_tui_wake - which a
+ * signal handler may call, so it can take no lock): sequentially consistent operations on
+ * a `long`, so that "set the handle to none, then see no waker" in the closer and
+ * "count myself a waker, then read the handle" in a waker cannot both miss (see
+ * "live loop"). The compiler's builtins, or Win32's Interlocked calls; plain volatile
+ * accesses elsewhere (no ordering guarantee - a compiler with neither is not a target). */
+#if defined(__GNUC__) || defined(__clang__)
+static long sc_get(volatile long *p)         { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static void sc_set(volatile long *p, long v) { __atomic_store_n(p, v, __ATOMIC_SEQ_CST); }
+static void sc_add(volatile long *p, long v) { (void)__atomic_add_fetch(p, v, __ATOMIC_SEQ_CST); }
+#elif defined(_WIN32)
+static long sc_get(volatile long *p)         { return InterlockedCompareExchange(p, 0, 0); }
+static void sc_set(volatile long *p, long v) { (void)InterlockedExchange(p, v); }
+static void sc_add(volatile long *p, long v) { (void)InterlockedExchangeAdd(p, v); }
+#else
+static long sc_get(volatile long *p)         { return *p; }
+static void sc_set(volatile long *p, long v) { *p = v; }
+static void sc_add(volatile long *p, long v) { *p += v; }
 #endif
 
 /* cfg.max_tasks: the TASKS rows (and gptps_tui_add_task entries) by default, and the most
@@ -84,6 +104,16 @@ static int  fd_is_tty(FILE *f)       { return isatty(fileno(f)); }
 #define TUI_WHY_SCAN  512
 /* A toast or status message is shown for this long, on every pane. */
 #define TUI_TOAST_MS  3000u
+/* The frame buffer of gptps_tui_run and gptps_tui_snapshot: it starts at the first size and
+ * grows to what a frame needs, up to the second; past that a frame is cut, with a visible
+ * "[frame truncated]" line (counted). */
+#define TUI_FRAME_MIN (16u * 1024u)
+#define TUI_FRAME_MAX (256u * 1024u)
+/* The rows a frame is fitted to at most (a taller terminal draws this many). */
+#define TUI_ROWS_MAX  1000
+/* done/s: the snapshots of the finished count the windowed rate is computed from, taken at
+ * render - none on the event path - at most one per max(1 s, window / TUI_RATE_N). */
+#define TUI_RATE_N    32
 /* The RECENT journals' sizes (cfg.recent_lines / activity_lines, tui.recent / tui.activity):
  * the most a journal may hold, and the default (1.10's max_recent default). */
 #define TUI_JOURNAL_CAP 4096
@@ -503,6 +533,68 @@ typedef struct {
     char                 why[96];
 } tui_held;
 
+/* The dashboard pane's legend: an item per printable hotkey bound with gptps_tui_add_task
+ * (the first binding of each key: the one a press submits), a separator, then the global
+ * keys. Items are formatted one at a time, so their number is bounded by the keys that can
+ * be typed (33..126), never by a guess: an array sized for 64 task rows plus 8 once took
+ * 9 items and 64 printable hotkeys wrote one past its end. */
+#define TUI_LEGEND_ITEM 96
+static const char *const TUI_LEGEND_KEYS[] = {
+    NULL /* the scroll keys: arrows or words, by cfg.unicode */,
+    "s settings", "t tasks", "l dead-letter", "m kpi", "p pause", "? help", "q quit"
+};
+#define TUI_LEGEND_NKEYS ((int)(sizeof TUI_LEGEND_KEYS / sizeof TUI_LEGEND_KEYS[0]))
+#define TUI_LEGEND_MAX   (94 + 1 + TUI_LEGEND_NKEYS)   /* typeable hotkeys + separator + keys */
+/* what legend_text can write: every item and its gap or line break, plus "keys:" */
+#define TUI_LEGEND_CAP   (TUI_LEGEND_MAX * (TUI_LEGEND_ITEM + 8) + 16)
+
+/* ---- the frame's copy-out (see "render") ----
+ * A dashboard frame is made in two steps: what it shows is COPIED out of the live state
+ * under `mu` - counters, gauges, the TASKS rows and RECENT records that fit the terminal,
+ * nothing more - and then FORMATTED with the lock released, so an engine thread waits for
+ * a few microseconds of copying, not for the formatting (render held `mu` ~50 us). The
+ * copy lives in a tui_view, allocated at the first frame and kept (only render touches it,
+ * under `rmu`); the legend and the rule are cached in it and rebuilt only when the
+ * bindings, the width or the glyphs change. */
+typedef struct {
+    char     label[TUI_NAME_CAP];      /* the row's label (or name), raw: cleaned when shown */
+    int      hotkey, has_mem;
+    uint64_t started, finished, failed, dead, dropped, lat_sum, lat_n, mem_peak;
+    char     pq[3][16];                /* p50 / p95 / p99 (FULL, a wide terminal) */
+} tui_vrow;
+typedef struct { uint64_t ms, fin; } tui_rs;   /* a done/s snapshot: when, and the finished count */
+typedef struct {
+    /* header */
+    int      tier, kpi, mode, color, uni, W, R, clock, rate_state;   /* rate_state: 0 "-", 1 a rate, 2 "n/a" */
+    uint32_t refresh;
+    uint64_t up_ms;
+    double   rate;
+    uint64_t q, s, fin, fail, retr, dead, drop, cancel, alive, inflt, pend, peak;
+    int      exact, lb, miss;          /* miss: the parts the tier runs without (bits, see dash_format) */
+    uint64_t l_folded, l_untracked, l_plost, l_trunc, l_nomem;
+    /* TASKS */
+    int      has_tasks, pcols, nrows, more, nfold, fold_more, max_tasks, lat_cap, has_tab;
+    uint64_t lat_untracked, lat_unmatched;
+    /* RECENT */
+    int      has_rec, act_on, scroll, nrec;
+    uint64_t frame_unseen, rec_t0;     /* rec_t0: install time, RECENT's 0 */
+    int      toast_on;
+    char     status[320];
+    /* the live loop: when this frame next changes with no event (0: never), and the state
+     * generation it shows */
+    uint64_t next_change, gen;
+    /* caches: rebuilt only when what they are made of changes */
+    char     legend[TUI_LEGEND_CAP];
+    int      legrows, leg_W, leg_uni, leg_ok;
+    uint64_t leg_gen;
+    char     rule[16 + 200 * 3 + 16];
+    int      rule_W, rule_uni;
+    /* the rows and records this frame shows: at most R of each */
+    tui_vrow  *rows;
+    tui_event *recs;
+    int        rows_cap, recs_cap;
+} tui_view;
+
 struct gptps_tui {
     gptps           *e;
     gptps_tui_config cfg;
@@ -583,12 +675,35 @@ struct gptps_tui {
     int              lat_warned;    /* the window size the table-full WARN was given for (0: none) */
     /* gptps_tui_health: counted since install, never reset (h_*). */
     uint64_t         h_untracked, h_orphans, h_folded, h_trunc, h_nomem;
-    uint64_t         h_painted, h_skipped, h_written, h_wakes;
+    uint64_t         h_painted, h_skipped, h_written, h_wakes, h_made;   /* h_made: frames the loop formatted */
     size_t           frame_bytes;   /* the frame buffer gptps_tui_run holds while it runs */
     int              scroll;        /* recent-log scroll offset (lines back) */
     int              kpi;           /* effective gptps_tui_kpi (never DEFAULT) */
     int              mode;          /* effective gptps_tui_mode */
-    int              dirty;         /* state changed since last paint (for ON_DEMAND) */
+    int              dirty;         /* state changed since the live loop's last frame */
+    /* ---- the live loop (see "live loop") ----
+     * gen: bumped by every event and every UI change (under mu) - CONTINUOUS skips a frame
+     * whose generation, clock and toast are unchanged. ui_gen: the add_task bindings
+     * changed (the cached legend). waiting: the loop blocks in ON_DEMAND, so an event that
+     * turns `dirty` 0 -> 1 wakes it (after mu_unlock: never a syscall under the lock). */
+    uint64_t         gen, ui_gen, h_kicks;
+    int              waiting;
+    /* The wake handle, only while gptps_tui_run runs (POSIX: the self-pipe's write end, -1
+     * else; Windows: an auto-reset event, 0 else), read with no lock through sc_* (see
+     * there); wakers counts the calls between reading it and using it, so run closes it only
+     * once none is; wake_req: gptps_tui_wake asked for a resize check and a repaint. POSIX:
+     * wake_h is the pipe's write end + 1; Windows: 1 while wake_ev is the event. 0: none. */
+    volatile long    wake_h, wakers, wake_req;
+    /* the windowed done/s (TUI_RATE_N snapshots, a ring) and peak (two buckets: this window
+     * and the last), advanced at render, under mu; clock is the effective gptps_tui_clock */
+    tui_rs           rate[TUI_RATE_N];
+    int              rate_n, rate_head, clock;
+    uint64_t         peak_prev, peak_ms;
+    /* render (dashboard pane): its copy-out, and the lock that makes render one at a time -
+     * taken before mu (and before any engine lock), never while holding one */
+    tui_mutex        rmu;
+    tui_view        *view;
+    int              view_warned;
     /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
      * all - taking a mutex to discover you have nothing to do is the entire cost this
      * tier exists to remove. Not the HAL's gptps_flag: the amalgamation ships gptps.c
@@ -631,6 +746,7 @@ struct gptps_tui {
 #else
     DWORD            saved_out_mode; int modes_saved;
     UINT             saved_cp;      /* console output codepage to restore (0 = none saved) */
+    HANDLE           wake_ev;       /* the live loop's event (see wake_h) */
 #endif
 };
 
@@ -660,6 +776,39 @@ static uint64_t name_hash(const char *s)
 }
 
 static size_t next_pow2(size_t n) { size_t p = 1; while (p < n) p <<= 1; return p; }
+
+/* Wake the live loop, if one runs (see "live loop"): one byte down its self-pipe, or its
+ * event set. Takes no lock and calls only write() / SetEvent, so a signal handler may call
+ * it (gptps_tui_wake). A full pipe already holds a wake: EAGAIN is ignored. */
+static void tui_kick(gptps_tui *t)
+{
+    sc_add(&t->wakers, 1);                       /* before reading the handle: see run's close */
+#if !defined(_WIN32)
+    {
+        long h = sc_get(&t->wake_h);
+        if (h > 0) { char c = 0; ssize_t r = write((int)(h - 1), &c, 1); (void)r; }
+    }
+#else
+    if (sc_get(&t->wake_h)) SetEvent(t->wake_ev);
+#endif
+    sc_add(&t->wakers, -1);
+}
+
+void gptps_tui_wake(gptps_tui *t)
+{
+    int saved = errno;                           /* a signal handler must leave errno as it was */
+    if (!t) return;
+    sc_set(&t->wake_req, 1);
+    tui_kick(t);
+    errno = saved;
+}
+
+/* mu held: the state changed (a setter, a binding): the next frame is due. The caller
+ * calls tui_kick once it has dropped mu (a loop may be waiting, in any mode). */
+static void tui_touch(gptps_tui *t) { t->gen++; t->dirty = 1; t->waiting = 0; }
+/* Ask the live loop to return (it is woken: it may be blocked with no deadline). */
+static void tui_quit(gptps_tui *t) { mu_lock(&t->mu); t->quit = 1; tui_touch(t); mu_unlock(&t->mu); tui_kick(t); }
+
 
 /* ---- the name index (TASKS) ------------------------------------------------------
  * rows[1..ntasks) are the task types in the order they were first seen; their ids never
@@ -977,14 +1126,16 @@ static int engine_idle(gptps *e)
 static void trk_resync(gptps_tui *t)
 {
     uint64_t gen;
+    int cleared = 0;
     mu_lock(&t->mu);
     if (!t->tab || !t->trk_lb || !t->observing) { mu_unlock(&t->mu); return; }
     gen = t->lb_gen;
     mu_unlock(&t->mu);
     if (!engine_idle(t->e)) return;
     mu_lock(&t->mu);
-    if (t->tab && t->trk_lb && t->lb_gen == gen && t->tab_n == t->tab_done) { t->trk_lb = 0; t->dirty = 1; }
+    if (t->tab && t->trk_lb && t->lb_gen == gen && t->tab_n == t->tab_done) { t->trk_lb = 0; tui_touch(t); cleared = 1; }
     mu_unlock(&t->mu);
+    if (cleared) tui_kick(t);
 }
 
 /* ---- journals --------------------------------------------------------------------
@@ -1008,13 +1159,21 @@ static void tui_on_event(const gptps_event *ev, void *ud)
 {
     gptps_tui *t = (gptps_tui *)ud;
     tui_task *tk;
-    int first_fold = 0, win = 0, g;
+    int first_fold = 0, win = 0, g, kick = 0;
     uint64_t depth = 0, running = 0;
     if (TUI_FLAG_GET(&t->off)) return;   /* KPI OFF: before the lock, deliberately - see the field */
     /* A running job's samples (measure.sample_ms) are not part of any item's life: they
      * would only flood the log. The peak column reads the attempts' own measurements. */
     if (ev->kind == GPTPS_EV_SAMPLE) return;
     mu_lock(&t->mu);
+    t->gen++;
+    /* Something changed. The first change after a frame wakes a live loop that waits in
+     * ON_DEMAND - once: until the loop paints, `dirty` stays 1 and nothing more is sent, so
+     * a burst costs one wake per frame interval, and none when no loop waits. */
+    if (!t->dirty) {
+        t->dirty = 1;
+        if (t->waiting) { t->waiting = 0; t->h_kicks++; kick = 1; }
+    }
     g = t->tier >= TUI_T_GAUGE;          /* MINIMAL keeps the totals only */
     switch (ev->kind) {
         case GPTPS_EV_QUEUED:        t->q++;    break;
@@ -1035,11 +1194,10 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         default: break;
     }
     if (g && !t->tab && t->inflight > t->peak) t->peak = t->inflight;   /* with the table: its exact gauge */
-    t->dirty = 1;                                /* something changed (for ON_DEMAND repaint) */
 
     /* MINIMAL and GAUGE stop here. Each part below runs only when it exists, and it exists
      * only at its tier and up (tui_reconfig); the tier test only skips the probes. */
-    if (t->tier < TUI_T_PROBLEMS) { mu_unlock(&t->mu); return; }
+    if (t->tier < TUI_T_PROBLEMS) goto out;
     if (t->prob && ev_problem(ev->kind)) {       /* nothing on a success */
         tui_event *re = &t->prob[t->phead];
         re->ts = ev->ts_ms; re->kind = ev->kind; re->handle = ev->handle; re->status = ev->status;
@@ -1048,7 +1206,7 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         t->phead = t->phead + 1 == t->pcap ? 0 : t->phead + 1;
         t->p_seq++;
     }
-    if (t->tier < TUI_T_TASKS) { mu_unlock(&t->mu); return; }
+    if (t->tier < TUI_T_TASKS) goto out;
     tk = row_for_event(t, ev->task_name, &first_fold);
 
     if (t->tab) {
@@ -1088,7 +1246,9 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         t->ahead = t->ahead + 1 == t->acap ? 0 : t->ahead + 1;
         t->a_seq++;
     }
+out:
     mu_unlock(&t->mu);
+    if (kick) tui_kick(t);                       /* after the lock: never a syscall under it */
     /* never silent - logged outside the lock, so a log sink cannot stall the event path's lock */
     if (first_fold) {
         char msg[512], nm[GPTPS_TASK_NAME_MAX * 2 + 2];
@@ -1136,17 +1296,18 @@ static const char *kind_str(int k)
     }
 }
 
-/* bounded formatted append into buf at pos; returns new pos (clamped to cap) */
+/* Bounded formatted append into buf at pos. Returns the new pos AS IF the buffer had room:
+ * past cap nothing is written, but the length is still counted, so a frame that did not
+ * fit says how much room it needed (gptps_tui_run and gptps_tui_snapshot grow their buffer
+ * to it) and frame_finish cuts it. Never index buf with a pos that may be past cap. */
 static size_t appendf(char *buf, size_t cap, size_t pos, const char *fmt, ...)
 {
     va_list ap; int n;
-    if (pos >= cap) return pos;
     va_start(ap, fmt);
-    n = vsnprintf(buf + pos, cap - pos, fmt, ap);
+    n = pos < cap ? vsnprintf(buf + pos, cap - pos, fmt, ap) : vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
     if (n < 0) return pos;
-    pos += (size_t)n;
-    return pos > cap ? cap : pos;
+    return pos + (size_t)n;
 }
 
 #define TUI_TRUNC_MARK "[frame truncated]\n"
@@ -1250,6 +1411,17 @@ static const char *hist_pct(const uint64_t *hb, unsigned p, char *out, size_t ca
 static const char *a_ud(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x91\xe2\x86\x93" : "Up/Dn"; }
 static const char *a_lt(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x90"             : "Left";  }
 static const char *a_rt(const gptps_tui *t) { return t->cfg.unicode ? "\xe2\x86\x92"             : "Right"; }
+
+/* "GPTPS · " before the title on every pane - unless the title already starts with GPTPS
+ * (examples/dashboard.c's "GPTPS live demo" read "GPTPS · GPTPS live demo"). */
+static const char *brand(const gptps_tui *t) { return strncmp(t->cfg.title, "GPTPS", 5) == 0 ? "" : "GPTPS \xc2\xb7 "; }
+
+/* The rows a frame is fitted to: the terminal's, 24 headless, at most TUI_ROWS_MAX. */
+static int draw_rows(const gptps_tui *t)
+{
+    int R = t->rows > 0 ? t->rows : 24;
+    return R > TUI_ROWS_MAX ? TUI_ROWS_MAX : R;
+}
 
 /* terminal width clamped to a sane drawing range */
 static int draw_width(const gptps_tui *t) { int W = t->cols > 0 ? t->cols : 80; if (W < 24) W = 24; if (W > 200) W = 200; return W; }
@@ -1409,7 +1581,7 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
     first = t->sel - rows / 2;
     if (first > (int)n - rows) first = (int)n - rows;
     if (first < 0) first = 0;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 settings%s  %s(%d of %lu)%s\n\n", B, t->cfg.title, X,
+    pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 settings%s  %s(%d of %lu)%s\n\n", B, brand(t), t->cfg.title, X,
                   D, n ? t->sel + 1 : 0, (unsigned long)n, X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < rows; ++i) {
         if (!tui_setting_at(t->e, i, &info)) continue;
@@ -1420,7 +1592,7 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
     if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     pos = status_line(t, buf, cap, pos, "", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
-    return tui_finish(t, buf, cap, pos);
+    return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
 /* After a set: what happened, in the status line. */
@@ -1466,38 +1638,13 @@ static void toast(gptps_tui *t, const char *fmt, ...)
 }
 
 
-/* full-width inverse title bar (color mode): left title, right-aligned stats */
-static size_t titlebar(char *buf, size_t cap, size_t pos, gptps_tui *t, int W, double up, double rate)
-{
-    char line[256], stats[64];
-    int len, sl;
-    if (W > (int)sizeof line - 1) W = (int)sizeof line - 1;
-    len = snprintf(line, sizeof line, " GPTPS  %s", t->cfg.title);
-    if (len < 0) len = 0;
-    sl = snprintf(stats, sizeof stats, "up %.1fs  %.1f done/s ", up, rate);
-    if (sl > 0 && len + 2 + sl <= W) { while (len < W - sl) line[len++] = ' '; memcpy(line + len, stats, (size_t)sl); len += sl; }
-    if (len > W) len = W;
-    while (len < W) line[len++] = ' ';
-    line[len] = 0;
-    return appendf(buf, cap, pos, "\x1b[7m\x1b[1m%s\x1b[0m\n", line);
-}
-
-/* horizontal rule across the width (color mode) */
-static size_t rule(char *buf, size_t cap, size_t pos, int W, int uni)
-{
-    int i;
-    pos = appendf(buf, cap, pos, "\x1b[2m");
-    for (i = 0; i < W; ++i) pos = appendf(buf, cap, pos, "%s", uni ? "\xe2\x94\x80" : "-");
-    return appendf(buf, cap, pos, "\x1b[0m\n");
-}
-
 /* Help overlay: every key + what it does. Pure; reads only cfg. */
 static size_t render_help(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0;
     int color = t->cfg.color;
     const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 help%s\n\n", B, t->cfg.title, X);
+    pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 help%s\n\n", B, brand(t), t->cfg.title, X);
     pos = appendf(buf, cap, pos, "%sDashboard%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s submit its task\n", "<hotkey>");
     pos = appendf(buf, cap, pos, "  %-9s scroll the event log (older / newer)\n", "k / j");
@@ -1524,7 +1671,7 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "  %-9s re-submit all \xc2\xb7 this one \xc2\xb7 discard this one \xc2\xb7 all\n", "r/e/x/D");
     pos = appendf(buf, cap, pos, "  %-9s %s(a re-submit the engine refuses stays here, with the reason)%s\n", "", D, X);
     pos = appendf(buf, cap, pos, "\n%spress any key to return%s\n", D, X);
-    return tui_finish(t, buf, cap, pos);
+    return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
 static const char *exec_str(int k)
@@ -1579,13 +1726,26 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "",
                *R = color ? "\x1b[31m" : "", *G = color ? "\x1b[32m" : "", *Y = color ? "\x1b[33m" : "", *X = color ? "\x1b[0m" : "";
     char pn[sizeof t->prompt_name * 2];
+    int room, first, more;
     n = gptps_task_count(t->e);
     if (t->task_sel < 0) t->task_sel = 0;
     if (n && (size_t)t->task_sel >= n) t->task_sel = (int)n - 1;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 tasks%s  (%lu)\n\n", B, t->cfg.title, X, (unsigned long)n);
+    /* Fitted to the terminal's height, around the selection, with "+N more" for the rest:
+     * a list taller than the screen scrolled it on every paint. Rows: the title and its
+     * blank line, the column header, a prompt (2), the status, the legend and its blank
+     * line, and the frame's last newline. Only the rows shown are read from the engine. */
+    room = draw_rows(t) - 3 - (t->prompt_kind != TUI_PK_NONE ? 2 : 0) -
+           (status_live(t->status, t->status_ms, gptps_now_ms(NULL)) ? 1 : 0) - 2 - 1;
+    if (room < 2) room = 2;
+    if ((int)n > room) --room;                       /* the "+N more" line */
+    first = t->task_sel - room / 2;
+    if (first > (int)n - room) first = (int)n - room;
+    if (first < 0) first = 0;
+    more = (int)n > room ? (int)n - room : 0;
+    pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 tasks%s  (%lu)\n\n", B, brand(t), t->cfg.title, X, (unsigned long)n);
     if (n == 0) pos = appendf(buf, cap, pos, "  %s(no task types registered)%s\n", D, X);
     else pos = appendf(buf, cap, pos, "%s  %-18s %-7s %4s %4s %4s %4s  %s%s\n", D, "name", "exec", "pri", "que", "run", "dl", "state", X);
-    for (i = 0; i < n; ++i) {
+    for (i = (size_t)first; i < n && (int)(i - (size_t)first) < room; ++i) {
         gptps_task_info info; const char *st; const char *sc; char nm[GPTPS_TASK_NAME_MAX * 2 + 2];
         if (!tui_task_at(t->e, i, &info)) continue;
         st = info.removed ? "draining" : !info.enabled ? "paused" : "on";
@@ -1595,6 +1755,7 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
                       tui_cell(info.name_copy, nm, sizeof nm, 18), exec_str(info.exec), info.priority, info.queued, info.running, info.dead,
                       sc, st, color ? X : "", X);
     }
+    if (more) pos = appendf(buf, cap, pos, "  %s+%d more (%s to scroll)%s\n", D, more, a_ud(t), X);
     if (t->prompt_kind == TUI_PK_CONFIRM_DELETE) {
         gptps_task_info info;                 /* resolve by the captured NAME, not a stale index */
         if (find_task_by_name(t, t->prompt_name, &info))
@@ -1614,7 +1775,7 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
     }
     pos = status_line(t, buf, cap, pos, "", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s inspect  %s back  a pause  c clone  n new  d delete  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
-    return tui_finish(t, buf, cap, pos);
+    return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
 /* Detail pane: one task's resolved settings (built-in policy + generic per-task),
@@ -1656,7 +1817,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
     if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     pos = status_line(t, buf, cap, pos, "", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
-    return tui_finish(t, buf, cap, pos);
+    return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
 /* Dead-letter pane. The engine keeps its dead letters where only a DRAIN can read
@@ -1675,7 +1836,7 @@ static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
     int color = t->cfg.color, rows = list_rows(t), first, W = draw_width(t);
     const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *R = color ? "\x1b[31m" : "",
                *INV = color ? "\x1b[7m" : "", *X = color ? "\x1b[0m" : "";
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 %s \xc2\xb7 dead letter%s\n\n", B, t->cfg.title, X);
+    pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 dead letter%s\n\n", B, brand(t), t->cfg.title, X);
     pos = appendf(buf, cap, pos, "  %s%lu%s retained by the engine \xc2\xb7 %s%lu%s held here\n",
                   dn ? R : "", (unsigned long)dn, X, t->nheld ? R : "", (unsigned long)t->nheld, X);
     pos = appendf(buf, cap, pos, "  %sthese exhausted retries (or were denied). g loads the engine's here (it takes them\n"
@@ -1709,23 +1870,93 @@ static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
     pos = status_line(t, buf, cap, pos, "\n", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s g load  r re-submit all  e re-submit this one  x discard this one  D discard all\n"
                   "      %s move  %s back  q quit\n", D, X, a_ud(t), a_lt(t));
-    return tui_finish(t, buf, cap, pos);
+    return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
-/* The dashboard's key legend: an item per printable hotkey bound with gptps_tui_add_task
- * (the first binding of each key: the one a press submits), a separator, then the global
- * keys. Items are formatted one at a time, so their number is bounded by the keys that can
- * be typed (33..126), never by a guess: an array sized for 64 task rows plus 8 once took
- * 9 items and 64 printable hotkeys wrote one past its end. */
-#define TUI_LEGEND_ITEM 96
-static const char *const TUI_LEGEND_KEYS[] = {
-    NULL /* the scroll keys: arrows or words, by cfg.unicode */,
-    "s settings", "t tasks", "l dead-letter", "m kpi", "p pause", "? help", "q quit"
-};
-#define TUI_LEGEND_NKEYS ((int)(sizeof TUI_LEGEND_KEYS / sizeof TUI_LEGEND_KEYS[0]))
-#define TUI_LEGEND_MAX   (94 + 1 + TUI_LEGEND_NKEYS)   /* typeable hotkeys + separator + keys */
-/* what legend_text can write: every item and its gap or line break, plus "keys:" */
-#define TUI_LEGEND_CAP   (TUI_LEGEND_MAX * (TUI_LEGEND_ITEM + 8) + 16)
+
+/* ---- the header's clock, done/s and peak (1.11) -------------------------------------
+ * None of them costs anything per event: each is advanced when a frame is made, from the
+ * counters, and each says when it next changes with no event (the live loop's deadlines),
+ * so an idle dashboard can stay still. On a host whose clock is not real (the freestanding
+ * stub HAL), set cfg.clock = OFF. */
+
+/* The uptime as the header shows it: MINUTES "up <1m", "up 42m", "up 3h07m", "up 2d05h";
+ * SECONDS "up 9s", "up 4m09s", "up 3h07m09s". */
+static void fmt_up(char *b, size_t cap, uint64_t ms, int clock)
+{
+    unsigned long long s = (unsigned long long)(ms / 1000u), m = s / 60u, h = m / 60u;
+    if (clock == GPTPS_TUI_CLOCK_SECONDS) {
+        if (s < 60u)      snprintf(b, cap, "up %llus", s);
+        else if (m < 60u) snprintf(b, cap, "up %llum%02llus", m, s % 60u);
+        else              snprintf(b, cap, "up %lluh%02llum%02llus", h, m % 60u, s % 60u);
+    } else {
+        if (m < 1u)       snprintf(b, cap, "up <1m");
+        else if (h < 1u)  snprintf(b, cap, "up %llum", m);
+        else if (h < 24u) snprintf(b, cap, "up %lluh%02llum", h, m % 60u);
+        else              snprintf(b, cap, "up %llud%02lluh", h / 24u, h % 24u);
+    }
+}
+
+/* When the uptime shown at `up` ms next changes, as an uptime (0: never - the clock is off). */
+static uint64_t clock_next(uint64_t up, int clock)
+{
+    uint64_t unit = clock == GPTPS_TUI_CLOCK_SECONDS ? 1000u : clock == GPTPS_TUI_CLOCK_MINUTES ?
+                    (up >= 24u * 3600000u ? 3600000u : 60000u) : 0u;
+    return unit ? (up / unit + 1u) * unit : 0u;
+}
+
+/* The step between done/s snapshots for a window of win_s seconds. */
+static uint64_t rate_step(int win_s)
+{
+    uint64_t w = (uint64_t)win_s * 1000u / TUI_RATE_N;
+    return w < 1000u ? 1000u : w;
+}
+
+/* mu held: done/s over the last rate_window_s. A snapshot of the finished count is taken
+ * when the newest is a step old; the rate is the count since the oldest snapshot inside the
+ * window (with none inside: the newest one before it), over the time since it. *state: 0
+ * when no earlier snapshot exists ("-": nothing to measure against yet - and *next is the
+ * next ms, when there is), else 1. *next:
+ * when it next changes with no event - while it is not 0, at the next snapshot (so it falls
+ * to 0, frame by frame, as the last completions leave the window); 0 once it is 0. */
+static double rate_take(gptps_tui *t, uint64_t now, int *state, uint64_t *next)
+{
+    uint64_t win = (uint64_t)t->cfg.rate_window_s * 1000u, step = rate_step(t->cfg.rate_window_s);
+    const tui_rs *pick = NULL, *older = NULL, *newest;
+    int i;
+    if (!t->rate_n || now - t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms >= step) {
+        t->rate[t->rate_head].ms = now; t->rate[t->rate_head].fin = t->fin;
+        t->rate_head = (t->rate_head + 1) % TUI_RATE_N;
+        if (t->rate_n < TUI_RATE_N) t->rate_n++;
+    }
+    newest = &t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N];
+    for (i = t->rate_n; i >= 1; --i) {                     /* oldest first */
+        const tui_rs *r = &t->rate[(t->rate_head + TUI_RATE_N - i) % TUI_RATE_N];
+        if (r->ms >= now) continue;                        /* taken now: no time to measure over */
+        if (r->ms + win >= now) { pick = r; break; }
+        older = r;                                         /* the newest before the window, so far */
+    }
+    if (!pick) pick = older;
+    *next = 0;
+    if (!pick) { *state = 0; *next = newest->ms + 1; return 0.0; }   /* measurable from the next ms */
+    *state = 1;
+    if (t->fin != pick->fin) *next = newest->ms + step > now ? newest->ms + step : now + step;
+    return (double)(t->fin - pick->fin) * 1000.0 / (double)(now - pick->ms);
+}
+
+/* mu held: the in-flight peak over the window - two buckets, this one (`peak`, raised by
+ * the event path with one compare) and the last (peak_prev), rotated here - so it covers
+ * the last one to two windows (longer when no frame was made in between: never less).
+ * `cur` is the gauge now. *next: when it next falls with no event (0: it equals cur). */
+static uint64_t peak_take(gptps_tui *t, uint64_t now, uint64_t cur, uint64_t *next)
+{
+    uint64_t win = (uint64_t)t->cfg.rate_window_s * 1000u, shown;
+    if (now - t->peak_ms >= win) { t->peak_prev = t->peak; t->peak = cur; t->peak_ms = now; }
+    if (cur > t->peak) t->peak = cur;
+    shown = t->peak > t->peak_prev ? t->peak : t->peak_prev;
+    *next = shown > cur ? t->peak_ms + win : 0;
+    return shown;
+}
 
 /* The legend wrapped to W columns: one line was over 80 columns with no hotkeys bound,
  * so it wrapped and the frame was a row taller than counted. Plain text, lines joined
@@ -1770,27 +2001,41 @@ static int legend_text(gptps_tui *t, int W, char *out, size_t cap)
     return rows;
 }
 
-size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
-{
-    size_t pos = 0;
-    int i, color, uni, W, toast_on, legrows;
-    const char *B, *D, *R, *G, *X;
-    double up, rate;
-    char legend[TUI_LEGEND_CAP];
-    uint64_t warn_plost;
-    if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
-    if (t->pane == TUI_PANE_SETTINGS) return render_settings(t, buf, cap);
-    if (t->pane == TUI_PANE_HELP)     return render_help(t, buf, cap);
-    if (t->pane == TUI_PANE_TASKS)    return render_tasks(t, buf, cap);
-    if (t->pane == TUI_PANE_DETAIL)   return render_detail(t, buf, cap);
-    if (t->pane == TUI_PANE_DL)       return render_deadletter(t, buf, cap);
-    color = t->cfg.color; uni = t->cfg.unicode; W = draw_width(t);
-    B = color ? "\x1b[1m" : ""; D = color ? "\x1b[2m" : ""; R = color ? "\x1b[31m" : "";
-    G = color ? "\x1b[32m" : ""; X = color ? "\x1b[0m" : "";
 
-    trk_resync(t);                       /* before the lock: it asks the engine */
+/* rmu held: the view, with room for `R` rows and records (allocated here - never under mu,
+ * never on the event path). 0 when there is no memory for the view itself; with too little
+ * for the rows, it keeps its old room (the frame shows fewer, and "+N more"). */
+static int view_ready(gptps_tui *t, int R)
+{
+    tui_view *v = t->view;
+    int nomem = 0;
+    if (!v) {
+        v = (tui_view *)calloc(1, sizeof *v);
+        if (!v) nomem = 1;
+        else { v->rule_W = -1; t->view = v; }
+    }
+    if (v && v->rows_cap < R) {
+        tui_vrow *r = (tui_vrow *)realloc(v->rows, (size_t)R * sizeof *r);
+        if (r) { v->rows = r; v->rows_cap = R; } else nomem = 1;
+    }
+    if (v && v->recs_cap < R) {
+        tui_event *r = (tui_event *)realloc(v->recs, (size_t)R * sizeof *r);
+        if (r) { v->recs = r; v->recs_cap = R; } else nomem = 1;
+    }
+    if (nomem) { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
+    return v != NULL;
+}
+
+/* rmu held: copy out under mu what the dashboard pane shows at `now` (see "render").
+ * Layout first - which TASKS rows and RECENT records the terminal has room for - so that
+ * only those are copied. `loop`: the live loop's frame, which clears `dirty`. *warn_plost:
+ * the PROBLEMS losses to WARN about, once mu is dropped (0: none). */
+static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_t *warn_plost)
+{
+    int R = v->R, W = v->W, i, k, n;
+    uint64_t nx_rate = 0, nx_peak = 0, nx_clock;
     mu_lock(&t->mu);
-    warn_plost = 0;
+    *warn_plost = 0;
     /* This frame shows the journals: what left them since the last one was not shown. */
     {
         uint64_t lp = ring_unseen_lost(t->p_seq, t->p_seen, t->prob ? t->pcap : 0),
@@ -1798,31 +2043,194 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         t->p_lost += lp; t->a_lost += la; t->p_seen = t->p_seq; t->a_seen = t->a_seq;
         t->frame_unseen = lp + la;
         if (t->prob || t->act) { t->frame_unseen += t->drop_pend; t->drop_pend = 0; }  /* RECENT is shown */
-        if (t->p_lost && !t->p_warned) { t->p_warned = 1; warn_plost = t->p_lost; }
+        if (t->p_lost && !t->p_warned) { t->p_warned = 1; *warn_plost = t->p_lost; }
     }
-    toast_on = status_live(t->status, t->status_ms, gptps_now_ms(NULL));
-    legrows = legend_text(t, W, legend, sizeof legend);
-    up = (double)(gptps_now_ms(NULL) - t->start_ms) / 1000.0;
-    rate = (up > 0.05) ? (double)t->fin / up : 0.0;
+    v->gen = t->gen;
+    if (loop) t->dirty = 0;
+    v->tier = t->tier; v->kpi = t->kpi; v->mode = t->mode; v->refresh = t->cfg.refresh_ms;
+    v->color = t->cfg.color; v->uni = t->cfg.unicode; v->clock = t->clock;
+    v->up_ms = now >= t->start_ms ? now - t->start_ms : 0;
+    v->toast_on = status_live(t->status, t->status_ms, now);
+    if (v->toast_on) memcpy(v->status, t->status, sizeof v->status);
+    if (!v->leg_ok || v->leg_gen != t->ui_gen || v->leg_W != W || v->leg_uni != v->uni) {
+        v->legrows = legend_text(t, W, v->legend, sizeof v->legend);
+        v->leg_ok = 1; v->leg_gen = t->ui_gen; v->leg_W = W; v->leg_uni = v->uni;
+    }
+    /* done/s needs only the totals; at OFF they stand still, so there is no rate to show */
+    if (t->tier == TUI_T_OFF) { v->rate_state = 2; v->rate = 0.0; }
+    else v->rate = rate_take(t, now, &v->rate_state, &nx_rate);
+    v->q = t->q; v->s = t->s; v->fin = t->fin; v->fail = t->fail; v->retr = t->retr; v->dead = t->dead;
+    v->drop = t->drop; v->cancel = t->cancel;
+    v->alive = t->q > t->term ? t->q - t->term : 0;
+    /* EXACT from the handle table (LATENCY+); '>=' while that is a lower bound (see
+     * trk_lb); '~' from the counters, which cannot be exact (see `inflight`) */
+    v->exact = t->tab != NULL; v->lb = t->trk_lb;
+    v->inflt = v->exact ? t->g_run : t->inflight;
+    v->pend = v->exact ? t->g_pend : (v->alive > v->inflt ? v->alive - v->inflt : 0);
+    v->peak = t->tier >= TUI_T_GAUGE ? peak_take(t, now, v->inflt, &nx_peak) : 0;
+    v->miss = 0;
+    if (t->tier >= TUI_T_PROBLEMS && t->show_recent && t->prob_want && !t->prob) v->miss |= 1;
+    if (t->tier >= TUI_T_TASKS && t->show_tasks && !t->tasks)                    v->miss |= 2;
+    if (t->tier >= TUI_T_ACTIVITY && t->show_recent && t->act_want && !t->act)   v->miss |= 4;
+    if (t->tier >= TUI_T_LATENCY && !t->tab)                                     v->miss |= 8;
+    if (t->tier >= TUI_T_FULL && t->tasks && !t->hist)                           v->miss |= 16;
+    v->l_folded = t->h_folded; v->l_untracked = t->h_untracked; v->l_plost = t->p_lost;
+    v->l_trunc = t->h_trunc; v->l_nomem = t->h_nomem; v->fold_more = t->fold_more;
+    v->has_tasks = t->tasks != NULL; v->has_tab = t->tab != NULL;
+    v->pcols = t->hist && W >= 100;               /* the percentiles when the width has room: 21 columns */
+    v->nfold = t->nfold; v->max_tasks = t->max_tasks; v->lat_cap = t->lat_cap;
+    v->lat_untracked = t->lat_untracked; v->lat_unmatched = t->lat_unmatched;
+    v->has_rec = t->prob || t->act; v->act_on = t->act != NULL;
+    v->frame_unseen = t->frame_unseen;
+    v->nrows = v->more = v->nrec = 0;
+    {   /* the layout: every line of the frame is one terminal row (each is fitted to W), and
+         * the frame's last newline must not scroll the screen */
+        int budget = R - 1 - (v->color ? 2 : 1) - 3 - (v->miss ? 1 : 0)
+                   - ((v->l_folded || v->l_untracked || v->l_plost || v->l_trunc || v->l_nomem) ? 1 : 0)
+                   - (v->toast_on ? 2 : 0) - 1 - v->legrows;
+        int want_rows = 0, other = 0, want_rec = 0, np = 0, na = 0, lines = 0;
+        if (t->tasks) {
+            tui_task *o = &t->tasks[0];
+            uint64_t oterm = o->finished + o->dead + o->dropped;
+            other = t->nfold || o->started || o->failed || o->retried || oterm;   /* '(other)' once it counted something */
+            want_rows = t->ntasks - 1 + other;
+            budget -= 3 + (t->nfold ? 1 : 0) + ((t->tab && (t->lat_untracked || t->lat_unmatched)) ? 1 : 0);
+        }
+        if (v->has_rec) {
+            np = (int)ring_held(t->p_seq, t->p_base, t->prob ? t->pcap : 0);
+            na = (int)ring_held(t->a_seq, t->a_base, t->act ? t->acap : 0);
+            lines = (t->prob && t->pcap > (t->act ? t->acap : 0)) ? t->pcap : t->acap;
+            want_rec = np + na < lines ? np + na : lines;
+            budget -= 2;
+        }
+        if (t->tasks) {   /* TASKS first, leaving RECENT a few lines; "+N more" for the rest */
+            int room = budget - (want_rec < 3 ? want_rec : 3), show;
+            if (want_rows <= room) show = want_rows;
+            else show = room - 1 > 0 ? room - 1 : 0;          /* one line says how many more */
+            if (show > v->rows_cap) show = v->rows_cap;      /* no memory for more: still counted */
+            v->more = want_rows - show;
+            budget -= show + (v->more ? 1 : 0);
+            for (i = 1, n = 0; i <= t->ntasks && n < show; ++i) {
+                tui_task *src = &t->tasks[i < t->ntasks ? i : 0];
+                const tui_ui *u = (src->ui >= 0 && src->ui < t->nui) ? &t->ui[src->ui] : NULL;
+                tui_vrow *o = &v->rows[n];
+                if (i == t->ntasks && !other) break;
+                copy_u8(o->label, sizeof o->label, u ? u->label : src->name);
+                o->hotkey = u ? u->hotkey : 0;
+                o->started = src->started; o->finished = src->finished; o->failed = src->failed;
+                o->dead = src->dead; o->dropped = src->dropped; o->lat_sum = src->lat_sum_ms; o->lat_n = src->lat_n;
+                o->mem_peak = src->mem_peak; o->has_mem = src->mem_method[0] != 0;
+                if (v->pcols) {
+                    const uint64_t *hb = &t->hist[(size_t)(src - t->tasks) * TUI_HIST_B];
+                    hist_pct(hb, 50, o->pq[0], sizeof o->pq[0]); hist_pct(hb, 95, o->pq[1], sizeof o->pq[1]);
+                    hist_pct(hb, 99, o->pq[2], sizeof o->pq[2]);
+                }
+                ++n;
+            }
+            v->nrows = n;
+        }
+        if (v->has_rec) {
+            /* The two journals merged by time, newest last; `scroll` lines back. Shown: at
+             * most the larger journal's size, and what the screen has room for. */
+            int shown = want_rec, total = np + na, maxoff, ip = 0, ia = 0, m;
+            if (shown > budget) shown = budget;
+            if (shown < 1) shown = 1;
+            if (shown > v->recs_cap) shown = v->recs_cap;
+            maxoff = total - shown; if (maxoff < 0) maxoff = 0;
+            if (t->scroll > maxoff) t->scroll = maxoff;   /* clamp (keys can over-scroll) */
+            if (t->scroll < 0) t->scroll = 0;
+            v->scroll = t->scroll;
+            /* newest first: the k-th newest of a ring is (head - 1 - k) mod cap; a tie in time
+             * puts the problem after the activity (a STARTED, then its FAILED, in one ms).
+             * Stored newest first; the format prints them oldest at the top. */
+            for (k = 0, m = 0; k < t->scroll + shown && (ip < np || ia < na); ++k) {
+                int pi = ip < np ? (t->phead - 1 - ip + t->pcap * 2) % t->pcap : -1,
+                    ai = ia < na ? (t->ahead - 1 - ia + t->acap * 2) % t->acap : -1;
+                int isp = pi >= 0 && (ai < 0 || t->prob[pi].ts >= t->act[ai].ts);
+                if (isp) ++ip; else ++ia;
+                if (k < t->scroll || m >= shown) continue;
+                if (isp) v->recs[m] = t->prob[pi];
+                else {
+                    const tui_act *ra = &t->act[ai];
+                    tui_event *o = &v->recs[m];
+                    o->ts = ra->ts; o->kind = ra->kind; o->handle = ra->handle; o->status = GPTPS_OK;
+                    copy_u8(o->name, sizeof o->name,
+                            (ra->row >= 0 && t->tasks && ra->row < t->ntasks) ? t->tasks[ra->row].name
+                            : t->act_nm ? t->act_nm[ai] : "?");
+                    o->why[0] = 0; o->tail_len = 0; o->tail_cut = 0;
+                }
+                ++m;
+            }
+            v->nrec = m;
+        }
+    }
+    v->rec_t0 = t->start_ms;
+    nx_clock = v->clock != GPTPS_TUI_CLOCK_OFF ? t->start_ms + clock_next(v->up_ms, v->clock) : 0;
+    mu_unlock(&t->mu);
+    v->next_change = 0;
+    if (nx_rate && (!v->next_change || nx_rate < v->next_change)) v->next_change = nx_rate;
+    if (nx_peak && (!v->next_change || nx_peak < v->next_change)) v->next_change = nx_peak;
+    if (nx_clock && (!v->next_change || nx_clock < v->next_change)) v->next_change = nx_clock;
+}
+
+/* full-width inverse title bar (color mode): left title, right-aligned stats */
+static size_t titlebar(char *buf, size_t cap, size_t pos, const gptps_tui *t, int W, const char *stats)
+{
+    char line[256];
+    int len, sl = (int)strlen(stats);
+    if (W > (int)sizeof line - 1) W = (int)sizeof line - 1;
+    len = snprintf(line, sizeof line, *brand(t) ? " GPTPS  %s" : " %s", t->cfg.title);
+    if (len < 0) len = 0;
+    if (len > (int)sizeof line - 1) len = (int)sizeof line - 1;
+    if (len + 2 + sl + 1 <= W) {
+        while (len < W - sl - 1) line[len++] = ' ';
+        memcpy(line + len, stats, (size_t)sl); len += sl;
+    }
+    if (len > W) len = W;
+    while (len < W) line[len++] = ' ';
+    line[len] = 0;
+    return appendf(buf, cap, pos, "\x1b[7m\x1b[1m%s\x1b[0m\n", line);
+}
+
+/* The dashboard pane, formatted from its view with no lock held. Returns the length it
+ * needed (see appendf); the caller finishes the frame. */
+static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap)
+{
+    size_t pos = 0;
+    int i, color = v->color, uni = v->uni, W = v->W;
+    const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *R = color ? "\x1b[31m" : "",
+               *G = color ? "\x1b[32m" : "", *X = color ? "\x1b[0m" : "";
+    char stats[96], up[40], rt[32];
 
     /* header: a framed title bar when color is on; a plain line otherwise */
-    if (color) { pos = titlebar(buf, cap, pos, t, W, up, rate); pos = rule(buf, cap, pos, W, uni); }
-    else pos = appendf(buf, cap, pos, "GPTPS \xc2\xb7 %s   up %.1fs   %.1f done/s\n", t->cfg.title, up, rate);
+    up[0] = 0;
+    if (v->clock != GPTPS_TUI_CLOCK_OFF) fmt_up(up, sizeof up, v->up_ms, v->clock);
+    if (v->rate_state == 1) snprintf(rt, sizeof rt, "%.1f", v->rate);
+    else snprintf(rt, sizeof rt, "%s", v->rate_state == 2 ? "n/a" : "-");
+    if (color) {
+        int k;
+        snprintf(stats, sizeof stats, "%s%s%s done/s", up, up[0] ? "  " : "", rt);
+        pos = titlebar(buf, cap, pos, t, W, stats);
+        if (v->rule_W != W || v->rule_uni != uni) {        /* the rule: cached, by width and glyphs */
+            size_t rp = (size_t)snprintf(v->rule, sizeof v->rule, "\x1b[2m");
+            for (k = 0; k < W && rp + 4 < sizeof v->rule - 6; ++k) {
+                memcpy(v->rule + rp, uni ? "\xe2\x94\x80" : "-", uni ? 3 : 1); rp += uni ? 3 : 1;
+            }
+            memcpy(v->rule + rp, "\x1b[0m\n", 6);
+            v->rule_W = W; v->rule_uni = uni;
+        }
+        pos = appendf(buf, cap, pos, "%s", v->rule);
+    } else {
+        pos = appendf(buf, cap, pos, "%s%s%s%s   %s done/s\n", brand(t), t->cfg.title, up[0] ? "   " : "", up, rt);
+    }
 
-    if (t->tier < TUI_T_GAUGE) {     /* MINIMAL keeps no gauge: what is alive, as one sum */
+    if (v->tier < TUI_T_GAUGE) {     /* MINIMAL keeps no gauge: what is alive, as one sum */
         char pc[16], gl[128];
-        uint64_t alive = t->q > t->term ? t->q - t->term : 0;
         snprintf(gl, sizeof gl, "queued %llu  started %llu  pending+in-flight ~%s",
-                 (unsigned long long)t->q, (unsigned long long)t->s, fmt_count(pc, sizeof pc, alive));
+                 (unsigned long long)v->q, (unsigned long long)v->s, fmt_count(pc, sizeof pc, v->alive));
         pos = appendf(buf, cap, pos, "%.*s\n", (int)u8_fit(gl, W - 1), gl);   /* one row: the fit counts '\n' */
     } else {   /* the gauges, and an in-flight bar fitted to what the line leaves of the width */
-        /* EXACT from the handle table (LATENCY+); '>=' while that is a lower bound (see
-         * trk_lb); '~' from the counters, which cannot be exact (see `inflight`) */
-        int exact = t->tab != NULL;
-        const char *mk = exact ? (t->trk_lb ? ">=" : "") : "~";
-        uint64_t inflt = exact ? t->g_run : t->inflight;
-        uint64_t alive = t->q > t->term ? t->q - t->term : 0;
-        uint64_t pend = exact ? t->g_pend : (alive > inflt ? alive - inflt : 0);
+        const char *mk = v->exact ? (v->lb ? ">=" : "") : "~";
         unsigned j, gw, w;
         int ll, rl;
         char left[160], right[48], pc[16];
@@ -1830,13 +2238,13 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         const char *trakc = uni ? "\xe2\x96\x91" : ".";   /* light shade / dot  */
         const char *C = color ? "\x1b[36m" : "";          /* cyan bar */
         ll = snprintf(left, sizeof left, "queued %llu  started %llu  pending %s%s  in-flight %s%llu  ",
-                      (unsigned long long)t->q, (unsigned long long)t->s, mk, fmt_count(pc, sizeof pc, pend), mk,
-                      (unsigned long long)inflt);
-        rl = snprintf(right, sizeof right, " peak %llu", (unsigned long long)t->peak);
+                      (unsigned long long)v->q, (unsigned long long)v->s, mk, fmt_count(pc, sizeof pc, v->pend), mk,
+                      (unsigned long long)v->inflt);
+        rl = snprintf(right, sizeof right, " peak %llu", (unsigned long long)v->peak);
         gw = (unsigned)(W / 3); if (gw > 40) gw = 40;
         if ((int)gw > W - 1 - ll - 2 - rl) gw = (unsigned)(W - 1 - ll - 2 - rl > 0 ? W - 1 - ll - 2 - rl : 0);
         if (gw < 10) gw = 10;
-        w = (t->peak && inflt) ? (unsigned)((double)inflt * gw / (double)t->peak) : 0; if (w > gw) w = gw;
+        w = (v->peak && v->inflt) ? (unsigned)((double)v->inflt * gw / (double)v->peak) : 0; if (w > gw) w = gw;
         pos = appendf(buf, cap, pos, "%s%s[%s", left, D, C);
         for (j = 0; j < gw; ++j) pos = appendf(buf, cap, pos, "%s", j < w ? fillc : trakc);
         pos = appendf(buf, cap, pos, "%s%s]%s%s\n", X, D, X, right);
@@ -1845,74 +2253,64 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         char cn[48], pl[256];
         int plen;
         cn[0] = 0;                                   /* cancelled: part of failed, named when any */
-        if (t->cancel) snprintf(cn, sizeof cn, " (%llu cancelled)", (unsigned long long)t->cancel);
+        if (v->cancel) snprintf(cn, sizeof cn, " (%llu cancelled)", (unsigned long long)v->cancel);
         plen = snprintf(pl, sizeof pl, "finished %llu  failed %llu%s  retried %llu  dead %llu  dropped %llu",
-                        (unsigned long long)t->fin, (unsigned long long)t->fail, cn, (unsigned long long)t->retr,
-                        (unsigned long long)t->dead, (unsigned long long)t->drop);
+                        (unsigned long long)v->fin, (unsigned long long)v->fail, cn, (unsigned long long)v->retr,
+                        (unsigned long long)v->dead, (unsigned long long)v->drop);
         if (plen >= 0 && (size_t)plen < sizeof pl && (int)u8_fit(pl, W - 1) == plen)
             pos = appendf(buf, cap, pos, "%sfinished %llu%s  %sfailed %llu%s%s  retried %llu  %sdead %llu%s  %sdropped %llu%s\n",
-                          G, (unsigned long long)t->fin, X, (t->fail ? R : ""), (unsigned long long)t->fail, X, cn,
-                          (unsigned long long)t->retr, (t->dead ? R : ""), (unsigned long long)t->dead, X,
-                          (t->drop ? R : ""), (unsigned long long)t->drop, X);
+                          G, (unsigned long long)v->fin, X, (v->fail ? R : ""), (unsigned long long)v->fail, X, cn,
+                          (unsigned long long)v->retr, (v->dead ? R : ""), (unsigned long long)v->dead, X,
+                          (v->drop ? R : ""), (unsigned long long)v->drop, X);
         else   /* narrower than the line: one row, cut, without its colors (the fit counts '\n') */
             pos = appendf(buf, cap, pos, "%.*s\n", (int)u8_fit(pl, W - 1), pl);
     }
     {   /* the tier, and the parts it runs without for want of memory (logged) */
+        static const char *const MISS[5] = { "problems log", "tasks", "activity log", "latency", "percentiles" };
         char kl[320];
-        int r = t->tier;
-        size_t kp = (size_t)snprintf(kl, sizeof kl, "kpi:%s mode:%s refresh:%ums", kpi_str(t->kpi),
-                                     mode_str(t->mode), t->cfg.refresh_ms);
-        const char *miss[5];
-        int nm = 0, k;
-        if (r >= TUI_T_PROBLEMS && t->show_recent && t->prob_want && !t->prob) miss[nm++] = "problems log";
-        if (r >= TUI_T_TASKS && t->show_tasks && !t->tasks)                    miss[nm++] = "tasks";
-        if (r >= TUI_T_ACTIVITY && t->show_recent && t->act_want && !t->act)   miss[nm++] = "activity log";
-        if (r >= TUI_T_LATENCY && !t->tab)                                     miss[nm++] = "latency";
-        if (r >= TUI_T_FULL && t->tasks && !t->hist)                           miss[nm++] = "percentiles";
+        size_t kp = 0;
+        int k, nm = 0;
+        snprintf(kl, sizeof kl, "kpi:%s mode:%s refresh:%ums", kpi_str(v->kpi), mode_str(v->mode), v->refresh);
         pos = appendf(buf, cap, pos, "%s%.*s%s\n", D, (int)u8_fit(kl, W - 1), kl, X);
-        kp = 0;                                      /* and, when any, the parts it lacks: a line of its own */
-        for (k = 0; k < nm && kp < sizeof kl; ++k)
-            kp += (size_t)snprintf(kl + kp, sizeof kl - kp, "%s%s", k ? ", " : "no memory for: ", miss[k]);
+        for (k = 0; k < 5 && kp < sizeof kl; ++k)    /* and, when any, the parts it lacks: a line of its own */
+            if (v->miss & (1 << k))
+                kp += (size_t)snprintf(kl + kp, sizeof kl - kp, "%s%s", nm++ ? ", " : "no memory for: ", MISS[k]);
         if (nm) pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(kl, W - 1), kl, X);
     }
     /* never silent: a line of what has been lost, only once something has (gptps_tui_health) */
-    if (t->h_folded || t->h_untracked || t->p_lost || t->h_trunc || t->h_nomem) {
+    if (v->l_folded || v->l_untracked || v->l_plost || v->l_trunc || v->l_nomem) {
         char ls[320];
         size_t lp = (size_t)snprintf(ls, sizeof ls, "lost:");
-        if (t->h_folded)
+        if (v->l_folded)
             lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu%s types folded into (other);",
-                                   (unsigned long long)t->h_folded, t->fold_more ? "+" : "");
-        if (t->h_untracked && lp < sizeof ls)
+                                   (unsigned long long)v->l_folded, v->fold_more ? "+" : "");
+        if (v->l_untracked && lp < sizeof ls)
             lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu items not tracked (latency window full);",
-                                   (unsigned long long)t->h_untracked);
-        if (t->p_lost && lp < sizeof ls)
+                                   (unsigned long long)v->l_untracked);
+        if (v->l_plost && lp < sizeof ls)
             lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu problem events not shown (tui.recent too small);",
-                                   (unsigned long long)t->p_lost);
-        if (t->h_trunc && lp < sizeof ls)
-            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu frames truncated;", (unsigned long long)t->h_trunc);
-        if (t->h_nomem && lp < sizeof ls)
-            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu allocations failed;", (unsigned long long)t->h_nomem);
+                                   (unsigned long long)v->l_plost);
+        if (v->l_trunc && lp < sizeof ls)
+            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu frames truncated;", (unsigned long long)v->l_trunc);
+        if (v->l_nomem && lp < sizeof ls)
+            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu allocations failed;", (unsigned long long)v->l_nomem);
         if (lp >= sizeof ls) lp = sizeof ls - 1;
         if (lp && ls[lp - 1] == ';') ls[--lp] = 0;
         pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(ls, W - 1), ls, X);
     }
 
-    if (t->tasks) {                      /* the TASKS tier and up, and shown (else not built) */
-        /* the percentiles (FULL) when the width has room for them: 21 columns more */
-        int pcols = t->hist && W >= 100;
+    if (v->has_tasks) {                  /* the TASKS tier and up, and shown (else not built) */
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
         pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s%s %8s  key%s\n",
                       D, "label", "run", "ok", "fail", "dead", "drop", "ok%", "avg ms",
-                      pcols ? "    p50    p95    p99" : "", "peak MB", X);
+                      v->pcols ? "    p50    p95    p99" : "", "peak MB", X);
         /* the types in the order first seen, then '(other)' once anything was folded there */
-        for (i = 1; i <= t->ntasks; ++i) {
-            tui_task *k = &t->tasks[i < t->ntasks ? i : 0];
-            const tui_ui *u = (k->ui >= 0 && k->ui < t->nui) ? &t->ui[k->ui] : NULL;
-            char key[8], pct[8], lat[24], peak[32], lb[TUI_LABEL_CAP * 2], c[5][16], pq[3][16], pcs[32];
+        for (i = 0; i < v->nrows; ++i) {
+            const tui_vrow *k = &v->rows[i];
+            char key[8], pct[8], lat[24], peak[32], lb[TUI_NAME_CAP * 2], c[5][16], pcs[64];
             uint64_t terminal = k->finished + k->dead + k->dropped;
             const char *pc = "";
-            if (i == t->ntasks && !t->nfold && !k->started && !k->failed && !k->retried && !terminal) break;
-            if (u && u->hotkey > 32 && u->hotkey < 127) snprintf(key, sizeof key, "[%c]", u->hotkey); else key[0] = 0;
+            if (k->hotkey > 32 && k->hotkey < 127) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
             if (terminal) {
                 /* In double, then clamped: the counters are 64-bit, so finished * 100 could
                  * still wrap in integers. Clamped, the invariant the %3u here and the %5s
@@ -1925,127 +2323,178 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
             } else strcpy(pct, "  --");
             /* avg ms: queue->finish of FINISHED items only (an item that ends any other
              * way releases its latency entry without a sample) */
-            if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum_ms / (double)k->lat_n);
+            if (k->lat_n) snprintf(lat, sizeof lat, "%8.1f", (double)k->lat_sum / (double)k->lat_n);
             else          strcpy(lat, "      --");
             /* What a process job's attempts measured at their peak (docs/MEASUREMENTS.md);
              * "--" for an in-process task, which is never measured. */
-            if (k->mem_method[0]) snprintf(peak, sizeof peak, "%8.1f", (double)k->mem_peak / 1048576.0);
-            else                  strcpy(peak, "      --");
+            if (k->has_mem) snprintf(peak, sizeof peak, "%8.1f", (double)k->mem_peak / 1048576.0);
+            else            strcpy(peak, "      --");
             pcs[0] = 0;
-            if (pcols) {
-                const uint64_t *hb = &t->hist[(size_t)(k - t->tasks) * TUI_HIST_B];
-                snprintf(pcs, sizeof pcs, " %6s %6s %6s", hist_pct(hb, 50, pq[0], sizeof pq[0]),
-                         hist_pct(hb, 95, pq[1], sizeof pq[1]), hist_pct(hb, 99, pq[2], sizeof pq[2]));
-            }
+            if (v->pcols) snprintf(pcs, sizeof pcs, " %6s %6s %6s", k->pq[0], k->pq[1], k->pq[2]);
             pos = appendf(buf, cap, pos, "  %s %5s %5s %5s %5s %5s %s%5s%s %8s%s %8s  %s\n",
-                          tui_cell(u ? u->label : k->name, lb, sizeof lb, 16), fmt_count(c[0], sizeof c[0], k->started),
+                          tui_cell(k->label, lb, sizeof lb, 16), fmt_count(c[0], sizeof c[0], k->started),
                           fmt_count(c[1], sizeof c[1], k->finished), fmt_count(c[2], sizeof c[2], k->failed),
                           fmt_count(c[3], sizeof c[3], k->dead), fmt_count(c[4], sizeof c[4], k->dropped),
                           pc, pct, color ? X : "", lat, pcs, peak, key);
         }
+        if (v->more)                     /* fitted to the terminal: the rows it has no room for */
+            pos = appendf(buf, cap, pos, "  %s+%d more (a taller terminal shows them)%s\n", D, v->more, X);
         /* never silent: the types the full table folds, and the latency it lost */
-        if (t->nfold)
-            pos = appendf(buf, cap, pos, "  %s+%d%s types folded into (other) (the table holds %d)%s\n", R, t->nfold,
-                          t->fold_more ? " or more" : "", t->max_tasks, X);
-        if (t->tab && (t->lat_untracked || t->lat_unmatched))
+        if (v->nfold)
+            pos = appendf(buf, cap, pos, "  %s+%d%s types folded into (other) (the table holds %d)%s\n", R, v->nfold,
+                          v->fold_more ? " or more" : "", v->max_tasks, X);
+        if (v->has_tab && (v->lat_untracked || v->lat_unmatched))
             pos = appendf(buf, cap, pos, "  %slatency: %llu not tracked (window %d full), %llu ends unmatched%s\n",
-                          D, (unsigned long long)t->lat_untracked, t->lat_cap, (unsigned long long)t->lat_unmatched, X);
+                          D, (unsigned long long)v->lat_untracked, v->lat_cap, (unsigned long long)v->lat_unmatched, X);
     }
 
-    if (t->prob || t->act) {             /* a journal's tier and up, and shown (else not built) */
-        /* The two journals merged by time, newest last; `scroll` lines back. Shown: at most
-         * the larger journal's size, and what the screen has room for. */
-        enum { TUI_VIEW_MAX = 512 };
-        int ref[TUI_VIEW_MAX];               /* >= 0: a PROBLEMS index; < 0: -(ACTIVITY index) - 1 */
-        int np = (int)ring_held(t->p_seq, t->p_base, t->prob ? t->pcap : 0),
-            na = (int)ring_held(t->a_seq, t->a_base, t->act ? t->acap : 0),
-            total = np + na, lines = (t->prob && t->pcap > (t->act ? t->acap : 0)) ? t->pcap : t->acap,
-            shown, maxoff, used = 0, avail, ip = 0, ia = 0, k, n = 0;
-        size_t z;
+    if (v->has_rec) {                    /* a journal's tier and up, and shown (else not built) */
         char lost[48];
-        shown = total < lines ? total : lines;
-        for (z = 0; z < pos; ++z) if (buf[z] == '\n') ++used;     /* vertical fit: stay within rows */
-        /* every line below is one row (each is fitted to W): the RECENT heading and
-         * its blank line, the toast and its blank line, the legend and its blank line;
-         * and the frame's last newline must not scroll the screen */
-        avail = (t->rows > 0 ? t->rows : 24) - 1 - used - 2 - (toast_on ? 2 : 0) - 1 - legrows;
-        if (avail < 1) avail = 1;
-        if (shown > avail) shown = avail;
-        if (shown > TUI_VIEW_MAX) shown = TUI_VIEW_MAX;
-        maxoff = total - shown; if (maxoff < 0) maxoff = 0;
-        if (t->scroll > maxoff) t->scroll = maxoff;     /* clamp (keys can over-scroll) */
-        if (t->scroll < 0) t->scroll = 0;
-        /* newest first: the k-th newest of a ring is (head - 1 - k) mod cap; a tie in time
-         * puts the problem after the activity (a STARTED, then its FAILED, in one ms) */
-        for (k = 0; k < t->scroll + shown && (ip < np || ia < na); ++k) {
-            int pi = ip < np ? (t->phead - 1 - ip + t->pcap * 2) % t->pcap : -1,
-                ai = ia < na ? (t->ahead - 1 - ia + t->acap * 2) % t->acap : -1, r;
-            if (pi >= 0 && (ai < 0 || t->prob[pi].ts >= t->act[ai].ts)) { r = pi; ++ip; }
-            else { r = -ai - 1; ++ia; }
-            if (k >= t->scroll) ref[n++] = r;
-        }
         lost[0] = 0;
-        if (t->frame_unseen)
-            snprintf(lost, sizeof lost, "  %llu not shown", (unsigned long long)t->frame_unseen);
-        if (t->scroll > 0) pos = appendf(buf, cap, pos, "\n%sRECENT%s  %s(scrolled +%d)%s%s%s%s\n", B, X, D, t->scroll, X,
+        if (v->frame_unseen)
+            snprintf(lost, sizeof lost, "  %llu not shown", (unsigned long long)v->frame_unseen);
+        if (v->scroll > 0) pos = appendf(buf, cap, pos, "\n%sRECENT%s  %s(scrolled +%d)%s%s%s%s\n", B, X, D, v->scroll, X,
                                          R, lost, X);
         else               pos = appendf(buf, cap, pos, "\n%sRECENT%s%s%s%s%s%s%s\n", B, X, R, lost, X,
-                                         D, t->act ? "" : "  problems only", X);
-        for (k = n - 1; k >= 0; --k) {       /* oldest at the top */
-            char pre[128], nm[TUI_NAME_CAP * 2], why[sizeof t->prob[0].why + TUI_TAIL_KEEP + 16];
-            const char *name, *kc;
-            uint64_t ts;
-            gptps_handle hd;
-            int kind, pl, room, wl = 0;
+                                         D, v->act_on ? "" : "  problems only", X);
+        for (i = v->nrec - 1; i >= 0; --i) {   /* oldest at the top */
+            const tui_event *re = &v->recs[i];
+            char pre[128], nm[TUI_NAME_CAP * 2], why[sizeof re->why + TUI_TAIL_KEEP + 16];
+            const char *kc;
+            int pl, room, wl = 0;
             double rel;
             why[0] = 0;
-            if (ref[k] >= 0) {
-                const tui_event *re = &t->prob[ref[k]];
-                ts = re->ts; kind = re->kind; hd = re->handle; name = re->name;
-                why_join(re->why, re->tail, re->tail_len, re->tail_cut, why, sizeof why);   /* cleaned here */
-            } else {
-                int ai = -ref[k] - 1;
-                const tui_act *ra = &t->act[ai];
-                ts = ra->ts; kind = ra->kind; hd = ra->handle;
-                name = (ra->row >= 0 && t->tasks && ra->row < t->ntasks) ? t->tasks[ra->row].name
-                     : t->act_nm ? t->act_nm[ai] : "?";
-            }
-            kc = (kind == GPTPS_EV_FAILED || kind == GPTPS_EV_DEAD_LETTERED || kind == GPTPS_EV_DROPPED) ? R
-               : (kind == GPTPS_EV_FINISHED) ? G : D;
-            rel = (double)(ts - t->start_ms) / 1000.0; /* seconds since install */
-            /* One terminal row each: the vertical fit above counts rows by '\n', so a
-             * line that wrapped took two and pushed the frame past the screen. The fixed
-             * fields are measured as printed; the why text gets what is left. */
-            pl = snprintf(pre, sizeof pre, "  %6.1f %-8s %s #%llu", rel, kind_str(kind), tui_cell(name, nm, sizeof nm, 14),
-                          (unsigned long long)hd);
+            if (re->why[0] || re->tail_len) why_join(re->why, re->tail, re->tail_len, re->tail_cut, why, sizeof why);
+            kc = (re->kind == GPTPS_EV_FAILED || re->kind == GPTPS_EV_DEAD_LETTERED || re->kind == GPTPS_EV_DROPPED) ? R
+               : (re->kind == GPTPS_EV_FINISHED) ? G : D;
+            rel = (double)(re->ts - v->rec_t0) / 1000.0; /* seconds since install */
+            /* One terminal row each: the vertical fit counts rows, so a line that wrapped took
+             * two and pushed the frame past the screen. The fixed fields are measured as
+             * printed; the why text gets what is left. */
+            pl = snprintf(pre, sizeof pre, "  %6.1f %-8s %s #%llu", rel, kind_str(re->kind), tui_cell(re->name, nm, sizeof nm, 14),
+                          (unsigned long long)re->handle);
             room = W - 1 - (pl < 0 ? 0 : pl) - 2;
             wl = (why[0] && room >= 4) ? (int)u8_fit(why, room) : 0;
             pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %s #%llu%s%s%.*s%s\n",
-                          D, rel, X, kc, kind_str(kind), X, nm, (unsigned long long)hd,
+                          D, rel, X, kc, kind_str(re->kind), X, nm, (unsigned long long)re->handle,
                           wl ? "  " : "", D, wl, why, X);
         }
     }
 
     /* transient action toast (fades after a few seconds), one row */
-    if (toast_on) {
-        char shown[sizeof t->status * 2];
-        tui_clean(t->status, strlen(t->status), shown, sizeof shown, W - 1, NULL);
+    if (v->toast_on) {
+        char shown[sizeof v->status * 2];
+        tui_clean(v->status, strlen(v->status), shown, sizeof shown, W - 1, NULL);
         pos = appendf(buf, cap, pos, "\n%s%s%s\n", (color ? "\x1b[36m" : ""), shown, X);
     }
 
-    /* key legend: task hotkeys first, then the global keys, wrapped to the width */
-    pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, legend, X);
-    mu_unlock(&t->mu);
-    if (warn_plost) {            /* never silent; once, and outside the lock, as the event path's WARNs */
-        char msg[384];
-        snprintf(msg, sizeof msg, "gptps_tui: %llu problem events (FAILED, RETRIED, DEAD_LETTERED, DROPPED) "
-                 "left the dashboard's PROBLEMS journal before a frame showed them; they are counted on the "
-                 "'lost:' line and in gptps_tui_health.problems_not_shown; raise tui.recent (cfg.recent_lines) "
-                 "or refresh more often to see them all", (unsigned long long)warn_plost);
-        gptps_log(NULL, GPTPS_LOG_WARN, msg);
-    }
+    /* key legend: task hotkeys first, then the global keys, wrapped to the width (cached) */
+    pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, v->legend, X);
+    return pos;
+}
 
-    return tui_finish(t, buf, cap, pos);
+/* What a pane needs, formatted into buf: the length it needed (see appendf), not yet
+ * finished. The dashboard formats its view, which the caller has just taken. */
+static size_t pane_format(gptps_tui *t, char *buf, size_t cap)
+{
+    switch (t->pane) {
+        case TUI_PANE_SETTINGS: return render_settings(t, buf, cap);
+        case TUI_PANE_HELP:     return render_help(t, buf, cap);
+        case TUI_PANE_TASKS:    return render_tasks(t, buf, cap);
+        case TUI_PANE_DETAIL:   return render_detail(t, buf, cap);
+        case TUI_PANE_DL:       return render_deadletter(t, buf, cap);
+        default:                return t->view ? dash_format(t, t->view, buf, cap)
+                                               : appendf(buf, cap, 0, "%s%s: no memory for the frame (see the log)\n",
+                                                         brand(t), t->cfg.title);
+    }
+}
+
+/* The frame gptps_tui_run / gptps_tui_snapshot paint: a buffer grown to what a frame needs,
+ * from TUI_FRAME_MIN to TUI_FRAME_MAX (16 KiB cut a tall colour frame silently in 1.10). */
+typedef struct { char *b; size_t cap; } tui_fbuf;
+
+/* What the live loop learns from a frame it has made. */
+typedef struct { uint64_t gen, next_change; int pane; } tui_fmeta;
+
+/* rmu held, the pane is the dashboard: take its view (allocating it first, unlocked). 0
+ * with no memory for it (counted; WARNed once). */
+static int view_frame(gptps_tui *t, uint64_t now, int loop, uint64_t *warn_plost)
+{
+    int R = draw_rows(t);
+    *warn_plost = 0;
+    if (!view_ready(t, R)) {
+        if (!t->view_warned) {
+            t->view_warned = 1;
+            gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui: no memory for the dashboard frame's view; the frame "
+                      "says so until there is");
+        }
+        return 0;
+    }
+    t->view->W = draw_width(t);
+    t->view->R = R;
+    view_take(t, t->view, now, loop, warn_plost);
+    return 1;
+}
+
+static void warn_problems_lost(uint64_t n)
+{
+    char msg[384];
+    if (!n) return;              /* never silent; once, and outside the lock, as the event path's WARNs */
+    snprintf(msg, sizeof msg, "gptps_tui: %llu problem events (FAILED, RETRIED, DEAD_LETTERED, DROPPED) "
+             "left the dashboard's PROBLEMS journal before a frame showed them; they are counted on the "
+             "'lost:' line and in gptps_tui_health.problems_not_shown; raise tui.recent (cfg.recent_lines) "
+             "or refresh more often to see them all", (unsigned long long)n);
+    gptps_log(NULL, GPTPS_LOG_WARN, msg);
+}
+
+/* One frame into f, grown as it needs (run / snapshot). `loop`: the live loop's (clears
+ * `dirty`; *meta filled). Returns its length. */
+static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
+{
+    uint64_t warn = 0, now = gptps_now_ms(NULL);
+    size_t pos, n;
+    int dash = t->pane == TUI_PANE_DASH;
+    if (dash) trk_resync(t);             /* before any lock: it asks the engine */
+    mu_lock(&t->rmu);
+    if (dash && !view_frame(t, now, loop, &warn)) {
+        if (loop) { mu_lock(&t->mu); t->dirty = 0; mu_unlock(&t->mu); }
+    }
+    pos = pane_format(t, f->b, f->cap);
+    if (pos >= f->cap && f->cap < TUI_FRAME_MAX) {   /* grow to what it needs, then format it again */
+        size_t want = next_pow2(pos + 1);
+        char *nb;
+        if (want > TUI_FRAME_MAX) want = TUI_FRAME_MAX;
+        nb = (char *)realloc(f->b, want);
+        if (nb) {
+            f->b = nb; f->cap = want;
+            pos = pane_format(t, f->b, f->cap);
+        } else {
+            mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
+        }
+    }
+    n = tui_finish(t, f->b, f->cap, pos);
+    if (meta) {
+        meta->pane = t->pane;
+        meta->gen = dash && t->view ? t->view->gen : 0;
+        meta->next_change = dash && t->view ? t->view->next_change : 0;
+    }
+    mu_unlock(&t->rmu);
+    warn_problems_lost(warn);
+    return n;
+}
+
+size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
+{
+    uint64_t warn = 0;
+    size_t n;
+    if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
+    if (t->pane == TUI_PANE_DASH) trk_resync(t);   /* before any lock: it asks the engine */
+    mu_lock(&t->rmu);
+    if (t->pane == TUI_PANE_DASH) view_frame(t, gptps_now_ms(NULL), 0, &warn);
+    n = tui_finish(t, buf, cap, pane_format(t, buf, cap));
+    mu_unlock(&t->rmu);
+    warn_problems_lost(warn);
+    return n;
 }
 
 /* One key into the line editor shared by every pane (settings, detail, the task
@@ -2152,7 +2601,7 @@ static int settings_press(gptps_tui *t, int key)
         return 4;
     }
     switch (key) {
-        case 'q': case 'Q': mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1;
+        case 'q': case 'Q': tui_quit(t); return -1;
         case 27: case 's': case 'S': case '\t': t->pane = 0; t->status[0] = 0; return 4;   /* back to dashboard */
         case 'j': case 'J': { size_t n = gptps_settings_count(t->e); if (n && (size_t)t->sel + 1 < n) t->sel++; return 4; }
         case 'k': case 'K': if (t->sel > 0) t->sel--; return 4;
@@ -2312,7 +2761,7 @@ static int tasks_press(gptps_tui *t, int key)
         return 4;
     }
     switch (key) {
-        case 'q': case 'Q': mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1;
+        case 'q': case 'Q': tui_quit(t); return -1;
         case 27: case 's': case 'S': case 't': case 'T': case '\t': t->pane = TUI_PANE_DASH; t->status[0] = 0; return 4;
         case 'j': case 'J': if (n && (size_t)t->task_sel + 1 < n) t->task_sel++; return 4;
         case 'k': case 'K': if (t->task_sel > 0) t->task_sel--; return 4;
@@ -2365,7 +2814,7 @@ static int detail_press(gptps_tui *t, int key)
         return 4;
     }
     switch (key) {
-        case 'q': case 'Q': mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1;
+        case 'q': case 'Q': tui_quit(t); return -1;
         case 27: case 's': case 'S': case '\t': t->pane = TUI_PANE_TASKS; t->status[0] = 0; return 4;
         case 'j': case 'J': { int c = count_prefixed(t, prefix); if (c && t->detail_sel + 1 < c) t->detail_sel++; return 4; }
         case 'k': case 'K': if (t->detail_sel > 0) t->detail_sel--; return 4;
@@ -2382,7 +2831,7 @@ static int deadletter_press(gptps_tui *t, int key)
 {
     if (t->dl_sel < 0 || (size_t)t->dl_sel >= t->nheld) t->dl_sel = t->nheld ? (int)t->nheld - 1 : 0;
     switch (key) {
-        case 'q': case 'Q': mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1;
+        case 'q': case 'Q': tui_quit(t); return -1;
         case 27: case 'l': case 'L': case 's': case 'S': case '\t': t->pane = TUI_PANE_DASH; t->status[0] = 0; return 4;
         case 'j': case 'J': if (t->nheld && (size_t)t->dl_sel + 1 < t->nheld) t->dl_sel++; return 4;
         case 'k': case 'K': if (t->dl_sel > 0) t->dl_sel--; return 4;
@@ -2450,11 +2899,11 @@ int gptps_tui_press(gptps_tui *t, int key)
     if (t->pane == TUI_PANE_DETAIL)   return detail_press(t, key);
     if (t->pane == TUI_PANE_DL)       return deadletter_press(t, key);
     if (t->pane == TUI_PANE_HELP) {                     /* help overlay: any key returns */
-        if (key == 'q' || key == 'Q') { mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu); return -1; }
+        if (key == 'q' || key == 'Q') { tui_quit(t); return -1; }
         t->pane = TUI_PANE_DASH; return 4;
     }
     if (key == 'q' || key == 'Q' || key == 27) {
-        mu_lock(&t->mu); t->quit = 1; mu_unlock(&t->mu);
+        tui_quit(t);
         return -1;
     }
     if (key == '?') { t->pane = TUI_PANE_HELP; return 4; }      /* open the help overlay */
@@ -2587,8 +3036,10 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
             if (r < 0) r = row_add(t, task_name, h);
             if (r > 0) t->tasks[r].ui = (int)(u - t->ui);
         }
-        t->dirty = 1;
+        t->ui_gen++;                                          /* the legend is rebuilt */
+        tui_touch(t);
         mu_unlock(&t->mu);
+        tui_kick(t);
         break;
     }
     free(grown);                       /* grown for a capacity another call reached first */
@@ -2649,19 +3100,86 @@ static int term_decode_escape(void)
         default:            return 27;             /* unrecognized => Esc */
     }
 }
-static int term_poll_key(int ms)
+/* The next key typed, without waiting (-1: none). *eof: stdin is at its end (the terminal
+ * went away): select() would report it readable at once forever, so the loop stops
+ * watching it rather than spin. */
+static int term_key(int *eof, int *resized)
 {
-    int c = term_read_byte(ms);
-    if (c == 27) return term_decode_escape();      /* may be an arrow key; else a bare Esc */
-    return c;
+    fd_set fds; struct timeval tv; unsigned char c; ssize_t r;
+    (void)resized;                                 /* POSIX: a resize is the host's SIGWINCH */
+    FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
+    tv.tv_sec = 0; tv.tv_usec = 0;
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) return -1;
+    r = read(STDIN_FILENO, &c, 1);
+    if (r == 1) return c == 27 ? term_decode_escape() : c;   /* may be an arrow key; else a bare Esc */
+    if (r == 0 || (errno != EINTR && errno != EAGAIN)) *eof = 1;
+    return -1;
 }
 static void term_size(gptps_tui *t)
 {
     struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+    if (ioctl(fileno(t->cfg.out), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {   /* the terminal drawn on */
         t->cols = ws.ws_col;
         if (ws.ws_row > 0) t->rows = ws.ws_row;
     }
+}
+/* The wake handle: a self-pipe, both ends non-blocking and close-on-exec (a job the engine
+ * starts meanwhile must not inherit it). *rfd: the end the loop reads. */
+static int wake_open(gptps_tui *t, int *rfd)
+{
+    int fds[2], k;
+    if (pipe(fds) != 0) return 0;
+    for (k = 0; k < 2; ++k) {
+        int fl = fcntl(fds[k], F_GETFL);
+        if (fl < 0 || fcntl(fds[k], F_SETFL, fl | O_NONBLOCK) != 0 || fcntl(fds[k], F_SETFD, FD_CLOEXEC) != 0) {
+            close(fds[0]); close(fds[1]);
+            return 0;
+        }
+    }
+    *rfd = fds[0];
+    sc_set(&t->wake_h, (long)fds[1] + 1);          /* published last: tui_kick may use it from now */
+    return 1;
+}
+/* Close it: first make it unreachable, then wait out a tui_kick / gptps_tui_wake that read
+ * it before that (wakers), so none writes into a descriptor number reused meanwhile. */
+static void wake_close(gptps_tui *t, int rfd)
+{
+    long h = sc_get(&t->wake_h);
+    sc_set(&t->wake_h, 0);
+    while (sc_get(&t->wakers)) { struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 1000; select(0, NULL, NULL, NULL, &tv); }
+    if (h > 0) close((int)(h - 1));
+    if (rfd >= 0) close(rfd);
+}
+/* Wait for a key, a wake or `ms` (< 0: no limit). Bits: 1 stdin is readable, 2 woken (the
+ * pipe, drained). */
+static int term_wait(gptps_tui *t, int rfd, int use_stdin, long ms)
+{
+    fd_set fds; struct timeval tv; int mx = -1, r, got = 0;
+    (void)t;
+    FD_ZERO(&fds);
+    if (use_stdin) { FD_SET(STDIN_FILENO, &fds); mx = STDIN_FILENO; }
+    if (rfd >= 0) { FD_SET(rfd, &fds); if (rfd > mx) mx = rfd; }
+    if (mx < 0 && ms < 0) ms = 250;                /* nothing to wait on: never block for good */
+    if (ms >= 0) { tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000; }
+    r = select(mx + 1, &fds, NULL, NULL, ms >= 0 ? &tv : NULL);
+    if (r <= 0) return 0;                          /* the timeout, or a signal (EINTR) */
+    if (rfd >= 0 && FD_ISSET(rfd, &fds)) { char b[64]; while (read(rfd, b, sizeof b) > 0) { } got |= 2; }
+    if (use_stdin && FD_ISSET(STDIN_FILENO, &fds)) got |= 1;
+    return got;
+}
+/* One frame's bytes in one write() (stdio would send a line-buffered terminal one per
+ * line). Returns what was written. */
+static size_t term_write(FILE *out, const char *b, size_t n)
+{
+    size_t done = 0;
+    int fd = fileno(out);
+    fflush(out);
+    while (done < n) {
+        ssize_t w = write(fd, b + done, n - done);
+        if (w < 0) { if (errno == EINTR) continue; break; }
+        done += (size_t)w;
+    }
+    return done;
 }
 #else
 static void term_enable(gptps_tui *t)
@@ -2719,26 +3237,27 @@ static int tui_key_of(const KEY_EVENT_RECORD *k)
            tui_kq[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F)); tui_kq[3] = (unsigned char)(0x80 | (cp & 0x3F)); tui_kq_n = 4; }
     return tui_kq[tui_kq_i++];
 }
-static int term_poll_key(int ms)
+/* The next key typed, without waiting (-1: none): a character's later UTF-8 bytes first,
+ * then the console's input records - keys, and WINDOW_BUFFER_SIZE_EVENT, which sets
+ * *resized (1.10 read and dropped it). *eof: there is no console input to read. */
+static int term_key(int *eof, int *resized)
 {
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD start = GetTickCount();
     if (tui_kq_i < tui_kq_n) return tui_kq[tui_kq_i++];
+    if (in == NULL || in == INVALID_HANDLE_VALUE) { *eof = 1; return -1; }
     for (;;) {
-        DWORD spent = GetTickCount() - start, n = 0;
+        DWORD n = 0;
         INPUT_RECORD rec;
-        if (spent > (DWORD)ms) return -1;
-        if (in == NULL || in == INVALID_HANDLE_VALUE ||
-            WaitForSingleObject(in, (DWORD)ms - spent) != WAIT_OBJECT_0) {
-            if (in == NULL || in == INVALID_HANDLE_VALUE) Sleep((DWORD)ms);   /* never spin */
-            return -1;
-        }
-        if (!ReadConsoleInputW(in, &rec, 1, &n) || n == 0) { Sleep(15); continue; }
+        if (!GetNumberOfConsoleInputEvents(in, &n)) { *eof = 1; return -1; }
+        if (n == 0) return -1;
+        if (!ReadConsoleInputW(in, &rec, 1, &n) || n == 0) return -1;
         if (rec.EventType == KEY_EVENT) {
             int c = tui_key_of(&rec.Event.KeyEvent);
             if (c >= 0) return c;
+        } else if (rec.EventType == WINDOW_BUFFER_SIZE_EVENT) {
+            *resized = 1;
         }
-        /* a key release, a mouse, focus or resize event: wait on */
+        /* a key release, a mouse or focus event: on to the next record */
     }
 }
 static void term_size(gptps_tui *t)
@@ -2750,22 +3269,97 @@ static void term_size(gptps_tui *t)
         if (r > 0) t->rows = r;
     }
 }
+/* The wake handle: an auto-reset event (not inheritable). */
+static int wake_open(gptps_tui *t, int *rfd)
+{
+    HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    *rfd = -1;
+    if (!ev) return 0;
+    t->wake_ev = ev;
+    sc_set(&t->wake_h, 1);                         /* published last: tui_kick may use it from now */
+    return 1;
+}
+/* Close it once no tui_kick / gptps_tui_wake that saw it is still using it. */
+static void wake_close(gptps_tui *t, int rfd)
+{
+    int had = sc_get(&t->wake_h) != 0;
+    (void)rfd;
+    sc_set(&t->wake_h, 0);
+    while (sc_get(&t->wakers)) Sleep(1);
+    if (had) CloseHandle(t->wake_ev);
+    t->wake_ev = NULL;
+}
+/* Wait for console input, a wake or `ms` (< 0: no limit). Bits: 1 input, 2 woken. */
+static int term_wait(gptps_tui *t, int rfd, int use_stdin, long ms)
+{
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE), hs[2];
+    DWORD n = 0, r;
+    int ev = -1;
+    (void)rfd;
+    if (tui_kq_i < tui_kq_n) return 1;             /* a character's bytes still queued */
+    if (use_stdin && in != NULL && in != INVALID_HANDLE_VALUE) hs[n++] = in;
+    if (sc_get(&t->wake_h)) { ev = (int)n; hs[n++] = t->wake_ev; }
+    if (n == 0) { Sleep(ms < 0 ? 250u : (DWORD)ms); return 0; }   /* never block for good */
+    r = WaitForMultipleObjects(n, hs, FALSE, ms < 0 ? INFINITE : (DWORD)ms);
+    if (r == WAIT_FAILED) { Sleep(15); return 0; }  /* never spin */
+    if (r >= WAIT_OBJECT_0 + n) return 0;          /* the timeout */
+    return (int)(r - WAIT_OBJECT_0) == ev ? 2 : 1;
+}
+/* One frame's bytes in one write. */
+static size_t term_write(FILE *out, const char *b, size_t n)
+{
+    size_t done = fwrite(b, 1, n, out);
+    fflush(out);
+    return done;
+}
 #endif
 
-/* write a frame flicker-free: erase each line's tail (ESC[K) instead of clearing
- * the whole screen, so unchanged regions don't flash. */
-static size_t write_frame(FILE *out, const char *s)
+/* ---- output: one write a frame, only the lines that changed ----------------------
+ * A frame's lines are its text between newlines (the last, after the final newline, is
+ * often empty). frame_diff turns the screen that shows `old` into `nw`: each changed line
+ * is rewritten in place (ESC[row;1H, the line, ESC[K - erase its old tail), a shorter
+ * frame wipes what is below it (ESC[J); a frame identical to the last is 0 bytes. A full
+ * repaint - home, every line with ESC[K, ESC[J: still no full-screen clear, so nothing
+ * flashes - when asked (first frame, a resize, another pane), when there is no old frame,
+ * or when more than half the lines changed (cheaper than addressing each). */
+static size_t frame_nlines(const char *f) { size_t n = 1; for (; *f; ++f) n += *f == '\n'; return n; }
+/* the room frame_diff needs for a frame of len bytes and n lines */
+static size_t frame_out_cap(size_t len, size_t n) { return len + n * 24u + 64u; }
+static size_t line_len(const char *p) { const char *e = strchr(p, '\n'); return e ? (size_t)(e - p) : strlen(p); }
+static const char *line_next(const char *p) { const char *e = p ? strchr(p, '\n') : NULL; return e ? e + 1 : NULL; }
+
+static size_t frame_diff(const char *nw, const char *old, int full, char *o)
 {
-    const char *p = s, *nl;
-    size_t n = 0;
-    while ((nl = strchr(p, '\n')) != NULL) {
-        fwrite(p, 1, (size_t)(nl - p), out);
-        fputs("\x1b[K\n", out);
-        n += (size_t)(nl - p) + 4;
-        p = nl + 1;
+    size_t op = 0, nn = frame_nlines(nw), no = old ? frame_nlines(old) : 0, ch = 0, i;
+    const char *p, *q;
+    if (!old) full = 1;
+    if (!full) {
+        for (i = 0, p = nw, q = old; i < nn || i < no; ++i, p = line_next(p), q = line_next(q)) {
+            size_t pl = p ? line_len(p) : 0, ql = q ? line_len(q) : 0;
+            if (!p || !q || pl != ql || memcmp(p, q, pl) != 0) ++ch;
+        }
+        if (ch == 0) return 0;                       /* nothing changed: nothing to send */
+        if (ch * 2 > nn) full = 1;
     }
-    if (*p) { fputs(p, out); fputs("\x1b[K", out); n += strlen(p) + 3; }
-    return n;
+    if (full) {
+        memcpy(o + op, "\x1b[H", 3); op += 3;        /* home */
+        for (p = nw; (q = strchr(p, '\n')) != NULL; p = q + 1) {
+            memcpy(o + op, p, (size_t)(q - p)); op += (size_t)(q - p);
+            memcpy(o + op, "\x1b[K\n", 4); op += 4;  /* erase the old tail */
+        }
+        if (*p) { size_t l = strlen(p); memcpy(o + op, p, l); op += l; memcpy(o + op, "\x1b[K", 3); op += 3; }
+        memcpy(o + op, "\x1b[J", 3); op += 3;        /* wipe the lines a longer frame left below */
+        return op;
+    }
+    for (i = 0, p = nw, q = old; i < nn; ++i, p = line_next(p), q = line_next(q)) {
+        size_t pl = line_len(p), ql = q ? line_len(q) : 0;
+        if (q && pl == ql && memcmp(p, q, pl) == 0) continue;
+        op += (size_t)snprintf(o + op, 24, "\x1b[%lu;1H", (unsigned long)(i + 1));
+        memcpy(o + op, p, pl); op += pl;
+        memcpy(o + op, "\x1b[K", 3); op += 3;
+    }
+    if (no > nn) op += (size_t)snprintf(o + op, 32, "\x1b[%lu;1H\x1b[J", (unsigned long)(nn + 1));
+    return op;
 }
 
 /* Until when the frame just painted shows a toast (0: none): the loop must paint
@@ -2775,21 +3369,43 @@ static uint64_t toast_until(const gptps_tui *t, uint64_t now)
     return status_live(t->status, t->status_ms, now) ? t->status_ms + TUI_TOAST_MS : 0;
 }
 
-/* The live loop's cadence: CONTINUOUS every frame; ON_DEMAND when state changed, a key
- * was pressed, or a toast it showed has expired (else it stayed up until the next
- * change, however long that took); PAUSED only after a key (or the first frame). */
-static int paint_due(int first, int kp, int mode, int dirty, uint64_t shown_until, uint64_t now)
+/* The live loop's cadence, with when a frame is due: CONTINUOUS every refresh_ms, but only
+ * when something visible changed (see below); ON_DEMAND when state changed (no sooner than
+ * refresh_ms after the last frame), a key was pressed, or what the frame shows changes
+ * with time (a toast's expiry, the clock, done/s or peak settling); PAUSED only after a key
+ * (or the first frame). `vis` (0: none): when the painted frame next changes with no
+ * event. */
+static int paint_due(int first, int kp, int mode, int dirty, uint64_t vis, uint64_t now)
 {
-    if (first || kp || mode == GPTPS_TUI_CONTINUOUS) return 1;
-    if (mode != GPTPS_TUI_ON_DEMAND) return 0;
-    return dirty || (shown_until && now >= shown_until);
+    if (first || kp) return 1;
+    if (mode == GPTPS_TUI_PAUSED) return 0;
+    return dirty || (vis && now >= vis);
 }
 
+/* ---- live loop -------------------------------------------------------------------
+ * Idle costs nothing: the loop blocks on {stdin, a wake handle} until the earliest
+ * deadline of what it shows, and with none, for good (1.10 woke every refresh_ms in every
+ * mode, PAUSED included, and repainted the whole frame in CONTINUOUS). The deadlines:
+ *   - refresh_ms after the last frame, when state changed since (the rate limit);
+ *   - a toast's expiry, in every pane;
+ *   - the clock's next visible tick, when the header shows it;
+ *   - done/s and peak settling, while they are not yet what an idle engine shows;
+ *   - CONTINUOUS: every refresh_ms - and then, when the state's generation, the clock and
+ *     the toast are as they were (the dashboard pane), no frame is even made: no render, no
+ *     ioctl, no write (frames_skipped). The other panes read the engine, so CONTINUOUS
+ *     formats them every refresh_ms, and an unchanged one writes 0 bytes.
+ * The wake handle (a self-pipe on POSIX, an auto-reset event on Windows) exists only while
+ * gptps_tui_run runs: a headless or MANUAL host, or one that only snapshots, has none. The
+ * observer signals it only on a dirty 0 -> 1 transition while the loop waits in ON_DEMAND,
+ * and only after it has dropped the lock - at most one signal a frame interval, none when
+ * no loop waits. Setters, quit and gptps_tui_wake signal it too. */
 void gptps_tui_run(gptps_tui *t)
 {
-    char *buf; size_t cap = 16384;
-    int first = 1, kp = 0;
-    uint64_t shown_until = 0;       /* the painted toast's expiry (see paint_due) */
+    tui_fbuf fb, pv;                    /* the frame being made, and the one the screen shows */
+    char *ob = NULL;
+    size_t ocap = 0;
+    int first = 1, kp = 0, rfd = -1, have_wake, use_stdin = 1, resized = 0, painted_pane = -1;
+    uint64_t last = 0, painted_gen = 0, vis = 0;
     if (!t || !t->cfg.interactive) return;
     /* Needs a terminal both ways: frames out, keys in. With stdin at end of input
      * (</dev/null, a closed pipe, a launcher that gives it none) the key poll returned
@@ -2799,45 +3415,118 @@ void gptps_tui_run(gptps_tui *t)
                   "the live dashboard does not run (gptps_tui_snapshot renders a frame)");
         return;
     }
-    buf = (char *)malloc(cap);
-    if (!buf) {
+    fb.b = (char *)malloc(TUI_FRAME_MIN);
+    pv.b = fb.b ? (char *)malloc(TUI_FRAME_MIN) : NULL;
+    if (!pv.b) {
+        free(fb.b);
         mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: no memory for the 16 KiB frame buffer; "
                   "the live dashboard does not run");
         return;
     }
-    mu_lock(&t->mu); t->frame_bytes = cap; mu_unlock(&t->mu);
-    term_enable(t);
-    fputs("\x1b[?25l", t->cfg.out);                 /* hide cursor */
-    for (;;) {
-        int q, md, key, paint, dirty;
-        uint32_t rms;
-        uint64_t now = gptps_now_ms(NULL);
-        mu_lock(&t->mu); q = t->quit; md = t->mode; rms = t->cfg.refresh_ms; dirty = t->dirty; mu_unlock(&t->mu);
-        if (q) break;
-        paint = paint_due(first, kp, md, dirty, shown_until, now);   /* the cadence: see paint_due */
-        if (paint) {
-            size_t wrote;
-            mu_lock(&t->mu); t->dirty = 0; mu_unlock(&t->mu);
-            term_size(t);                            /* adapt the layout to the current window */
-            gptps_tui_render(t, buf, cap);
-            shown_until = toast_until(t, gptps_now_ms(NULL));
-            if (first) fputs("\x1b[2J", t->cfg.out); /* clear once; then redraw in place */
-            fputs("\x1b[H", t->cfg.out);             /* home */
-            wrote = write_frame(t->cfg.out, buf);    /* per-line erase => no full-screen flash */
-            fputs("\x1b[J", t->cfg.out);             /* wipe any lines a shorter frame left behind */
-            fflush(t->cfg.out);
-            mu_lock(&t->mu); t->h_painted++; t->h_written += wrote + 6 + (first ? 4 : 0); mu_unlock(&t->mu);
-        }
-        first = 0; kp = 0;
-        key = term_poll_key((int)(rms ? rms : 250));
-        mu_lock(&t->mu); t->h_wakes++; mu_unlock(&t->mu);
-        if (key >= 0) { gptps_tui_press(t, key); kp = 1; }
+    fb.cap = pv.cap = TUI_FRAME_MIN;
+    pv.b[0] = 0;
+    have_wake = wake_open(t, &rfd);
+    if (!have_wake) {                   /* never silent: it still runs, as 1.10 did */
+        mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
+        gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: could not make the live loop's wake handle (a pipe / "
+                  "an event); it wakes every refresh_ms to look for changes instead of only when there is one");
     }
-    fputs("\x1b[?25h", t->cfg.out); fflush(t->cfg.out); /* show cursor */
+    term_enable(t);
+    for (;;) {
+        int q, md, dirty, paint, eof = 0, rz = 0, w;
+        uint32_t rms;
+        uint64_t now, gen, deadline = 0;
+        long ms;
+        mu_lock(&t->mu); q = t->quit; md = t->mode; rms = t->cfg.refresh_ms; gen = t->gen; dirty = t->dirty; mu_unlock(&t->mu);
+        if (q) break;
+        now = gptps_now_ms(NULL);
+        if (sc_get(&t->wake_req)) { sc_set(&t->wake_req, 0); resized |= 2; }   /* gptps_tui_wake: look again */
+        paint = first || kp || resized;
+        if (!paint && md != GPTPS_TUI_PAUSED && now >= last + rms) {
+            /* CONTINUOUS: the generation skip - the dashboard pane's state, clock and toast
+             * as they were painted: no frame (the other panes read the engine: formatted) */
+            int changed = md == GPTPS_TUI_CONTINUOUS ? gen != painted_gen || t->pane != TUI_PANE_DASH : dirty;
+            paint = paint_due(0, 0, md, changed, vis, now);
+            if (!paint && md == GPTPS_TUI_CONTINUOUS) { last = now; mu_lock(&t->mu); t->h_skipped++; mu_unlock(&t->mu); }
+        } else if (!paint && md == GPTPS_TUI_ON_DEMAND && vis && now >= vis) {
+            paint = 1;                          /* a toast to take away: not held to the rate limit */
+        }
+        if (paint) {
+            int oc = t->cols, orw = t->rows, full;
+            size_t n, nl, olen = 0, wrote = 0, hdr = first ? 12 : 0;
+            tui_fmeta meta;
+            term_size(t);                       /* the layout follows the window */
+            if (t->cols != oc || t->rows != orw) resized |= 1;
+            n = tui_frame(t, &fb, 1, &meta);
+            mu_lock(&t->mu); t->h_made++; mu_unlock(&t->mu);
+            nl = frame_nlines(fb.b);
+            full = first || (resized & 1) || meta.pane != painted_pane || (int)nl > draw_rows(t);
+            if (ocap < hdr + frame_out_cap(n, nl)) {   /* the output buffer, grown with the frame */
+                char *nb = (char *)realloc(ob, hdr + frame_out_cap(n, nl));
+                if (nb) { ob = nb; ocap = hdr + frame_out_cap(n, nl); }
+                else { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
+            }
+            if (ocap >= hdr + frame_out_cap(n, nl)) {
+                if (first) memcpy(ob, "\x1b[?25l\x1b[2J", 10);   /* hide the cursor, clear once */
+                olen = frame_diff(fb.b, first ? NULL : pv.b, full, ob + (first ? 10 : 0)) + (first ? 10 : 0);
+                if (olen) wrote = term_write(t->cfg.out, ob, olen);
+            } else {                            /* no room to build it: the frame as it is, in pieces */
+                fputs(first ? "\x1b[?25l\x1b[2J\x1b[H" : "\x1b[H", t->cfg.out);
+                fputs(fb.b, t->cfg.out); fputs("\x1b[J", t->cfg.out); fflush(t->cfg.out);
+                wrote = n;
+            }
+            mu_lock(&t->mu);
+            if (wrote) { t->h_painted++; t->h_written += wrote; } else t->h_skipped++;
+            t->frame_bytes = fb.cap + pv.cap + ocap;
+            mu_unlock(&t->mu);
+            { tui_fbuf x = fb; fb = pv; pv = x; }   /* what the screen shows now */
+            painted_pane = meta.pane;
+            painted_gen = meta.pane == TUI_PANE_DASH ? meta.gen : gen;
+            vis = meta.next_change;
+            {
+                uint64_t tu = toast_until(t, gptps_now_ms(NULL));
+                if (tu && (!vis || tu < vis)) vis = tu;
+            }
+            last = now; first = 0; kp = 0; resized = 0;
+        }
+        /* how long to wait: the earliest deadline, none (block) when there is none */
+        mu_lock(&t->mu);
+        if (md == GPTPS_TUI_CONTINUOUS) deadline = last + rms;
+        else if (md == GPTPS_TUI_ON_DEMAND) {
+            if (t->dirty) deadline = last + rms;
+            else if (have_wake) t->waiting = 1;  /* the next change signals (see tui_on_event) */
+            if (vis && (!deadline || vis < deadline)) deadline = vis;
+        }
+        mu_unlock(&t->mu);
+        if (!have_wake && md != GPTPS_TUI_CONTINUOUS && (!deadline || deadline > now + rms))
+            deadline = gptps_now_ms(NULL) + rms;    /* no wake handle: look every refresh_ms */
+        now = gptps_now_ms(NULL);
+        ms = !deadline ? -1 : deadline > now ? (deadline - now > 86400000u ? 86400000L : (long)(deadline - now)) : 0;
+        w = term_wait(t, rfd, use_stdin, ms);
+        mu_lock(&t->mu); t->waiting = 0; t->h_wakes++; mu_unlock(&t->mu);
+        if (w & 1) {                            /* every key that arrived (a paste), then one frame */
+            int k;
+            while ((k = term_key(&eof, &rz)) >= 0) {
+                uint64_t sm = t->status_ms;
+                if (gptps_tui_press(t, k) != 0 || t->status_ms != sm) kp = 1;   /* a key that did nothing: no frame */
+            }
+            if (rz) resized |= 1;
+            if (eof && use_stdin) {
+                use_stdin = 0;
+                gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: stdin reached its end (the terminal went away?); "
+                          "keys are no longer read - the dashboard keeps drawing until gptps_tui_press(t, 'q')");
+            }
+        }
+    }
+    {
+        static const char show[] = "\x1b[?25h";        /* show the cursor */
+        term_write(t->cfg.out, show, sizeof show - 1);
+    }
     term_restore(t);
-    mu_lock(&t->mu); t->frame_bytes = 0; mu_unlock(&t->mu);
-    free(buf);
+    if (have_wake) wake_close(t, rfd);
+    mu_lock(&t->mu); t->frame_bytes = 0; t->waiting = 0; mu_unlock(&t->mu);
+    free(fb.b); free(pv.b); free(ob);
 }
 
 /* ---- settings registry bindings (target = the gptps_tui) ---- */
@@ -2848,6 +3537,7 @@ static const int TUI_KPI_CHOICE_VAL[] = { GPTPS_TUI_KPI_OFF, GPTPS_TUI_KPI_MINIM
                                           GPTPS_TUI_KPI_GAUGE, GPTPS_TUI_KPI_PROBLEMS, GPTPS_TUI_KPI_TASKS,
                                           GPTPS_TUI_KPI_ACTIVITY, GPTPS_TUI_KPI_LATENCY, GPTPS_TUI_KPI_COUNT };
 static const char *const TUI_MODE_CHOICES[] = { "realtime", "on-demand", "paused", 0 };
+static const char *const TUI_CLOCK_CHOICES[] = { "off", "minutes", "seconds", 0 };   /* GPTPS_TUI_CLOCK_* - 1 */
 
 static size_t ts_rd_refresh(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; unsigned ms; mu_lock(&t->mu); ms = t->cfg.refresh_ms; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%u", ms); }
 static gptps_status ts_wr_refresh(void *p, const char *v) { return gptps_tui_set_refresh((gptps_tui *)p, (uint32_t)strtoul(v, NULL, 10)); }
@@ -2865,6 +3555,19 @@ static size_t ts_rd_activity(void *p, char *b, size_t c) { gptps_tui *t = (gptps
 static gptps_status ts_wr_activity(void *p, const char *v) { return gptps_tui_set_recent((gptps_tui *)p, -1, (int)strtol(v, NULL, 10)); }
 static size_t ts_rd_latwin(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->lat_cap; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
 static gptps_status ts_wr_latwin(void *p, const char *v) { return gptps_tui_set_latency_window((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
+static size_t ts_rd_clock(void *p, char *b, size_t c)
+{
+    gptps_tui *t = (gptps_tui *)p; int k;
+    mu_lock(&t->mu); k = t->clock; mu_unlock(&t->mu);
+    return (size_t)snprintf(b, c, "%s", k >= GPTPS_TUI_CLOCK_OFF && k <= GPTPS_TUI_CLOCK_SECONDS ? TUI_CLOCK_CHOICES[k - 1] : "?");
+}
+static gptps_status ts_wr_clock(void *p, const char *v)
+{
+    int k;
+    for (k = 0; TUI_CLOCK_CHOICES[k]; ++k)
+        if (strcmp(v, TUI_CLOCK_CHOICES[k]) == 0) return gptps_tui_set_clock((gptps_tui *)p, (gptps_tui_clock)(k + 1));
+    return GPTPS_E_INVAL;              /* the registry checks the choices first: not reached */
+}
 static size_t ts_rd_mode(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int m; mu_lock(&t->mu); m = t->mode; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", mode_str(m)); }
 static gptps_status ts_wr_mode(void *p, const char *v) { int m = (strcmp(v, "realtime") == 0) ? GPTPS_TUI_CONTINUOUS : (strcmp(v, "on-demand") == 0) ? GPTPS_TUI_ON_DEMAND : GPTPS_TUI_PAUSED; return gptps_tui_set_mode((gptps_tui *)p, (gptps_tui_mode)m); }
 
@@ -2900,6 +3603,10 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
                                                     "(the ACTIVITY journal, kpi normal and up); by default "
                                                     "as tui.recent; 0 = off, its memory freed",
                                                     NULL, ts_rd_activity, ts_wr_activity, 1, 0, TUI_JOURNAL_CAP },
+        { "tui.clock",          GPTPS_SETTING_ENUM, "the header's uptime: off, whole minutes (an idle "
+                                                    "dashboard repaints once a minute) or seconds (once a "
+                                                    "second)",
+                                                    TUI_CLOCK_CHOICES, ts_rd_clock, ts_wr_clock, 0, 0, 0 },
     };
     size_t i;
     gptps_setting_def d;
@@ -3101,7 +3808,15 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
         t->trk_lb = 1; t->lb_gen++;
     }
     /* The gauge counter starts with the tier that keeps it: below, nothing kept it true. */
-    if (otier < TUI_T_GAUGE && tier >= TUI_T_GAUGE) { t->inflight = 0; t->peak = 0; }
+    if (otier < TUI_T_GAUGE && tier >= TUI_T_GAUGE) {
+        t->inflight = 0; t->peak = 0; t->peak_prev = 0; t->peak_ms = gptps_now_ms(NULL);
+    }
+    /* done/s starts again when the totals do: at OFF they stood still, so a snapshot from
+     * before would average the time off in as no work */
+    if (otier == TUI_T_OFF && tier != TUI_T_OFF) {
+        t->rate_n = 1; t->rate_head = 1 % TUI_RATE_N;
+        t->rate[0].ms = gptps_now_ms(NULL); t->rate[0].fin = t->fin;
+    }
     if (w.prob && t->pcap != w.prob) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
         pos += (size_t)snprintf(what + pos, cap - pos, "the PROBLEMS journal (%lu bytes%s)",
@@ -3129,7 +3844,7 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
     }
     t->kpi = lvl;
     t->tier = tier;
-    t->dirty = 1;
+    tui_touch(t);
     /* Published LAST: tui_on_event reads this without the lock, so everything it
      * guards must already be consistent before the event path is allowed back in. */
     TUI_FLAG_SET(&t->off, tier == TUI_T_OFF);
@@ -3137,6 +3852,7 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
     parts_free(&old);                   /* swapped out above: nothing can reach them now */
     parts_free(&nw);                    /* nothing left, unless a part was not needed after all */
     mu_unlock(&t->smu);
+    tui_kick(t);                        /* a live loop shows the new tier */
     trk_resync(t);                      /* a table built on an idle engine is exact at once */
     return st;
 }
@@ -3152,6 +3868,8 @@ static void tui_destroy(gptps_tui *t)
     p.act_nm = t->act_nm; p.hist = t->hist; p.tab = t->tab;
     parts_free(&p);
     free(t->held);
+    if (t->view) { free(t->view->rows); free(t->view->recs); free(t->view); }
+    mu_destroy(&t->rmu);
     mu_destroy(&t->smu);
     mu_destroy(&t->mu);
     free(t);
@@ -3177,6 +3895,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     }
     mu_init(&t->mu);
     mu_init(&t->smu);
+    mu_init(&t->rmu);
     t->e = e;
     /* As much as the caller's struct holds, the rest zero (its defaults): an older
      * caller's struct ends before the fields appended since, and what follows it in
@@ -3218,6 +3937,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
             }
         }
         if (!t->cfg.clock)           t->cfg.clock = GPTPS_TUI_CLOCK_MINUTES;
+        t->clock = t->cfg.clock;
         if (!t->cfg.rate_window_s)   t->cfg.rate_window_s = 10;
         if (!t->cfg.pane_refresh_ms) t->cfg.pane_refresh_ms = 2000;
     }
@@ -3422,28 +4142,42 @@ gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode)
 {
     if (!t) return GPTPS_E_INVAL;
     if (mode < GPTPS_TUI_CONTINUOUS || mode > GPTPS_TUI_PAUSED) return GPTPS_E_INVAL;
-    mu_lock(&t->mu); t->mode = mode; t->dirty = 1; mu_unlock(&t->mu);
+    mu_lock(&t->mu); t->mode = mode; tui_touch(t); mu_unlock(&t->mu);
+    tui_kick(t);                         /* a loop blocked in PAUSED wakes to the new cadence */
     return GPTPS_OK;
 }
 
 gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms)
 {
     if (!t) return GPTPS_E_INVAL;
-    mu_lock(&t->mu); t->cfg.refresh_ms = refresh_ms ? refresh_ms : 250; mu_unlock(&t->mu);
+    mu_lock(&t->mu); t->cfg.refresh_ms = refresh_ms ? refresh_ms : 250; tui_touch(t); mu_unlock(&t->mu);
+    tui_kick(t);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_tui_set_clock(gptps_tui *t, gptps_tui_clock clock)
+{
+    if (!t) return GPTPS_E_INVAL;
+    if (clock == GPTPS_TUI_CLOCK_DEFAULT) clock = GPTPS_TUI_CLOCK_MINUTES;
+    if (clock != GPTPS_TUI_CLOCK_OFF && clock != GPTPS_TUI_CLOCK_MINUTES && clock != GPTPS_TUI_CLOCK_SECONDS)
+        return GPTPS_E_INVAL;
+    mu_lock(&t->mu); t->clock = clock; t->cfg.clock = clock; tui_touch(t); mu_unlock(&t->mu);
+    tui_kick(t);
     return GPTPS_OK;
 }
 
 void gptps_tui_snapshot(gptps_tui *t)
 {
-    char *buf; size_t cap = 16384;
+    tui_fbuf f;
     if (!t) return;
-    buf = (char *)malloc(cap);
-    if (!buf) {
+    f.cap = TUI_FRAME_MIN;
+    f.b = (char *)malloc(f.cap);
+    if (!f.b) {
         mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_snapshot: no memory for the 16 KiB frame buffer; no frame");
         return;
     }
-    gptps_tui_render(t, buf, cap);     /* one frame, right now, regardless of mode */
-    fputs(buf, t->cfg.out); fputc('\n', t->cfg.out); fflush(t->cfg.out);
-    free(buf);
+    tui_frame(t, &f, 0, NULL);         /* one frame, right now, regardless of mode; grown to fit */
+    fputs(f.b, t->cfg.out); fputc('\n', t->cfg.out); fflush(t->cfg.out);
+    free(f.b);
 }

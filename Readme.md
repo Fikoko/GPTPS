@@ -611,7 +611,7 @@ point it at your engine, and watch tasks flow in real time. Pure ANSI/VT (no ncu
 auto-enabled on a TTY, with the Windows console put into VT mode automatically.
 
 ```text
-GPTPS · live demo   up 0.1s   28.6 done/s
+GPTPS live demo   up <1m   28.6 done/s
 queued 18  started 8  pending 10  in-flight 4  [#######################] peak 4
 finished 4  failed 0  retried 0  dead 0  dropped 0
 kpi:full mode:realtime refresh:250ms
@@ -646,8 +646,10 @@ keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter
   with a confirm dialog (`d`) that shows the outstanding count and offers drain or
   cancel-force. `l` opens a **dead-letter** view to bulk re-submit or discard retained
   failures.
-- **Friendly:** adapts to the terminal size, redraws flicker-free, confirms actions with a
-  toast, and on a real terminal adds a framed title bar, a Unicode block gauge, and color
+- **Friendly:** adapts to the terminal size (the tables fit its height, `+N more`), redraws
+  flicker-free — only the lines that changed, in one write — and costs nothing idle (it
+  blocks until something it shows changes; see `gptps_tui_run` in `addons/gptps_tui.h`),
+  confirms actions with a toast, and on a real terminal adds a framed title bar, a Unicode block gauge, and color
   (with an ASCII fallback shown above). Built on a pure render-to-string core, so it is
   fully testable headlessly.
 

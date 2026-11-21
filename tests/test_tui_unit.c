@@ -95,6 +95,23 @@
  * 38) RECENT merges the journals by time (a problem after its activity at the same ms);
  *     with ACTIVITY off it shows problems only.
  * 39) The 1.11 config fields: out of range refused at install, with an ERROR.
+ * 40) (test_narrow_lines) every line of a narrow frame is one row.
+ * 1.11, the frame and the live loop:
+ * 41) The line diff: 0 bytes for an identical frame, a changed line rewritten in place, a
+ *     shorter frame wiped below, a full repaint past half the lines.
+ * 42) The header: the clock off / minutes (the default) / seconds and tui.clock; done/s over
+ *     the window ("-", then a rate that settles to 0 when the window empties, "n/a" at OFF);
+ *     peak over one to two windows; "GPTPS" once when the title starts with it.
+ * 43) run's and snapshot's frame grows to 256 KiB; past that the cut is visible and counted.
+ * 44) The TASKS table and the tasks pane fit the terminal's height, with "+N more".
+ * 45) The legend is cached, and rebuilt when a binding or the width changes.
+ * 46) POSIX: the dashboard is formatted with the lock released (copy-out under it only).
+ * 47) POSIX, on a pseudo-terminal: PAUSED and ON_DEMAND idle 3 s - no frame, no byte, no
+ *     wake; gptps_tui_wake wakes it once (a resize repaints); a toast fades on its own in
+ *     ON_DEMAND; CONTINUOUS idle makes no frame and writes nothing; one changed line costs
+ *     one line's bytes; a burst of 100k events at refresh 250 ms costs frames bounded by
+ *     the time and at most one wake a frame; the wake pipe exists only while run runs,
+ *     and a headless run makes none.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -500,7 +517,9 @@ static void test_windows_keys(void)
     k.wVirtualKeyCode = 'A'; k.uChar.UnicodeChar = 0x00E0;   /* a grave */
     CHECK(tui_key_of(&k) == 0xC3);
     CHECK(tui_kq_n == 2 && tui_kq[1] == 0xA0);
-    CHECK(term_poll_key(0) == 0xA0);               /* the queued byte, no wait */
+    {   int eof = 0, rz = 0;
+        CHECK(term_key(&eof, &rz) == 0xA0);        /* the queued byte, no wait */
+    }
     k.wVirtualKeyCode = VK_UP; k.uChar.UnicodeChar = 0;
     CHECK(tui_key_of(&k) == 'k');
     k.wVirtualKeyCode = VK_LEFT;
@@ -1266,7 +1285,11 @@ static void test_toast_fades(void)
     CHECK(paint_due(0, 0, GPTPS_TUI_ON_DEMAND, 1, 0, 5000) == 1);
     CHECK(paint_due(0, 0, GPTPS_TUI_PAUSED, 1, 1000, 5000) == 0);   /* PAUSED stays frozen */
     CHECK(paint_due(0, 1, GPTPS_TUI_PAUSED, 0, 0, 5000) == 1);
-    CHECK(paint_due(0, 0, GPTPS_TUI_CONTINUOUS, 0, 0, 5000) == 1);
+    /* 1.11: CONTINUOUS too paints only when something it shows changed (the generation
+     * skip; the loop asks every refresh_ms) - it used to repaint every frame */
+    CHECK(paint_due(0, 0, GPTPS_TUI_CONTINUOUS, 0, 0, 5000) == 0);
+    CHECK(paint_due(0, 0, GPTPS_TUI_CONTINUOUS, 1, 0, 5000) == 1);
+    CHECK(paint_due(0, 0, GPTPS_TUI_CONTINUOUS, 0, 4000, 5000) == 1);
     gptps_shutdown(e);
     gptps_tui_close(t);
 }
@@ -2279,6 +2302,475 @@ static void test_config_111(void)
     gptps_tui_close(t);
 }
 
+/* ---- 1.11, the frame and the live loop -------------------------------------------- */
+
+/* lines in a frame (its newlines) */
+static int frame_rows(const char *f) { int n = 0; for (; *f; ++f) n += *f == '\n'; return n; }
+
+/* 41) the line diff: an identical frame is 0 bytes; one changed line is rewritten in place
+ * (and nothing else); a shorter frame wipes what is below it; more than half changed, or
+ * no old frame, is a full repaint from home */
+static void test_frame_diff(void)
+{
+    static const char a[] = "one\ntwo\nthree\nfour\nfive\n", b[] = "one\nTWO\nthree\nfour\nfive\n",
+                      c[] = "1\n2\n3\n4\n5\n6\n", c0[] = "1\n2\n3\n4\n5\n6\n7\n8\n", d[] = "1\n2\n3\n4\nfive\n";
+    char o[512];
+    size_t n;
+    CHECK(frame_diff(a, a, 0, o) == 0);
+    n = frame_diff(b, a, 0, o); o[n] = 0;
+    CHECK(strcmp(o, "\x1b[2;1HTWO\x1b[K") == 0);
+    n = frame_diff(c, c0, 0, o); o[n] = 0;                 /* rows 7..8 go; row 7 is now the empty last line */
+    CHECK(strcmp(o, "\x1b[7;1H\x1b[K\x1b[8;1H\x1b[J") == 0);
+    n = frame_diff(d, a, 0, o); o[n] = 0;                  /* 4 of 6 lines: all of it */
+    CHECK(strcmp(o, "\x1b[H1\x1b[K\n2\x1b[K\n3\x1b[K\n4\x1b[K\nfive\x1b[K\n\x1b[J") == 0);
+    n = frame_diff(b, NULL, 0, o); o[n] = 0;
+    CHECK(strncmp(o, "\x1b[Hone\x1b[K\nTWO", 13) == 0);
+    n = frame_diff(a, a, 1, o);                            /* asked for: a full one, identical or not */
+    CHECK(n == strlen(a) + 5 * 3 + 6);
+    CHECK(frame_out_cap(strlen(a), frame_nlines(a)) >= n);
+}
+
+/* 42) the header: the clock (off / minutes / seconds; minutes by default), done/s over a
+ * window (not since install) with "-" before there is anything to measure and "n/a" at
+ * OFF, peak over the window (not for ever), GPTPS once in a title that starts with it */
+static void test_header(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[16384]; char b[64]; int st;
+    uint64_t nx, now;
+    double r;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    fmt_up(b, sizeof b, 59999, GPTPS_TUI_CLOCK_MINUTES);  CHECK(strcmp(b, "up <1m") == 0);
+    fmt_up(b, sizeof b, 125000, GPTPS_TUI_CLOCK_MINUTES); CHECK(strcmp(b, "up 2m") == 0);
+    fmt_up(b, sizeof b, 3725000, GPTPS_TUI_CLOCK_MINUTES); CHECK(strcmp(b, "up 1h02m") == 0);
+    fmt_up(b, sizeof b, 90000000, GPTPS_TUI_CLOCK_MINUTES); CHECK(strcmp(b, "up 1d01h") == 0);
+    fmt_up(b, sizeof b, 9000, GPTPS_TUI_CLOCK_SECONDS);   CHECK(strcmp(b, "up 9s") == 0);
+    fmt_up(b, sizeof b, 125000, GPTPS_TUI_CLOCK_SECONDS); CHECK(strcmp(b, "up 2m05s") == 0);
+    CHECK(clock_next(59000, GPTPS_TUI_CLOCK_MINUTES) == 60000 && clock_next(60000, GPTPS_TUI_CLOCK_MINUTES) == 120000);
+    CHECK(clock_next(1500, GPTPS_TUI_CLOCK_SECONDS) == 2000 && clock_next(1500, GPTPS_TUI_CLOCK_OFF) == 0);
+    CHECK(t->clock == GPTPS_TUI_CLOCK_MINUTES);            /* the default, for a 1.10-layout caller too */
+    now = gptps_now_ms(NULL);
+    t->start_ms = now - 125000;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "GPTPS \xc2\xb7 tasks   up 2m   ") != NULL && strstr(frame, " done/s") != NULL);
+    CHECK(gptps_tui_set_clock(t, GPTPS_TUI_CLOCK_SECONDS) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "up 2m0") != NULL);
+    CHECK(gptps_settings_set(e, "tui.clock", "off") == GPTPS_OK && t->clock == GPTPS_TUI_CLOCK_OFF);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "up ") == NULL);
+    CHECK(gptps_settings_set(e, "tui.clock", "fortnights") == GPTPS_E_CONFIG);
+    CHECK(gptps_settings_get(e, "tui.clock", b, sizeof b) == GPTPS_OK && strcmp(b, "off") == 0);
+    CHECK(gptps_tui_set_clock(t, (gptps_tui_clock)9) == GPTPS_E_INVAL);
+    CHECK(gptps_tui_set_clock(t, GPTPS_TUI_CLOCK_DEFAULT) == GPTPS_OK && t->clock == GPTPS_TUI_CLOCK_MINUTES);
+    /* done/s over the last 10 s: 50 finished in the second after the first snapshot... */
+    mu_lock(&t->mu);
+    t->rate_n = 0; t->rate_head = 0; t->fin = 0;
+    r = rate_take(t, 1000, &st, &nx);
+    CHECK(st == 0 && nx == 1001);                          /* nothing to measure against: "-", until the next ms */
+    t->fin = 50;
+    r = rate_take(t, 2000, &st, &nx);
+    CHECK(st == 1 && r > 49.9 && r < 50.1 && nx == 3000);  /* and it settles with no event: a deadline */
+    r = rate_take(t, 6000, &st, &nx);
+    CHECK(st == 1 && r > 9.9 && r < 10.1);                 /* the same 50, over 5 s */
+    r = rate_take(t, 12500, &st, &nx);                     /* ...and 10.5 s later they have left the window */
+    CHECK(st == 1 && r == 0.0 && nx == 0);                 /* 0, and no more deadlines (since install: 4.8) */
+    /* peak: the highest in-flight over the last one or two windows */
+    t->peak = 7; t->peak_prev = 0; t->peak_ms = 0;
+    CHECK(peak_take(t, 5000, 2, &nx) == 7 && nx == 10000);
+    CHECK(peak_take(t, 10000, 2, &nx) == 7 && nx == 20000);   /* the last window's */
+    CHECK(peak_take(t, 20000, 2, &nx) == 2 && nx == 0);       /* gone: it was 1.10's for ever */
+    mu_unlock(&t->mu);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_OFF) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "n/a done/s") != NULL);             /* the totals stand still at OFF */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_MINIMAL) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);               /* back: measured from now, "-" or a rate */
+    CHECK(strstr(frame, "n/a done/s") == NULL);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    {   /* a title that starts with GPTPS gets no second one: plain, colour, and the panes */
+        gptps_tui_config c;
+        e = open_manual();
+        if (!e) return;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.title = "GPTPS live demo";
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        if (t) {
+            gptps_tui_render(t, frame, sizeof frame);
+            CHECK(strncmp(frame, "GPTPS live demo   up <1m", 24) == 0);
+            t->cfg.color = 1;
+            gptps_tui_render(t, frame, sizeof frame);
+            CHECK(strstr(frame, " GPTPS live demo ") != NULL && strstr(frame, "GPTPS  GPTPS") == NULL);
+            t->cfg.color = 0;
+            t->pane = TUI_PANE_HELP;
+            gptps_tui_render(t, frame, sizeof frame);
+            CHECK(strncmp(frame, "GPTPS live demo \xc2\xb7 help", 22) == 0);
+            t->pane = TUI_PANE_DASH;
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+}
+
+/* 43) run's and snapshot's frame grows to what it needs, to 256 KiB (16 KiB cut a tall
+ * colour frame); past that the cut is visible and counted */
+static void test_frame_grows(void)
+{
+    static char title[300000];
+    gptps *e = open_manual(); gptps_tui *t; gptps_tui_config c; FILE *out;
+    long n;
+    char tail[64];
+    if (!e) return;
+    out = tmpfile();
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.out = out; c.title = title;
+    memset(title, 'x', 40000); title[40000] = 0;         /* a frame of ~40 KiB */
+    t = out ? gptps_tui_install(e, &c) : NULL;
+    CHECK(t != NULL);
+    if (t) {
+        gptps_tui_snapshot(t);
+        n = ftell(out);
+        CHECK(n > 40000 && health(t).frames_truncated == 0);
+        fseek(out, n - 40, SEEK_SET);
+        CHECK(fread(tail, 1, 40, out) == 40);
+        tail[40] = 0;
+        CHECK(strstr(tail, "q quit") != NULL);           /* all of it: the legend, at the end */
+        memset(title, 'y', sizeof title - 1); title[sizeof title - 1] = 0;   /* past the cap */
+        rewind(out);
+        gptps_tui_snapshot(t);
+        n = ftell(out);
+        CHECK(n <= (long)TUI_FRAME_MAX + 2 && n > (long)TUI_FRAME_MAX / 2);
+        CHECK(health(t).frames_truncated == 1);
+        gptps_tui_render(t, title, 64);                  /* a caller's buffer is never grown */
+        CHECK(health(t).frames_truncated == 2);
+    }
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    if (out) fclose(out);
+}
+
+/* 44) the TASKS table and the tasks pane fit the terminal's height, with "+N more" */
+static void test_height_fit(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[65536]; int i;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    for (i = 0; i < TUI_MAX_TASKS; ++i) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "fit_%02d", i);
+        emit(t, GPTPS_EV_QUEUED, nm, (gptps_handle)(i + 1), GPTPS_OK, 1);
+        deftask(e, nm, ok_task);
+    }
+    t->cols = 80; t->rows = 24;
+    gptps_tui_render(t, frame, sizeof frame);
+    if (frame_rows(frame) > 24) printf("%s\n", frame);
+    CHECK(frame_rows(frame) <= 23);                        /* and the last newline does not scroll */
+    CHECK(strstr(frame, " more (a taller terminal shows them)") != NULL);
+    CHECK(strstr(frame, "fit_00") != NULL && strstr(frame, "RECENT") != NULL);
+    t->rows = 200;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "fit_63") != NULL && strstr(frame, " more (") == NULL);   /* room: all of them */
+    t->rows = 24;
+    t->pane = TUI_PANE_TASKS;
+    t->task_sel = 40;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(frame_rows(frame) <= 23);
+    {
+        gptps_task_info a, b;
+        char sel[GPTPS_TASK_NAME_MAX + 8];
+        CHECK(tui_task_at(e, 0, &a) && tui_task_at(e, 40, &b));
+        snprintf(sel, sizeof sel, "> %s ", b.name_copy);
+        CHECK(strstr(frame, sel) != NULL && strstr(frame, a.name_copy) == NULL);   /* around the selection */
+    }
+    CHECK(strstr(frame, " more (") != NULL);
+    t->pane = TUI_PANE_DASH;
+    drain(e);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 45) the legend is cached, and rebuilt when a binding or the width changes */
+static void test_legend_cache(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[16384];
+    uint64_t g;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "[w] Wash") == NULL && t->view != NULL);
+    g = t->view->leg_gen;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->view->leg_gen == g);                          /* nothing changed: not rebuilt */
+    CHECK(gptps_tui_add_task(t, "wash", "Wash", 'w', NULL, 0) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "[w] Wash") != NULL);              /* a new binding: rebuilt */
+    t->cols = 200;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->view->legrows == 1 && strstr(frame, "[w] Wash  \xc2\xb7  Up/Dn scroll  s settings") != NULL);
+    t->cols = 40;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->view->legrows > 2 && widest(t->view->legend) <= 40);   /* a new width: rewrapped */
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+#if !defined(_WIN32)
+/* 46) the dashboard is formatted with the lock released: only the copy-out holds it (the
+ * format would deadlock here, holding mu, if it took it) */
+static void test_format_unlocked(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[16384];
+    size_t n;
+    if (!e) return;
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    emit(t, GPTPS_EV_QUEUED, "fmt", 1, GPTPS_OK, 1);
+    gptps_tui_render(t, frame, sizeof frame);              /* takes the view */
+    alarm(10);
+    mu_lock(&t->mu);
+    n = dash_format(t, t->view, frame, sizeof frame);
+    mu_unlock(&t->mu);
+    alarm(0);
+    CHECK(n > 0 && n < sizeof frame);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 47) the live loop on a pseudo-terminal: idle costs nothing */
+static gptps_tui *lv_t;
+static void *lv_run(void *p) { (void)p; gptps_tui_run(lv_t); return NULL; }
+static int lv_m = -1;
+static size_t lv_got;                          /* bytes read from the terminal's other side */
+static char lv_buf[65536];
+static size_t lv_buflen;
+static void lv_drain(void)
+{
+    char b[4096];
+    ssize_t r;
+    while ((r = read(lv_m, b, sizeof b)) > 0) {
+        if (lv_buflen + (size_t)r < sizeof lv_buf) { memcpy(lv_buf + lv_buflen, b, (size_t)r); lv_buflen += (size_t)r; }
+        lv_got += (size_t)r;
+    }
+}
+static void lv_sleep(int ms)               /* sleep, reading what the loop writes meanwhile */
+{
+    uint64_t end = gptps_now_ms(NULL) + (uint64_t)ms;
+    while (gptps_now_ms(NULL) < end) {
+        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 5000;
+        select(0, NULL, NULL, NULL, &tv);
+        lv_drain();
+    }
+    lv_drain();
+}
+static int lv_until_painted(uint64_t n)       /* wait for the n-th frame (3 s at most) */
+{
+    int i;
+    for (i = 0; i < 300 && health(lv_t).frames_painted < n; ++i) lv_sleep(10);
+    return health(lv_t).frames_painted >= n;
+}
+static gptps *lv_e;
+static FILE *lv_out;
+static pthread_t lv_th;
+/* install on a fresh engine with this config, and start gptps_tui_run on its own thread */
+static int lv_start(int mode, int kpi, uint32_t refresh)
+{
+    gptps_tui_config c;
+    lv_e = open_manual();
+    if (!lv_e) return 0;
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.color = 0; c.unicode = 0; c.interactive = 1; c.out = lv_out;
+    c.mode = mode; c.kpi = kpi; c.refresh_ms = refresh;
+    lv_t = gptps_tui_install(lv_e, &c);
+    if (!lv_t) { gptps_shutdown(lv_e); return 0; }
+    CHECK(gptps_tui_add_task(lv_t, "nosuch", "Nosuch", 'n', NULL, 0) == GPTPS_OK);   /* refused: a toast */
+    lv_got = 0; lv_buflen = 0;
+    if (pthread_create(&lv_th, NULL, lv_run, NULL) != 0) { gptps_shutdown(lv_e); gptps_tui_close(lv_t); return 0; }
+    CHECK(lv_until_painted(1));
+    lv_sleep(300);                                        /* settled */
+    return 1;
+}
+static void lv_stop(void)
+{
+    tui_quit(lv_t);
+    pthread_join(lv_th, NULL);
+    CHECK(sc_get(&lv_t->wake_h) == 0);                    /* the wake handle is gone with the loop */
+    gptps_shutdown(lv_e);
+    gptps_tui_close(lv_t);
+    lv_t = NULL;
+}
+static int lv_burst_done;
+static void *lv_burst(void *p)               /* 100k events over ~2 s */
+{
+    int i, k;
+    (void)p;
+    for (i = 0; i < 100; ++i) {
+        struct timeval tv;
+        for (k = 0; k < 500; ++k) {
+            gptps_handle h = (gptps_handle)(i * 500 + k + 1);
+            emit_a(lv_t, GPTPS_EV_QUEUED, "burst", h, GPTPS_OK, gptps_now_ms(NULL), 0);
+            emit_a(lv_t, GPTPS_EV_FINISHED, "burst", h, GPTPS_OK, gptps_now_ms(NULL), 1);
+        }
+        tv.tv_sec = 0; tv.tv_usec = 20000;
+        select(0, NULL, NULL, NULL, &tv);
+    }
+    __atomic_store_n(&lv_burst_done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+static int open_fds(void) { int fd, n = 0; for (fd = 0; fd < 1024; ++fd) n += fcntl(fd, F_GETFD) != -1; return n; }
+static void test_live_idle(void)
+{
+    static const int modes[] = { GPTPS_TUI_ON_DEMAND, GPTPS_TUI_PAUSED };
+    gptps_tui_health_info h0, h1;
+    struct winsize ws;
+    int s, k, fd, before;
+    size_t i;
+    lv_m = posix_openpt(O_RDWR | O_NOCTTY);
+    if (lv_m < 0 || grantpt(lv_m) != 0 || unlockpt(lv_m) != 0) { printf("note: no pty here; live loop checks skipped\n"); return; }
+    s = open(ptsname(lv_m), O_RDWR | O_NOCTTY);
+    if (s < 0 || !freopen(ptsname(lv_m), "r", stdin) || (lv_out = fdopen(s, "w")) == NULL) {
+        printf("note: cannot set up a pty; live loop checks skipped\n"); close(lv_m); return;
+    }
+    fcntl(lv_m, F_SETFL, fcntl(lv_m, F_GETFL) | O_NONBLOCK);
+    memset(&ws, 0, sizeof ws); ws.ws_col = 80; ws.ws_row = 24;
+    ioctl(s, TIOCSWINSZ, &ws);
+    alarm(120);
+    /* PAUSED and ON_DEMAND idle 3 s: no frame, no byte, no wake */
+    for (i = 0; i < sizeof modes / sizeof modes[0]; ++i) {
+        if (!lv_start(modes[i], 0, 50)) continue;
+        fd = (int)sc_get(&lv_t->wake_h) - 1;
+        CHECK(fd >= 0 && (fcntl(fd, F_GETFD) & FD_CLOEXEC) && (fcntl(fd, F_GETFL) & O_NONBLOCK));   /* the pipe */
+        h0 = health(lv_t); lv_got = 0;
+        lv_sleep(3000);
+        h1 = health(lv_t);
+        if (h1.wakes != h0.wakes || h1.frames_painted != h0.frames_painted)
+            printf("mode %d idle: %llu wakes, %llu frames\n", modes[i], (unsigned long long)(h1.wakes - h0.wakes),
+                   (unsigned long long)(h1.frames_painted - h0.frames_painted));
+        CHECK(h1.frames_painted == h0.frames_painted && h1.bytes_written == h0.bytes_written && lv_got == 0);
+        CHECK(h1.wakes == h0.wakes);                      /* blocked, no timeout */
+        if (modes[i] == GPTPS_TUI_ON_DEMAND) {
+            /* gptps_tui_wake: one wake, a frame made, nothing to write (nothing changed) */
+            lv_buflen = 0;
+            gptps_tui_wake(lv_t);
+            lv_sleep(200);
+            h0 = health(lv_t);
+            if (getenv("LVDBG")) { lv_buf[lv_buflen] = 0; printf("[[%s]]\n", lv_buf); }
+            if (!(h0.wakes == h1.wakes + 1 && h0.bytes_written == h1.bytes_written && h0.frames_skipped == h1.frames_skipped + 1))
+                printf("wake: %llu wakes, %llu bytes, %llu skipped, %llu painted\n", (unsigned long long)(h0.wakes - h1.wakes),
+                       (unsigned long long)(h0.bytes_written - h1.bytes_written), (unsigned long long)(h0.frames_skipped - h1.frames_skipped),
+                       (unsigned long long)(h0.frames_painted - h1.frames_painted));
+            CHECK(h0.wakes == h1.wakes + 1 && h0.bytes_written == h1.bytes_written && h0.frames_skipped == h1.frames_skipped + 1);
+            /* ...and on a resize, all of it at the new size */
+            ws.ws_col = 100; ioctl(s, TIOCSWINSZ, &ws);
+            gptps_tui_wake(lv_t);
+            lv_sleep(200);
+            h1 = health(lv_t);
+            CHECK(h1.frames_painted == h0.frames_painted + 1 && lv_t->cols == 100);
+            ws.ws_col = 80; ioctl(s, TIOCSWINSZ, &ws);
+            /* a toast clears by itself at 3 s: one frame for the key, one when it fades */
+            h0 = health(lv_t);
+            CHECK(write(lv_m, "n", 1) == 1);
+            lv_sleep(500);
+            h1 = health(lv_t);
+            CHECK(h1.frames_painted == h0.frames_painted + 1 && strstr(lv_buf, "NOT submitted Nosuch") != NULL);
+            lv_sleep(2000);
+            CHECK(health(lv_t).frames_painted == h1.frames_painted);   /* nothing until it fades */
+            lv_buflen = 0;
+            lv_sleep(1000);
+            h0 = health(lv_t);
+            CHECK(h0.frames_painted == h1.frames_painted + 1 && lv_buflen > 0);
+            lv_buf[lv_buflen] = 0;
+            CHECK(strstr(lv_buf, "NOT submitted") == NULL);
+        }
+        lv_stop();
+        CHECK(fcntl(fd, F_GETFD) == -1);                  /* gone with the loop */
+    }
+    /* CONTINUOUS idle: it looks every refresh_ms, makes no frame, writes nothing */
+    if (lv_start(GPTPS_TUI_CONTINUOUS, 0, 50)) {
+        uint64_t made;
+        h0 = health(lv_t); lv_got = 0;
+        mu_lock(&lv_t->mu); made = lv_t->h_made; mu_unlock(&lv_t->mu);
+        lv_sleep(2000);
+        h1 = health(lv_t);
+        CHECK(h1.bytes_written == h0.bytes_written && lv_got == 0 && h1.frames_painted == h0.frames_painted);
+        CHECK(h1.frames_skipped >= h0.frames_skipped + 10);
+        mu_lock(&lv_t->mu); CHECK(lv_t->h_made == made); mu_unlock(&lv_t->mu);   /* not even rendered */
+        lv_stop();
+    }
+    /* one changed line is one line's bytes (GAUGE: an event changes the gauge line only) */
+    if (lv_start(GPTPS_TUI_ON_DEMAND, GPTPS_TUI_KPI_GAUGE, 50)) {
+        static char full[16384];
+        size_t fl = gptps_tui_render(lv_t, full, sizeof full);
+        h0 = health(lv_t);
+        emit(lv_t, GPTPS_EV_QUEUED, "one", 1, GPTPS_OK, gptps_now_ms(NULL));
+        CHECK(lv_until_painted(h0.frames_painted + 1));
+        h1 = health(lv_t);
+        if (!(h1.bytes_written - h0.bytes_written < fl / 2))
+            printf("one line changed: %llu bytes written, the frame is %lu\n",
+                   (unsigned long long)(h1.bytes_written - h0.bytes_written), (unsigned long)fl);
+        CHECK(h1.bytes_written > h0.bytes_written && h1.bytes_written - h0.bytes_written < fl / 2);
+        lv_stop();
+    }
+    /* a burst of 100k events at refresh 250 ms: frames bounded by the time, one wake each */
+    for (k = 0; k < 2; ++k) {
+        pthread_t b;
+        uint64_t t0, dt;
+        if (!lv_start(k ? GPTPS_TUI_CONTINUOUS : GPTPS_TUI_ON_DEMAND, GPTPS_TUI_KPI_MINIMAL, 250)) continue;
+        h0 = health(lv_t);
+        mu_lock(&lv_t->mu); lv_t->h_kicks = 0; mu_unlock(&lv_t->mu);
+        t0 = gptps_now_ms(NULL);
+        lv_burst_done = 0;
+        CHECK(pthread_create(&b, NULL, lv_burst, NULL) == 0);
+        while (!__atomic_load_n(&lv_burst_done, __ATOMIC_SEQ_CST)) lv_sleep(20);
+        pthread_join(b, NULL);
+        dt = gptps_now_ms(NULL) - t0;
+        lv_sleep(600);
+        h1 = health(lv_t);
+        {
+            uint64_t frames = h1.frames_painted - h0.frames_painted, kicks;
+            mu_lock(&lv_t->mu); kicks = lv_t->h_kicks; mu_unlock(&lv_t->mu);
+            if (frames > dt / 250 + 4 || frames < 2 || kicks > frames + 2 || getenv("LVDBG"))
+                printf("burst (%s): %llu frames, %llu wakes sent, in %llu ms\n", k ? "realtime" : "on-demand",
+                       (unsigned long long)frames, (unsigned long long)kicks, (unsigned long long)dt);
+            CHECK(frames >= 2 && frames <= dt / 250 + 4);
+            CHECK(kicks <= frames + 2);                   /* on-demand: one signal a frame; realtime: none */
+            if (k) CHECK(kicks == 0);
+        }
+        lv_stop();
+    }
+    /* headless: no pipe at all */
+    CHECK(freopen("/dev/null", "r", stdin) != NULL);
+    before = open_fds();
+    lv_e = open_manual();
+    if (lv_e) {
+        gptps_tui_config c;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.interactive = 1; c.out = lv_out;
+        lv_t = gptps_tui_install(lv_e, &c);
+        CHECK(lv_t != NULL);
+        if (lv_t) {
+            gptps_tui_run(lv_t);                          /* returns at once: stdin is no terminal */
+            CHECK(sc_get(&lv_t->wake_h) == 0 && health(lv_t).wakes == 0 && health(lv_t).frames_painted == 0);
+            gptps_tui_wake(lv_t);                         /* a no-op with no loop */
+        }
+        gptps_shutdown(lv_e);
+        gptps_tui_close(lv_t);
+    }
+    CHECK(open_fds() == before);
+    alarm(0);
+    fclose(lv_out);
+    close(lv_m);
+}
+#endif
+
 int main(void)
 {
     test_sanitiser();
@@ -2315,7 +2807,14 @@ int main(void)
     test_recent_merged();
     test_config_111();
     test_narrow_lines();
+    test_frame_diff();
+    test_header();
+    test_frame_grows();
+    test_height_fit();
+    test_legend_cache();
 #if !defined(_WIN32)
+    test_format_unlocked();
+    test_live_idle();
     test_health_vs_dead_letters();
     test_storage_storm();
     test_run_without_stdin();

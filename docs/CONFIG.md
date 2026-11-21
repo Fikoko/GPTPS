@@ -188,6 +188,7 @@ key nothing claimed.
 | `latency_window` | whole number, 0 or more | `1024` | at once | handles tracked for latency at LATENCY and FULL |
 | `recent` | whole number, 0 to 4096 | `8` | at once | failed/retried/dead/dropped events the RECENT log keeps (the PROBLEMS journal, kpi problems and up); 0 = off, its memory freed |
 | `activity` | whole number, 0 to 4096 | `8` | at once | queued/started/finished events the RECENT log keeps (the ACTIVITY journal, kpi normal and up); by default as tui.recent; 0 = off, its memory freed |
+| `clock` | one of `"off"`, `"minutes"`, `"seconds"` | `"minutes"` | at once | the header's uptime: off, whole minutes (an idle dashboard repaints once a minute) or seconds (once a second) |
 
 ### [gpu_quota]
 

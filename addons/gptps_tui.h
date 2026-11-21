@@ -104,18 +104,26 @@ typedef enum {
     GPTPS_TUI_KPI_COUNT = GPTPS_TUI_KPI_MINIMAL   /* tier 1 under its ladder name */
 } gptps_tui_kpi;
 
-/* cfg.clock (1.11): the header's uptime. 0 = the default. */
+/* cfg.clock (1.11): the header's uptime. 0 = the default. 1.10 printed "up 12.3s", which
+ * changed on every frame, so no frame could ever be skipped as unchanged. */
 typedef enum {
-    GPTPS_TUI_CLOCK_DEFAULT = 0,  /* = MINUTES */
-    GPTPS_TUI_CLOCK_OFF,          /* no uptime in the header */
-    GPTPS_TUI_CLOCK_MINUTES,      /* whole minutes ("up <1m" the first minute) */
-    GPTPS_TUI_CLOCK_SECONDS       /* whole seconds */
+    GPTPS_TUI_CLOCK_DEFAULT = 0,  /* = MINUTES (also for a 1.10-layout caller) */
+    GPTPS_TUI_CLOCK_OFF,          /* no uptime in the header: an idle frame never changes */
+    GPTPS_TUI_CLOCK_MINUTES,      /* "up <1m", "up 42m", "up 3h07m", "up 2d05h": an idle
+                                   * dashboard repaints the header once a minute */
+    GPTPS_TUI_CLOCK_SECONDS       /* "up 9s", "up 4m09s", "up 3h07m09s": once a second */
 } gptps_tui_clock;
 
-/* When the live loop (gptps_tui_run) repaints. Tunable at runtime. */
+/* When the live loop (gptps_tui_run) repaints. Tunable at runtime. See IDLE at
+ * gptps_tui_run for what each costs when nothing happens. */
 typedef enum {
-    GPTPS_TUI_CONTINUOUS = 0,  /* repaint every refresh_ms (real-time) */
-    GPTPS_TUI_ON_DEMAND,       /* repaint only when state changed since last frame, or on a key */
+    GPTPS_TUI_CONTINUOUS = 0,  /* real-time: looks every refresh_ms, and repaints when something it
+                                * shows changed (1.11: an unchanged dashboard is not even rendered;
+                                * 1.10 repainted the whole frame every time) */
+    GPTPS_TUI_ON_DEMAND,       /* repaint only when state changed (no sooner than refresh_ms after the
+                                * last frame), on a key, or when what it shows changes with time - a
+                                * toast fading, the clock, done/s and peak settling; blocked, no
+                                * timer, in between */
     GPTPS_TUI_PAUSED           /* frozen; repaint only on an explicit key / gptps_tui_snapshot */
 } gptps_tui_mode;
 
@@ -193,7 +201,13 @@ typedef struct {
     int         activity_lines;/* ACTIVITY journal lines (0 => as recent_lines; -1 => off; 1..4096) */
     int         clock;         /* gptps_tui_clock: the header's uptime (0 => MINUTES; out of range =>
                                 * install returns NULL, with an ERROR) */
-    int         rate_window_s; /* done/s and peak cover the last this many seconds (0 => 10; 1..300) */
+    int         rate_window_s; /* the window of the header's done/s and of peak (0 => 10 s; 1..300).
+                                * done/s: what finished in the last this-many seconds, over that
+                                * time (1.10: since install), from snapshots of the count a frame
+                                * takes (none on the event path); "-" until there is an earlier
+                                * snapshot to measure against, "n/a" at OFF (the totals stand
+                                * still). peak: the highest in-flight in the last one to two
+                                * windows (1.10: ever) */
     int         pane_refresh_ms;/* the tasks / settings / detail panes re-read the engine at most this
                                 * often (0 => 2000; 100..600000) */
 } gptps_tui_config;
@@ -245,8 +259,13 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
                                    int hotkey, const void *payload, size_t len,
                                    const gptps_submit_options *opts);
 
-/* Render one frame into `buf` (NUL-terminated, truncated to cap). Returns the
- * length written (excluding NUL). Pure read of live state - no terminal needed. */
+/* Render one frame into `buf` (NUL-terminated, truncated to cap - with a "[frame
+ * truncated]" line, counted). Returns the length written (excluding NUL). Pure read of
+ * live state - no terminal needed. The dashboard pane copies what it shows out under the
+ * dashboard's lock - only the TASKS rows and RECENT lines that fit the terminal's height
+ * (cols / rows: 80x24 headless) - and formats it with the lock released, so the engine's
+ * threads wait for the copy, not the formatting. One render at a time per dashboard: a
+ * second thread's render waits for the first. */
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
 
 /* Apply a key as if pressed: a bound hotkey submits its task (returns 1; if the engine
@@ -282,6 +301,15 @@ gptps_status gptps_tui_set_recent(gptps_tui *t, int problems, int activity);
 gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles);
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode);
 gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms);
+/* The header's uptime (1.11): OFF, MINUTES (DEFAULT) or SECONDS; else GPTPS_E_INVAL. Also
+ * `tui.clock` ("off", "minutes", "seconds"). See IDLE at gptps_tui_run for what each costs. */
+gptps_status gptps_tui_set_clock(gptps_tui *t, gptps_tui_clock clock);
+/* Wake gptps_tui_run (1.11): it re-reads the terminal's size and repaints - the lines that
+ * changed, or all of them when the size did. Async-signal-safe (it calls only write(2) on
+ * POSIX, SetEvent on Windows, and lock-free atomics), so a host's own SIGWINCH handler may
+ * call it: the dashboard installs no signal handler - the host owns its process. Without
+ * one, a resize is noticed at the next frame. A no-op when no live loop runs. */
+void gptps_tui_wake(gptps_tui *t);
 
 /* How the pending / in-flight gauges were obtained (gptps_tui_health.gauges, and the
  * mark before them on the frame). EXACT needs the handle table (LATENCY and up): from the events
@@ -336,13 +364,18 @@ typedef struct {
     uint64_t bytes_activity;      /* the ACTIVITY journal (NORMAL and up) */
     uint64_t bytes_handles;       /* the latency (handle) table (LATENCY and up) */
     uint64_t bytes_histogram;     /* the percentile histograms (FULL) */
-    uint64_t bytes_frame;         /* gptps_tui_run's frame buffer, while it runs */
+    uint64_t bytes_frame;         /* gptps_tui_run's frame buffers (16 KiB up to 256 KiB each),
+                                   * while it runs */
     uint64_t bytes_dead_letters;  /* the dead-letter view's held items (array only) */
     /* the live loop */
-    uint64_t frames_painted;      /* frames gptps_tui_run wrote */
-    uint64_t frames_skipped;      /* reserved: 0 */
-    uint64_t bytes_written;       /* what those frames wrote to the output, escapes included */
-    uint64_t wakes;               /* times gptps_tui_run's loop woke (a key, or its timeout) */
+    uint64_t frames_painted;      /* frames gptps_tui_run wrote (at least one byte) */
+    uint64_t frames_skipped;      /* frames it did not write, as nothing visible had changed: not
+                                   * made at all (CONTINUOUS, the dashboard unchanged) or made
+                                   * identical to the one on the screen (0 bytes) */
+    uint64_t bytes_written;       /* what those frames wrote to the output, escapes included: the
+                                   * lines that changed, not the whole frame (see OUTPUT) */
+    uint64_t wakes;               /* times gptps_tui_run's loop woke: a key, a wake (an event in
+                                   * ON_DEMAND, a setter, gptps_tui_wake), or a deadline */
     /* gauges, as the frame shows them */
     int      gauges;              /* gptps_tui_gauges */
     uint64_t pending, in_flight;
@@ -367,9 +400,47 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  * independent of the live loop or mode. */
 void gptps_tui_snapshot(gptps_tui *t);
 
-/* Blocking live loop: clear screen, then redraw every refresh_ms and dispatch
- * keystrokes until quit. No-op (returns immediately) unless both the output and stdin
- * are terminals - with a WARN when cfg.interactive asked for it anyway. Typed text is
+/* Blocking live loop: clear screen, then redraw (see the modes) and dispatch keystrokes
+ * until quit. No-op (returns immediately) unless both the output and stdin
+ * are terminals - with a WARN when cfg.interactive asked for it anyway.
+ *
+ * IDLE (1.11). Nothing happening costs nothing: the loop blocks on {stdin, a wake handle}
+ * until the earliest deadline of what it shows, and with none, for good - PAUSED and an idle
+ * ON_DEMAND make no wake, no frame and no write (1.10 woke every refresh_ms in every mode).
+ * The deadlines: refresh_ms after the last frame when state changed since (the rate limit);
+ * a toast's expiry (in every pane); the clock's next visible tick (cfg.clock: once a minute
+ * by default, never with OFF); done/s and peak settling after activity. CONTINUOUS looks
+ * every refresh_ms and, when the dashboard's state, clock and toast are as painted, makes no
+ * frame at all (frames_skipped: no render, no ioctl, no write); the other panes read the
+ * engine, so CONTINUOUS formats them every refresh_ms and writes only what changed. The wake
+ * handle - a self-pipe (O_NONBLOCK, FD_CLOEXEC) on POSIX, an auto-reset event on Windows -
+ * exists only while gptps_tui_run runs: a headless or MANUAL host, or one that only renders
+ * or snapshots, has none. The observer signals it only when the state turns dirty while the
+ * loop waits in ON_DEMAND, and after it has dropped its lock: at most one signal a frame
+ * interval, none when no loop waits. Setters, a quit and gptps_tui_wake signal it too. A
+ * resize is noticed at the next frame, at once on Windows (WINDOW_BUFFER_SIZE_EVENT) and on
+ * POSIX when the host's SIGWINCH handler calls gptps_tui_wake.
+ *
+ * OUTPUT (1.11). A frame is sent in one write. Only the lines that changed are rewritten
+ * (ESC[row;1H ... ESC[K); a frame equal to the one on the screen is 0 bytes; the whole
+ * frame is repainted after a resize, on another pane, or when more than half its lines
+ * changed. The frame buffer grows from 16 KiB to what a frame needs, up to 256 KiB; past
+ * that it is cut at a line with a visible "[frame truncated]" line (counted). The TASKS
+ * table and the tasks pane are fitted to the terminal's height ("+N more").
+ *
+ * HOST PROFILES.
+ *   - Embedded / MANUAL (no thread, render or snapshot only): no loop, no pipe, no timer -
+ *     done/s, peak and the clock advance inside render. Pick the tier by what you can
+ *     spare per event (MINIMAL or GAUGE); with the stub HAL's clock, cfg.clock = OFF.
+ *   - A server at 100k events/s: every tier is O(1) an event, but MINIMAL and up take one
+ *     mutex an event on every thread that emits; ON_DEMAND costs at most one wake a frame
+ *     interval; size latency_window to the in-flight depth.
+ *   - Task Scheduler / a service / headless: run returns at once (no console); only the
+ *     observer's cost remains - set kpi to what snapshots need, or OFF.
+ *   - An operator's console: the defaults (FULL, CONTINUOUS, clock in minutes) - idle, it
+ *     writes nothing and repaints the header once a minute.
+ *
+ * Typed text is
  * UTF-8 (on Windows the console's UTF-16 is converted, keys told apart by their
  * virtual-key code); bytes that do not form UTF-8 characters - a terminal not set to
  * UTF-8 - are left out, and the status line says so. Anything shown that the

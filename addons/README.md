@@ -602,7 +602,11 @@ enabled automatically). Panes/metrics:
 
 **Submit options (1.8).** `gptps_tui_add_task_ex` binds a hotkey that submits with `gptps_submit_options` — a due time counting from each press. Re-running the dead-letter view (`r`) re-submits each item with the options it was first given (`gptps_dead_letter.options`), except a due time that has passed.
 
-- header: uptime + **throughput** (done/s);
+- header: uptime (`cfg.clock` / `tui.clock` / `gptps_tui_set_clock`: `off`, `minutes` — the
+  default, `up <1m`, `up 42m` — or `seconds`) + **throughput**: `done/s` over the last
+  `cfg.rate_window_s` (10 s by default; 1.10 averaged since install), `-` until there is
+  anything to measure against, `n/a` at `off`; the in-flight `peak` covers the last one to two
+  windows (1.10: ever). A title that starts with `GPTPS` is not prefixed with it again;
 - counts (queued/started/finished/failed/retried/dead/dropped) + an **in-flight gauge
   bar**;
 - per-task table: run / ok / fail / dead / drop, **success rate (ok%)**, and **average
@@ -666,10 +670,24 @@ enabled automatically). Panes/metrics:
     `(other)` row, and the types folded there are counted and shown.
   - **Health** (`gptps_tui_health`): what the dashboard has lost (types folded, items not
     tracked, frames truncated, allocations failed, unmatched ends), the bytes each part
-    holds, and the live loop's paints, bytes and wakes. A `lost:` line appears on the frame
-    once something is.
+    holds, and the live loop's paints, skipped frames, bytes and wakes. A `lost:` line appears
+    on the frame once something is.
   - **Cadence** (`gptps_tui_set_mode`, or `p` live): `CONTINUOUS`, `ON_DEMAND`,
     `PAUSED`. `gptps_tui_snapshot()` renders one frame on demand.
+  - **Idle costs nothing** (1.11). `gptps_tui_run` blocks on stdin and a wake handle (a
+    self-pipe on POSIX, an event on Windows — made only while `run` runs) until the earliest
+    deadline of what the frame shows: `refresh_ms` after a change, a toast's expiry, the
+    clock's next tick, `done/s` and `peak` settling. `PAUSED` and an idle `ON_DEMAND` make no
+    wake, no frame and no write; an idle `CONTINUOUS` looks every `refresh_ms` and makes no
+    frame (`frames_skipped`). The observer signals the loop only when the state turns dirty
+    while it waits in `ON_DEMAND`, after dropping its lock — at most one signal a frame
+    interval. A frame goes out in **one write**, with only the lines that changed (`ESC[row;1H`
+    … `ESC[K`; an unchanged frame is 0 bytes), in a buffer that grows from 16 KiB to 256 KiB.
+    The TASKS table and the tasks pane fit the terminal's height (`+N more`). The dashboard
+    pane copies what it shows out under its lock and formats it with the lock released.
+    `gptps_tui_wake(t)` is async-signal-safe, for a host's own `SIGWINCH` handler — the
+    add-on installs no handler (the host owns its process); on Windows a console resize
+    repaints by itself.
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and
   `gptps_tui_press()` applies a key — both unit-tested headlessly; `gptps_tui_run()` is
   the blocking live loop (and self-skips without a TTY).
