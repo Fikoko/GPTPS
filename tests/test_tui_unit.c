@@ -2435,12 +2435,20 @@ static void test_header(void)
     CHECK(clock_next(1500, GPTPS_TUI_CLOCK_SECONDS) == 2000 && clock_next(1500, GPTPS_TUI_CLOCK_OFF) == 0);
     CHECK(t->clock == GPTPS_TUI_CLOCK_MINUTES);            /* the default, for a 1.10-layout caller too */
     now = gptps_now_ms(NULL);
-    t->start_ms = now - 125000;
-    gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "GPTPS \xc2\xb7 tasks   up 2m   ") != NULL && strstr(frame, " done/s") != NULL);
-    CHECK(gptps_tui_set_clock(t, GPTPS_TUI_CLOCK_SECONDS) == GPTPS_OK);
-    gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "up 2m0") != NULL);
+    /* an install 2m05s ago - which the monotonic clock (from boot) can show only once the
+     * machine has been up that long: a freshly booted host or runner says so and skips */
+    if (now >= 125000u) {
+        t->start_ms = now - 125000;
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "GPTPS \xc2\xb7 tasks   up 2m   ") != NULL && strstr(frame, " done/s") != NULL);
+        CHECK(gptps_tui_set_clock(t, GPTPS_TUI_CLOCK_SECONDS) == GPTPS_OK);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "up 2m0") != NULL);
+    } else {
+        printf("note: the clock reads %llu ms since boot; the 'up 2m' header check needs 125000 - skipped\n",
+               (unsigned long long)now);
+        CHECK(gptps_tui_set_clock(t, GPTPS_TUI_CLOCK_SECONDS) == GPTPS_OK);
+    }
     CHECK(gptps_settings_set(e, "tui.clock", "off") == GPTPS_OK && t->clock == GPTPS_TUI_CLOCK_OFF);
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(strstr(frame, "up ") == NULL);
@@ -2823,6 +2831,11 @@ static void test_pane_cache(void)
     CHECK(t->pc.n == 0 && t->pc.short_by > 0);
     CHECK(strstr(frame, "no task types registered") == NULL && strstr(frame, "no memory to list") != NULL);
     CHECK(strstr(frame, "not read: no memory") != NULL);
+    /* ...and at 80 columns with a slow pass's long figures it is still shown: it leads the
+     * line, which is cut to the width (seed 788 on the sim HAL: a 1.0 ms pass cut it) */
+    t->pc.cost_us = 116200; t->pc.every_ms = 11600; t->cols = 80;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "not read: no memory") != NULL && widest(frame) <= 80);
     gptps_tui_press(t, 'R');
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(t->pc.n == 7 && strstr(frame, "no memory") == NULL);   /* 8 less pc_2 */

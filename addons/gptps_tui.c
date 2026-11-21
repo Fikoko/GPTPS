@@ -1871,10 +1871,13 @@ static size_t pc_footer(gptps_tui *t, char *buf, size_t cap, size_t pos, const c
     int n;
     if (c->cost_us < 1000u) snprintf(cost, sizeof cost, "%llu us", (unsigned long long)c->cost_us);
     else                    snprintf(cost, sizeof cost, "%.1f ms", (double)c->cost_us / 1000.0);
-    n = snprintf(ln, sizeof ln, "  %s: %s, every %.1f s, age %llu s (R reads now)", what, cost,
+    /* what was not read comes first: the line is cut to the width, and a loss is the part
+     * that must show (at the end, 80 columns cut it once a pass took a millisecond) */
+    n = c->short_by ? snprintf(ln, sizeof ln, "  %s: %lu not read: no memory; ", what, (unsigned long)c->short_by)
+                    : snprintf(ln, sizeof ln, "  %s: ", what);
+    if (n > 0 && (size_t)n < sizeof ln)
+        snprintf(ln + n, sizeof ln - (size_t)n, "%s, every %.1f s, age %llu s (R reads now)", cost,
                  (double)c->every_ms / 1000.0, (unsigned long long)(now > c->read_ms ? (now - c->read_ms) / 1000u : 0u));
-    if (c->short_by && n > 0 && (size_t)n < sizeof ln)
-        snprintf(ln + n, sizeof ln - (size_t)n, "; %lu not read: no memory", (unsigned long)c->short_by);
     return appendf(buf, cap, pos, "%s%.*s%s\n", D, (int)u8_fit(ln, draw_width(t) - 1), ln, X);
 }
 
