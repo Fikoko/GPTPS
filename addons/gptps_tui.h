@@ -308,7 +308,10 @@ gptps_status gptps_tui_set_clock(gptps_tui *t, gptps_tui_clock clock);
  * changed, or all of them when the size did. Async-signal-safe (it calls only write(2) on
  * POSIX, SetEvent on Windows, and lock-free atomics), so a host's own SIGWINCH handler may
  * call it: the dashboard installs no signal handler - the host owns its process. Without
- * one, a resize is noticed at the next frame. A no-op when no live loop runs. */
+ * one, CONTINUOUS still notices a resize within refresh_ms; an idle ON_DEMAND or PAUSED
+ * loop, which waits with no timeout, notices it only at its next frame (an event, a key,
+ * the clock) - a change from 1.10, which looked every refresh_ms in every mode. A no-op
+ * when no live loop runs. */
 void gptps_tui_wake(gptps_tui *t);
 
 /* How the pending / in-flight gauges were obtained (gptps_tui_health.gauges, and the
@@ -411,15 +414,19 @@ void gptps_tui_snapshot(gptps_tui *t);
  * a toast's expiry (in every pane); the clock's next visible tick (cfg.clock: once a minute
  * by default, never with OFF); done/s and peak settling after activity. CONTINUOUS looks
  * every refresh_ms and, when the dashboard's state, clock and toast are as painted, makes no
- * frame at all (frames_skipped: no render, no ioctl, no write); the other panes read the
+ * frame at all (frames_skipped: no render, no write - one size ioctl); the other panes read the
  * engine, so CONTINUOUS formats them every refresh_ms and writes only what changed. The wake
  * handle - a self-pipe (O_NONBLOCK, FD_CLOEXEC) on POSIX, an auto-reset event on Windows -
  * exists only while gptps_tui_run runs: a headless or MANUAL host, or one that only renders
  * or snapshots, has none. The observer signals it only when the state turns dirty while the
  * loop waits in ON_DEMAND, and after it has dropped its lock: at most one signal a frame
  * interval, none when no loop waits. Setters, a quit and gptps_tui_wake signal it too. A
- * resize is noticed at the next frame, at once on Windows (WINDOW_BUFFER_SIZE_EVENT) and on
- * POSIX when the host's SIGWINCH handler calls gptps_tui_wake.
+ * resize is noticed: at once on Windows (WINDOW_BUFFER_SIZE_EVENT; the loop sets
+ * ENABLE_WINDOW_INPUT on the console input while it runs, and restores the mode after) and
+ * on POSIX when the host's SIGWINCH handler calls gptps_tui_wake; without that handler,
+ * within refresh_ms in CONTINUOUS, and in an idle ON_DEMAND or PAUSED loop only at its
+ * next frame (1.10 re-measured every refresh_ms in every mode). The loop waits with poll(),
+ * so a host with more than FD_SETSIZE descriptors open is fine.
  *
  * OUTPUT (1.11). A frame is sent in one write. Only the lines that changed are rewritten
  * (ESC[row;1H ... ESC[K); a frame equal to the one on the screen is 0 bytes; the whole

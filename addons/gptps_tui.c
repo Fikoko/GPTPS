@@ -36,9 +36,9 @@ static int  fd_is_tty(FILE *f)       { return _isatty(_fileno(f)); }
 #else
 #  include <unistd.h>
 #  include <termios.h>
-#  include <sys/select.h>
 #  include <sys/ioctl.h>
 #  include <fcntl.h>    /* the live loop's self-pipe: O_NONBLOCK, FD_CLOEXEC */
+#  include <poll.h>     /* poll, not select: the self-pipe may be past FD_SETSIZE in a busy host */
 #  include <pthread.h>
 typedef pthread_mutex_t tui_mutex;
 static void mu_init(tui_mutex *m)    { pthread_mutex_init(m, NULL); }
@@ -586,6 +586,7 @@ typedef struct {
     /* caches: rebuilt only when what they are made of changes */
     char     legend[TUI_LEGEND_CAP];
     int      legrows, leg_W, leg_uni, leg_ok;
+    uint64_t leg_builds;                 /* times the legend was rebuilt (tests: the cache holds) */
     uint64_t leg_gen;
     char     rule[16 + 200 * 3 + 16];
     int      rule_W, rule_uni;
@@ -745,6 +746,7 @@ struct gptps_tui {
     struct termios   saved_termios;
 #else
     DWORD            saved_out_mode; int modes_saved;
+    DWORD            saved_in_mode;  int in_mode_saved;
     UINT             saved_cp;      /* console output codepage to restore (0 = none saved) */
     HANDLE           wake_ev;       /* the live loop's event (see wake_h) */
 #endif
@@ -1924,6 +1926,8 @@ static double rate_take(gptps_tui *t, uint64_t now, int *state, uint64_t *next)
     uint64_t win = (uint64_t)t->cfg.rate_window_s * 1000u, step = rate_step(t->cfg.rate_window_s);
     const tui_rs *pick = NULL, *older = NULL, *newest;
     int i;
+    if (now < t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms && t->rate_n)
+        now = t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms;   /* never back in time */
     if (!t->rate_n || now - t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms >= step) {
         t->rate[t->rate_head].ms = now; t->rate[t->rate_head].fin = t->fin;
         t->rate_head = (t->rate_head + 1) % TUI_RATE_N;
@@ -1951,7 +1955,7 @@ static double rate_take(gptps_tui *t, uint64_t now, int *state, uint64_t *next)
 static uint64_t peak_take(gptps_tui *t, uint64_t now, uint64_t cur, uint64_t *next)
 {
     uint64_t win = (uint64_t)t->cfg.rate_window_s * 1000u, shown;
-    if (now - t->peak_ms >= win) { t->peak_prev = t->peak; t->peak = cur; t->peak_ms = now; }
+    if (now >= t->peak_ms && now - t->peak_ms >= win) { t->peak_prev = t->peak; t->peak = cur; t->peak_ms = now; }
     if (cur > t->peak) t->peak = cur;
     shown = t->peak > t->peak_prev ? t->peak : t->peak_prev;
     *next = shown > cur ? t->peak_ms + win : 0;
@@ -2054,7 +2058,7 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     if (v->toast_on) memcpy(v->status, t->status, sizeof v->status);
     if (!v->leg_ok || v->leg_gen != t->ui_gen || v->leg_W != W || v->leg_uni != v->uni) {
         v->legrows = legend_text(t, W, v->legend, sizeof v->legend);
-        v->leg_ok = 1; v->leg_gen = t->ui_gen; v->leg_W = W; v->leg_uni = v->uni;
+        v->leg_ok = 1; v->leg_gen = t->ui_gen; v->leg_W = W; v->leg_uni = v->uni; v->leg_builds++;
     }
     /* done/s needs only the totals; at OFF they stand still, so there is no rate to show */
     if (t->tier == TUI_T_OFF) { v->rate_state = 2; v->rate = 0.0; }
@@ -2451,12 +2455,15 @@ static void warn_problems_lost(uint64_t n)
  * `dirty`; *meta filled). Returns its length. */
 static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
 {
-    uint64_t warn = 0, now = gptps_now_ms(NULL);
+    uint64_t warn = 0, now;
     size_t pos, n;
     int dash = t->pane == TUI_PANE_DASH;
     if (dash) trk_resync(t);             /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
-    if (dash && !view_frame(t, now, loop, &warn)) {
+    now = gptps_now_ms(NULL);            /* under rmu: frames take their times in order */
+    if (!dash || !view_frame(t, now, loop, &warn)) {
+        /* every pane's frame shows the state as of now: the next change is a 0 -> 1 again
+         * (on the dashboard view_take clears it, under the same lock as the copy-out) */
         if (loop) { mu_lock(&t->mu); t->dirty = 0; mu_unlock(&t->mu); }
     }
     pos = pane_format(t, f->b, f->cap);
@@ -3065,18 +3072,16 @@ static void term_restore(gptps_tui *t)
 /* Read one byte within `ms`; -1 if none arrived. */
 static int term_read_byte(int ms)
 {
-    fd_set fds; struct timeval tv; unsigned char c;
-    FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
-    tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+    struct pollfd pf; unsigned char c;
+    pf.fd = STDIN_FILENO; pf.events = POLLIN; pf.revents = 0;
+    if (poll(&pf, 1, ms) > 0) {
         ssize_t r = read(STDIN_FILENO, &c, 1);
         if (r == 1) return c;
         if (r == 0 || (errno != EINTR && errno != EAGAIN)) {
             /* readable but nothing to read: end of input (the terminal went away, or
-             * stdin was never one). select() would report that at once forever, and
+             * stdin was never one). poll() would report that at once forever, and
              * the loop spun repainting with no wait: wait the interval anyway. */
-            tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
-            select(0, NULL, NULL, NULL, &tv);
+            poll(NULL, 0, ms);
         }
     }
     return -1;
@@ -3101,33 +3106,47 @@ static int term_decode_escape(void)
     }
 }
 /* The next key typed, without waiting (-1: none). *eof: stdin is at its end (the terminal
- * went away): select() would report it readable at once forever, so the loop stops
+ * went away): poll() would report it readable at once forever, so the loop stops
  * watching it rather than spin. */
 static int term_key(int *eof, int *resized)
 {
-    fd_set fds; struct timeval tv; unsigned char c; ssize_t r;
+    struct pollfd pf; unsigned char c; ssize_t r;
     (void)resized;                                 /* POSIX: a resize is the host's SIGWINCH */
-    FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
-    tv.tv_sec = 0; tv.tv_usec = 0;
-    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) return -1;
+    pf.fd = STDIN_FILENO; pf.events = POLLIN; pf.revents = 0;
+    if (poll(&pf, 1, 0) <= 0) return -1;
     r = read(STDIN_FILENO, &c, 1);
     if (r == 1) return c == 27 ? term_decode_escape() : c;   /* may be an arrow key; else a bare Esc */
     if (r == 0 || (errno != EINTR && errno != EAGAIN)) *eof = 1;
     return -1;
 }
-static void term_size(gptps_tui *t)
+static int term_size_set(gptps_tui *t, int c, int r);
+/* The terminal's size into t->cols / rows; 1 when it changed. */
+static int term_size(gptps_tui *t)
 {
     struct winsize ws;
-    if (ioctl(fileno(t->cfg.out), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {   /* the terminal drawn on */
-        t->cols = ws.ws_col;
-        if (ws.ws_row > 0) t->rows = ws.ws_row;
-    }
+    if (ioctl(fileno(t->cfg.out), TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)   /* the terminal drawn on */
+        return term_size_set(t, ws.ws_col, ws.ws_row > 0 ? ws.ws_row : t->rows);
+    return 0;
 }
 /* The wake handle: a self-pipe, both ends non-blocking and close-on-exec (a job the engine
- * starts meanwhile must not inherit it). *rfd: the end the loop reads. */
+ * starts meanwhile must not inherit it). *rfd: the end the loop reads. Where pipe2 exists
+ * the pipe is born close-on-exec, so a job the engine forks on another thread between
+ * pipe() and fcntl() cannot inherit it; elsewhere (macOS) that window remains. */
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#  define TUI_HAVE_PIPE2 1
+int pipe2(int fds[2], int flags);                  /* hidden by _POSIX_C_SOURCE; in libc all the same */
+#endif
 static int wake_open(gptps_tui *t, int *rfd)
 {
     int fds[2], k;
+#if defined(TUI_HAVE_PIPE2) && defined(O_CLOEXEC)
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == 0) {
+        *rfd = fds[0];
+        sc_set(&t->wake_h, (long)fds[1] + 1);
+        return 1;
+    }
+    if (errno != ENOSYS) return 0;
+#endif
     if (pipe(fds) != 0) return 0;
     for (k = 0; k < 2; ++k) {
         int fl = fcntl(fds[k], F_GETFL);
@@ -3146,7 +3165,7 @@ static void wake_close(gptps_tui *t, int rfd)
 {
     long h = sc_get(&t->wake_h);
     sc_set(&t->wake_h, 0);
-    while (sc_get(&t->wakers)) { struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 1000; select(0, NULL, NULL, NULL, &tv); }
+    while (sc_get(&t->wakers)) poll(NULL, 0, 1);
     if (h > 0) close((int)(h - 1));
     if (rfd >= 0) close(rfd);
 }
@@ -3154,17 +3173,16 @@ static void wake_close(gptps_tui *t, int rfd)
  * pipe, drained). */
 static int term_wait(gptps_tui *t, int rfd, int use_stdin, long ms)
 {
-    fd_set fds; struct timeval tv; int mx = -1, r, got = 0;
+    struct pollfd pf[2]; int n = 0, r, got = 0, si = -1, wi = -1;
     (void)t;
-    FD_ZERO(&fds);
-    if (use_stdin) { FD_SET(STDIN_FILENO, &fds); mx = STDIN_FILENO; }
-    if (rfd >= 0) { FD_SET(rfd, &fds); if (rfd > mx) mx = rfd; }
-    if (mx < 0 && ms < 0) ms = 250;                /* nothing to wait on: never block for good */
-    if (ms >= 0) { tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000; }
-    r = select(mx + 1, &fds, NULL, NULL, ms >= 0 ? &tv : NULL);
+    if (use_stdin) { si = n; pf[n].fd = STDIN_FILENO; pf[n].events = POLLIN; pf[n].revents = 0; ++n; }
+    if (rfd >= 0)  { wi = n; pf[n].fd = rfd;          pf[n].events = POLLIN; pf[n].revents = 0; ++n; }
+    if (n == 0 && ms < 0) ms = 250;                /* nothing to wait on: never block for good */
+    if (ms > 86400000L) ms = 86400000L;
+    r = poll(n ? pf : NULL, (nfds_t)n, ms < 0 ? -1 : (int)ms);
     if (r <= 0) return 0;                          /* the timeout, or a signal (EINTR) */
-    if (rfd >= 0 && FD_ISSET(rfd, &fds)) { char b[64]; while (read(rfd, b, sizeof b) > 0) { } got |= 2; }
-    if (use_stdin && FD_ISSET(STDIN_FILENO, &fds)) got |= 1;
+    if (wi >= 0 && pf[wi].revents) { char b[64]; while (read(rfd, b, sizeof b) > 0) { } got |= 2; }
+    if (si >= 0 && pf[si].revents) got |= 1;       /* POLLHUP too: term_key then sees the end */
     return got;
 }
 /* One frame's bytes in one write() (stdio would send a line-buffered terminal one per
@@ -3187,6 +3205,15 @@ static void term_enable(gptps_tui *t)
     HANDLE ho = GetStdHandle(STD_OUTPUT_HANDLE); DWORD m;
     if (GetConsoleMode(ho, &m)) { t->saved_out_mode = m; t->modes_saved = 1;
         SetConsoleMode(ho, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING); }
+    /* The console sends WINDOW_BUFFER_SIZE_EVENT only with ENABLE_WINDOW_INPUT, which the
+     * default input mode leaves out: set it (the other bits kept) so a resize repaints. */
+    {
+        HANDLE hi = GetStdHandle(STD_INPUT_HANDLE); DWORD im;
+        if (hi != NULL && hi != INVALID_HANDLE_VALUE && GetConsoleMode(hi, &im)) {
+            t->saved_in_mode = im; t->in_mode_saved = 1;
+            SetConsoleMode(hi, im | ENABLE_WINDOW_INPUT);
+        }
+    }
     /* Our frames are UTF-8 bytes; put the console in UTF-8 so box-drawing and
      * other glyphs render (a legacy OEM codepage - e.g. CP857 - shows mojibake).
      * Save the old codepage and restore it in term_restore. If UTF-8 can't be
@@ -3197,6 +3224,7 @@ static void term_enable(gptps_tui *t)
 }
 static void term_restore(gptps_tui *t)
 { if (t->modes_saved) { SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), t->saved_out_mode); t->modes_saved = 0; }
+  if (t->in_mode_saved) { SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), t->saved_in_mode); t->in_mode_saved = 0; }
   if (t->saved_cp) { SetConsoleOutputCP(t->saved_cp); t->saved_cp = 0; }
   t->raw_active = 0; }
 /* Keys come from ReadConsoleInputW: each KEY_EVENT carries the character typed
@@ -3260,14 +3288,15 @@ static int term_key(int *eof, int *resized)
         /* a key release, a mouse or focus event: on to the next record */
     }
 }
-static void term_size(gptps_tui *t)
+static int term_size_set(gptps_tui *t, int c, int r);
+static int term_size(gptps_tui *t)
 {
     CONSOLE_SCREEN_BUFFER_INFO ci;
     if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &ci)) {
         int c = ci.srWindow.Right - ci.srWindow.Left + 1, r = ci.srWindow.Bottom - ci.srWindow.Top + 1;
-        if (c > 0) t->cols = c;
-        if (r > 0) t->rows = r;
+        return term_size_set(t, c > 0 ? c : t->cols, r > 0 ? r : t->rows);
     }
+    return 0;
 }
 /* The wake handle: an auto-reset event (not inheritable). */
 static int wake_open(gptps_tui *t, int *rfd)
@@ -3313,6 +3342,15 @@ static size_t term_write(FILE *out, const char *b, size_t n)
     return done;
 }
 #endif
+
+/* The size, stored only when it changed, and then under rmu: a host's render on another
+ * thread reads it while it formats (the loop, its only writer, reads it unlocked). */
+static int term_size_set(gptps_tui *t, int c, int r)
+{
+    if (c == t->cols && r == t->rows) return 0;
+    mu_lock(&t->rmu); t->cols = c; t->rows = r; mu_unlock(&t->rmu);
+    return 1;
+}
 
 /* ---- output: one write a frame, only the lines that changed ----------------------
  * A frame's lines are its text between newlines (the last, after the final newline, is
@@ -3405,7 +3443,7 @@ void gptps_tui_run(gptps_tui *t)
     char *ob = NULL;
     size_t ocap = 0;
     int first = 1, kp = 0, rfd = -1, have_wake, use_stdin = 1, resized = 0, painted_pane = -1;
-    uint64_t last = 0, painted_gen = 0, vis = 0;
+    uint64_t last = 0, painted_gen = 0, painted_lost = 0, vis = 0;
     if (!t || !t->cfg.interactive) return;
     /* Needs a terminal both ways: frames out, keys in. With stdin at end of input
      * (</dev/null, a closed pipe, a launcher that gives it none) the key poll returned
@@ -3436,9 +3474,10 @@ void gptps_tui_run(gptps_tui *t)
     for (;;) {
         int q, md, dirty, paint, eof = 0, rz = 0, w;
         uint32_t rms;
-        uint64_t now, gen, deadline = 0;
+        uint64_t now, gen, lost, deadline = 0;
         long ms;
-        mu_lock(&t->mu); q = t->quit; md = t->mode; rms = t->cfg.refresh_ms; gen = t->gen; dirty = t->dirty; mu_unlock(&t->mu);
+        mu_lock(&t->mu); q = t->quit; md = t->mode; rms = t->cfg.refresh_ms; gen = t->gen; dirty = t->dirty;
+        lost = t->h_trunc + t->h_nomem; mu_unlock(&t->mu);
         if (q) break;
         now = gptps_now_ms(NULL);
         if (sc_get(&t->wake_req)) { sc_set(&t->wake_req, 0); resized |= 2; }   /* gptps_tui_wake: look again */
@@ -3446,28 +3485,36 @@ void gptps_tui_run(gptps_tui *t)
         if (!paint && md != GPTPS_TUI_PAUSED && now >= last + rms) {
             /* CONTINUOUS: the generation skip - the dashboard pane's state, clock and toast
              * as they were painted: no frame (the other panes read the engine: formatted) */
-            int changed = md == GPTPS_TUI_CONTINUOUS ? gen != painted_gen || t->pane != TUI_PANE_DASH : dirty;
+            int changed = md == GPTPS_TUI_CONTINUOUS
+                        ? gen != painted_gen || lost != painted_lost || t->pane != TUI_PANE_DASH : dirty;
             paint = paint_due(0, 0, md, changed, vis, now);
-            if (!paint && md == GPTPS_TUI_CONTINUOUS) { last = now; mu_lock(&t->mu); t->h_skipped++; mu_unlock(&t->mu); }
+            if (!paint && md == GPTPS_TUI_CONTINUOUS) {
+                /* still follow the window (one ioctl: no render, no write), as 1.10 did
+                 * every refresh_ms - a host need not install a SIGWINCH handler */
+                if (term_size(t)) { resized |= 1; paint = 1; }
+                else { last = now; mu_lock(&t->mu); t->h_skipped++; mu_unlock(&t->mu); }
+            }
         } else if (!paint && md == GPTPS_TUI_ON_DEMAND && vis && now >= vis) {
             paint = 1;                          /* a toast to take away: not held to the rate limit */
         }
         if (paint) {
-            int oc = t->cols, orw = t->rows, full;
+            int full, asked;
             size_t n, nl, olen = 0, wrote = 0, hdr = first ? 12 : 0;
             tui_fmeta meta;
-            term_size(t);                       /* the layout follows the window */
-            if (t->cols != oc || t->rows != orw) resized |= 1;
+            if (term_size(t)) resized |= 1;     /* the layout follows the window */
             n = tui_frame(t, &fb, 1, &meta);
             mu_lock(&t->mu); t->h_made++; mu_unlock(&t->mu);
             nl = frame_nlines(fb.b);
-            full = first || (resized & 1) || meta.pane != painted_pane || (int)nl > draw_rows(t);
+            asked = first || (resized & 1) || meta.pane != painted_pane;
+            full = asked || (int)nl > draw_rows(t);     /* taller than the screen: scrolled, so redraw it all */
             if (ocap < hdr + frame_out_cap(n, nl)) {   /* the output buffer, grown with the frame */
                 char *nb = (char *)realloc(ob, hdr + frame_out_cap(n, nl));
                 if (nb) { ob = nb; ocap = hdr + frame_out_cap(n, nl); }
                 else { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
             }
-            if (ocap >= hdr + frame_out_cap(n, nl)) {
+            if (!asked && strcmp(fb.b, pv.b) == 0) {
+                olen = 0;                       /* the same frame, even one taller than the screen */
+            } else if (ocap >= hdr + frame_out_cap(n, nl)) {
                 if (first) memcpy(ob, "\x1b[?25l\x1b[2J", 10);   /* hide the cursor, clear once */
                 olen = frame_diff(fb.b, first ? NULL : pv.b, full, ob + (first ? 10 : 0)) + (first ? 10 : 0);
                 if (olen) wrote = term_write(t->cfg.out, ob, olen);
@@ -3479,6 +3526,7 @@ void gptps_tui_run(gptps_tui *t)
             mu_lock(&t->mu);
             if (wrote) { t->h_painted++; t->h_written += wrote; } else t->h_skipped++;
             t->frame_bytes = fb.cap + pv.cap + ocap;
+            painted_lost = t->h_trunc + t->h_nomem;   /* as this frame left them (it may add one) */
             mu_unlock(&t->mu);
             { tui_fbuf x = fb; fb = pv; pv = x; }   /* what the screen shows now */
             painted_pane = meta.pane;
@@ -3509,7 +3557,9 @@ void gptps_tui_run(gptps_tui *t)
             int k;
             while ((k = term_key(&eof, &rz)) >= 0) {
                 uint64_t sm = t->status_ms;
-                if (gptps_tui_press(t, k) != 0 || t->status_ms != sm) kp = 1;   /* a key that did nothing: no frame */
+                int pr = gptps_tui_press(t, k);
+                if (pr != 0 || t->status_ms != sm) kp = 1;   /* a key that did nothing: no frame */
+                if (pr < 0) break;              /* quit: the keys typed after it are not applied */
             }
             if (rz) resized |= 1;
             if (eof && use_stdin) {

@@ -154,6 +154,8 @@ static void *tui_test_malloc(size_t n)
 #  include <fcntl.h>
 #  include <pthread.h>
 #  include <signal.h>
+#  include <sys/select.h>   /* FD_SETSIZE */
+#  include <sys/resource.h>
 #endif
 
 static int fails = 0;
@@ -2382,6 +2384,16 @@ static void test_header(void)
     CHECK(peak_take(t, 5000, 2, &nx) == 7 && nx == 10000);
     CHECK(peak_take(t, 10000, 2, &nx) == 7 && nx == 20000);   /* the last window's */
     CHECK(peak_take(t, 20000, 2, &nx) == 2 && nx == 0);       /* gone: it was 1.10's for ever */
+    /* a frame whose time was read before another's (two threads render): no snapshot out
+     * of order, no early rotation - the unsigned differences must not wrap */
+    {
+        int n0 = t->rate_n;
+        r = rate_take(t, 11000, &st, &nx);
+        CHECK(t->rate_n == n0 && t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms == 12500);
+        CHECK(st == 1 && r == 0.0);
+        t->peak = 5;
+        CHECK(peak_take(t, 15000, 2, &nx) == 5 && t->peak_ms == 20000 && t->peak == 5);
+    }
     mu_unlock(&t->mu);
     CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_OFF) == GPTPS_OK);
     gptps_tui_render(t, frame, sizeof frame);
@@ -2499,19 +2511,21 @@ static void test_height_fit(void)
 static void test_legend_cache(void)
 {
     gptps *e = open_manual(); gptps_tui *t; static char frame[16384];
-    uint64_t g;
+    uint64_t g, b;
     if (!e) return;
     t = install(e);
     CHECK(t != NULL);
     if (!t) { gptps_shutdown(e); return; }
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(strstr(frame, "[w] Wash") == NULL && t->view != NULL);
-    g = t->view->leg_gen;
+    g = t->view->leg_gen; b = t->view->leg_builds;
+    CHECK(b == 1);
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(t->view->leg_gen == g);                          /* nothing changed: not rebuilt */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->view->leg_gen == g && t->view->leg_builds == b);   /* nothing changed: not rebuilt */
     CHECK(gptps_tui_add_task(t, "wash", "Wash", 'w', NULL, 0) == GPTPS_OK);
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "[w] Wash") != NULL);              /* a new binding: rebuilt */
+    CHECK(strstr(frame, "[w] Wash") != NULL && t->view->leg_builds == b + 1);   /* a new binding: rebuilt */
     t->cols = 200;
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(t->view->legrows == 1 && strstr(frame, "[w] Wash  \xc2\xb7  Up/Dn scroll  s settings") != NULL);
@@ -2673,7 +2687,8 @@ static void test_live_idle(void)
             gptps_tui_wake(lv_t);
             lv_sleep(200);
             h1 = health(lv_t);
-            CHECK(h1.frames_painted == h0.frames_painted + 1 && lv_t->cols == 100);
+            mu_lock(&lv_t->rmu); k = lv_t->cols; mu_unlock(&lv_t->rmu);
+            CHECK(h1.frames_painted == h0.frames_painted + 1 && k == 100);
             ws.ws_col = 80; ioctl(s, TIOCSWINSZ, &ws);
             /* a toast clears by itself at 3 s: one frame for the key, one when it fades */
             h0 = health(lv_t);
@@ -2703,6 +2718,63 @@ static void test_live_idle(void)
         CHECK(h1.bytes_written == h0.bytes_written && lv_got == 0 && h1.frames_painted == h0.frames_painted);
         CHECK(h1.frames_skipped >= h0.frames_skipped + 10);
         mu_lock(&lv_t->mu); CHECK(lv_t->h_made == made); mu_unlock(&lv_t->mu);   /* not even rendered */
+        lv_stop();
+    }
+    /* CONTINUOUS follows a resize with no SIGWINCH handler (no gptps_tui_wake): one ioctl
+     * each refresh_ms, as 1.10 - and the 'lost:' line follows a truncated render */
+    if (lv_start(GPTPS_TUI_CONTINUOUS, 0, 50)) {
+        static char tiny[64];
+        h0 = health(lv_t);
+        ws.ws_col = 120; ioctl(s, TIOCSWINSZ, &ws);
+        lv_sleep(1500);
+        h1 = health(lv_t);
+        mu_lock(&lv_t->rmu); k = lv_t->cols; mu_unlock(&lv_t->rmu);
+        if (k != 120 || h1.frames_painted != h0.frames_painted + 1)
+            printf("continuous resize, no wake: cols %d, %llu frames\n", k,
+                   (unsigned long long)(h1.frames_painted - h0.frames_painted));
+        CHECK(k == 120 && h1.frames_painted == h0.frames_painted + 1);
+        ws.ws_col = 80; ioctl(s, TIOCSWINSZ, &ws);
+        lv_sleep(500);
+        h0 = health(lv_t); lv_buflen = 0;
+        gptps_tui_render(lv_t, tiny, sizeof tiny);        /* a host's render, cut: counted */
+        lv_sleep(500);
+        h1 = health(lv_t);
+        lv_buf[lv_buflen] = 0;
+        CHECK(h1.frames_truncated == h0.frames_truncated + 1);
+        CHECK(h1.frames_painted == h0.frames_painted + 1 && strstr(lv_buf, "1 frames truncated") != NULL);
+        lv_sleep(500);
+        CHECK(health(lv_t).frames_painted == h1.frames_painted);   /* and then quiet again */
+        lv_stop();
+    }
+    /* ON_DEMAND on another pane: an event costs one frame, then it waits again with no
+     * timeout; the help pane is taller than 24 rows, and the same frame again writes 0 */
+    if (lv_start(GPTPS_TUI_ON_DEMAND, 0, 50)) {
+        lv_buflen = 0;
+        CHECK(write(lv_m, "?", 1) == 1);
+        lv_sleep(500);
+        lv_buf[lv_buflen] = 0;
+        CHECK(strstr(lv_buf, "Up/Down move") != NULL);   /* the help pane is up */
+        h0 = health(lv_t);
+        emit(lv_t, GPTPS_EV_QUEUED, "one", 1, GPTPS_OK, gptps_now_ms(NULL));
+        lv_sleep(500);
+        h1 = health(lv_t);
+        CHECK(h1.bytes_written == h0.bytes_written);      /* the help frame did not change */
+        lv_sleep(2000);
+        h0 = health(lv_t);
+        if (h0.wakes != h1.wakes || h0.bytes_written != h1.bytes_written)
+            printf("help pane idle after an event: %llu wakes, %llu bytes\n", (unsigned long long)(h0.wakes - h1.wakes),
+                   (unsigned long long)(h0.bytes_written - h1.bytes_written));
+        CHECK(h0.wakes == h1.wakes && h0.bytes_written == h1.bytes_written);
+        lv_stop();
+    }
+    /* keys typed after 'q' in the same read are not applied ('n' would try to submit) */
+    if (lv_start(GPTPS_TUI_ON_DEMAND, 0, 50)) {
+        CHECK(write(lv_m, "qn", 2) == 2);
+        pthread_join(lv_th, NULL);                        /* it quit */
+        CHECK(strstr(lv_t->status, "Nosuch") == NULL);
+        mu_lock(&lv_t->mu); lv_t->quit = 0; mu_unlock(&lv_t->mu);
+        CHECK(pthread_create(&lv_th, NULL, lv_run, NULL) == 0);   /* for lv_stop to join */
+        lv_sleep(100);
         lv_stop();
     }
     /* one changed line is one line's bytes (GAUGE: an event changes the gauge line only) */
@@ -2765,6 +2837,29 @@ static void test_live_idle(void)
         gptps_tui_close(lv_t);
     }
     CHECK(open_fds() == before);
+    /* a host with more than FD_SETSIZE descriptors open: the wake pipe lands past it, and the
+     * loop still waits on it (select's fd_set could not hold it) */
+    {
+        struct rlimit rl;
+        int dn[FD_SETSIZE + 16], nd = 0, j;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && (rl.rlim_cur >= FD_SETSIZE + 64 ||
+            (rl.rlim_max >= FD_SETSIZE + 64 && (rl.rlim_cur = FD_SETSIZE + 64, setrlimit(RLIMIT_NOFILE, &rl) == 0)))) {
+            int z = open("/dev/null", O_RDONLY);
+            while (z >= 0 && nd < (int)(sizeof dn / sizeof dn[0]) && (dn[nd] = dup(z)) >= 0 && dn[nd] < FD_SETSIZE + 4) ++nd;
+            if (z >= 0 && nd < (int)(sizeof dn / sizeof dn[0]) && dn[nd] >= 0) ++nd;
+            /* z stays open until the end: a hole below FD_SETSIZE would take the pipe's read end */
+            CHECK(freopen(ptsname(lv_m), "r", stdin) != NULL);
+            if (lv_start(GPTPS_TUI_ON_DEMAND, 0, 50)) {
+                CHECK(sc_get(&lv_t->wake_h) - 1 >= FD_SETSIZE);
+                h0 = health(lv_t);
+                emit(lv_t, GPTPS_EV_QUEUED, "one", 1, GPTPS_OK, gptps_now_ms(NULL));
+                CHECK(lv_until_painted(h0.frames_painted + 1));   /* woken through the pipe */
+                lv_stop();
+            }
+            for (j = 0; j < nd; ++j) close(dn[j]);
+            if (z >= 0) close(z);
+        } else printf("note: cannot open %d descriptors; the FD_SETSIZE check is skipped\n", FD_SETSIZE + 64);
+    }
     alarm(0);
     fclose(lv_out);
     close(lv_m);

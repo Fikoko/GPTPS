@@ -686,8 +686,11 @@ enabled automatically). Panes/metrics:
     The TASKS table and the tasks pane fit the terminal's height (`+N more`). The dashboard
     pane copies what it shows out under its lock and formats it with the lock released.
     `gptps_tui_wake(t)` is async-signal-safe, for a host's own `SIGWINCH` handler — the
-    add-on installs no handler (the host owns its process); on Windows a console resize
-    repaints by itself.
+    add-on installs no handler (the host owns its process). Without one, `CONTINUOUS`
+    still follows a resize within `refresh_ms`, but an idle `ON_DEMAND` or `PAUSED` loop
+    (which waits with no timeout) notices it only at its next frame — 1.10 looked every
+    `refresh_ms` in every mode. On Windows a console resize repaints by itself (the loop
+    turns on `ENABLE_WINDOW_INPUT` while it runs).
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and
   `gptps_tui_press()` applies a key — both unit-tested headlessly; `gptps_tui_run()` is
   the blocking live loop (and self-skips without a TTY).
