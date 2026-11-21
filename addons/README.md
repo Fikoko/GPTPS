@@ -587,8 +587,43 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   off by an out-of-order event is taken from the late one instead, as a lower bound.
   `tests/test_stats_order.c` runs 15 handle lifecycles - retries, cancels, REQUEUE
   cycles - through every order their events can arrive in.
-- **Cost:** one lock and one hash lookup per event. The handle table is bounded by the
-  engine's own queue.
+- **Cost:** one lock and one hash lookup per event, plus a hashed task-row lookup (FNV-1a,
+  one probe and one compare, whatever the number of types) on a handle's first event.
+  The event path allocates nothing (1.12): the task rows, the handle table and the
+  measurement tables are made at install, sized by `gptps_stats_install_ex(e, &cfg)`
+  (`gptps_stats_config`: `max_tasks` 256, `handles` 1024, `handles_max` 1<<20,
+  `measure_tables` 8 by default — about 0.25 MiB; out-of-range values are refused, never
+  clamped). What does not fit is counted and WARNed, at most once a minute per condition,
+  never grown into and never evicted: a task type past `max_tasks` counts in one
+  `(other)` row (enumerated last, `GPTPS_STATS_ROW_OTHER` in a snapshot); a handle that
+  finds every live entry taken is not tracked (the gauges undercount); markers for
+  handles whose `QUEUED` never came — work submitted before install, a service's later
+  runs — are bounded to the newest 64, the oldest dropped and counted. The handle table
+  grows only outside the event path: `gptps_stats_reserve(st, n)`, or any read (total,
+  task, snapshot, health) that finds it over half full or refusing, up to `handles_max` —
+  allocated with the lock released, swapped in under it, the old one freed after. A
+  host that never reads sizes it at install.
+- **Switch:** `gptps_stats_set_enabled(st, 0)` makes the observer return before its lock
+  (a flag read); nothing is counted while off, so the totals miss those events.
+  Switching on again drops the handle table and zeroes the gauges: the gauges (and
+  samples) then cover only work queued after the resume, which
+  `gptps_stats_health` says (`resumes`, `gauges_since_ms`). Both transitions WARN.
+  `GPTPS_STATS_START_DISABLED` installs it off — observers are registered before the
+  first submit, so this is how a host makes stats optional at run time.
+- **Health:** `gptps_stats_health(st, &h)` — enabled, table capacity, live entries,
+  markers, handles untracked, markers dropped, growths, rows in use, types folded,
+  measurement tables used and refused, failed allocations (`nomem`: a growth, a host
+  fold's table) and the memory held.
+- **Snapshot:** `gptps_stats_snapshot(st, &total, &health, rows, sizeof rows[0], cap,
+  &needed)` reads the totals, the health and every task row under ONE lock acquisition,
+  so the rows add up to the totals (separate getters are each consistent, not with each
+  other). `GPTPS_E_FULL` with `needed` when `cap` is short.
+- **`struct_size`:** every getter fills the caller's struct only as far as its
+  `struct_size` says (1.12; before, the whole current struct): a 1.2–1.6 caller's size
+  gets the 1.2 fields, and a value below the 1.7 size — a caller that never set it —
+  gets the 1.7 fields, which every caller since has room for. The new structs
+  (`gptps_stats_config`, `_health_info`, `_row`) require theirs; a snapshot's row stride
+  is the caller's `row_size`.
 - **Not settings.** The counters are deliberately not registered in the settings
   registry: there is no `gptps_unregister_setting`, so a registered read callback
   would outlive `gptps_stats_close`. If a host wants them in the TUI, that is the

@@ -948,6 +948,14 @@ target_include_directories(test_stats_order PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_stats_order PRIVATE gptps)
 add_test(NAME stats_order COMMAND test_stats_order)
 set_tests_properties(stats_order PROPERTIES TIMEOUT 30)
+# 1.12 hardening: the switch, hashed rows + '(other)', bounded orphans, no allocation on
+# the event path, struct_size, the bulk snapshot, counted OOM (compiles the add-on in,
+# its allocator, lock and strcmp interposed)
+add_executable(test_stats_unit tests/test_stats_unit.c)
+target_include_directories(test_stats_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_stats_unit PRIVATE gptps)
+add_test(NAME stats_unit COMMAND test_stats_unit)
+set_tests_properties(stats_unit PROPERTIES TIMEOUT 60)
 endif()
 
 if(TARGET gptps_stats AND TARGET gptps_pool)

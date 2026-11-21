@@ -29,7 +29,26 @@
  *     gptps_stats_reset); every gauge is the live value. Latencies use the event
  *     timestamps the core stamps (monotonic ms), so they measure the engine, not the
  *     observer.
- *   - Thread-safe: snapshot from any thread while the engine runs.
+ *   - Thread-safe: snapshot from any thread while the engine runs. Separate getter calls
+ *     are each consistent but not with one another; gptps_stats_snapshot reads the
+ *     totals, every task row and the health under ONE lock acquisition.
+ *
+ * Bounded (1.12): everything the event path touches is allocated at install - the task
+ * rows (cfg.max_tasks, then an '(other)' row), the handle table (cfg.handles live
+ * entries plus GPTPS_STATS_ORPHANS markers), the measurement tables
+ * (cfg.measure_tables). The observer never allocates, rehashes or grows anything; it
+ * counts what does not fit (gptps_stats_health) and WARNs, at most once a minute per
+ * condition. The handle table grows only OUTSIDE the event path: gptps_stats_reserve,
+ * or a reader (total / task / task_at / snapshot / health) that finds it more than half
+ * full, up to cfg.handles_max - allocated with the lock released, swapped (rehashed) in
+ * under it, the old one freed after. A host that never reads should size it at install.
+ *
+ * Runtime switch (1.12): gptps_stats_set_enabled(s, 0) makes the observer return before
+ * it takes its lock (a flag read, nothing else). Events while off are not counted
+ * anywhere - the totals miss them. Turning it back on drops the handle table and zeroes
+ * the gauges, because the work in flight across the pause cannot be accounted for: from
+ * then on the gauges (and wait / run samples) cover only work queued after the resume,
+ * which gptps_stats_health reports (resumes, gauges_since_ms). Both transitions WARN.
  *
  * Measurements (docs/MEASUREMENTS.md): what process jobs actually used - mem.peak,
  * cpu.user_ms, ..., and any name an add-on reports - folded per task type and for
@@ -130,31 +149,144 @@ gptps_status gptps_stats_measure_fold(gptps_stats *s, const char *task,
 
 /* A stats object that no engine feeds: only gptps_stats_measure_fold fills it - in a
  * process that sends work through gptps_xport and keeps no engine of its own. Its
- * counters stay 0. Free it with gptps_stats_close. NULL on allocation failure. */
+ * counters stay 0. Free it with gptps_stats_close. NULL on allocation failure. It has
+ * the default task rows; its measurement tables are allocated as folds need them. */
 gptps_stats *gptps_stats_open(void);
 
 /* Install on an engine: registers one observer. NULL on allocation failure or if
- * the core refuses the observer. Call BEFORE submitting work. */
+ * the core refuses the observer. Call BEFORE submitting work. Same as
+ * gptps_stats_install_ex(e, NULL). */
 gptps_stats *gptps_stats_install(gptps *e);
+
+/* ---- 1.12: sizing, the switch, health, bulk snapshot ----------------------- */
+#define GPTPS_STATS_ORPHANS     64     /* markers kept for late events (see health.orphans_dropped) */
+#define GPTPS_STATS_TASK_NAME   128    /* a task row's name, with its NUL (= GPTPS_TASK_NAME_MAX + 1) */
+#define GPTPS_STATS_OTHER_NAME  "(other)"
+
+/* Install-time sizing. Every field 0 means its default; a value out of range makes
+ * install return NULL with a WARN (nothing is clamped). struct_size is required: at
+ * least sizeof this 1.12 layout; fields appended later are read only when it covers
+ * them. */
+#define GPTPS_STATS_START_DISABLED 0x1u  /* flags: install with the observer off (see set_enabled) */
+typedef struct {
+    size_t   struct_size;          /* = sizeof(gptps_stats_config) */
+    uint32_t max_tasks;            /* task rows (0 => 256; 1..65536). Rows are found by an FNV-1a
+                                    * hash of the name - one probe and one compare per lookup,
+                                    * whatever the number of types - and a row keeps its index for
+                                    * the life of the object. A type that arrives once every row is
+                                    * taken (or with a name longer than GPTPS_TASK_NAME_MAX) counts in
+                                    * one '(other)' row, enumerated after the real ones; the distinct
+                                    * types folded there are counted (health.types_folded). About
+                                    * 312 bytes a row (64-bit). */
+    uint32_t handles;              /* live handle-table entries at install (0 => 1024; 1..1<<24).
+                                    * A slot is 56 bytes, the table a power of two at most 3/4 full. A
+                                    * handle that finds every live entry taken is NOT tracked - its
+                                    * gauges and samples are skipped, never another's evicted - and
+                                    * counted (health.handles_untracked); the gauges then undercount. */
+    uint32_t handles_max;          /* how far reads may grow the table (0 => max(handles, 1<<20);
+                                    * handles..1<<24; = handles: never grow by itself) */
+    uint32_t measure_tables;       /* task types that may keep measurement rows (0 => 8; 1..65536),
+                                    * GPTPS_STATS_MEASURE_ROWS rows (about 6 KiB) each, allocated at
+                                    * install. A type whose first measurement finds none left keeps no
+                                    * rows: its values count in measures_dropped and
+                                    * health.measure_tables_refused (the engine's rows still fold
+                                    * them). gptps_stats_measure_fold, a host call, allocates one
+                                    * instead when they run out. */
+    uint32_t flags;                /* GPTPS_STATS_START_DISABLED */
+} gptps_stats_config;
+
+/* Install with sizing (cfg NULL: every default). */
+gptps_stats *gptps_stats_install_ex(gptps *e, const gptps_stats_config *cfg);
+
+/* The runtime switch (see "Runtime switch" above). on = 0: the observer returns before
+ * its lock until switched on again. on != 0 after off: the handle table is dropped and
+ * the gauges zeroed; they count work queued from now. GPTPS_E_INVAL for a NULL s. */
+gptps_status gptps_stats_set_enabled(gptps_stats *s, int on);
+int          gptps_stats_enabled(gptps_stats *s);         /* 1 when counting; 0 when off or NULL */
+
+/* Grow the handle table to hold `handles` live entries, now, with the lock held only
+ * for the swap (never shrinks; may exceed cfg.handles_max). GPTPS_E_INVAL for a NULL s
+ * or past 1<<24, GPTPS_E_NOMEM (counted in health.nomem) if it cannot be allocated. */
+gptps_status gptps_stats_reserve(gptps_stats *s, size_t handles);
+
+/* What the object could not count, and how full it is. Never silent: each loss here
+ * is also a WARN (at most once a minute per condition). */
+typedef struct {
+    size_t   struct_size;          /* = sizeof(gptps_stats_health_info); at least the 1.12 size */
+    uint32_t enabled;              /* 1 while the observer counts */
+    uint32_t types_folded_more;    /* 1: more distinct types were folded than types_folded counts */
+    uint64_t resumes;              /* times switched on again after off */
+    uint64_t gauges_since_ms;      /* 0: the gauges cover all work queued since install; else the
+                                    * gptps_now_ms of the last resume - work admitted before it is
+                                    * not in them */
+    uint64_t handles_cap;          /* live entries the handle table holds now */
+    uint64_t handles_max;          /* how far reads may grow it (cfg.handles_max) */
+    uint64_t handles_live;         /* entries for queued / running / retry-parked handles */
+    uint64_t markers;              /* entries kept for a late event (<= GPTPS_STATS_ORPHANS) */
+    uint64_t handles_untracked;    /* events of a handle the full table could not take */
+    uint64_t orphans_dropped;      /* markers dropped, oldest first, to bound them (work submitted
+                                    * before install, a service's later runs). If the late event
+                                    * still comes, it counts as a new handle's. */
+    uint64_t grows;                /* handle-table growths */
+    uint64_t tasks_cap;            /* cfg.max_tasks */
+    uint64_t tasks;                /* rows in use, '(other)' not counted */
+    uint64_t types_folded;         /* distinct task types counted in '(other)' (up to 192) */
+    uint64_t measure_tables_cap;   /* cfg.measure_tables */
+    uint64_t measure_tables_used;
+    uint64_t measure_tables_refused; /* first measurements of a type that found no table left */
+    uint64_t nomem;                /* allocations that failed: a growth, a host fold's table */
+    uint64_t memory_bytes;         /* what this object holds */
+} gptps_stats_health_info;
+gptps_status gptps_stats_health(gptps_stats *s, gptps_stats_health_info *out);
+
+/* One task row of a snapshot. */
+#define GPTPS_STATS_ROW_OTHER 0x1u   /* flags: the '(other)' row */
+typedef struct {
+    size_t               struct_size;   /* written: the bytes of this row filled */
+    uint32_t             flags;         /* GPTPS_STATS_ROW_OTHER */
+    char                 name[GPTPS_STATS_TASK_NAME];
+    gptps_stats_counters c;
+} gptps_stats_row;
+
+/* The totals, the health and every task row (first-seen order, then '(other)' if it
+ * counted anything), all under ONE lock acquisition, so the rows add up to the totals.
+ * Any output may be NULL. rows is an array of `cap` elements of `row_size` bytes each -
+ * pass sizeof(gptps_stats_row); a later, larger row is filled as far as row_size
+ * covers. *needed (if not NULL) gets the number of rows there are. GPTPS_OK when they
+ * all fit; GPTPS_E_FULL when only `cap` were written (totals and health are still
+ * written); GPTPS_E_INVAL for a NULL s, rows with cap > 0 and a row_size below the 1.12
+ * sizeof(gptps_stats_row), or a health below its 1.12 size. */
+gptps_status gptps_stats_snapshot(gptps_stats *s, gptps_stats_counters *total,
+                                  gptps_stats_health_info *health,
+                                  gptps_stats_row *rows, size_t row_size, size_t cap,
+                                  size_t *needed);
 
 /* Free. Call AFTER gptps_shutdown (see the contract above). */
 void gptps_stats_close(gptps_stats *s);
 
-/* Whole-engine counters. */
+/* Whole-engine counters. Every getter fills the caller's struct only as far as its
+ * struct_size says (1.12; earlier releases wrote the whole current struct): the 1.2-1.6
+ * size gets the 1.2 fields, any other value below the 1.7 size - a caller that never
+ * set it - gets the 1.7 fields, which every caller since has room for. The size
+ * written is stored back in struct_size. gptps_stats_measure_* do the same with
+ * gptps_stats_measure (its floor is its 1.7 size). */
 gptps_status gptps_stats_total(gptps_stats *s, gptps_stats_counters *out);
 
 /* Counters for one task type by name; GPTPS_E_NOTFOUND if no event for that name
  * has been seen. */
 gptps_status gptps_stats_task(gptps_stats *s, const char *task, gptps_stats_counters *out);
 
-/* Enumerate task types seen so far (order is first-seen; stable while attached). */
+/* Enumerate task types seen so far (order is first-seen; stable while attached). Past
+ * cfg.max_tasks types, an '(other)' row (GPTPS_STATS_OTHER_NAME) comes last; by name it
+ * is found only when no real type has that name. */
 size_t       gptps_stats_task_count(gptps_stats *s);
 gptps_status gptps_stats_task_at(gptps_stats *s, size_t index,
                                  char *name_buf, size_t name_cap,
                                  gptps_stats_counters *out);   /* any of the outputs may be NULL */
 
 /* Zero the totals and latencies (engine-wide and per task), and forget every
- * measurement row. The gauges are the live truth and are left alone. */
+ * measurement row. The gauges are the live truth and are left alone, and so are the
+ * task rows themselves (names and indexes) and the health counters. */
 void gptps_stats_reset(gptps_stats *s);
 
 /* dst += src, for folding shards or task rows into one view. Totals and gauges add;

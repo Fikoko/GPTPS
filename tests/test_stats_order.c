@@ -40,23 +40,9 @@ typedef struct {
     uint64_t       runs, waits;   /* expected run / wait samples; waits UINT64_MAX = skip */
 } scenario;
 
-static gptps_stats *fresh(void)
-{
-    gptps_stats *s = (gptps_stats *)calloc(1, sizeof *s);
-    if (!s) return NULL;
-    s->total.struct_size = sizeof s->total;
-    apx_mutex_init(&s->mu);
-    return s;
-}
-
-static void discard(gptps_stats *s)
-{
-    size_t i;
-    for (i = 0; i < s->ntasks; ++i) free(s->tasks[i].name);
-    free(s->tasks); free(s->tab);
-    apx_mutex_destroy(&s->mu);
-    free(s);
-}
+/* An object with no engine (installed sizing, nothing registered): fed by hand below. */
+static gptps_stats *fresh(void) { return st_new(NULL, ST_DEF_MTABS); }
+static void discard(gptps_stats *s) { gptps_stats_close(s); }
 
 static void feed(gptps_stats *s, const ev_spec *e)
 {
