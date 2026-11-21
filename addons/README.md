@@ -612,24 +612,37 @@ enabled automatically). Panes/metrics:
 - **Cost is a budgeted knob** — the dashboard runs on the engine's worker threads, so
   its own CPU/RAM is tunable **at runtime**:
   - **KPI level** (`gptps_tui_set_kpi`, or `m` live): `OFF` = installed but off the
-    event path — the observer returns *before* it takes the dashboard lock and both
-    rings are freed, which is the tier for leaving the dashboard in place after you
-    have stopped looking at it (counters do not advance while off);
+    event path — the observer returns *before* it takes the dashboard lock and every
+    per-event part is freed, which is the tier for leaving the dashboard in place after
+    you have stopped looking at it (counters do not advance while off);
     `MINIMAL` = counts only — cheap in work, but still one mutex per event;
-    `NORMAL` = + per-task table + recent log; `FULL` = + per-handle latency (allocates
-    a ring; **freed when you drop below FULL**). `m` cycles `MINIMAL`→`NORMAL`→`FULL`
+    `NORMAL` = + per-task table + recent log; `FULL` = + the handle table (latency and
+    exact gauges). Each part exists only at its level and up: it is allocated with the
+    lock released, swapped in under it, and **freed when you drop below its level** (the
+    per-task counts start again when the table is rebuilt); the event path never
+    allocates. `m` cycles `MINIMAL`→`NORMAL`→`FULL`
     and never *into* `OFF`, so a stray keypress cannot blind the dashboard.
-  - **Latency window** (`gptps_tui_set_latency_window`, or `tui.latency_window`): size
-    it to your in-flight **depth**, not your throughput (24 bytes a handle: 24 KiB at
-    the default 1024, 24 MiB at the 1<<20 cap). An entry lives from `QUEUED` to the
+  - **Latency window** (`gptps_tui_set_latency_window`, or `tui.latency_window`): the
+    live handles FULL's **handle table** tracks (1.11: a hash table, one hash operation
+    an event at any size; 64 KiB at the default 1024, 64 MiB at the 1<<20 cap). Size it
+    to your in-flight **depth**, not your throughput. An entry lives from `QUEUED` to the
     item's terminal event (`FINISHED`, `DEAD_LETTERED`, `DROPPED`, or `FAILED` with
-    `GPTPS_E_CANCELLED`), so a burst deeper than the window overwrites the oldest live
-    entries before they resolve — the longest waits, so `avg ms` reads **low**. The
-    loss is counted under the TASKS table and logged (a WARN once per window size,
-    naming the depth reached), and the items still tracked keep giving samples. `avg
-    ms` covers `FINISHED` items only. The ordering inversion (a terminal event that
-    outruns its own `QUEUED`) is handled internally with a tombstone, the same way
-    `gptps_stats` handles it.
+    `GPTPS_E_CANCELLED`); past the window a new item is **not tracked** — no tracked one is
+    ever evicted — which is counted under the TASKS table and in `gptps_tui_health`, and
+    logged (a WARN once per window size, naming the depth reached). `avg ms` covers
+    `FINISHED` items only. The table also makes the **pending / in-flight gauges exact**
+    (below FULL they come from the counters, which cannot tell a cancelled attempt that
+    ran from an item cancelled while queued, and the frame marks them `~`; `>=` while
+    some handle is not tracked). Event-order inversions are handled with `gptps_stats`'
+    rules (tests/test_tui_order.c replays its order matrix against the dashboard); the
+    markers of ends whose `QUEUED` never comes are bounded by a 64-entry FIFO.
+  - **Task types** (`cfg.max_tasks`, 1..4096, default 64): TASKS rows are found by a
+    hash of the name; a type that arrives once every row is taken counts in an
+    `(other)` row, and the types folded there are counted and shown.
+  - **Health** (`gptps_tui_health`): what the dashboard has lost (types folded, items not
+    tracked, frames truncated, allocations failed, unmatched ends), the bytes each part
+    holds, and the live loop's paints, bytes and wakes. A `lost:` line appears on the frame
+    once something is.
   - **Cadence** (`gptps_tui_set_mode`, or `p` live): `CONTINUOUS`, `ON_DEMAND`,
     `PAUSED`. `gptps_tui_snapshot()` renders one frame on demand.
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and

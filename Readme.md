@@ -612,7 +612,7 @@ auto-enabled on a TTY, with the Windows console put into VT mode automatically.
 
 ```text
 GPTPS · live demo   up 0.1s   28.6 done/s
-queued 18  started 8  in-flight 4  [##########################] peak 4
+queued 18  started 8  pending 10  in-flight 4  [#######################] peak 4
 finished 4  failed 0  retried 0  dead 0  dropped 0
 kpi:full mode:realtime refresh:250ms
 
@@ -630,7 +630,8 @@ RECENT
 keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter  m kpi  p pause  q quit
 ```
 
-- **Live metrics:** throughput, an in-flight gauge, cumulative counts, and a per-task
+- **Live metrics:** throughput, pending and in-flight gauges (exact at `full`, marked `~`
+  below it), cumulative counts, and a per-task
   table (runs / ok / fail / dead / drop / success-rate / average latency).
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
   dashboard's own CPU/RAM cost (minimal/normal/full) live; `p` pauses; `s` opens the live

@@ -46,20 +46,42 @@ static void mu_unlock(tui_mutex *m)  { pthread_mutex_unlock(m); }
 static void mu_destroy(tui_mutex *m) { pthread_mutex_destroy(m); }
 static int  fd_is_tty(FILE *f)       { return isatty(fileno(f)); }
 #endif
+/* The one word the event path reads without the lock (see `off`): the compiler's atomic
+ * builtins where there are some - no HAL, so the drop-in build has them too - else a
+ * volatile access (MSVC gives volatile acquire/release semantics on its targets). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define TUI_FLAG_GET(p)    __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#  define TUI_FLAG_SET(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#else
+#  define TUI_FLAG_GET(p)    (*(p))
+#  define TUI_FLAG_SET(p, v) (*(p) = (v))
+#endif
 
+/* cfg.max_tasks: the TASKS rows (and gptps_tui_add_task entries) by default, and the most
+ * an install may ask for. */
 #define TUI_MAX_TASKS 64
-/* Latency ring: how many slots past a live head a new entry may look for room in, and
- * how many skipped terminal events are remembered (see lat_slot, lat_memo). */
-#define TUI_LAT_PROBE 16
-#define TUI_LAT_MEMO  8
-/* A row and a RECENT record hold the FULL task name: the lookup (task_for) compares
- * whole names, so a shorter copy made every 64..127-byte name a new row on every
- * event, and one such task used up all 64 rows. The label is display only. */
+#define TUI_TASKS_CAP 4096
+/* The latency window's cap (cfg.latency_window / tui.latency_window). */
+#define TUI_LAT_CAP   (1 << 20)
+/* Terminal events that outran the event they are owed (their QUEUED, or a RETRIED) are
+ * kept as markers in the handle table, and the newest this many are remembered in a FIFO:
+ * the oldest marker is dropped (and counted) when a newer one needs the room, so markers
+ * whose late event never comes - work queued before the table existed, an always-up
+ * service's later runs - cannot pile up. See "handle table". */
+#define TUI_ORPHANS   64
+/* A row and a RECENT record hold the FULL task name: the lookup compares whole names, so
+ * a shorter copy made every 64..127-byte name a new row on every event, and one such task
+ * used up all 64 rows. The label is display only. */
 #define TUI_NAME_CAP  (GPTPS_TASK_NAME_MAX + 1)
 #define TUI_LABEL_CAP 64
-/* Task types past TUI_MAX_TASKS are not tracked, but they are counted (distinct by a
- * hash of the name, up to this many) so the table can say how many it leaves out. */
-#define TUI_OVER_MAX  256
+/* Task types past max_tasks fold into the '(other)' row; the distinct ones are counted by
+ * a hash of the name in a set of this many slots (filled to 3/4, then "or more"). */
+#define TUI_FOLD_SLOTS 256
+#define TUI_FOLD_MAX   192
+/* A FAILED's "why": at most this many bytes of its stderr tail are looked at, from the
+ * end, for the last line - a 64 KiB tail with no newline was scanned whole, under the
+ * lock, on the thread that emitted the event. */
+#define TUI_WHY_SCAN  512
 /* A toast or status message is shown for this long, on every pane. */
 #define TUI_TOAST_MS  3000u
 
@@ -68,6 +90,9 @@ enum { TUI_PANE_DASH = 0, TUI_PANE_SETTINGS, TUI_PANE_HELP, TUI_PANE_TASKS, TUI_
 /* active prompt / confirm in the tasks pane (0 = none) */
 enum { TUI_PK_NONE = 0, TUI_PK_CONFIRM_DELETE, TUI_PK_CLONE_NAME, TUI_PK_NEW_NAME, TUI_PK_NEW_ARGV };
 
+/* What gptps_tui_add_task said about a task type: its label, hotkey and payload. Kept at
+ * every KPI level (the tiers own the counting, not the operator's bindings), in an array
+ * that grows only in add_task, up to max_tasks. */
 typedef struct {
     char     name[TUI_NAME_CAP], label[TUI_LABEL_CAP];
     int      hotkey;
@@ -75,6 +100,16 @@ typedef struct {
     size_t   plen;
     int      has_opts;                 /* gptps_tui_add_task_ex: the hotkey submits with these */
     gptps_submit_options opts;
+} tui_ui;
+
+/* A TASKS row: one task type's counts. Rows are found by name through an open-addressing
+ * index (FNV-1a of the whole name, then one strcmp), are never reused while the table
+ * exists, so a row id names one type for good, and row 0 is '(other)': the types that
+ * arrive once all max_tasks rows are taken are counted there instead of nowhere. */
+typedef struct {
+    char     name[TUI_NAME_CAP];
+    uint64_t hash;                     /* name_hash(name): compared before the strcmp */
+    int      ui;                       /* its tui_ui entry, or -1 (label = name, no hotkey) */
     /* 64-bit: a 32-bit count wraps after ~12 h at 100k events/s */
     uint64_t started, finished, failed, retried, dead, dropped;
     /* queue->finish latency of FINISHED items only: an item that ends dead-lettered,
@@ -87,8 +122,27 @@ typedef struct {
     char     mem_method[40];
 } tui_task;
 
+/* A handle-table slot (see "handle table"). `ts` is the QUEUED time once the QUEUED has
+ * been seen, and before that the time of a FINISHED that outran it (owe_fin), whose
+ * sample the late QUEUED then takes. */
+enum { TS_NONE = 0, TS_PENDING, TS_RUNNING, TS_LIMBO, TS_DONE };
+typedef struct {
+    gptps_handle h;                    /* 0: empty (the core's handles start at 1) */
+    uint64_t     ts;
+    uint32_t     att;                  /* highest attempt started or ended this cycle */
+    uint32_t     ann;                  /* highest attempt a RETRIED announced this cycle */
+    uint8_t      state, seen_q, owe_fin;
+} tui_slot;
+
+/* A RECENT record. Why a FAILED failed is kept as the event left it - the dashboard's own
+ * words (exit code, signal, start error or status) and the RAW bytes of its stderr's last
+ * line (at most TUI_TAIL_KEEP, cut at a character) - and cleaned when a frame shows it
+ * (why_join): cleaning on the event path cost more than the rest of the event. */
+#define TUI_TAIL_KEEP 80
 typedef struct { uint64_t ts; int kind; char name[TUI_NAME_CAP]; uint64_t handle; gptps_status status;
-                 char why[96]; } tui_event;   /* why a FAILED failed: its exit and its stderr's last line */
+                 char why[64];                  /* its own words: "exit 3", "task failed", ... */
+                 char tail[TUI_TAIL_KEEP];      /* the raw stderr line (not NUL-terminated) */
+                 unsigned char tail_len, tail_cut; } tui_event;
 
 /* ---- text that is not ours: a job's stderr, a value typed or configured ----------
  *
@@ -168,9 +222,16 @@ static size_t tui_clean(const char *s, size_t n, char *out, size_t cap, int maxc
     if (!cap && !measure) return 0;
     while (i < n) {
         uint32_t cp = 0;
-        size_t len = u8_decode(u + i, n - i, &cp);
+        size_t len;
         const char *rep = NULL;
         int w;
+        if (u[i] >= 0x20 && u[i] < 0x7f) {                   /* printable ASCII, the common case */
+            if (maxcols >= 0 && used + 1 > maxcols) break;
+            if (!measure) { if (pos + 2 > cap) break; out[pos] = (char)u[i]; }
+            ++pos; ++used; ++i;
+            continue;
+        }
+        len = u8_decode(u + i, n - i, &cp);
         if (len == 0)                rep = "?", len = 1;      /* not UTF-8: this byte only */
         else if (cp < 0x20 || cp == 0x7f) rep = " ";          /* C0 / DEL: a gap */
         else if (!u8_printable(cp))  rep = "?";
@@ -271,40 +332,108 @@ static int tui_task_at(gptps *e, size_t i, gptps_task_info *out)
 
 /* Why an attempt failed, in one short line: "exit 3", "signal 9", "not started (error
  * 2)" or the status, then the last line of its stderr tail when it kept one (ABI 2.7 /
- * 2.8), cleaned (tui_clean). From an event or a dead letter alike. */
+ * 2.8), cleaned (tui_clean). From an event or a dead letter alike. In three steps, so the
+ * event path does only the cheap ones: why_head (its own words), why_tail (which bytes
+ * of the tail), and why_join (the line, cleaned - at render for an event). */
+static size_t why_head(const gptps_measure *start_err, const gptps_measure *exit_code,
+                       const gptps_measure *exit_sig, gptps_status status, char *out, size_t n)
+{
+    int k;
+    if (start_err)      k = snprintf(out, n, "not started (error %llu)", (unsigned long long)start_err->value);
+    else if (exit_code) k = snprintf(out, n, "exit %llu", (unsigned long long)exit_code->value);
+    else if (exit_sig)  k = snprintf(out, n, "signal %llu", (unsigned long long)exit_sig->value);
+    else                k = snprintf(out, n, "%s", gptps_strerror(status));
+    if (k < 0) { out[0] = 0; return 0; }
+    return (size_t)k >= n ? n - 1 : (size_t)k;
+}
+
+/* Which bytes of a stderr tail a why shows: [*start, *end), its last line without the
+ * trailing blanks, at most `keep` bytes. Only the last TUI_WHY_SCAN bytes are looked at:
+ * this runs under the lock on the thread that emitted the FAILED, and a 64 KiB tail with
+ * no newline was walked whole to find a line start. When that window holds no line
+ * break, the line is longer than it: its END is kept (what was written last), from a
+ * whole character, and 1 is returned - the line is shown after an ellipsis. A line that
+ * starts in the window but is longer than `keep` keeps its start, as before. */
+static int why_tail(const char *tail, size_t tail_len, size_t keep, size_t *start, size_t *end)
+{
+    size_t lo = tail_len > TUI_WHY_SCAN ? tail_len - TUI_WHY_SCAN : 0, e = tail_len, s;
+    int cut = 0;
+    while (e > lo && (tail[e - 1] == '\n' || tail[e - 1] == '\r' || tail[e - 1] == ' ')) --e;
+    s = e;
+    while (s - lo >= 8) {                                        /* its last line: 8 bytes a step */
+        uint64_t v;
+        memcpy(&v, tail + s - 8, 8);
+        v ^= 0x0a0a0a0a0a0a0a0aULL;                              /* a '\n' byte becomes 0 */
+        if ((v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL) break;   /* one is in these 8 */
+        s -= 8;
+    }
+    while (s > lo && tail[s - 1] != '\n') --s;
+    if (s == lo && lo > 0) cut = 1;                              /* ...longer than the window */
+    if (e - s > keep) {
+        if (cut) {
+            s = e - keep;
+            while (s < e && ((unsigned char)tail[s] & 0xc0u) == 0x80u) ++s;   /* a whole character */
+        } else {
+            e = s + keep;
+            while (e > s && ((unsigned char)tail[e] & 0xc0u) == 0x80u) --e;   /* tail[e] starts the next one */
+        }
+    }
+    *start = s; *end = e;
+    return cut;
+}
+
+/* head + " \xc2\xb7 " + (an ellipsis when cut) + the raw line, cleaned, into out (n bytes). A cut
+ * line keeps its end when it does not all fit: cleaning never makes text longer (a byte
+ * it replaces becomes one byte), so the last `room` raw bytes fit. */
+static void why_join(const char *head, const char *raw, size_t rawlen, int cut, char *out, size_t n)
+{
+    size_t pos;
+    if (!n) return;
+    pos = (size_t)snprintf(out, n, "%s", head);
+    if (pos >= n) pos = n - 1;
+    if (!rawlen || pos + 6 >= n) return;
+    memcpy(out + pos, " \xc2\xb7 ", 4); pos += 4; out[pos] = 0;
+    if (cut && pos + 4 < n) {
+        size_t room = n - pos - 4, s = 0;
+        memcpy(out + pos, "\xe2\x80\xa6", 3); pos += 3; out[pos] = 0;
+        if (rawlen > room) {
+            s = rawlen - room;
+            while (s < rawlen && ((unsigned char)raw[s] & 0xc0u) == 0x80u) ++s;
+        }
+        raw += s; rawlen -= s;
+    }
+    tui_clean(raw, rawlen, out + pos, n - pos, -1, NULL);
+}
+
 static void why_line(const gptps_measure *start_err, const gptps_measure *exit_code,
                      const gptps_measure *exit_sig, gptps_status status,
                      const char *tail, size_t tail_len, char *out, size_t n)
 {
-    size_t pos;
+    char head[64];
+    size_t s = 0, e = 0;
+    int cut = 0;
     out[0] = 0;
     if (n < 8) return;
-    if (start_err)      pos = (size_t)snprintf(out, n, "not started (error %llu)", (unsigned long long)start_err->value);
-    else if (exit_code) pos = (size_t)snprintf(out, n, "exit %llu", (unsigned long long)exit_code->value);
-    else if (exit_sig)  pos = (size_t)snprintf(out, n, "signal %llu", (unsigned long long)exit_sig->value);
-    else                pos = (size_t)snprintf(out, n, "%s", gptps_strerror(status));
-    if (pos >= n) pos = n - 1;
-    if (tail && tail_len) {
-        size_t end = tail_len, start;
-        while (end && (tail[end - 1] == '\n' || tail[end - 1] == '\r' || tail[end - 1] == ' ')) --end;
-        start = end;
-        while (start && tail[start - 1] != '\n') --start;            /* its last line */
-        if (end > start && pos + 6 < n) {
-            pos += (size_t)snprintf(out + pos, n - pos, " \xc2\xb7 ");
-            if (pos >= n) pos = n - 1;
-            tui_clean(tail + start, end - start, out + pos, n - pos, -1, NULL);
-        }
-    }
+    why_head(start_err, exit_code, exit_sig, status, head, sizeof head);
+    if (tail && tail_len) cut = why_tail(tail, tail_len, n, &s, &e);
+    why_join(head, tail ? tail + s : NULL, e - s, cut, out, n);
 }
 
-static void tui_why(const gptps_event *ev, char *out, size_t n)
+/* The event path's part: a FAILED's own words and the raw bytes of its stderr line, into
+ * the record; nothing cleaned (see tui_event). */
+static void why_record(const gptps_event *ev, tui_event *re)
 {
     int has_tail = ev->struct_size >= offsetof(gptps_event, stderr_tail_len) + sizeof ev->stderr_tail_len;
-    out[0] = 0;
+    re->why[0] = 0; re->tail_len = 0; re->tail_cut = 0;
     if (ev->kind != GPTPS_EV_FAILED) return;
-    why_line(gptps_event_measure(ev, GPTPS_M_START_ERROR), gptps_event_measure(ev, GPTPS_M_EXIT_CODE),
-             gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL), ev->status,
-             has_tail ? ev->stderr_tail : NULL, has_tail ? ev->stderr_tail_len : 0, out, n);
+    why_head(gptps_event_measure(ev, GPTPS_M_START_ERROR), gptps_event_measure(ev, GPTPS_M_EXIT_CODE),
+             gptps_event_measure(ev, GPTPS_M_EXIT_SIGNAL), ev->status, re->why, sizeof re->why);
+    if (has_tail && ev->stderr_tail && ev->stderr_tail_len) {
+        size_t s, e;
+        re->tail_cut = (unsigned char)why_tail(ev->stderr_tail, ev->stderr_tail_len, TUI_TAIL_KEEP, &s, &e);
+        memcpy(re->tail, ev->stderr_tail + s, e - s);
+        re->tail_len = (unsigned char)(e - s);
+    }
 }
 
 /* A dead letter's measurement by name (ABI 2.8), NULL when it has none. */
@@ -334,55 +463,73 @@ struct gptps_tui {
     gptps           *e;
     gptps_tui_config cfg;
     tui_mutex        mu;
+    /* Serialises the setters that swap storage in and out (see "storage"), so one of them
+     * can allocate with `mu` released and still find, when it takes `mu` back, the state it
+     * allocated for. Taken before `mu`, never while holding it. */
+    tui_mutex        smu;
     uint64_t         start_ms;
     /* 64-bit: 32-bit counters wrapped after ~12 h at 100k events/s. `term` counts the
      * terminal events (FINISHED, DEAD_LETTERED, DROPPED, FAILED/E_CANCELLED), so that
-     * q - term estimates the depth queued or running (named by the latency WARN). */
+     * q - term is the number of items not yet ended (queued, running or waiting to retry)
+     * - exact once every item's QUEUED and terminal event have been seen. */
     uint64_t         q, s, fin, fail, retr, dead, drop, peak, term;
-    /* In-flight is COUNTED, not derived as started - finished - failed. A cancel that
-     * lands while the item is still queued emits a terminal FAILED with no preceding
-     * STARTED, so the subtraction wrapped to 4294967295 on unsigned - and since peak
-     * is a running maximum, that wrap poisoned the gauge's divisor for the life of
-     * the process, leaving the bar empty forever. Counted with a floor, the unpaired
-     * terminal event is absorbed instead. */
+    /* The APPROXIMATE in-flight gauge, the one shown below FULL. Counted with a floor, not
+     * derived as started - finished - failed (which wrapped to 4294967295). It cannot be
+     * exact from the events alone: a FAILED / GPTPS_E_CANCELLED for an attempt that ran and
+     * one for an item cancelled while queued (or parked for a retry) carry the same kind,
+     * status, attempt and flags, so the event cannot say whether something left the
+     * running set - every FAILED decrements it, and a cancel-in-queue undercounts while
+     * other items run. The frame marks it '~'. The handle table (FULL) keeps each handle's
+     * state and gives the exact gauges (g_pend, g_run). */
     uint64_t         inflight;
-    tui_task         tasks[TUI_MAX_TASKS];
-    int              ntasks;
-    /* Task types that could not get a row (the table is full): distinct names, by a
-     * hash, up to TUI_OVER_MAX; over_more once more than that were seen. */
-    uint64_t         over_hash[TUI_OVER_MAX];
-    int              nover, over_more;
+    /* gptps_tui_add_task's entries (see tui_ui); max_tasks is cfg.max_tasks, resolved. */
+    tui_ui          *ui;
+    int              nui, ui_cap, max_tasks;
+    /* TASKS storage (NORMAL and up; NULL below): rows[0..nrows), row 0 = '(other)'; the
+     * name index (tidx_mask + 1 int32 slots, -1 empty, at most half full); and the set of
+     * the folded types' name hashes (TUI_FOLD_SLOTS; 0 empty). */
+    tui_task        *tasks;
+    int              ntasks, tasks_cap;
+    int32_t         *tidx;
+    uint32_t         tidx_mask;
+    uint64_t        *fold;
+    int              nfold, fold_more;
     tui_event       *recent;
     int              rcap, rn, rhead;
-    /* handle -> queued-ts ring for latency. `done` marks a TOMBSTONE: a terminal event
-     * that arrived before its own QUEUED - 1 for a FINISHED, holding the finish time
-     * until the late QUEUED turns the pair into a sample, 2 for an item that ended
-     * without finishing (no sample; the late QUEUED only clears it). 0 is a LIVE entry
-     * (QUEUED seen, terminal event not yet). See tui_on_event. */
-    struct { gptps_handle h; uint64_t ts; int done; } *lat;
-    int              lat_cap, lat_head;
-    int              lat_tomb;      /* tombstones in the ring */
-    int              lat_live;      /* live entries in the ring */
-    uint64_t         lat_evicted;   /* live entries overwritten before their terminal event: samples lost */
-    uint64_t         lat_skipped;   /* terminal events with no entry and no room for a tombstone */
-    /* The handles of the last TUI_LAT_MEMO terminal events that were skipped: their late
-     * QUEUED must not start a clock (the item has ended), which would leave an entry no
-     * terminal event will ever release - and evict a live one to make room for it. */
-    gptps_handle     lat_memo[TUI_LAT_MEMO];
-    int              lat_nmemo, lat_memo_head;
-    int              lat_warned;    /* the window size the eviction WARN was given for (0: none) */
+    /* The handle table (FULL; NULL below): tab_mask + 1 slots, open addressing keyed by
+     * the handle (murmur finalizer, linear probing, backward-shift delete), never more
+     * than lat_cap live entries plus the markers the orphan FIFO bounds. tab_n slots are
+     * used, tab_done of them markers (TS_DONE). g_pend / g_run are the EXACT gauges: the
+     * slots in TS_PENDING and TS_RUNNING. trk_lb: they are a lower bound just now - the
+     * table was built while work was already in flight, or a handle found it full - until
+     * the counters say nothing is left (q <= term). */
+    tui_slot        *tab;
+    size_t           tab_mask, tab_n, tab_done;
+    gptps_handle     orph[TUI_ORPHANS];
+    int              orph_n, orph_head;
+    uint64_t         g_pend, g_run;
+    int              trk_lb;
+    int              lat_cap;       /* tui.latency_window: the live entries the table may hold */
+    uint64_t         lat_untracked; /* this window: QUEUEDs that found the table full (no sample) */
+    uint64_t         lat_unmatched; /* this window: markers dropped from the orphan FIFO */
+    int              lat_warned;    /* the window size the table-full WARN was given for (0: none) */
+    /* gptps_tui_health: counted since install, never reset (h_*). */
+    uint64_t         h_untracked, h_orphans, h_folded, h_trunc, h_nomem;
+    uint64_t         h_painted, h_skipped, h_written, h_wakes;
+    size_t           frame_bytes;   /* the frame buffer gptps_tui_run holds while it runs */
     int              scroll;        /* recent-log scroll offset (lines back) */
     int              kpi;           /* effective gptps_tui_kpi (never DEFAULT) */
     int              mode;          /* effective gptps_tui_mode */
     int              dirty;         /* state changed since last paint (for ON_DEMAND) */
     /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
      * all - taking a mutex to discover you have nothing to do is the entire cost this
-     * tier exists to remove. `volatile` rather than an atomic because an add-on has no
-     * atomic to reach for in the drop-in build: the amalgamation ships gptps.c and
-     * gptps.h only, so the HAL's gptps_flag is not declared there. The race is benign
-     * by construction - one writer (gptps_tui_set_kpi, under the lock), a single word,
-     * and a stale read costs one extra event processed or skipped at the instant the
-     * tier changes, which breaks no invariant the dashboard keeps. */
+     * tier exists to remove. Not the HAL's gptps_flag: the amalgamation ships gptps.c
+     * and gptps.h only, so it is not declared there. Read and written through TUI_FLAG_*:
+     * the compiler's own atomic builtins where it has them (GCC, Clang - so a thread
+     * sanitizer sees a release/acquire pair, not a race), else a volatile word. The race
+     * is benign by construction either way - one writer (tui_reconfig, under the lock), a
+     * single word, and a stale read costs one extra event processed or skipped at the
+     * instant the tier changes: the event path re-reads every part under the lock. */
     volatile int     off;           /* KPI OFF: leave the event path entirely */
     /* Settings pane state - touched only by the run/press/render thread (not the
      * observer), so it needs no lock. */
@@ -436,7 +583,7 @@ static void copy_u8(char *dst, size_t cap, const char *src)
     dst[n] = 0;
 }
 
-/* FNV-1a of a name: the types that got no row are counted by it, distinct. */
+/* FNV-1a of a name: the name index hashes by it, and the folded types are counted by it. */
 static uint64_t name_hash(const char *s)
 {
     uint64_t h = 1469598103934665603ULL;
@@ -444,39 +591,72 @@ static uint64_t name_hash(const char *s)
     return h;
 }
 
-/* A task type that gets no row (the table is full): count it, once per name. Returns 1
- * for the first type ever left out - the caller WARNs, once, after it drops the lock. */
-static int note_untracked(gptps_tui *t, const char *name)
+static size_t next_pow2(size_t n) { size_t p = 1; while (p < n) p <<= 1; return p; }
+
+/* ---- the name index (TASKS) ------------------------------------------------------
+ * rows[1..ntasks) are the task types in the order they were first seen; their ids never
+ * change while the table exists. tidx holds row ids by name_hash, open addressing with
+ * linear probing at most half full, so a lookup is one or two probes and one strcmp,
+ * whatever the number of types: the old lookup compared the name against every row
+ * (33 -> 250 ns an event from 1 to 64 types). A type that arrives once every row is
+ * taken is counted in row 0, '(other)', and its name hash goes in the fold set, so the
+ * types folded are counted, distinct (up to TUI_FOLD_MAX of them, then "or more"). */
+
+/* The row for `name` (hash h), or -1 when it has none. Caller holds mu, rows exist. */
+static int row_lookup(const gptps_tui *t, const char *name, uint64_t h)
 {
-    uint64_t h = name_hash(name);
-    int i;
-    for (i = 0; i < t->nover; ++i) if (t->over_hash[i] == h) return 0;
-    if (t->nover < TUI_OVER_MAX) { t->over_hash[t->nover++] = h; return t->nover == 1; }
-    t->over_more = 1;
-    return 0;
+    uint32_t i = (uint32_t)h & t->tidx_mask;
+    for (;; i = (i + 1) & t->tidx_mask) {
+        int32_t r = t->tidx[i];
+        if (r < 0) return -1;
+        if (t->tasks[r].hash == h && strcmp(t->tasks[r].name, name) == 0) return r;
+    }
 }
 
-/* The row of task type `name`, made on first sight. NULL when the table is full. On the
- * event path (left_out not NULL) the type is then counted as left out, and *left_out is
- * set for the first one, which the caller WARNs about. gptps_tui_add_task passes NULL:
- * it reports the full table as GPTPS_E_FULL, and a name it was given has no events yet -
- * counting it used up the one WARN, so the first type whose events really got no row
- * was never logged, and the "+N types not shown" footer counted a type with none. */
-static tui_task *task_for(gptps_tui *t, const char *name, int *left_out)
+/* A new row for `name` (hash h, not in the index), or -1 when every row is taken. */
+static int row_add(gptps_tui *t, const char *name, uint64_t h)
 {
-    int i;
+    uint32_t i = (uint32_t)h & t->tidx_mask;
     size_t n = strlen(name);
-    if (n > GPTPS_TASK_NAME_MAX) return NULL;     /* never a task's name: the engine refuses it */
-    for (i = 0; i < t->ntasks; ++i) if (strcmp(t->tasks[i].name, name) == 0) return &t->tasks[i];
-    if (t->ntasks < TUI_MAX_TASKS) {
-        tui_task *tk = &t->tasks[t->ntasks++];
-        memset(tk, 0, sizeof *tk);
-        memcpy(tk->name, name, n + 1);            /* whole: what the lookup above compares */
-        copy_u8(tk->label, sizeof tk->label, name);
-        return tk;
+    tui_task *k;
+    if (t->ntasks >= t->tasks_cap || n > GPTPS_TASK_NAME_MAX) return -1;
+    while (t->tidx[i] >= 0) i = (i + 1) & t->tidx_mask;
+    k = &t->tasks[t->ntasks];
+    memset(k, 0, sizeof *k);
+    memcpy(k->name, name, n + 1);             /* whole: what the lookup compares */
+    k->hash = h; k->ui = -1;
+    t->tidx[i] = (int32_t)t->ntasks;
+    return t->ntasks++;
+}
+
+/* A type with no row: count it in the fold set. 1 for the first type ever folded - the
+ * caller WARNs, once, after it drops the lock. */
+static int fold_note(gptps_tui *t, uint64_t h)
+{
+    uint32_t i;
+    if (!h) h = 1;                            /* 0 marks an empty slot */
+    for (i = (uint32_t)h & (TUI_FOLD_SLOTS - 1); t->fold[i]; i = (i + 1) & (TUI_FOLD_SLOTS - 1))
+        if (t->fold[i] == h) return 0;
+    if (t->nfold >= TUI_FOLD_MAX) { t->fold_more = 1; return 0; }
+    t->fold[i] = h; ++t->nfold;
+    return ++t->h_folded == 1;
+}
+
+/* The row an event of task type `name` counts in: its own, made on first sight, or
+ * '(other)' once the table is full (*first_fold set for the first type folded ever).
+ * NULL without rows (below NORMAL, or no memory for them). */
+static tui_task *row_for_event(gptps_tui *t, const char *name, int *first_fold)
+{
+    uint64_t h;
+    int r;
+    if (!t->tasks) return NULL;
+    h = name_hash(name);
+    r = row_lookup(t, name, h);
+    if (r < 0 && (r = row_add(t, name, h)) < 0) {
+        if (fold_note(t, h)) *first_fold = 1;
+        r = 0;
     }
-    if (left_out && note_untracked(t, name)) *left_out = 1;
-    return NULL;
+    return &t->tasks[r];
 }
 
 /* A queue->finish latency sample, into the task's row. */
@@ -488,61 +668,6 @@ static void lat_sample(tui_task *tk, uint64_t from, uint64_t to)
     if (l > tk->lat_max_ms) tk->lat_max_ms = l;
 }
 
-/* The slot a new entry goes in: the head, or - when the head holds a live entry (an
- * item that is still queued or running when the ring comes round to it, a long-running
- * one, say) - the first of the next TUI_LAT_PROBE slots that holds none. Writing over
- * the live head while slots behind it were free evicted that item for nothing: its
- * sample was lost and counted as the window being too small when it was not. -1 when
- * every probed slot is live (the ring is, as near as the probe can tell, full). */
-static int lat_slot(const gptps_tui *t)
-{
-    int i, j;
-    for (i = 0; i < TUI_LAT_PROBE && i < t->lat_cap; ++i) {
-        j = (t->lat_head + i) % t->lat_cap;
-        if (!t->lat[j].h || t->lat[j].done) return j;
-    }
-    return -1;
-}
-
-/* Write an entry (done: 0 live, 1 or 2 a tombstone) at slot j, over what is there; the
- * head moves past it when `advance`. Returns 1 when that was a LIVE entry: its sample
- * is lost, and counted. */
-static int lat_put(gptps_tui *t, int j, int advance, gptps_handle h, uint64_t ts, int done)
-{
-    int evicted = 0;
-    if (t->lat[j].h) {
-        if (t->lat[j].done) --t->lat_tomb;
-        else { --t->lat_live; ++t->lat_evicted; evicted = 1; }
-    }
-    t->lat[j].h = h; t->lat[j].ts = ts; t->lat[j].done = done;
-    if (done) ++t->lat_tomb; else ++t->lat_live;
-    if (advance) t->lat_head = (j + 1) % t->lat_cap;
-    return evicted;
-}
-
-/* QUEUED: complete a tombstone a terminal event left, or start the clock. Returns 1
- * when starting it evicted a live entry (the window is smaller than the depth). */
-static int lat_queued(gptps_tui *t, const gptps_event *ev, tui_task *tk)
-{
-    int j;
-    if (t->lat_tomb) {
-        for (j = 0; j < t->lat_cap; ++j)                  /* a terminal event beat us here */
-            if (t->lat[j].h == ev->handle && t->lat[j].done) {
-                if (t->lat[j].done == 1) lat_sample(tk, ev->ts_ms, t->lat[j].ts);
-                t->lat[j].h = 0; t->lat[j].done = 0; --t->lat_tomb;
-                return 0;
-            }
-    }
-    for (j = 0; j < t->lat_nmemo; ++j)                    /* ...and found no room: it ended */
-        if (t->lat_memo[j] == ev->handle) {
-            t->lat_memo[j] = t->lat_memo[--t->lat_nmemo]; /* already counted in lat_skipped */
-            return 0;
-        }
-    j = lat_slot(t);
-    return j >= 0 ? lat_put(t, j, 1, ev->handle, ev->ts_ms, 0)
-                  : lat_put(t, t->lat_head, 1, ev->handle, ev->ts_ms, 0);   /* full: evict the oldest */
-}
-
 /* The item's life ends with this event (gptps.h, EVENTS): FINISHED, DEAD_LETTERED,
  * DROPPED, or a FAILED carrying GPTPS_E_CANCELLED - never a retry or a dead letter. A
  * FAILED attempt that is retried (or dead-lettered next) is not the end. */
@@ -552,47 +677,211 @@ static int ev_terminal(const gptps_event *ev)
            (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED);
 }
 
-/* A terminal event: release the handle's entry - with a sample for a FINISHED only, so
- * avg ms covers finished items. Every terminal event releases it: only FINISHED used
- * to, and an item that was dead-lettered, dropped or cancelled kept its entry until
- * the ring came round, so the window tracked fewer items than it was sized for. */
-static int lat_terminal(gptps_tui *t, const gptps_event *ev, tui_task *tk)
+/* ---- handle table (FULL) --------------------------------------------------------
+ * Keyed by handle, it gives two things nothing else here can: queue->finish latency, and
+ * EXACT pending / in-flight gauges (the counters cannot tell a cancelled attempt that
+ * ran from an item cancelled while queued - see `inflight`). One hash operation an event:
+ * the 1.10 ring scanned its whole window for every FINISHED (89 ns at 1024, 4.5 us at
+ * 65536, under the lock).
+ *
+ * Event order is NOT guaranteed across threads (gptps.h, EVENTS), so every transition is
+ * keyed on the slot's state and on the attempt an event names, never on arrival order -
+ * the rules of gptps_stats (whose order matrix tests/test_tui_order.c replays here):
+ *   - a terminal event that outruns its QUEUED leaves a marker (TS_DONE) that the late
+ *     QUEUED clears - taking the sample a FINISHED left owed, since those are the fastest
+ *     items and dropping them would pull avg ms up;
+ *   - a terminal event that outruns the RETRIED it is owed (an attempt > 1 whose RETRIED
+ *     has not arrived) leaves a marker that RETRIED clears, and a late RETRIED moves
+ *     nothing for an attempt already started or ended;
+ *   - a STARTED with no slot (it outran its QUEUED) opens one, running.
+ * Every terminal kind - FINISHED, DEAD_LETTERED, DROPPED, FAILED/E_CANCELLED - deletes
+ * the slot or leaves a marker; only FINISHED gives a sample.
+ *
+ * Bounded, never evicting: at most lat_cap live entries. A QUEUED that finds them all
+ * taken is not tracked (counted, WARNed once per window, shown under the table, and the
+ * gauges show '>=' - a lower bound - until nothing is left in flight); a live entry is
+ * never overwritten. Markers whose late event never comes (work queued before the table
+ * existed; an always-up service's later runs, which have no QUEUED; the end of a handle
+ * the table was too full to take) are bounded by the orphan FIFO: the newest
+ * TUI_ORPHANS are kept, the oldest dropped and counted. The table has
+ * next_pow2((lat_cap + TUI_ORPHANS) * 4 / 3 + 1) slots, so it is never more than 3/4
+ * full. */
+
+/* Where a handle's probe starts: murmur3's 64-bit finalizer over the handle's BLOCK of
+ * TUI_TRK_RUN consecutive handles, the low bits kept. The engine numbers handles in
+ * submission order, and items submitted together live together, so a block's handles
+ * share a few cache lines instead of each taking a line of its own somewhere in the
+ * table: a 1<<20 window is 64 MiB, and one cache (and TLB) miss per new handle made it
+ * 3x the cost of the 64 KiB default; per block it is one miss in eight. Blocks are still
+ * spread at random, so any set of handles - strided, sparse, adversarial - probes like
+ * murmur-hashed keys, in runs of at most a block. */
+#define TUI_TRK_RUN 8u
+static size_t trk_home(gptps_handle h, size_t mask)
 {
-    int j, fin = (ev->kind == GPTPS_EV_FINISHED), free_j = -1;
-    for (j = 0; j < t->lat_cap; ++j) {
-        if (t->lat[j].h == ev->handle && !t->lat[j].done) {
-            if (fin) lat_sample(tk, t->lat[j].ts, ev->ts_ms);
-            t->lat[j].h = 0; --t->lat_live;
-            return 0;
-        }
-        if (free_j < 0 && !t->lat[j].h) free_j = j;
+    uint64_t x = (uint64_t)h / TUI_TRK_RUN;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+    return (size_t)(x * TUI_TRK_RUN + (uint64_t)h % TUI_TRK_RUN) & mask;
+}
+static size_t trk_slots(int window) { return next_pow2(((size_t)window + TUI_ORPHANS) * 4 / 3 + 1); }
+
+static tui_slot *trk_find(gptps_tui *t, gptps_handle h)
+{
+    size_t i;
+    for (i = trk_home(h, t->tab_mask); ; i = (i + 1) & t->tab_mask) {
+        if (t->tab[i].h == h) return &t->tab[i];
+        if (t->tab[i].h == 0) return NULL;
     }
-    /* No live entry: this event outran its own QUEUED - leave a tombstone for it (these
-     * are the FASTEST items; dropping them would skew avg ms up) - or its entry was
-     * evicted because the window is smaller than the depth. The two cannot be told
-     * apart here, so a tombstone may only take a slot that holds no live entry. Planted
-     * over a live one, it evicted a second item, whose terminal event then missed and
-     * evicted a third: at depth >= window that cascade left 0 samples and a ring full
-     * of tombstones nothing would claim, each one turning on the scan above for every
-     * QUEUED. So it goes in a slot near the head that holds none (lat_slot), else in
-     * any free slot the scan above passed, and only when there is neither is it skipped
-     * (counted, and remembered so its late QUEUED starts no clock for an ended item).
-     * Returns 1 when skipped. */
-    if ((j = lat_slot(t)) >= 0) { lat_put(t, j, 1, ev->handle, ev->ts_ms, fin ? 1 : 2); return 0; }
-    if (free_j >= 0)            { lat_put(t, free_j, 0, ev->handle, ev->ts_ms, fin ? 1 : 2); return 0; }
-    ++t->lat_skipped;
-    if (t->lat_nmemo < TUI_LAT_MEMO) t->lat_memo[t->lat_nmemo++] = ev->handle;
-    else { t->lat_memo[t->lat_memo_head] = ev->handle; t->lat_memo_head = (t->lat_memo_head + 1) % TUI_LAT_MEMO; }
-    return 1;
+}
+
+/* Move a slot to state `st`, keeping the gauges and the marker count true. */
+static void trk_state(gptps_tui *t, tui_slot *sl, int st)
+{
+    if (sl->state == st) return;
+    if (sl->state == TS_PENDING) t->g_pend--;
+    else if (sl->state == TS_RUNNING) t->g_run--;
+    else if (sl->state == TS_DONE) t->tab_done--;
+    sl->state = (uint8_t)st;
+    if (st == TS_PENDING) t->g_pend++;
+    else if (st == TS_RUNNING) t->g_run++;
+    else if (st == TS_DONE) t->tab_done++;
+}
+
+static tui_slot *trk_insert(gptps_tui *t, gptps_handle h)
+{
+    size_t i = trk_home(h, t->tab_mask);
+    while (t->tab[i].h) i = (i + 1) & t->tab_mask;
+    memset(&t->tab[i], 0, sizeof t->tab[i]);
+    t->tab[i].h = h;
+    t->tab_n++;
+    return &t->tab[i];
+}
+
+/* Delete a slot, tombstone-free (backward shift), so probes stay short. Moves entries:
+ * any slot pointer taken before this call is stale after it. */
+static void trk_del(gptps_tui *t, tui_slot *sl)
+{
+    size_t mask = t->tab_mask, i = (size_t)(sl - t->tab), j = i;
+    trk_state(t, sl, TS_NONE);
+    for (;;) {
+        size_t k;
+        j = (j + 1) & mask;
+        if (t->tab[j].h == 0) break;
+        k = trk_home(t->tab[j].h, mask);
+        /* can the entry at j move to i? yes iff its home k is not in (i, j] cyclically */
+        if ((i <= j) ? (k <= i || k > j) : (k <= i && k > j)) { t->tab[i] = t->tab[j]; i = j; }
+    }
+    memset(&t->tab[i], 0, sizeof t->tab[i]);
+    t->tab_n--;
+}
+
+/* Remember a new marker; drop the oldest when the FIFO is full (it may delete a slot). */
+static void trk_orphan(gptps_tui *t, gptps_handle h)
+{
+    if (t->orph_n == TUI_ORPHANS) {
+        tui_slot *o = trk_find(t, t->orph[t->orph_head]);
+        if (o && o->state == TS_DONE) { trk_del(t, o); t->h_orphans++; t->lat_unmatched++; }
+        t->orph[t->orph_head] = h;
+        t->orph_head = (t->orph_head + 1) % TUI_ORPHANS;
+    } else {
+        t->orph[(t->orph_head + t->orph_n) % TUI_ORPHANS] = h;
+        t->orph_n++;
+    }
+}
+
+/* An event of attempt N > 1 has arrived and the RETRIED announcing attempt N has not. */
+#define TRK_OWES_RETRIED(sl) ((sl)->att > 1 && (sl)->ann < (sl)->att)
+
+/* The handle's life is over: delete its slot, or keep it as a marker for the event it
+ * still owes (its QUEUED, or a RETRIED). Last use of `sl`. */
+static void trk_finish(gptps_tui *t, tui_slot *sl)
+{
+    if (sl->seen_q && !TRK_OWES_RETRIED(sl)) { trk_del(t, sl); return; }
+    if (sl->state != TS_DONE) {
+        gptps_handle h = sl->h;
+        trk_state(t, sl, TS_DONE);
+        trk_orphan(t, h);
+    }
+}
+
+/* One event into the handle table; `tk` is the event's row (for the sample), or NULL.
+ * Returns 1 when a QUEUED found the table full for the first time at this window size
+ * (the caller WARNs once it drops the lock). */
+static int trk_event(gptps_tui *t, const gptps_event *ev, tui_task *tk)
+{
+    tui_slot *sl;
+    int term = ev_terminal(ev), warn = 0;
+    if (!ev->handle) return 0;
+    sl = trk_find(t, ev->handle);
+    if (!sl) {
+        /* A terminal event may always take a slot: it becomes a marker at once, and the
+         * orphan FIFO bounds those. Anything else needs a live entry's room. */
+        if (!term && t->tab_n - t->tab_done >= (size_t)t->lat_cap) {
+            t->trk_lb = 1;                                  /* the gauges miss this handle */
+            if (ev->kind == GPTPS_EV_QUEUED) {
+                t->h_untracked++; t->lat_untracked++;
+                if (t->lat_warned != t->lat_cap) { t->lat_warned = t->lat_cap; warn = 1; }
+            }
+            return warn;
+        }
+        sl = trk_insert(t, ev->handle);
+    }
+    switch (ev->kind) {
+    case GPTPS_EV_QUEUED:
+        sl->seen_q = 1;
+        if (sl->owe_fin) { lat_sample(tk, ev->ts_ms, sl->ts); sl->owe_fin = 0; }   /* the FINISHED that beat it */
+        sl->ts = ev->ts_ms;
+        if (sl->state == TS_DONE) {                         /* already over */
+            if (!TRK_OWES_RETRIED(sl)) trk_del(t, sl);
+            break;
+        }
+        if (sl->state == TS_NONE) trk_state(t, sl, TS_PENDING);
+        break;
+    case GPTPS_EV_STARTED:
+        if (ev->attempt <= 1) sl->ann = 0;                  /* a new cycle (REQUEUE, service restart) */
+        sl->att = ev->attempt;
+        trk_state(t, sl, TS_RUNNING);
+        break;
+    case GPTPS_EV_FINISHED:
+        if (ev->attempt > sl->att) sl->att = ev->attempt;
+        if (sl->seen_q) lat_sample(tk, sl->ts, ev->ts_ms);
+        else if (!sl->owe_fin) { sl->owe_fin = 1; sl->ts = ev->ts_ms; }   /* its QUEUED takes the sample */
+        trk_finish(t, sl);
+        break;
+    case GPTPS_EV_FAILED:
+        if (ev->attempt > sl->att) sl->att = ev->attempt;
+        if (term) trk_finish(t, sl);                        /* cancelled: whether it ran or not */
+        else trk_state(t, sl, TS_LIMBO);                    /* a retry, a dead letter or a drop follows */
+        break;
+    case GPTPS_EV_RETRIED:
+        if (ev->attempt > sl->ann) sl->ann = ev->attempt;
+        /* LATE: the attempt it announces has already started or ended, or the handle is
+         * over. It moves nothing, and clears the marker a terminal event left for it. */
+        if (sl->att >= ev->attempt || sl->state == TS_DONE) {
+            if (sl->state == TS_DONE && sl->seen_q && !TRK_OWES_RETRIED(sl)) trk_del(t, sl);
+            break;
+        }
+        trk_state(t, sl, TS_PENDING);
+        break;
+    case GPTPS_EV_DEAD_LETTERED:
+    case GPTPS_EV_DROPPED:
+        if (ev->attempt > sl->att) sl->att = ev->attempt;
+        trk_finish(t, sl);
+        break;
+    default:
+        break;
+    }
+    if (t->g_run > t->peak) t->peak = t->g_run;
+    return warn;
 }
 
 static void tui_on_event(const gptps_event *ev, void *ud)
 {
     gptps_tui *t = (gptps_tui *)ud;
     tui_task *tk;
-    int left_out = 0, evicted = 0, win = 0;
+    int first_fold = 0, win = 0;
     uint64_t depth = 0, running = 0;
-    if (t->off) return;              /* KPI OFF: before the lock, deliberately - see the field */
+    if (TUI_FLAG_GET(&t->off)) return;   /* KPI OFF: before the lock, deliberately - see the field */
     /* A running job's samples (measure.sample_ms) are not part of any item's life: they
      * would only flood the log. The peak column reads the attempts' own measurements. */
     if (ev->kind == GPTPS_EV_SAMPLE) return;
@@ -615,47 +904,21 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         case GPTPS_EV_DROPPED:       t->drop++; t->term++; break;
         default: break;
     }
-    if (t->inflight > t->peak) t->peak = t->inflight;
+    if (!t->tab && t->inflight > t->peak) t->peak = t->inflight;   /* with the table: its exact gauge */
     t->dirty = 1;                                /* something changed (for ON_DEMAND repaint) */
 
-    /* MINIMAL stops here - counts only, ~no per-event cost. NORMAL+ does the
-     * per-task table + recent log; latency tracking runs only when its ring exists
-     * (FULL), and that ring is freed when the KPI level is lowered. */
+    /* MINIMAL stops here - counts only. NORMAL+ does the per-task table + recent log;
+     * the handle table runs only when it exists (FULL), and it is freed below FULL. */
     if (t->kpi < GPTPS_TUI_KPI_NORMAL) { mu_unlock(&t->mu); return; }
-    tk = task_for(t, ev->task_name, &left_out);
+    tk = row_for_event(t, ev->task_name, &first_fold);
 
-    /* Latency, and why this is not simply "record at QUEUED, resolve at FINISHED".
-     *
-     * Event order is NOT guaranteed across threads (see the EVENTS block in gptps.h):
-     * QUEUED is emitted by the submitting thread after the engine lock is dropped, and
-     * the dispatcher was signalled while it was still held, so a task that runs in under
-     * a microsecond reports FINISHED before its own QUEUED callback has run. Resolving
-     * only at FINISHED silently loses every one of those, and the loss is not neutral -
-     * the items that win that race are by construction the ones that waited least, so
-     * dropping them drags the reported average UP. gptps_stats meets the same inversion
-     * and answers it the same way, with a tombstone the late event clears.
-     *
-     * So: a terminal event with no entry leaves one (a tombstone), and the QUEUED that
-     * arrives afterwards completes the sample (FINISHED) or just clears it, instead of
-     * starting a new one. Every terminal event releases the entry; only FINISHED gives
-     * a sample, so avg ms covers finished items only.
-     *
-     * The larger distortion is the ring being too small for the in-flight depth: an
-     * entry lives from QUEUED to its terminal event, so a burst that backs up past
-     * lat_cap items overwrites the oldest live entries before they resolve. Those
-     * samples are lost - the longest waits, so avg ms then reads LOW - and counted
-     * (lat_evicted, and lat_skipped for the ends that found no entry, both shown under
-     * the table), with a WARN once per window size. The
-     * window is the caller's to size (cfg.latency_window, or tui.latency_window at
-     * runtime), which is why it is a knob and not a guess. */
-    if (t->lat) {
-        if (ev->kind == GPTPS_EV_QUEUED) evicted = lat_queued(t, ev, tk);
-        else if (ev_terminal(ev))        evicted = lat_terminal(t, ev, tk);
-        if (evicted && t->lat_warned != t->lat_cap) {    /* once per window size */
-            t->lat_warned = win = t->lat_cap;
+    if (t->tab) {
+        if (trk_event(t, ev, tk)) {
+            win = t->lat_cap;
             depth = t->q > t->term ? t->q - t->term : 0;
-            running = t->inflight;
+            running = t->g_run;
         }
+        if (t->trk_lb && t->q <= t->term) t->trk_lb = 0;   /* nothing left in flight: exact again */
     }
 
     if (tk) {
@@ -683,30 +946,27 @@ static void tui_on_event(const gptps_event *ev, void *ud)
         tui_event *re = &t->recent[t->rhead];
         re->ts = ev->ts_ms; re->kind = ev->kind; re->handle = ev->handle; re->status = ev->status;
         copy_u8(re->name, sizeof re->name, ev->task_name);   /* whole: a name is at most GPTPS_TASK_NAME_MAX */
-        tui_why(ev, re->why, sizeof re->why);
+        why_record(ev, re);
         t->rhead = (t->rhead + 1) % t->rcap;
         if (t->rn < t->rcap) t->rn++;
     }
     mu_unlock(&t->mu);
     /* never silent - logged outside the lock, so a log sink cannot stall the event path's lock */
-    if (left_out) {
+    if (first_fold) {
         char msg[512], nm[GPTPS_TASK_NAME_MAX * 2 + 2];
-        snprintf(msg, sizeof msg, "gptps_tui: task type '%s' gets no row in the dashboard's TASKS table, which "
-                 "holds %d types; its events still count in the totals, and the table shows how many types "
-                 "it leaves out", tui_cl(ev->task_name, nm, sizeof nm), TUI_MAX_TASKS);
+        snprintf(msg, sizeof msg, "gptps_tui: task type '%s' gets no row of its own in the dashboard's TASKS "
+                 "table, which holds %d types (cfg.max_tasks); its events count in the '(other)' row, and the "
+                 "table shows how many types it folds there", tui_cl(ev->task_name, nm, sizeof nm), t->max_tasks);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     if (win) {
-        char msg[512];
-        /* Not "the depth exceeds the window": an entry lives from QUEUED to the item's
-         * end, so long-lived items can fill the ring at a modest depth. Say what was
-         * measured - the depth when the loss began - and what to change. */
-        snprintf(msg, sizeof msg, "gptps_tui: latency samples are being lost: the ring of tui.latency_window = "
-                 "%d entries has no room left - an entry lives from an item's QUEUED to its end, and the "
-                 "entries have outlived the window (about %llu items were queued or running when this "
-                 "began, %llu running) - so entries are evicted, or an end finds no entry, without a "
-                 "sample, and avg ms leans to the shorter waits; raise tui.latency_window "
-                 "(cfg.latency_window) to cover the items in flight, long-running ones included",
+        char msg[640];
+        snprintf(msg, sizeof msg, "gptps_tui: latency samples are being lost: the handle table of "
+                 "tui.latency_window = %d entries has no room left - an entry lives from an item's QUEUED to its "
+                 "end, and about %llu items were queued or running when this began (%llu running) - so new "
+                 "items are not tracked: no avg ms sample, and the pending / in-flight gauges show a lower "
+                 "bound ('>='); no tracked item is evicted; raise tui.latency_window (cfg.latency_window) to "
+                 "cover the items in flight, long-running ones included",
                  win, (unsigned long long)depth, (unsigned long long)running);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
@@ -790,6 +1050,14 @@ static size_t frame_finish(int color, char *buf, size_t cap, size_t pos)
     memcpy(buf + pos, TUI_TRUNC_MARK, ml); pos += ml;
     buf[pos] = 0;
     return pos;
+}
+
+/* frame_finish for a pane, counting a frame that did not fit (gptps_tui_health). Called
+ * without mu held. */
+static size_t tui_finish(gptps_tui *t, char *buf, size_t cap, size_t pos)
+{
+    if (cap && pos >= cap) { mu_lock(&t->mu); t->h_trunc++; mu_unlock(&t->mu); }
+    return frame_finish(t->cfg.color, buf, cap, pos);
 }
 
 /* Whether the status / toast is still shown: every pane fades it after TUI_TOAST_MS. */
@@ -989,7 +1257,7 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
     if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     pos = status_line(t, buf, cap, pos, "", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
-    return frame_finish(t->cfg.color, buf, cap, pos);
+    return tui_finish(t, buf, cap, pos);
 }
 
 /* After a set: what happened, in the status line. */
@@ -1092,7 +1360,7 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "  %-9s re-submit all \xc2\xb7 this one \xc2\xb7 discard this one \xc2\xb7 all\n", "r/e/x/D");
     pos = appendf(buf, cap, pos, "  %-9s %s(a re-submit the engine refuses stays here, with the reason)%s\n", "", D, X);
     pos = appendf(buf, cap, pos, "\n%spress any key to return%s\n", D, X);
-    return frame_finish(t->cfg.color, buf, cap, pos);
+    return tui_finish(t, buf, cap, pos);
 }
 
 static const char *exec_str(int k)
@@ -1182,7 +1450,7 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
     }
     pos = status_line(t, buf, cap, pos, "", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s inspect  %s back  a pause  c clone  n new  d delete  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
-    return frame_finish(t->cfg.color, buf, cap, pos);
+    return tui_finish(t, buf, cap, pos);
 }
 
 /* Detail pane: one task's resolved settings (built-in policy + generic per-task),
@@ -1224,7 +1492,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
     if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     pos = status_line(t, buf, cap, pos, "", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
-    return frame_finish(t->cfg.color, buf, cap, pos);
+    return tui_finish(t, buf, cap, pos);
 }
 
 /* Dead-letter pane. The engine keeps its dead letters where only a DRAIN can read
@@ -1277,19 +1545,21 @@ static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
     pos = status_line(t, buf, cap, pos, "\n", D, X);
     pos = appendf(buf, cap, pos, "\n%skeys:%s g load  r re-submit all  e re-submit this one  x discard this one  D discard all\n"
                   "      %s move  %s back  q quit\n", D, X, a_ud(t), a_lt(t));
-    return frame_finish(t->cfg.color, buf, cap, pos);
+    return tui_finish(t, buf, cap, pos);
 }
 
-/* The dashboard's key legend: a hotkey item per task row, a separator, then the global
- * keys - the item array is sized from these counts, never by a guess (it once held 8
- * spare slots for 9 items, and 64 printable hotkeys wrote one past its end). */
+/* The dashboard's key legend: an item per printable hotkey bound with gptps_tui_add_task
+ * (the first binding of each key: the one a press submits), a separator, then the global
+ * keys. Items are formatted one at a time, so their number is bounded by the keys that can
+ * be typed (33..126), never by a guess: an array sized for 64 task rows plus 8 once took
+ * 9 items and 64 printable hotkeys wrote one past its end. */
 #define TUI_LEGEND_ITEM 96
 static const char *const TUI_LEGEND_KEYS[] = {
     NULL /* the scroll keys: arrows or words, by cfg.unicode */,
     "s settings", "t tasks", "l dead-letter", "m kpi", "p pause", "? help", "q quit"
 };
 #define TUI_LEGEND_NKEYS ((int)(sizeof TUI_LEGEND_KEYS / sizeof TUI_LEGEND_KEYS[0]))
-#define TUI_LEGEND_MAX   (TUI_MAX_TASKS + 1 + TUI_LEGEND_NKEYS)   /* hotkeys + separator + keys */
+#define TUI_LEGEND_MAX   (94 + 1 + TUI_LEGEND_NKEYS)   /* typeable hotkeys + separator + keys */
 /* what legend_text can write: every item and its gap or line break, plus "keys:" */
 #define TUI_LEGEND_CAP   (TUI_LEGEND_MAX * (TUI_LEGEND_ITEM + 8) + 16)
 
@@ -1298,30 +1568,40 @@ static const char *const TUI_LEGEND_KEYS[] = {
  * by '\n', no trailing one; returns the rows. Caller holds mu. */
 static int legend_text(gptps_tui *t, int W, char *out, size_t cap)
 {
-    char items[TUI_LEGEND_MAX][TUI_LEGEND_ITEM];
-    int n = 0, i, rows = 1, col;
-    size_t pos = 0;
-    for (i = 0; i < t->ntasks && i < TUI_MAX_TASKS; ++i)
-        if (t->tasks[i].hotkey > 32 && t->tasks[i].hotkey < 127) {   /* a key that can be typed and shown */
-            char lb[TUI_LEGEND_ITEM - 8];           /* cleaned, cut at a character, fits the item */
-            snprintf(items[n++], sizeof items[0], "[%c] %.*s", t->tasks[i].hotkey, (int)sizeof lb - 1,
-                     tui_cl(t->tasks[i].label, lb, sizeof lb));
-        }
-    if (n) snprintf(items[n++], sizeof items[0], "\xc2\xb7");
-    for (i = 0; i < TUI_LEGEND_NKEYS; ++i)
-        if (TUI_LEGEND_KEYS[i]) snprintf(items[n++], sizeof items[0], "%s", TUI_LEGEND_KEYS[i]);
-        else                    snprintf(items[n++], sizeof items[0], "%s scroll", a_ud(t));
+    unsigned char seen[128];
+    char item[TUI_LEGEND_ITEM];
+    int rows = 1, col = 5, nhot = 0, step;
+    size_t pos;
+    memset(seen, 0, sizeof seen);
     pos = (size_t)snprintf(out, cap, "keys:");
-    col = 5;
-    for (i = 0; i < n; ++i) {
-        int w = u8_cols(items[i]);
-        if (col > 6 && col + 2 + w > W - 1) {         /* the next row, indented */
-            pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "\n     ");
-            col = 5; ++rows;
+    /* step 0: the hotkeys; 1: the separator (when there were any); 2..: the global keys */
+    for (step = 0; step < 2 + TUI_LEGEND_NKEYS; ++step) {
+        int last = (step == 0) ? t->nui : 1, k;
+        for (k = 0; k < last; ++k) {
+            int w;
+            if (step == 0) {
+                int hk = t->ui[k].hotkey;
+                char lb[TUI_LEGEND_ITEM - 8];       /* cleaned, cut at a character, fits the item */
+                if (hk <= 32 || hk >= 127 || seen[hk]) continue;   /* a key that can be typed and shown */
+                seen[hk] = 1; ++nhot;
+                snprintf(item, sizeof item, "[%c] %.*s", hk, (int)sizeof lb - 1, tui_cl(t->ui[k].label, lb, sizeof lb));
+            } else if (step == 1) {
+                if (!nhot) continue;
+                snprintf(item, sizeof item, "\xc2\xb7");
+            } else if (TUI_LEGEND_KEYS[step - 2]) {
+                snprintf(item, sizeof item, "%s", TUI_LEGEND_KEYS[step - 2]);
+            } else {
+                snprintf(item, sizeof item, "%s scroll", a_ud(t));
+            }
+            w = u8_cols(item);
+            if (col > 6 && col + 2 + w > W - 1) {     /* the next row, indented */
+                pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "\n     ");
+                col = 5; ++rows;
+            }
+            pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "%s%s", col > 5 ? "  " : " ", item);
+            col += (col > 5 ? 2 : 1) + w;
+            if (pos >= cap) { out[cap - 1] = 0; return rows; }
         }
-        pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "%s%s", col > 5 ? "  " : " ", items[i]);
-        col += (col > 5 ? 2 : 1) + w;
-        if (pos >= cap) { out[cap - 1] = 0; break; }
     }
     return rows;
 }
@@ -1353,38 +1633,73 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     if (color) { pos = titlebar(buf, cap, pos, t, W, up, rate); pos = rule(buf, cap, pos, W, uni); }
     else pos = appendf(buf, cap, pos, "GPTPS \xc2\xb7 %s   up %.1fs   %.1f done/s\n", t->cfg.title, up, rate);
 
-    {   /* in-flight gauge, scaled to the terminal width */
-        uint64_t inflt = t->inflight;             /* counted, not derived: see the field */
+    {   /* the gauges, and an in-flight bar fitted to what the line leaves of the width */
+        /* EXACT from the handle table (FULL); '>=' while that is a lower bound (see
+         * trk_lb); '~' from the counters, which cannot be exact (see `inflight`) */
+        int exact = t->tab != NULL;
+        const char *mk = exact ? (t->trk_lb ? ">=" : "") : "~";
+        uint64_t inflt = exact ? t->g_run : t->inflight;
+        uint64_t alive = t->q > t->term ? t->q - t->term : 0;
+        uint64_t pend = exact ? t->g_pend : (alive > inflt ? alive - inflt : 0);
         unsigned j, gw, w;
+        int ll, rl;
+        char left[160], right[48], pc[16];
         const char *fillc = uni ? "\xe2\x96\x88" : "#";   /* full block / hash */
         const char *trakc = uni ? "\xe2\x96\x91" : ".";   /* light shade / dot  */
         const char *C = color ? "\x1b[36m" : "";          /* cyan bar */
-        gw = (unsigned)(W / 3); if (gw < 10) gw = 10; if (gw > 40) gw = 40;
+        ll = snprintf(left, sizeof left, "queued %llu  started %llu  pending %s%s  in-flight %s%llu  ",
+                      (unsigned long long)t->q, (unsigned long long)t->s, mk, fmt_count(pc, sizeof pc, pend), mk,
+                      (unsigned long long)inflt);
+        rl = snprintf(right, sizeof right, " peak %llu", (unsigned long long)t->peak);
+        gw = (unsigned)(W / 3); if (gw > 40) gw = 40;
+        if ((int)gw > W - 1 - ll - 2 - rl) gw = (unsigned)(W - 1 - ll - 2 - rl > 0 ? W - 1 - ll - 2 - rl : 0);
+        if (gw < 10) gw = 10;
         w = (t->peak && inflt) ? (unsigned)((double)inflt * gw / (double)t->peak) : 0; if (w > gw) w = gw;
-        pos = appendf(buf, cap, pos, "queued %llu  started %llu  in-flight %llu  %s[%s", (unsigned long long)t->q,
-                      (unsigned long long)t->s, (unsigned long long)inflt, D, C);
+        pos = appendf(buf, cap, pos, "%s%s[%s", left, D, C);
         for (j = 0; j < gw; ++j) pos = appendf(buf, cap, pos, "%s", j < w ? fillc : trakc);
-        pos = appendf(buf, cap, pos, "%s%s]%s peak %llu\n", X, D, X, (unsigned long long)t->peak);
+        pos = appendf(buf, cap, pos, "%s%s]%s%s\n", X, D, X, right);
     }
     pos = appendf(buf, cap, pos, "%sfinished %llu%s  %sfailed %llu%s  retried %llu  %sdead %llu%s  %sdropped %llu%s\n",
                   G, (unsigned long long)t->fin, X, (t->fail ? R : ""), (unsigned long long)t->fail, X,
                   (unsigned long long)t->retr, (t->dead ? R : ""), (unsigned long long)t->dead, X,
                   (t->drop ? R : ""), (unsigned long long)t->drop, X);
-    /* FULL with no ring: its allocation failed (logged) - say so where the tier is shown */
-    pos = appendf(buf, cap, pos, "%skpi:%s%s mode:%s refresh:%ums%s\n",
-                  D, kpi_str(t->kpi), (t->kpi == GPTPS_TUI_KPI_FULL && !t->lat) ? " (latency off: no memory)" : "",
+    /* a tier running without a buffer it could not allocate (logged) - said where the tier is shown */
+    pos = appendf(buf, cap, pos, "%skpi:%s%s%s mode:%s refresh:%ums%s\n",
+                  D, kpi_str(t->kpi), (t->kpi == GPTPS_TUI_KPI_FULL && !t->tab) ? " (latency off: no memory)" : "",
+                  (t->kpi >= GPTPS_TUI_KPI_NORMAL && !t->tasks) ? " (tasks off: no memory)" : "",
                   mode_str(t->mode), t->cfg.refresh_ms, X);
+    /* never silent: a line of what has been lost, only once something has (gptps_tui_health) */
+    if (t->h_folded || t->h_untracked || t->h_trunc || t->h_nomem) {
+        char ls[320];
+        size_t lp = (size_t)snprintf(ls, sizeof ls, "lost:");
+        if (t->h_folded)
+            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu%s types folded into (other);",
+                                   (unsigned long long)t->h_folded, t->fold_more ? "+" : "");
+        if (t->h_untracked && lp < sizeof ls)
+            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu items not tracked (latency window full);",
+                                   (unsigned long long)t->h_untracked);
+        if (t->h_trunc && lp < sizeof ls)
+            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu frames truncated;", (unsigned long long)t->h_trunc);
+        if (t->h_nomem && lp < sizeof ls)
+            lp += (size_t)snprintf(ls + lp, sizeof ls - lp, " %llu allocations failed;", (unsigned long long)t->h_nomem);
+        if (lp >= sizeof ls) lp = sizeof ls - 1;
+        if (lp && ls[lp - 1] == ';') ls[--lp] = 0;
+        pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(ls, W - 1), ls, X);
+    }
 
-    if (t->show_tasks && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
+    if (t->show_tasks && t->kpi >= GPTPS_TUI_KPI_NORMAL && t->tasks) {
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
         pos = appendf(buf, cap, pos, "%s  %-16s %5s %5s %5s %5s %5s %5s %8s %8s  key%s\n",
                       D, "label", "run", "ok", "fail", "dead", "drop", "ok%", "avg ms", "peak MB", X);
-        for (i = 0; i < t->ntasks; ++i) {
-            tui_task *k = &t->tasks[i];
-            char key[8], pct[8], lat[24], peak[32], lb[sizeof k->label * 2], c[5][16];
+        /* the types in the order first seen, then '(other)' once anything was folded there */
+        for (i = 1; i <= t->ntasks; ++i) {
+            tui_task *k = &t->tasks[i < t->ntasks ? i : 0];
+            const tui_ui *u = (k->ui >= 0 && k->ui < t->nui) ? &t->ui[k->ui] : NULL;
+            char key[8], pct[8], lat[24], peak[32], lb[TUI_LABEL_CAP * 2], c[5][16];
             uint64_t terminal = k->finished + k->dead + k->dropped;
             const char *pc = "";
-            if (k->hotkey > 32 && k->hotkey < 127) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
+            if (i == t->ntasks && !t->nfold && !k->started && !k->failed && !k->retried && !terminal) break;
+            if (u && u->hotkey > 32 && u->hotkey < 127) snprintf(key, sizeof key, "[%c]", u->hotkey); else key[0] = 0;
             if (terminal) {
                 /* In double, then clamped: the counters are 64-bit, so finished * 100 could
                  * still wrap in integers. Clamped, the invariant the %3u here and the %5s
@@ -1404,18 +1719,18 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
             if (k->mem_method[0]) snprintf(peak, sizeof peak, "%8.1f", (double)k->mem_peak / 1048576.0);
             else                  strcpy(peak, "      --");
             pos = appendf(buf, cap, pos, "  %s %5s %5s %5s %5s %5s %s%5s%s %8s %8s  %s\n",
-                          tui_cell(k->label, lb, sizeof lb, 16), fmt_count(c[0], sizeof c[0], k->started),
+                          tui_cell(u ? u->label : k->name, lb, sizeof lb, 16), fmt_count(c[0], sizeof c[0], k->started),
                           fmt_count(c[1], sizeof c[1], k->finished), fmt_count(c[2], sizeof c[2], k->failed),
                           fmt_count(c[3], sizeof c[3], k->dead), fmt_count(c[4], sizeof c[4], k->dropped),
                           pc, pct, color ? X : "", lat, peak, key);
         }
-        /* never silent: the types the full table leaves out, and the latency it lost */
-        if (t->nover)
-            pos = appendf(buf, cap, pos, "  %s+%d%s types not shown (the table holds %d)%s\n", R, t->nover,
-                          t->over_more ? " or more" : "", TUI_MAX_TASKS, X);
-        if (t->lat && (t->lat_evicted || t->lat_skipped))
-            pos = appendf(buf, cap, pos, "  %slatency: %llu not sampled, %llu ends unmatched (window %d too small)%s\n",
-                          D, (unsigned long long)t->lat_evicted, (unsigned long long)t->lat_skipped, t->lat_cap, X);
+        /* never silent: the types the full table folds, and the latency it lost */
+        if (t->nfold)
+            pos = appendf(buf, cap, pos, "  %s+%d%s types folded into (other) (the table holds %d)%s\n", R, t->nfold,
+                          t->fold_more ? " or more" : "", t->max_tasks, X);
+        if (t->tab && (t->lat_untracked || t->lat_unmatched))
+            pos = appendf(buf, cap, pos, "  %slatency: %llu not tracked (window %d full), %llu ends unmatched%s\n",
+                          D, (unsigned long long)t->lat_untracked, t->lat_cap, (unsigned long long)t->lat_unmatched, X);
     }
 
     if (t->show_recent && t->rcap > 0 && t->recent && t->kpi >= GPTPS_TUI_KPI_NORMAL) {
@@ -1444,14 +1759,15 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
             /* One terminal row each: the vertical fit above counts rows by '\n', so a
              * line that wrapped took two and pushed the frame past the screen. The fixed
              * fields are measured as printed; the why text gets what is left. */
-            char pre[128], nm[sizeof re->name * 2];
+            char pre[128], nm[sizeof re->name * 2], why[sizeof re->why + TUI_TAIL_KEEP + 16];
             int pl = snprintf(pre, sizeof pre, "  %6.1f %-8s %s #%llu", rel, kind_str(re->kind), tui_cell(re->name, nm, sizeof nm, 14),
                               (unsigned long long)re->handle);
-            int room = W - 1 - (pl < 0 ? 0 : pl) - 2;
-            int wl = (re->why[0] && room >= 4) ? (int)u8_fit(re->why, room) : 0;
+            int room = W - 1 - (pl < 0 ? 0 : pl) - 2, wl;
+            why_join(re->why, re->tail, re->tail_len, re->tail_cut, why, sizeof why);   /* cleaned here */
+            wl = (why[0] && room >= 4) ? (int)u8_fit(why, room) : 0;
             pos = appendf(buf, cap, pos, "  %s%6.1f%s %s%-8s%s %s #%llu%s%s%.*s%s\n",
                           D, rel, X, kc, kind_str(re->kind), X, nm, (unsigned long long)re->handle,
-                          wl ? "  " : "", D, wl, re->why, X);
+                          wl ? "  " : "", D, wl, why, X);
         }
     }
 
@@ -1466,7 +1782,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, legend, X);
     mu_unlock(&t->mu);
 
-    return frame_finish(t->cfg.color, buf, cap, pos);
+    return tui_finish(t, buf, cap, pos);
 }
 
 /* One key into the line editor shared by every pane (settings, detail, the task
@@ -1856,10 +2172,11 @@ static int deadletter_press(gptps_tui *t, int key)
 
 int gptps_tui_press(gptps_tui *t, int key)
 {
-    const char *name = NULL, *label = NULL;
-    const void *pl = NULL;
-    size_t pn = 0;
-    int i;
+    const char *name = NULL;
+    char nm[TUI_NAME_CAP], lb[TUI_LABEL_CAP];
+    void *plc = NULL;
+    size_t pn = 0, want = 0;
+    int i, tries;
     gptps_submit_options ko;
     int has_ko = 0;
     if (!t) return 0;
@@ -1876,24 +2193,43 @@ int gptps_tui_press(gptps_tui *t, int key)
         return -1;
     }
     if (key == '?') { t->pane = TUI_PANE_HELP; return 4; }      /* open the help overlay */
-    mu_lock(&t->mu);
-    for (i = 0; i < t->ntasks; ++i)
-        if (t->tasks[i].hotkey == key) {
-            name = t->tasks[i].name; label = t->tasks[i].label; pl = t->tasks[i].payload; pn = t->tasks[i].plen;
-            if ((has_ko = t->tasks[i].has_opts) != 0) ko = t->tasks[i].opts;   /* a copy: used unlocked */
-            break;
-        }
+    /* Copies, taken under the lock and used without it: add_task on another thread may
+     * grow the entries' array or replace this entry's payload meanwhile. The payload's
+     * copy is allocated with the lock released, then filled under it if its size still
+     * matches (replaced in between: once more). */
+    for (tries = 0; tries < 3; ++tries) {
+        mu_lock(&t->mu);
+        name = NULL;
+        for (i = 0; i < t->nui; ++i)
+            if (t->ui[i].hotkey == key) {
+                pn = t->ui[i].plen;
+                if (pn && (!plc || want != pn)) break;          /* a copy of this size first */
+                memcpy(nm, t->ui[i].name, sizeof nm); memcpy(lb, t->ui[i].label, sizeof lb);
+                name = nm;
+                if (pn) memcpy(plc, t->ui[i].payload, pn);
+                if ((has_ko = t->ui[i].has_opts) != 0) ko = t->ui[i].opts;
+                break;
+            }
+        if (name || i == t->nui) break;                         /* copied, or no such key: still locked */
+        mu_unlock(&t->mu);
+        free(plc);
+        want = pn;
+        if ((plc = malloc(want)) == NULL) { toast(t, "NOT submitted: no memory for the payload's copy"); return 0; }
+    }
+    if (tries == 3) { free(plc); return 0; }                    /* replaced each time: not this press */
     mu_unlock(&t->mu);                 /* submit OUTSIDE the lock: QUEUED fires our observer */
     if (name) {                        /* a due time counts from this press */
         gptps_handle h;
-        gptps_status st = gptps_submit_ex(t->e, name, pl, pn, has_ko ? &ko : NULL, &h);
+        gptps_status st = gptps_submit_ex(t->e, name, pn ? plc : NULL, pn, has_ko ? &ko : NULL, &h);
+        free(plc);
         if (st != GPTPS_OK) {          /* paused, unknown, full, denied, shutting down: say so */
-            toast(t, "NOT submitted %s: %s", label ? label : name, gptps_strerror(st));
+            toast(t, "NOT submitted %s: %s", lb[0] ? lb : name, gptps_strerror(st));
             return 0;
         }
-        toast(t, "submitted %s", label ? label : name);
+        toast(t, "submitted %s", lb[0] ? lb : name);
         return 1;
     }
+    free(plc);
     if (key == 'm' || key == 'M') {                 /* cycle KPI level (configure cost live) */
         int nk; mu_lock(&t->mu); nk = (t->kpi >= GPTPS_TUI_KPI_FULL) ? GPTPS_TUI_KPI_MINIMAL : t->kpi + 1; mu_unlock(&t->mu);
         if (gptps_tui_set_kpi(t, (gptps_tui_kpi)nk) == GPTPS_OK) toast(t, "kpi -> %s", kpi_str(nk));
@@ -1922,9 +2258,12 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
                                    int hotkey, const void *payload, size_t len,
                                    const gptps_submit_options *opts)
 {
-    tui_task *tk;
-    void *cp = NULL;
+    void *cp = NULL, *old_pl = NULL;
+    tui_ui *grown = NULL, *old_ui = NULL;
     gptps_submit_options o;
+    gptps_status st = GPTPS_OK;
+    uint64_t h;
+    int grown_for = -1;
     if (!t || !task_name) return GPTPS_E_INVAL;
     if (strlen(task_name) > GPTPS_TASK_NAME_MAX) return GPTPS_E_INVAL;   /* never a task's name */
     if (opts) {                        /* an older caller's struct: copy what it has, the rest 0 */
@@ -1936,18 +2275,61 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
         o.struct_size = sizeof o;
     }
     if (len) { cp = malloc(len); if (!cp) return GPTPS_E_NOMEM; memcpy(cp, payload, len); }
-    mu_lock(&t->mu);
-    tk = task_for(t, task_name, NULL);
-    if (tk) {
-        if (label) copy_u8(tk->label, sizeof tk->label, label);   /* display only: cut at a character */
-        tk->hotkey = hotkey;
-        free(tk->payload); tk->payload = cp; tk->plen = len; cp = NULL;
-        tk->has_opts = opts != NULL;
-        if (opts) tk->opts = o;
+    h = name_hash(task_name);
+    /* Under the lock: find the entry, or append one - growing the array means allocating,
+     * which is done with the lock released and the grown copy swapped in under it (see
+     * "storage"); another add_task may have grown it meanwhile, so look again. */
+    for (;;) {
+        int k, r = -1;
+        tui_ui *u = NULL;
+        mu_lock(&t->mu);
+        for (k = 0; k < t->nui; ++k) if (strcmp(t->ui[k].name, task_name) == 0) { u = &t->ui[k]; break; }
+        if (t->tasks) r = row_lookup(t, task_name, h);
+        if (!u) {
+            /* no room: max_tasks entries, or a TASKS table whose every row is taken by
+             * the types its events brought (GPTPS_E_FULL, as when the table was the list) */
+            if (t->nui >= t->max_tasks || (t->tasks && r < 0 && t->ntasks >= t->tasks_cap)) { st = GPTPS_E_FULL; mu_unlock(&t->mu); break; }
+            if (t->nui == t->ui_cap) {                        /* grow it, with the lock released */
+                int ncap = t->ui_cap ? t->ui_cap * 2 : 8;
+                if (ncap > t->max_tasks) ncap = t->max_tasks;
+                if (grown && grown_for == t->ui_cap) {        /* made last round for this capacity */
+                    if (t->nui) memcpy(grown, t->ui, (size_t)t->nui * sizeof *grown);
+                    old_ui = t->ui; t->ui = grown; t->ui_cap = ncap; grown = NULL;
+                } else {
+                    grown_for = t->ui_cap;
+                    mu_unlock(&t->mu);
+                    free(grown);
+                    grown = (tui_ui *)malloc((size_t)ncap * sizeof *grown);
+                    if (!grown) {
+                        mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
+                        st = GPTPS_E_NOMEM; break;
+                    }
+                    continue;
+                }
+            }
+            u = &t->ui[t->nui++];
+            memset(u, 0, sizeof *u);
+            memcpy(u->name, task_name, strlen(task_name) + 1);
+            copy_u8(u->label, sizeof u->label, task_name);
+        }
+        if (label) copy_u8(u->label, sizeof u->label, label);   /* display only: cut at a character */
+        u->hotkey = hotkey;
+        old_pl = u->payload; u->payload = cp; u->plen = len; cp = NULL;
+        u->has_opts = opts != NULL;
+        if (opts) u->opts = o;
+        if (t->tasks) {                                       /* its row, made now: shown in add order */
+            if (r < 0) r = row_add(t, task_name, h);
+            if (r > 0) t->tasks[r].ui = (int)(u - t->ui);
+        }
+        t->dirty = 1;
+        mu_unlock(&t->mu);
+        break;
     }
-    mu_unlock(&t->mu);
-    if (cp) free(cp);
-    return tk ? GPTPS_OK : GPTPS_E_FULL;
+    free(grown);                       /* grown for a capacity another call reached first */
+    free(old_ui);
+    free(old_pl);
+    free(cp);
+    return st;
 }
 
 /* ---- terminal control (live loop only) ---- */
@@ -2106,15 +2488,18 @@ static void term_size(gptps_tui *t)
 
 /* write a frame flicker-free: erase each line's tail (ESC[K) instead of clearing
  * the whole screen, so unchanged regions don't flash. */
-static void write_frame(FILE *out, const char *s)
+static size_t write_frame(FILE *out, const char *s)
 {
     const char *p = s, *nl;
+    size_t n = 0;
     while ((nl = strchr(p, '\n')) != NULL) {
         fwrite(p, 1, (size_t)(nl - p), out);
         fputs("\x1b[K\n", out);
+        n += (size_t)(nl - p) + 4;
         p = nl + 1;
     }
-    if (*p) { fputs(p, out); fputs("\x1b[K", out); }
+    if (*p) { fputs(p, out); fputs("\x1b[K", out); n += strlen(p) + 3; }
+    return n;
 }
 
 /* Until when the frame just painted shows a toast (0: none): the loop must paint
@@ -2150,10 +2535,12 @@ void gptps_tui_run(gptps_tui *t)
     }
     buf = (char *)malloc(cap);
     if (!buf) {
+        mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: no memory for the 16 KiB frame buffer; "
                   "the live dashboard does not run");
         return;
     }
+    mu_lock(&t->mu); t->frame_bytes = cap; mu_unlock(&t->mu);
     term_enable(t);
     fputs("\x1b[?25l", t->cfg.out);                 /* hide cursor */
     for (;;) {
@@ -2164,22 +2551,26 @@ void gptps_tui_run(gptps_tui *t)
         if (q) break;
         paint = paint_due(first, kp, md, dirty, shown_until, now);   /* the cadence: see paint_due */
         if (paint) {
+            size_t wrote;
             mu_lock(&t->mu); t->dirty = 0; mu_unlock(&t->mu);
             term_size(t);                            /* adapt the layout to the current window */
             gptps_tui_render(t, buf, cap);
             shown_until = toast_until(t, gptps_now_ms(NULL));
             if (first) fputs("\x1b[2J", t->cfg.out); /* clear once; then redraw in place */
             fputs("\x1b[H", t->cfg.out);             /* home */
-            write_frame(t->cfg.out, buf);            /* per-line erase => no full-screen flash */
+            wrote = write_frame(t->cfg.out, buf);    /* per-line erase => no full-screen flash */
             fputs("\x1b[J", t->cfg.out);             /* wipe any lines a shorter frame left behind */
             fflush(t->cfg.out);
+            mu_lock(&t->mu); t->h_painted++; t->h_written += wrote + 6 + (first ? 4 : 0); mu_unlock(&t->mu);
         }
         first = 0; kp = 0;
         key = term_poll_key((int)(rms ? rms : 250));
+        mu_lock(&t->mu); t->h_wakes++; mu_unlock(&t->mu);
         if (key >= 0) { gptps_tui_press(t, key); kp = 1; }
     }
     fputs("\x1b[?25h", t->cfg.out); fflush(t->cfg.out); /* show cursor */
     term_restore(t);
+    mu_lock(&t->mu); t->frame_bytes = 0; mu_unlock(&t->mu);
     free(buf);
 }
 
@@ -2235,12 +2626,180 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
 
 /* The oldest gptps_tui_config a caller can have: everything through `title`. */
 #define TUI_CFG_MIN (offsetof(gptps_tui_config, title) + sizeof(((gptps_tui_config *)0)->title))
+/* What struct_size 0 reads: the 1.10 layout, through `unicode` - the whole struct when 0
+ * was given that meaning (1.10.1), and never more, so a zero-init caller built against
+ * that header is not read past its end now that fields follow. */
+#define TUI_CFG_110 (offsetof(gptps_tui_config, unicode) + sizeof(int))
+
+/* ---- storage ----------------------------------------------------------------------
+ * Every buffer belongs to one part of a tier: the TASKS table (rows, name index and fold
+ * set) and the recent-events log at NORMAL and up, the handle table at FULL; below, none
+ * of it exists. A part is allocated with `mu` RELEASED, swapped in under `mu`, and freed
+ * only after it has been swapped out under `mu`. The observer touches a part only through
+ * the pointer it reads while holding `mu`, so it never sees one half-built or freed, and
+ * no allocation or free happens while an engine thread waits on the lock. The setters
+ * hold `smu` from the first look to the swap, so the state they allocated for is the
+ * state they find. */
+typedef struct {
+    tui_task  *tasks;
+    int32_t   *tidx;
+    uint64_t  *fold;
+    int        tasks_cap;
+    uint32_t   tidx_mask;
+    tui_event *recent;
+    tui_slot  *tab;
+    size_t     tab_mask;
+} tui_parts;
+
+static size_t tasks_bytes(int max_tasks)
+{
+    size_t rows = (size_t)max_tasks + 1, idx = next_pow2(2 * (size_t)max_tasks);
+    if (idx < 8) idx = 8;
+    return rows * sizeof(tui_task) + idx * sizeof(int32_t) + TUI_FOLD_SLOTS * sizeof(uint64_t);
+}
+
+static void parts_free(tui_parts *p)
+{
+    free(p->tasks); free(p->tidx); free(p->fold); free(p->recent); free(p->tab);
+    memset(p, 0, sizeof *p);
+}
+
+/* Allocate the parts asked for (unlocked). A part whose allocation fails stays NULL. */
+static void parts_make(tui_parts *p, int mk_tasks, int mk_ring, int mk_tab, int max_tasks, int rcap, int win)
+{
+    memset(p, 0, sizeof *p);
+    if (mk_tasks) {
+        size_t idx = next_pow2(2 * (size_t)max_tasks);
+        if (idx < 8) idx = 8;
+        p->tasks = (tui_task *)calloc((size_t)max_tasks + 1, sizeof(tui_task));
+        p->tidx = p->tasks ? (int32_t *)malloc(idx * sizeof(int32_t)) : NULL;
+        p->fold = p->tidx ? (uint64_t *)calloc(TUI_FOLD_SLOTS, sizeof(uint64_t)) : NULL;
+        if (!p->fold) { free(p->tasks); free(p->tidx); p->tasks = NULL; p->tidx = NULL; }
+        else {
+            memset(p->tidx, 0xff, idx * sizeof(int32_t));        /* -1: empty */
+            p->tasks_cap = max_tasks + 1; p->tidx_mask = (uint32_t)(idx - 1);
+            memcpy(p->tasks[0].name, "(other)", 8); p->tasks[0].ui = -1;
+        }
+    }
+    if (mk_ring && rcap > 0) p->recent = (tui_event *)calloc((size_t)rcap, sizeof(tui_event));
+    if (mk_tab) {
+        size_t n = trk_slots(win);
+        p->tab = (tui_slot *)calloc(n, sizeof(tui_slot));
+        p->tab_mask = n - 1;
+    }
+}
+
+/* mu held, the TASKS table just swapped in: a row for every add_task entry, in its order. */
+static void tasks_seed(gptps_tui *t)
+{
+    int k;
+    for (k = 0; k < t->nui; ++k) {
+        uint64_t h = name_hash(t->ui[k].name);
+        int r = row_lookup(t, t->ui[k].name, h);
+        if (r < 0) r = row_add(t, t->ui[k].name, h);
+        if (r > 0) t->tasks[r].ui = k;
+    }
+}
+
+/* Make the storage match KPI level `lvl` (-1: keep) and latency window `win` (0: keep):
+ * build what it needs and is missing, drop what it does not hold. A part that cannot be
+ * allocated is left out - the dashboard runs without it - and `what` (cap bytes, "" when
+ * all is well) names it, for the caller to log; GPTPS_E_NOMEM then. */
+static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, char *what, size_t cap)
+{
+    tui_parts nw, old;
+    int mk_tasks, mk_ring, mk_tab, rcap, maxt, cur_win;
+    size_t pos = 0;
+    gptps_status st = GPTPS_OK;
+    what[0] = 0;
+    memset(&old, 0, sizeof old);
+    mu_lock(&t->smu);
+    mu_lock(&t->mu);
+    if (lvl < 0) lvl = t->kpi;
+    if (win <= 0) win = t->lat_cap;
+    cur_win = t->lat_cap;
+    mk_tasks = lvl >= GPTPS_TUI_KPI_NORMAL && !t->tasks;
+    mk_ring  = lvl >= GPTPS_TUI_KPI_NORMAL && t->rcap > 0 && !t->recent;
+    mk_tab   = lvl == GPTPS_TUI_KPI_FULL && (!t->tab || win != cur_win);
+    rcap = t->rcap; maxt = t->max_tasks;
+    mu_unlock(&t->mu);
+
+    parts_make(&nw, mk_tasks, mk_ring, mk_tab, maxt, rcap, win);   /* unlocked */
+
+    mu_lock(&t->mu);
+    /* out: what the level does not hold, and the table a new window replaces */
+    if (lvl < GPTPS_TUI_KPI_NORMAL) {
+        old.tasks = t->tasks; old.tidx = t->tidx; old.fold = t->fold; old.recent = t->recent;
+        t->tasks = NULL; t->tidx = NULL; t->fold = NULL; t->recent = NULL;
+        t->ntasks = t->tasks_cap = 0; t->nfold = t->fold_more = 0; t->rn = t->rhead = 0;
+    }
+    if (lvl < GPTPS_TUI_KPI_FULL || mk_tab) {
+        old.tab = t->tab; t->tab = NULL;
+        t->tab_n = t->tab_done = 0; t->orph_n = t->orph_head = 0; t->g_pend = t->g_run = 0; t->trk_lb = 0;
+    }
+    if (win != cur_win || mk_tab) { t->lat_untracked = 0; t->lat_unmatched = 0; }   /* counted against the old table */
+    t->lat_cap = win;
+    /* in */
+    if (nw.tasks) {
+        t->tasks = nw.tasks; t->tidx = nw.tidx; t->fold = nw.fold;
+        t->tasks_cap = nw.tasks_cap; t->tidx_mask = nw.tidx_mask; t->ntasks = 1;   /* row 0: '(other)' */
+        nw.tasks = NULL; nw.tidx = NULL; nw.fold = NULL;
+        tasks_seed(t);
+    }
+    if (nw.recent) { t->recent = nw.recent; t->rn = t->rhead = 0; nw.recent = NULL; }
+    if (nw.tab) {
+        t->tab = nw.tab; t->tab_mask = nw.tab_mask; nw.tab = NULL;
+        /* work already in flight is not in it: a lower bound until that has ended */
+        t->trk_lb = t->q > t->term;
+    }
+    if (mk_tasks && !t->tasks) {
+        st = GPTPS_E_NOMEM; t->h_nomem++;
+        pos += (size_t)snprintf(what + pos, cap - pos, "the TASKS table (%lu bytes; per-task counts are off)",
+                                (unsigned long)tasks_bytes(maxt));
+    }
+    if (mk_ring && !t->recent && pos < cap) {
+        st = GPTPS_E_NOMEM; t->h_nomem++;
+        pos += (size_t)snprintf(what + pos, cap - pos, "%sthe recent-events log (%lu bytes)", pos ? " and " : "",
+                                (unsigned long)((size_t)rcap * sizeof(tui_event)));
+    }
+    if (mk_tab && !t->tab && pos < cap) {
+        st = GPTPS_E_NOMEM; t->h_nomem++;
+        snprintf(what + pos, cap - pos, "%sthe latency table (%lu bytes; avg ms is off and the gauges are "
+                 "approximate)", pos ? " and " : "", (unsigned long)(trk_slots(win) * sizeof(tui_slot)));
+    }
+    t->kpi = lvl;
+    t->dirty = 1;
+    /* Published LAST: tui_on_event reads this without the lock, so everything it
+     * guards must already be consistent before the event path is allowed back in. */
+    TUI_FLAG_SET(&t->off, lvl == GPTPS_TUI_KPI_OFF);
+    mu_unlock(&t->mu);
+    parts_free(&old);                   /* swapped out above: nothing can reach them now */
+    parts_free(&nw);                    /* nothing left, unless a part was not needed after all */
+    mu_unlock(&t->smu);
+    return st;
+}
+
+static void tui_destroy(gptps_tui *t)
+{
+    int i;
+    tui_parts p;
+    for (i = 0; i < t->nui; ++i) free(t->ui[i].payload);
+    free(t->ui);
+    memset(&p, 0, sizeof p);
+    p.tasks = t->tasks; p.tidx = t->tidx; p.fold = t->fold; p.recent = t->recent; p.tab = t->tab;
+    parts_free(&p);
+    free(t->held);
+    mu_destroy(&t->smu);
+    mu_destroy(&t->mu);
+    free(t);
+}
 
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
 {
     gptps_tui *t;
     gptps_status st;
     int max, kpi;
+    char what[400];
     if (!e) return NULL;
     if (cfg && cfg->struct_size && cfg->struct_size < TUI_CFG_MIN) {
         tui_logf(GPTPS_LOG_ERROR, "gptps_tui_install: cfg.struct_size %lu is smaller than any gptps_tui_config "
@@ -2254,16 +2813,28 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         return NULL;
     }
     mu_init(&t->mu);
+    mu_init(&t->smu);
     t->e = e;
     /* As much as the caller's struct holds, the rest zero (its defaults): an older
      * caller's struct ends before the fields appended since, and what follows it in
-     * its memory is not a config. 0 = the whole struct, as before struct_size counted. */
+     * its memory is not a config. 0 = the 1.10 layout (TUI_CFG_110). */
     if (cfg) {
-        size_t n = cfg->struct_size ? cfg->struct_size : sizeof t->cfg;
+        size_t n = cfg->struct_size ? cfg->struct_size : TUI_CFG_110;
         if (n > sizeof t->cfg) n = sizeof t->cfg;
         memcpy(&t->cfg, cfg, n);
     }
     t->cfg.struct_size = sizeof t->cfg;
+    if (t->cfg.max_tasks == 0) {
+        t->max_tasks = TUI_MAX_TASKS;
+    } else if (t->cfg.max_tasks < 1 || t->cfg.max_tasks > TUI_TASKS_CAP) {   /* a new field: refused, not clamped */
+        tui_logf(GPTPS_LOG_ERROR, "gptps_tui_install: cfg.max_tasks %d is outside 1..%d (0 means %d); the "
+                 "dashboard was not installed", t->cfg.max_tasks, TUI_TASKS_CAP, TUI_MAX_TASKS);
+        tui_destroy(t);
+        return NULL;
+    } else {
+        t->max_tasks = t->cfg.max_tasks;
+    }
+    t->cfg.max_tasks = t->max_tasks;
     if (!t->cfg.title) t->cfg.title = "tasks";   /* every pane prints it */
     if (!t->cfg.out) t->cfg.out = stdout;
     if (t->cfg.refresh_ms == 0) t->cfg.refresh_ms = 250;
@@ -2296,8 +2867,6 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
                  kpi, (int)GPTPS_TUI_KPI_FULL, kpi_str(used));
         kpi = used;
     }
-    t->kpi = kpi;
-    t->off = (t->kpi == GPTPS_TUI_KPI_OFF);
     t->mode = t->cfg.mode;
     if (t->mode < GPTPS_TUI_CONTINUOUS || t->mode > GPTPS_TUI_PAUSED) {
         tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: cfg.mode %d is not a gptps_tui_mode (0 to %d); using realtime",
@@ -2311,39 +2880,26 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         t->lat_cap = 1024;
     } else if (t->lat_cap == 0) {
         t->lat_cap = 1024;
-    } else if (t->lat_cap > (1 << 20)) {
+    } else if (t->lat_cap > TUI_LAT_CAP) {
         tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: cfg.latency_window %d is above the cap of %d handles; "
-                 "tracking %d", t->lat_cap, 1 << 20, 1 << 20);
-        t->lat_cap = 1 << 20;
+                 "tracking %d", t->lat_cap, TUI_LAT_CAP, TUI_LAT_CAP);
+        t->lat_cap = TUI_LAT_CAP;
     }
-    /* Resolved BEFORE either ring is sized, because installing straight at OFF must hold
-     * no per-event memory - the same state gptps_tui_set_kpi(OFF) reclaims down to. Both
-     * rings are built on the way up, so raising the tier later costs only the calloc.
-     * Without the memory for one, the dashboard runs without it and says so: the
-     * recent-events log at NORMAL and up, the latency ring (avg ms) at FULL only. */
-    t->recent = NULL;
-    t->lat = NULL;
-    if (!t->off) {
-        t->recent = (tui_event *)calloc((size_t)t->rcap, sizeof(tui_event));
-        if (!t->recent)
-            tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: no memory for the recent-events log (%lu bytes); "
-                     "the dashboard runs without it", (unsigned long)((size_t)t->rcap * sizeof(tui_event)));
-    }
-    if (t->kpi == GPTPS_TUI_KPI_FULL) {
-        t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
-        if (!t->lat)
-            tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: no memory for the latency ring (%lu bytes for "
-                     "latency_window %d); the dashboard runs without avg ms",
-                     (unsigned long)((size_t)t->lat_cap * sizeof *t->lat), t->lat_cap);
-    }
+    /* Built at the level's needs and no more: installing straight at OFF or MINIMAL holds
+     * no per-event memory, the same state gptps_tui_set_kpi reclaims down to. Without the
+     * memory for a part, the dashboard runs without it and says so. */
+    t->kpi = GPTPS_TUI_KPI_OFF;
+    TUI_FLAG_SET(&t->off, 1);
+    if (tui_reconfig(t, kpi, 0, what, sizeof what) != GPTPS_OK)
+        tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: no memory for %s; the dashboard runs without it", what);
     t->start_ms = gptps_now_ms(NULL);
     if ((st = gptps_register_observer(e, tui_on_event, t)) != GPTPS_OK) {
-        /* t->lat too - it is 24 KiB by default (24-byte entries) and up to 24 MiB with
-         * cfg.latency_window at its cap, and the caller gets NULL back with no handle to
-         * reclaim it. Unconditional: t->lat is NULL below KPI FULL. Mirrors tui_close. */
+        /* everything, the handle table too (64 KiB by default, 64 MiB at the cap): the
+         * caller gets NULL back and has no handle to reclaim it with */
         tui_logf(GPTPS_LOG_ERROR, "gptps_tui_install: the engine refused the dashboard's observer (%s); "
                  "the dashboard was not installed", gptps_strerror(st));
-        free(t->lat); free(t->recent); mu_destroy(&t->mu); free(t); return NULL;
+        tui_destroy(t);
+        return NULL;
     }
     tui_register_settings(e, t);   /* expose tui.refresh_ms / tui.kpi / tui.mode / tui.latency_window */
     return t;
@@ -2351,10 +2907,8 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
 
 void gptps_tui_close(gptps_tui *t)
 {
-    int i;
     if (!t) return;
     term_restore(t);                 /* in case run() was interrupted */
-    for (i = 0; i < t->ntasks; ++i) free(t->tasks[i].payload);
     if (t->nheld) {                  /* never silent: they were taken from the engine */
         char msg[160];
         size_t k;
@@ -2363,111 +2917,91 @@ void gptps_tui_close(gptps_tui *t)
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
         for (k = 0; k < t->nheld; ++k) held_free(&t->held[k]);
     }
-    free(t->held);
-    free(t->recent);
-    free(t->lat);
-    mu_destroy(&t->mu);
-    free(t);
+    tui_destroy(t);
 }
 
 /* ---- runtime reconfiguration ---- */
-/* caller holds mu: make the allocations and the off-path flag match the KPI level.
- * The latency ring exists only at FULL; the recent-event ring only above OFF, which
- * is the tier that exists to hold no per-event memory at all. Both are rebuilt on the
- * way back up, so raising the tier again is an allocation and nothing more. Without
- * the memory for one, the dashboard runs without it: GPTPS_E_NOMEM, and `msg` (cap
- * bytes, "" when all is well) says what is off, for the caller to log once it has
- * dropped the lock. */
-static gptps_status lat_apply(gptps_tui *t, char *msg, size_t cap)
-{
-    gptps_status st = GPTPS_OK;
-    size_t pos = 0;
-    msg[0] = 0;
-    if (t->kpi == GPTPS_TUI_KPI_FULL) {
-        if (!t->lat) {
-            t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
-            t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0; t->lat_nmemo = 0; t->lat_memo_head = 0;
-            if (!t->lat) {
-                st = GPTPS_E_NOMEM;
-                pos += (size_t)snprintf(msg + pos, cap - pos, "the latency ring (%lu bytes; avg ms is off)",
-                                        (unsigned long)((size_t)t->lat_cap * sizeof *t->lat));
-            }
-        }
-    } else if (t->lat) {
-        free(t->lat); t->lat = NULL; t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0; t->lat_nmemo = 0; t->lat_memo_head = 0;   /* reclaim the RAM */
-    }
-    if (t->kpi == GPTPS_TUI_KPI_OFF) {
-        if (t->recent) { free(t->recent); t->recent = NULL; t->rn = t->rhead = 0; }
-    } else if (!t->recent && t->rcap > 0) {
-        t->recent = (tui_event *)calloc((size_t)t->rcap, sizeof(tui_event));
-        t->rn = t->rhead = 0;
-        if (!t->recent && pos < cap) {    /* out of memory: run without the log, not without the dashboard */
-            st = GPTPS_E_NOMEM;
-            snprintf(msg + pos, cap - pos, "%sthe recent-events log (%lu bytes)", pos ? " and " : "",
-                     (unsigned long)((size_t)t->rcap * sizeof(tui_event)));
-        }
-    }
-    /* Published LAST: tui_on_event reads this without the lock, so everything it
-     * guards must already be consistent before the event path is allowed back in. */
-    t->off = (t->kpi == GPTPS_TUI_KPI_OFF);
-    return st;
-}
 
-/* Resize the latency ring at runtime. The old contents are dropped rather than
- * copied: every entry is an in-flight handle awaiting its terminal event, and a resize
- * is an admission that the window was wrong, so carrying a window's worth of samples
- * that were already being lost buys nothing. Samples resume on the next QUEUED. */
+/* Resize the latency (handle) table at runtime. The old contents are dropped rather than
+ * copied: every entry is an in-flight handle awaiting its terminal event, and a resize is
+ * an admission that the window was wrong. The gauges are a lower bound ('>=') until the
+ * work in flight at the resize has ended; samples resume with the next QUEUED. */
 gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
 {
-    gptps_status st = GPTPS_OK;
-    char msg[256];
-    msg[0] = 0;
+    gptps_status st;
+    char what[300];
+    int changed;
     if (!t || handles < 0) return GPTPS_E_INVAL;
     if (handles == 0) handles = 1024;
-    if (handles > (1 << 20)) {
+    if (handles > TUI_LAT_CAP) {
         tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_latency_window: %d is above the cap of %d handles; tracking %d",
-                 handles, 1 << 20, 1 << 20);
-        handles = 1 << 20;
+                 handles, TUI_LAT_CAP, TUI_LAT_CAP);
+        handles = TUI_LAT_CAP;
     }
     mu_lock(&t->mu);
-    /* also when FULL is running without its ring (an earlier allocation failed): retry */
-    if (handles != t->lat_cap || (t->kpi == GPTPS_TUI_KPI_FULL && !t->lat)) {
-        t->lat_cap = handles;
-        t->lat_evicted = 0; t->lat_skipped = 0;   /* counted against the old window */
-        if (t->lat || t->kpi == GPTPS_TUI_KPI_FULL) {   /* rebuild at the new size; FULL only */
-            free(t->lat);
-            t->lat = calloc((size_t)t->lat_cap, sizeof *t->lat);
-            t->lat_head = 0; t->lat_tomb = 0; t->lat_live = 0; t->lat_nmemo = 0; t->lat_memo_head = 0;
-            if (!t->lat) {
-                st = GPTPS_E_NOMEM;
-                snprintf(msg, sizeof msg, "gptps_tui_set_latency_window: no memory for the latency ring (%lu bytes "
-                         "for %d handles); the dashboard runs without avg ms",
-                         (unsigned long)((size_t)handles * sizeof *t->lat), handles);
-            }
-        }
-        t->dirty = 1;
-    }
+    /* also when FULL is running without its table (an earlier allocation failed): retry */
+    changed = handles != t->lat_cap || (t->kpi == GPTPS_TUI_KPI_FULL && !t->tab);
     mu_unlock(&t->mu);
-    if (msg[0]) gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    if (!changed) return GPTPS_OK;
+    st = tui_reconfig(t, -1, handles, what, sizeof what);
+    if (what[0]) tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_latency_window: no memory for %s; the dashboard runs "
+                          "without it", what);
     return st;
 }
 
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
 {
     gptps_status st;
-    char what[200];
+    char what[400];
     if (!t) return GPTPS_E_INVAL;
     if (level == GPTPS_TUI_KPI_DEFAULT) level = GPTPS_TUI_KPI_FULL;
     if (level < GPTPS_TUI_KPI_OFF || level > GPTPS_TUI_KPI_FULL) return GPTPS_E_INVAL;
-    mu_lock(&t->mu);
-    t->kpi = level;
-    st = lat_apply(t, what, sizeof what);   /* allocate at FULL, free below FULL */
-    t->dirty = 1;
-    mu_unlock(&t->mu);
+    st = tui_reconfig(t, (int)level, 0, what, sizeof what);   /* build what the level needs, free the rest */
     if (what[0])
         tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_kpi(%s): no memory for %s; the dashboard runs without it",
                  kpi_str(level), what);
     return st;
+}
+
+gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
+{
+    gptps_tui_health_info h;
+    size_t n;
+    if (!t || !out || out->struct_size < offsetof(gptps_tui_health_info, journal_not_shown) + sizeof(uint64_t))
+        return GPTPS_E_INVAL;
+    memset(&h, 0, sizeof h);
+    mu_lock(&t->mu);
+    h.journal_not_shown = 0;
+    h.handles_untracked = t->h_untracked;
+    h.orphans_expired   = t->h_orphans;
+    h.types_folded      = t->h_folded;
+    h.frames_truncated  = t->h_trunc;
+    h.alloc_failures    = t->h_nomem;
+    h.bytes_base        = sizeof *t + (uint64_t)t->ui_cap * sizeof(tui_ui);
+    h.bytes_tasks       = t->tasks ? tasks_bytes(t->max_tasks) : 0;
+    h.bytes_activity    = t->recent ? (uint64_t)t->rcap * sizeof(tui_event) : 0;
+    h.bytes_handles     = t->tab ? (uint64_t)(t->tab_mask + 1) * sizeof(tui_slot) : 0;
+    h.bytes_frame       = t->frame_bytes;
+    h.bytes_dead_letters = (uint64_t)t->held_cap * sizeof(tui_held);
+    h.frames_painted    = t->h_painted;
+    h.frames_skipped    = t->h_skipped;
+    h.bytes_written     = t->h_written;
+    h.wakes             = t->h_wakes;
+    h.gauges            = t->kpi < GPTPS_TUI_KPI_NORMAL || !t->tab ? GPTPS_TUI_GAUGES_APPROX
+                        : t->trk_lb ? GPTPS_TUI_GAUGES_LOWER_BOUND : GPTPS_TUI_GAUGES_EXACT;
+    if (t->tab) { h.pending = t->g_pend; h.in_flight = t->g_run; }
+    else {
+        uint64_t alive = t->q > t->term ? t->q - t->term : 0;
+        h.in_flight = t->inflight;
+        h.pending = alive > t->inflight ? alive - t->inflight : 0;
+    }
+    h.handles_tracked   = t->tab ? (uint64_t)(t->tab_n - t->tab_done) : 0;
+    h.handles_markers   = t->tab ? (uint64_t)t->tab_done : 0;
+    h.task_rows         = t->tasks ? (uint64_t)(t->ntasks - 1) : 0;
+    mu_unlock(&t->mu);
+    n = out->struct_size < sizeof h ? out->struct_size : sizeof h;   /* what the caller's struct has */
+    memcpy((char *)out + sizeof(size_t), (char *)&h + sizeof(size_t), n - sizeof(size_t));
+    return GPTPS_OK;
 }
 
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode)
@@ -2491,6 +3025,7 @@ void gptps_tui_snapshot(gptps_tui *t)
     if (!t) return;
     buf = (char *)malloc(cap);
     if (!buf) {
+        mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_snapshot: no memory for the 16 KiB frame buffer; no frame");
         return;
     }
