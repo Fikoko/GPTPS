@@ -411,7 +411,7 @@ typedef struct {
  * out->struct_size is kept). GPTPS_E_INVAL for a NULL argument or a struct_size that
  * does not reach journal_not_shown. Thread-safe; takes the dashboard's lock briefly, and
  * while the gauges are a lower bound it asks the engine (gptps_task_get_info) whether it
- * is idle - so it may be called from an observer, which runs with the engine lock
+ * is idle, on every call (not held to the frames' 1%: poll it at a rate you can spare) - so it may be called from an observer, which runs with the engine lock
  * released, but not from a callback gptps.h (THREADING) forbids to call the engine. */
 gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
 
@@ -467,7 +467,9 @@ void gptps_tui_snapshot(gptps_tui *t);
  * since the pass. The cache is freed when the dashboard pane is back (bytes_panes in
  * gptps_tui_health, with pane_reads, pane_read_us and pane_every_ms). The dashboard's own
  * engine read - asking whether the engine is idle, to clear the gauges' '>=' - follows the
- * same 1% rule once a look takes 200 us or more.
+ * same 1% rule: each look is timed and the next waits 99x as long, however often frames
+ * are rendered (a frame is then due when the hold ends, so an engine gone idle clears
+ * '>=' then). gptps_tui_health, install and a tier change always look.
  *
  * HOST PROFILES.
  *   - Embedded / MANUAL (no thread; render or snapshot only): no loop, no pipe, no timer -

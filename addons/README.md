@@ -707,7 +707,9 @@ enabled automatically). Panes/metrics:
     frame); an edit reads its setting fresh by key, so it lands where you chose even when
     the registry changed since the pass. The cache is freed back on the dashboard
     (`gptps_tui_health`: `pane_reads`, `pane_read_us`, `pane_every_ms`, `bytes_panes`).
-    The dashboard's own look at the engine (to clear the gauges' `>=`) keeps the same 1%.
+    The dashboard's frames keep the same 1% for their own look at the engine (to clear the
+    gauges' `>=`): each look is timed and the next waits 99× as long, and a frame is due
+    when that wait ends. `gptps_tui_health` always looks, at the rate the host calls it.
 - **Host profiles.**
 
   | host | suggested | why |

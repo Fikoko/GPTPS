@@ -149,8 +149,6 @@ static uint64_t tui_now_us(void)
  * at 64 types and 100k queued). A pass is timed, and the next waits at least this many
  * times as long as the last one took - so they hold it at most 1/TUI_DUTY of the time. */
 #define TUI_DUTY      100u
-/* trk_resync is not held back when its last look took less than this (microseconds) */
-#define TUI_RESYNC_FREE_US 200u
 
 /* ---- the KPI ladder ----------------------------------------------------------------
  * The public gptps_tui_kpi values keep their 1.10 numbers, so they are not in ladder
@@ -771,6 +769,7 @@ struct gptps_tui {
     uint64_t         h_pane_reads, h_pane_us, pane_cost_us, pane_every_ms, pane_bytes;
     /* trk_resync's own duty limit (under mu): no look before this (tui_now_us; 0: any time) */
     uint64_t         rs_next_us, rs_cost_us;
+    int              rs_held;     /* a look was held back since the last one: a frame is due at rs_next_us */
     /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
      * all - taking a mutex to discover you have nothing to do is the entire cost this
      * tier exists to remove. Not the HAL's gptps_flag: the amalgamation ships gptps.c
@@ -1192,30 +1191,49 @@ static int engine_idle(gptps *e)
  * never saw. So an engine that is never idle (an always-up service) keeps '>=', which
  * stays true. Called by render, gptps_tui_health and tui_reconfig, never under mu.
  * The look holds the engine's lock (a busy engine's first type answers, but its
- * gptps_task_get_info walks every queue: ~2 ms at 100k queued), so it is timed, and after
- * one of TUI_RESYNC_FREE_US or more the next waits TUI_DUTY - 1 times as long: at most 1%
- * of the time in the engine's lock, however often a host renders. */
-static void trk_resync(gptps_tui *t)
+ * gptps_task_get_info walks every queue: ~2 ms at 100k queued), so it is timed (at least
+ * 1 us), and the next look waits TUI_DUTY - 1 times as long as this one took: at most 1%
+ * of the time in the engine's lock, however often a host renders. A look held back sets
+ * rs_held, and tui_frame then asks for a frame when the hold ends (rs_due_ms), so an
+ * engine gone idle meanwhile does not keep '>=' until some other change. `force`: not
+ * held back (install and tui_reconfig: a new table on an idle engine is exact at once;
+ * gptps_tui_health: the host asks, at a rate it chooses), but it still sets the hold. */
+static void trk_resync(gptps_tui *t, int force)
 {
     uint64_t gen, t0, t1;
     int cleared = 0, idle;
     mu_lock(&t->mu);
-    if (!t->tab || !t->trk_lb || !t->observing) { mu_unlock(&t->mu); return; }
-    if (t->rs_next_us && tui_now_us() < t->rs_next_us) { mu_unlock(&t->mu); return; }
+    if (!t->tab || !t->trk_lb || !t->observing) { t->rs_held = 0; mu_unlock(&t->mu); return; }
+    if (!force && t->rs_next_us && tui_now_us() < t->rs_next_us) { t->rs_held = 1; mu_unlock(&t->mu); return; }
+    t->rs_held = 0;
     gen = t->lb_gen;
     mu_unlock(&t->mu);
     t0 = tui_now_us();
     idle = engine_idle(t->e);
     t1 = tui_now_us();
     mu_lock(&t->mu);
-    t->rs_cost_us = t1 > t0 ? t1 - t0 : 0;
-    t->rs_next_us = t->rs_cost_us >= TUI_RESYNC_FREE_US ? t1 + t->rs_cost_us * (TUI_DUTY - 1u) : 0;
+    t->rs_cost_us = t1 > t0 ? t1 - t0 : 1u;                  /* below the clock's resolution: 1 us */
+    t->rs_next_us = t1 + t->rs_cost_us * (TUI_DUTY - 1u);
     mu_unlock(&t->mu);
     if (!idle) return;
     mu_lock(&t->mu);
     if (t->tab && t->trk_lb && t->lb_gen == gen && t->tab_n == t->tab_done) { t->trk_lb = 0; tui_touch(t); cleared = 1; }
     mu_unlock(&t->mu);
     if (cleared) tui_kick(t);
+}
+
+/* When a frame is due for a look trk_resync held back (gptps_now_ms terms; 0: none). */
+static uint64_t rs_due_ms(gptps_tui *t, uint64_t now)
+{
+    uint64_t due = 0, nu;
+    mu_lock(&t->mu);
+    if (t->rs_held && t->trk_lb) {
+        nu = tui_now_us();
+        due = now + (t->rs_next_us > nu ? (t->rs_next_us - nu + 999u) / 1000u : 0u);
+        if (due <= now) due = now + 1u;
+    }
+    mu_unlock(&t->mu);
+    return due;
 }
 
 /* ---- journals --------------------------------------------------------------------
@@ -1630,12 +1648,35 @@ static size_t status_line(gptps_tui *t, char *buf, size_t cap, size_t pos, const
     return appendf(buf, cap, pos, "%s%s%s%s\n", lead, D, tui_cl(t->status, shown, sizeof shown), X);
 }
 
-/* The rows a settings list may use: what the terminal has, less the title, the
- * details, the edit and status lines, the age of what it shows and the key legend. */
-static int list_rows(const gptps_tui *t)
+/* The rows a list may use: what the terminal has, less the `used` lines the pane prints
+ * around it. */
+static int list_rows(const gptps_tui *t, int used)
 {
-    int r = (t->rows > 0 ? t->rows : 24) - 14;
+    int r = (t->rows > 0 ? t->rows : 24) - used;
     return r < 3 ? 3 : r;
+}
+
+static size_t setting_details(gptps_tui *t, char *buf, size_t cap, size_t pos, const gptps_setting_info *in,
+                              const char *kind);
+static size_t pc_footer(gptps_tui *t, char *buf, size_t cap, size_t pos, const char *what, const char *D, const char *X);
+
+/* The lines a settings or detail pane prints besides its list, as this frame has them:
+ * the title and its blank line, the selected setting's details (4 to 6), the edit prompt
+ * (2), the status, the age line, the blank line and the legend, and the frame's last
+ * newline. 1.11 stage D took a fixed 14, which hid one of a task's 11 settings at 24 rows. */
+static int settings_used(gptps_tui *t)
+{
+    const tui_pcache *c = &t->pc;
+    int used = 2 + (t->editing ? 2 : 0) + (status_live(t->status, t->status_ms, gptps_now_ms(NULL)) ? 1 : 0) + 1 + 2 + 1;
+    if (c->n && c->have_sel) {
+        char tmp[4096];
+        size_t n = setting_details(t, tmp, sizeof tmp, 0, &c->sel, c->sel_kind), i;
+        int nl = 0;
+        if (n >= sizeof tmp) nl = 6;                       /* the most it prints */
+        else for (i = 0; i < n; ++i) nl += tmp[i] == '\n';
+        used += nl;
+    }
+    return used;
 }
 
 static size_t edit_line(gptps_tui *t, char *buf, size_t cap, size_t pos, const char *B, const char *D, const char *X);
@@ -1842,7 +1883,7 @@ static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
 {
     const tui_pcache *c = &t->pc;
     size_t pos = 0, i, n = c->pane == TUI_PANE_SETTINGS ? c->n : 0;
-    int color = t->cfg.color, kw = c->kw, rows = list_rows(t), first;
+    int color = t->cfg.color, kw = c->kw, rows = list_rows(t, settings_used(t)), first;
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
     first = t->sel - rows / 2;
     if (first > (int)n - rows) first = (int)n - rows;
@@ -1973,7 +2014,9 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
     if (first < 0) first = 0;
     more = (int)n > room ? (int)n - room : 0;
     pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 tasks%s  (%lu)\n\n", B, brand(t), t->cfg.title, X, (unsigned long)n);
-    if (n == 0) pos = appendf(buf, cap, pos, "  %s(no task types registered)%s\n", D, X);
+    if (n == 0 && c->short_by)            /* not "none": they could not be read */
+        pos = appendf(buf, cap, pos, "  %sno memory to list %lu task types%s\n", D, (unsigned long)c->short_by, X);
+    else if (n == 0) pos = appendf(buf, cap, pos, "  %s(no task types registered)%s\n", D, X);
     else pos = appendf(buf, cap, pos, "%s  %-18s %-7s %4s %4s %4s %4s  %s%s\n", D, "name", "exec", "pri", "que", "run", "dl", "state", X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < room; ++i) {
         const tui_ctask *k = &c->tasks[i];
@@ -2018,7 +2061,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
 {
     const tui_pcache *c = &t->pc;
     size_t pos = 0, i, n = c->pane == TUI_PANE_DETAIL ? c->n : 0, plen;
-    int color = t->cfg.color, kw = c->kw, rows = list_rows(t), first;
+    int color = t->cfg.color, kw = c->kw, rows = list_rows(t, settings_used(t)), first;
     char prefix[160];   /* "tasks.<name>." - sized for the full detail_task buffer */
     char title[sizeof t->detail_task * 2];
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
@@ -2028,7 +2071,9 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
     if (first < 0) first = 0;
     pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 task '%s'%s  %s(%lu settings)%s\n\n", B,
                   tui_cl(t->detail_task, title, sizeof title), X, D, (unsigned long)n, X);
-    if (n == 0) pos = appendf(buf, cap, pos, "  %s(task no longer present)%s\n", D, X);
+    if (n == 0 && c->pane == TUI_PANE_DETAIL && c->short_by)
+        pos = appendf(buf, cap, pos, "  %sno memory to list its %lu settings%s\n", D, (unsigned long)c->short_by, X);
+    else if (n == 0) pos = appendf(buf, cap, pos, "  %s(task no longer present)%s\n", D, X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < rows; ++i) {
         const tui_cset *st = &c->sets[i];
         const char *k = c->pool + st->key;
@@ -2056,7 +2101,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
 static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
 {
     size_t pos = 0, dn = gptps_dead_letter_count(t->e), i;
-    int color = t->cfg.color, rows = list_rows(t), first, W = draw_width(t);
+    int color = t->cfg.color, rows = list_rows(t, 14), first, W = draw_width(t);
     const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *R = color ? "\x1b[31m" : "",
                *INV = color ? "\x1b[7m" : "", *X = color ? "\x1b[0m" : "";
     pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 dead letter%s\n\n", B, brand(t), t->cfg.title, X);
@@ -2679,7 +2724,7 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
     uint64_t warn = 0, now;
     size_t pos, n;
     int dash = t->pane == TUI_PANE_DASH;
-    if (dash) trk_resync(t);             /* before any lock: it asks the engine */
+    if (dash) trk_resync(t, 0);          /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
     now = gptps_now_ms(NULL);            /* under rmu: frames take their times in order */
     pane_prepare(t, now);                /* the engine-reading panes: a pass only when due */
@@ -2706,6 +2751,10 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
         meta->pane = t->pane;
         meta->gen = dash && t->view ? t->view->gen : 0;
         meta->next_change = dash ? (t->view ? t->view->next_change : 0) : pc_next(&t->pc, now);
+        if (dash) {                      /* a look held back: a frame when it may look again */
+            uint64_t rd = rs_due_ms(t, now);
+            if (rd && (!meta->next_change || rd < meta->next_change)) meta->next_change = rd;
+        }
     }
     mu_unlock(&t->rmu);
     warn_problems_lost(warn);
@@ -2717,7 +2766,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     uint64_t warn = 0;
     size_t n;
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
-    if (t->pane == TUI_PANE_DASH) trk_resync(t);   /* before any lock: it asks the engine */
+    if (t->pane == TUI_PANE_DASH) trk_resync(t, 0);   /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
     pane_prepare(t, gptps_now_ms(NULL));
     if (t->pane == TUI_PANE_DASH) view_frame(t, gptps_now_ms(NULL), 0, &warn);
@@ -4156,7 +4205,7 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
     parts_free(&nw);                    /* nothing left, unless a part was not needed after all */
     mu_unlock(&t->smu);
     tui_kick(t);                        /* a live loop shows the new tier */
-    trk_resync(t);                      /* a table built on an idle engine is exact at once */
+    trk_resync(t, 1);                   /* a table built on an idle engine is exact at once */
     return st;
 }
 
@@ -4316,7 +4365,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         return NULL;
     }
     mu_lock(&t->mu); t->observing = 1; mu_unlock(&t->mu);
-    trk_resync(t);                 /* only now: an item queued before this is missed by the table */
+    trk_resync(t, 1);              /* only now: an item queued before this is missed by the table */
     tui_register_settings(e, t);   /* expose tui.refresh_ms / kpi / mode / latency_window / recent / activity */
     return t;
 }
@@ -4398,7 +4447,8 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     if (!t || !out || out->struct_size < offsetof(gptps_tui_health_info, journal_not_shown) + sizeof(uint64_t))
         return GPTPS_E_INVAL;
     memset(&h, 0, sizeof h);
-    trk_resync(t);                       /* before the lock: it asks the engine */
+    trk_resync(t, 1);                    /* before the lock: it asks the engine - every call: the
+                                          * host's own question, at the host's own rate */
     mu_lock(&t->mu);
     {   /* what has left the journals unseen, and what has since the last frame */
         uint64_t lp = t->p_lost + ring_unseen_lost(t->p_seq, t->p_seen, t->prob ? t->pcap : 0);

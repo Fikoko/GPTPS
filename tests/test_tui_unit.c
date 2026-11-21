@@ -115,7 +115,10 @@
  * 48) The tasks / settings / detail panes read the engine in one pass into a cache: none
  *     between passes, one call per entry in a pass, a slow pass stretching the interval to
  *     100x its cost, a change made from the pane or 'R' read at once, an edit landing on
- *     the chosen key after the registry moved; trk_resync held back after a slow look.
+ *     the chosen key after the registry moved; trk_resync held back after any look (99x
+ *     its cost, a cheap one too), a frame due when the hold ends, install / a tier change /
+ *     health not held; the detail pane shows all 11 of a task's settings at 24 rows and
+ *     fits them in 24 rows while editing; a pass with no memory says so, not "none".
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -128,7 +131,13 @@ static int tui_calloc_skip, tui_calloc_fail;
 /* 1.11: every allocation the add-on makes, counted (the event path must make none) */
 static int tui_allocs;              /* an int: tests/test_atomic_compat.h maps it on MSVC */
 static void tui_count_alloc(void) { __atomic_add_fetch(&tui_allocs, 1, __ATOMIC_SEQ_CST); }   /* threads: 29) */
-static void *tui_test_realloc(void *p, size_t n) { tui_count_alloc(); return realloc(p, n); }
+static int tui_realloc_fail;        /* 48): the next `tui_realloc_fail` reallocs return NULL */
+static void *tui_test_realloc(void *p, size_t n)
+{
+    tui_count_alloc();
+    if (tui_realloc_fail > 0) { --tui_realloc_fail; return NULL; }
+    return realloc(p, n);
+}
 static void *tui_test_calloc(size_t n, size_t s)
 {
     tui_count_alloc();
@@ -2665,6 +2674,14 @@ static void test_pane_cache(void)
     gptps_tui_render(t, frame, sizeof frame);
     idx = pc_find(t, "tui.refresh_ms");
     CHECK(idx >= 0 && strcmp(t->pc.pool + t->pc.sets[idx].val, "555") == 0 && t->cfg.refresh_ms == 555);
+    /* a long list fitted to 24 rows, with its edit prompt and a status line too */
+    t->rows = 24;
+    CHECK(gptps_tui_press(t, '\r') == 4 && t->editing);
+    snprintf(t->status, sizeof t->status, "a status line"); t->status_ms = gptps_now_ms(NULL);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->pc.n > 24 && frame_nlines(frame) <= 24 && strstr(frame, "edit:") != NULL);
+    gptps_tui_press(t, 27);
+    t->status[0] = 0;
     /* detail pane: an edit goes to the key chosen, though the registry moved since the pass */
     t->pane = TUI_PANE_DETAIL; t->detail_sel = 0;
     copy_name(t->detail_task, sizeof t->detail_task, "pc_5");
@@ -2680,7 +2697,7 @@ static void test_pane_cache(void)
     t->pane = TUI_PANE_DASH;
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(health(t).bytes_panes == 0 && t->pc.pane == -1);
-    /* trk_resync: a slow look (>= 200 us) holds the next back for 99x as long */
+    /* trk_resync: a slow look holds the next back for 99x as long */
     mu_lock(&t->mu); t->trk_lb = 1; t->lb_gen++; mu_unlock(&t->mu);   /* pc_0's item is queued: not idle */
     tui_read_delay_us = 1000;
     r0 = reads();
@@ -2689,11 +2706,86 @@ static void test_pane_cache(void)
     CHECK(reads() > r0 && t->rs_next_us > tui_now_us() && strstr(frame, ">=") != NULL);
     r0 = reads();
     gptps_tui_render(t, frame, sizeof frame);
-    (void)health(t);
     CHECK(reads() == r0);                                  /* held back */
+    (void)health(t);
+    CHECK(reads() > r0);                                   /* health: the host asks - it looks */
+    r0 = reads();
     t->rs_next_us = 1;
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(reads() > r0);                                   /* due again */
+    /* a cheap look (well under 200 us) is held back too: 99x its cost (1.11 review: these
+     * were not limited, 32-45% of the time in the engine's lock rendering back to back) */
+    t->rs_next_us = 1;
+    tui_read_delay_us = 100;
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    tui_read_delay_us = 0;
+    CHECK(reads() > r0 && t->rs_cost_us >= 100 && t->rs_next_us >= tui_now_us());
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() == r0);                                  /* held back: within 9.9 ms of it */
+    t->rs_next_us = 1;
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);              /* the fastest look still sets a hold */
+    CHECK(reads() > r0 && t->rs_cost_us >= 1 && t->rs_next_us > 1);
+    /* the engine goes idle within a hold: the live loop's frame says when to look again,
+     * so '>=' clears then and not only at some unrelated change */
+    CHECK(gptps_tui_set_clock(t, GPTPS_TUI_CLOCK_OFF) == GPTPS_OK);
+    drain(e);
+    {
+        tui_fbuf fb; tui_fmeta meta; uint64_t now;
+        fb.b = (char *)malloc(TUI_FRAME_MIN); fb.cap = fb.b ? TUI_FRAME_MIN : 0;
+        CHECK(fb.b != NULL);
+        if (fb.b) {
+            t->rs_next_us = tui_now_us() + 50000;          /* 50 ms of hold left */
+            r0 = reads();
+            now = gptps_now_ms(NULL);
+            tui_frame(t, &fb, 1, &meta);
+            CHECK(reads() == r0 && t->trk_lb == 1 && strstr(fb.b, ">=") != NULL);   /* held: still '>=' */
+            CHECK(meta.next_change != 0 && meta.next_change <= now + 52);
+            t->rs_next_us = 1;                             /* the hold over: that frame clears it */
+            tui_frame(t, &fb, 1, &meta);
+            CHECK(t->trk_lb == 0 && strstr(fb.b, ">=") == NULL);
+            free(fb.b);
+        }
+    }
+    /* a tier change on an idle engine is exact at once, a hold or not; health always looks */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_OK);
+    t->rs_next_us = tui_now_us() + 60000000u;
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK);
+    CHECK(t->trk_lb == 0);
+    mu_lock(&t->mu); t->trk_lb = 1; t->lb_gen++; mu_unlock(&t->mu);
+    t->rs_next_us = tui_now_us() + 60000000u;
+    CHECK(health(t).gauges == GPTPS_TUI_GAUGES_EXACT && t->trk_lb == 0);
+    /* the detail pane at 24 rows: a task's 11 default settings all show (stage D's fixed
+     * 14 lines hid the last), and while editing with a status the frame still fits */
+    t->rows = 24;
+    t->pane = TUI_PANE_DETAIL; t->detail_sel = 0;
+    copy_name(t->detail_task, sizeof t->detail_task, "pc_5");
+    gptps_tui_press(t, 'R');
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->pc.n >= 2 && t->pc.n <= 11);
+    if (t->pc.n >= 2) {
+        const char *last = t->pc.pool + t->pc.sets[t->pc.n - 1].key + strlen("tasks.pc_5.");
+        CHECK(strstr(frame, last) != NULL);
+        CHECK(frame_nlines(frame) <= 24);
+        CHECK(gptps_tui_press(t, '\r') == 4 && t->editing);
+        snprintf(t->status, sizeof t->status, "a status line"); t->status_ms = gptps_now_ms(NULL);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(frame_nlines(frame) <= 24 && strstr(frame, "edit:") != NULL);
+        gptps_tui_press(t, 27);
+    }
+    /* a tasks pass with no memory says so, not "(no task types registered)" */
+    t->pane = TUI_PANE_TASKS;                              /* the detail cache freed: cap 0 */
+    tui_realloc_fail = 1000;
+    gptps_tui_render(t, frame, sizeof frame);
+    tui_realloc_fail = 0;
+    CHECK(t->pc.n == 0 && t->pc.short_by > 0);
+    CHECK(strstr(frame, "no task types registered") == NULL && strstr(frame, "no memory to list") != NULL);
+    CHECK(strstr(frame, "not read: no memory") != NULL);
+    gptps_tui_press(t, 'R');
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->pc.n == 7 && strstr(frame, "no memory") == NULL);   /* 8 less pc_2 */
     drain(e);
     gptps_shutdown(e);
     gptps_tui_close(t);
