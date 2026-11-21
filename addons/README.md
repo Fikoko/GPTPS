@@ -632,8 +632,11 @@ enabled automatically). Panes/metrics:
     logged (a WARN once per window size, naming the depth reached). `avg ms` covers
     `FINISHED` items only. The table also makes the **pending / in-flight gauges exact**
     (below FULL they come from the counters, which cannot tell a cancelled attempt that
-    ran from an item cancelled while queued, and the frame marks them `~`; `>=` while
-    some handle is not tracked). Event-order inversions are handled with `gptps_stats`'
+    ran from an item cancelled while queued, and the frame marks them `~`). Exact covers
+    the work queued *after* the table was built: a new table (install, a raise to FULL, a
+    resize) and one a handle found full show `>=` (a lower bound) until the engine reports
+    nothing queued or running — on an idle engine at once; an engine that is never idle,
+    such as one with an always-up service, keeps `>=`, which stays true. Event-order inversions are handled with `gptps_stats`'
     rules (tests/test_tui_order.c replays its order matrix against the dashboard); the
     markers of ends whose `QUEUED` never comes are bounded by a 64-entry FIFO.
   - **Task types** (`cfg.max_tasks`, 1..4096, default 64): TASKS rows are found by a

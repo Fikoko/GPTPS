@@ -630,7 +630,7 @@ RECENT
 keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter  m kpi  p pause  q quit
 ```
 
-- **Live metrics:** throughput, pending and in-flight gauges (exact at `full`, marked `~`
+- **Live metrics:** throughput, pending and in-flight gauges (exact at `full`, or `>=` while only a lower bound; marked `~`
   below it), cumulative counts, and a per-task
   table (runs / ok / fail / dead / drop / success-rate / average latency).
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the

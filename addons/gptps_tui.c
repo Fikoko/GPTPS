@@ -368,7 +368,7 @@ static int why_tail(const char *tail, size_t tail_len, size_t keep, size_t *star
         s -= 8;
     }
     while (s > lo && tail[s - 1] != '\n') --s;
-    if (s == lo && lo > 0) cut = 1;                              /* ...longer than the window */
+    if (s == lo && lo > 0 && tail[lo - 1] != '\n') cut = 1;     /* ...longer than the window */
     if (e - s > keep) {
         if (cut) {
             s = e - keep;
@@ -501,14 +501,20 @@ struct gptps_tui {
      * than lat_cap live entries plus the markers the orphan FIFO bounds. tab_n slots are
      * used, tab_done of them markers (TS_DONE). g_pend / g_run are the EXACT gauges: the
      * slots in TS_PENDING and TS_RUNNING. trk_lb: they are a lower bound just now - the
-     * table was built while work was already in flight, or a handle found it full - until
-     * the counters say nothing is left (q <= term). */
+     * table was just built (work queued before it is not in it), or a handle found it
+     * full. Only trk_resync clears it, and only on the ENGINE's word that nothing is
+     * queued or running while the table holds nothing live: no count of events can say
+     * that (a service's every run ends with a FINISHED and no QUEUED, a REQUEUE re-admits
+     * with none, and nothing from before the table was built was seen). lb_gen counts
+     * the times it was set, so a resync that raced a new miss leaves it alone. */
     tui_slot        *tab;
     size_t           tab_mask, tab_n, tab_done;
     gptps_handle     orph[TUI_ORPHANS];
     int              orph_n, orph_head;
     uint64_t         g_pend, g_run;
     int              trk_lb;
+    uint64_t         lb_gen;
+    int              observing;     /* the observer is registered: a resync can be trusted */
     int              lat_cap;       /* tui.latency_window: the live entries the table may hold */
     uint64_t         lat_untracked; /* this window: QUEUEDs that found the table full (no sample) */
     uint64_t         lat_unmatched; /* this window: markers dropped from the orphan FIFO */
@@ -699,7 +705,7 @@ static int ev_terminal(const gptps_event *ev)
  *
  * Bounded, never evicting: at most lat_cap live entries. A QUEUED that finds them all
  * taken is not tracked (counted, WARNed once per window, shown under the table, and the
- * gauges show '>=' - a lower bound - until nothing is left in flight); a live entry is
+ * gauges show '>=' - a lower bound - until trk_resync hears the engine is idle); a live entry is
  * never overwritten. Markers whose late event never comes (work queued before the table
  * existed; an always-up service's later runs, which have no QUEUED; the end of a handle
  * the table was too full to take) are bounded by the orphan FIFO: the newest
@@ -817,7 +823,7 @@ static int trk_event(gptps_tui *t, const gptps_event *ev, tui_task *tk)
         /* A terminal event may always take a slot: it becomes a marker at once, and the
          * orphan FIFO bounds those. Anything else needs a live entry's room. */
         if (!term && t->tab_n - t->tab_done >= (size_t)t->lat_cap) {
-            t->trk_lb = 1;                                  /* the gauges miss this handle */
+            t->trk_lb = 1; t->lb_gen++;                     /* the gauges miss this handle */
             if (ev->kind == GPTPS_EV_QUEUED) {
                 t->h_untracked++; t->lat_untracked++;
                 if (t->lat_warned != t->lat_cap) { t->lat_warned = t->lat_cap; warn = 1; }
@@ -875,6 +881,41 @@ static int trk_event(gptps_tui *t, const gptps_event *ev, tui_task *tk)
     return warn;
 }
 
+/* 1 when the engine says no item of any type is queued (intake or backoff) or running.
+ * Takes the engine's lock (gptps_task_get_info), so never under mu. */
+static int engine_idle(gptps *e)
+{
+    gptps_task_info info;
+    size_t i, n;
+    if (!e) return 0;
+    n = gptps_task_count(e);
+    for (i = 0; i < n; ++i) {
+        if (!tui_task_at(e, i, &info)) return 0;
+        if (info.queued || info.running) return 0;
+    }
+    return gptps_task_count(e) == n;      /* the registry moved under the walk: say no */
+}
+
+/* Clear the lower-bound mark (trk_lb) when that is sound: the engine has nothing queued
+ * or running, the table holds nothing live, and no handle was missed since this call
+ * began (lb_gen). Then nothing alive can be missing from the table - anything later
+ * sends its events to the observer, which is registered. Any other moment is not
+ * sound: an end still on its way to the observer can stand in for an item the table
+ * never saw. So an engine that is never idle (an always-up service) keeps '>=', which
+ * stays true. Called by render, gptps_tui_health and tui_reconfig, never under mu. */
+static void trk_resync(gptps_tui *t)
+{
+    uint64_t gen;
+    mu_lock(&t->mu);
+    if (!t->tab || !t->trk_lb || !t->observing) { mu_unlock(&t->mu); return; }
+    gen = t->lb_gen;
+    mu_unlock(&t->mu);
+    if (!engine_idle(t->e)) return;
+    mu_lock(&t->mu);
+    if (t->tab && t->trk_lb && t->lb_gen == gen && t->tab_n == t->tab_done) { t->trk_lb = 0; t->dirty = 1; }
+    mu_unlock(&t->mu);
+}
+
 static void tui_on_event(const gptps_event *ev, void *ud)
 {
     gptps_tui *t = (gptps_tui *)ud;
@@ -918,7 +959,6 @@ static void tui_on_event(const gptps_event *ev, void *ud)
             depth = t->q > t->term ? t->q - t->term : 0;
             running = t->g_run;
         }
-        if (t->trk_lb && t->q <= t->term) t->trk_lb = 0;   /* nothing left in flight: exact again */
     }
 
     if (tk) {
@@ -1623,6 +1663,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     B = color ? "\x1b[1m" : ""; D = color ? "\x1b[2m" : ""; R = color ? "\x1b[31m" : "";
     G = color ? "\x1b[32m" : ""; X = color ? "\x1b[0m" : "";
 
+    trk_resync(t);                       /* before the lock: it asks the engine */
     mu_lock(&t->mu);
     toast_on = status_live(t->status, t->status_ms, gptps_now_ms(NULL));
     legrows = legend_text(t, W, legend, sizeof legend);
@@ -1912,7 +1953,9 @@ static void tui_take(const gptps_dead_letter *dl, void *ud)
         size_t nc = t->held_cap ? t->held_cap * 2 : 16;
         tui_held *nh = nc <= TUI_HELD_MAX ? (tui_held *)realloc(t->held, nc * sizeof *nh) : NULL;
         if (!nh) { t->held_lost += 1; return; }
+        mu_lock(&t->mu);             /* gptps_tui_health reads held_cap under it */
         t->held = nh; t->held_cap = nc;
+        mu_unlock(&t->mu);
     }
     h = &t->held[t->nheld];
     memset(h, 0, sizeof *h);
@@ -2749,8 +2792,9 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, char *what, siz
     if (nw.recent) { t->recent = nw.recent; t->rn = t->rhead = 0; nw.recent = NULL; }
     if (nw.tab) {
         t->tab = nw.tab; t->tab_mask = nw.tab_mask; nw.tab = NULL;
-        /* work already in flight is not in it: a lower bound until that has ended */
-        t->trk_lb = t->q > t->term;
+        /* work queued before it is not in it: a lower bound until trk_resync (below)
+         * hears from the engine that nothing is queued or running */
+        t->trk_lb = 1; t->lb_gen++;
     }
     if (mk_tasks && !t->tasks) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
@@ -2776,6 +2820,7 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, char *what, siz
     parts_free(&old);                   /* swapped out above: nothing can reach them now */
     parts_free(&nw);                    /* nothing left, unless a part was not needed after all */
     mu_unlock(&t->smu);
+    trk_resync(t);                      /* a table built on an idle engine is exact at once */
     return st;
 }
 
@@ -2901,6 +2946,8 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         tui_destroy(t);
         return NULL;
     }
+    mu_lock(&t->mu); t->observing = 1; mu_unlock(&t->mu);
+    trk_resync(t);                 /* only now: an item queued before this is missed by the table */
     tui_register_settings(e, t);   /* expose tui.refresh_ms / tui.kpi / tui.mode / tui.latency_window */
     return t;
 }
@@ -2970,6 +3017,7 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     if (!t || !out || out->struct_size < offsetof(gptps_tui_health_info, journal_not_shown) + sizeof(uint64_t))
         return GPTPS_E_INVAL;
     memset(&h, 0, sizeof h);
+    trk_resync(t);                       /* before the lock: it asks the engine */
     mu_lock(&t->mu);
     h.journal_not_shown = 0;
     h.handles_untracked = t->h_untracked;

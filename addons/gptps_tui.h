@@ -96,7 +96,9 @@ typedef struct {
                                 * counted, shown under the TASKS table and in gptps_tui_health, and
                                 * logged (a WARN once per window size, naming the depth reached). avg
                                 * ms is queue-to-finish of FINISHED items only. The table also makes
-                                * the pending / in-flight gauges EXACT (see gptps_tui_health). Also
+                                * the pending / in-flight gauges EXACT for the work queued after it
+                                * was built (a lower bound until the engine is idle: see
+                                * gptps_tui_gauges). Also
                                 * settable at runtime as `tui.latency_window`. */
     const char *title;         /* dashboard title (default "tasks") */
     FILE       *out;           /* output stream (NULL => stdout) */
@@ -198,11 +200,17 @@ gptps_status gptps_tui_set_refresh(gptps_tui *t, uint32_t refresh_ms);
 typedef enum {
     GPTPS_TUI_GAUGES_APPROX = 0,      /* from the counters ('~' on the frame) */
     GPTPS_TUI_GAUGES_EXACT,           /* from each handle's state (no mark) */
-    GPTPS_TUI_GAUGES_LOWER_BOUND      /* exact for the handles tracked, but some are not
-                                       * ('>='): the table was built while work was in flight
-                                       * (a level raised, a window resized) or a handle found
-                                       * it full; exact again once the counters say nothing
-                                       * is left in flight (every QUEUED has had its end) */
+    GPTPS_TUI_GAUGES_LOWER_BOUND      /* exact for the handles tracked, but some may not be
+                                       * ('>='): every new table starts here (install, a level
+                                       * raised to FULL, a window resized - work queued before
+                                       * it is not in it), and a handle that finds it full puts
+                                       * it back. EXACT again only once the ENGINE reports
+                                       * nothing queued or running while the table holds
+                                       * nothing live - checked when a frame is rendered or
+                                       * health is read; on an idle engine a new table is EXACT
+                                       * at once. No event count can say it: an always-up
+                                       * service ends every run with a FINISHED and no QUEUED,
+                                       * so an engine that is never idle keeps '>=' (true) */
 } gptps_tui_gauges;
 
 /* What the dashboard has lost, holds and does (1.11). Counters are since install and
@@ -247,7 +255,10 @@ typedef struct {
 
 /* Fill *out (struct_size bytes of it; the rest of a newer struct is left alone, and
  * out->struct_size is kept). GPTPS_E_INVAL for a NULL argument or a struct_size that
- * does not reach journal_not_shown. Thread-safe; takes the dashboard's lock briefly. */
+ * does not reach journal_not_shown. Thread-safe; takes the dashboard's lock briefly, and
+ * while the gauges are a lower bound it asks the engine (gptps_task_get_info) whether it
+ * is idle - so it may be called from an observer, which runs with the engine lock
+ * released, but not from a callback gptps.h (THREADING) forbids to call the engine. */
 gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
 
 /* Render one frame to the configured output stream right now ("once" / on-demand),

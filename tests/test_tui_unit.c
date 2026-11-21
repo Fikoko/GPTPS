@@ -75,6 +75,10 @@
  * 30) ABI: the released config offsets and enum values (static asserts); a 1.10 caller's
  *     struct_size (its sizeof, tail padding included) and 0 read none of the 1.11
  *     fields, whatever its padding and what follows it hold.
+ * 31) The '>=' (lower bound) mark stays until the engine is idle and the table holds
+ *     nothing live: an always-up service's restarts (FINISHED, no QUEUED), a late
+ *     install and a table rebuilt while work waits no longer read EXACT.
+ * 32) POSIX: gptps_tui_health races nothing while the dashboard takes dead letters.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -915,7 +919,8 @@ static void test_latency_overflow(void)
             emit(t, GPTPS_EV_FINISHED, "deep", h, GPTPS_OK, 5000 + h);
             if (t->tab_done > maxmark) maxmark = t->tab_done;
         }
-        CHECK(t->trk_lb == 0);                             /* everything ended: exact again */
+        CHECK(t->trk_lb == 1);                             /* events alone never clear it... */
+        CHECK(health(t).gauges == GPTPS_TUI_GAUGES_EXACT && t->trk_lb == 0);   /* ...the idle engine does */
     }
     k = row(t, "deep");
     CHECK(k != NULL && k->lat_n == 128);                   /* the 64 tracked, each round */
@@ -1324,6 +1329,29 @@ static void test_why_bounded(void)
         for (k = 0; k + 2 <= 600; k += 2) { tail[k] = '\xc3'; tail[k + 1] = '\xa9'; }
         why_of(tail, 600, out, sizeof out);
         CHECK(clean_utf8(out) && strstr(out, "\xe2\x80\xa6\xc3\xa9") != NULL);
+        /* an odd length: the event path's own cut (TUI_TAIL_KEEP from the end) falls on a
+         * continuation byte, and the record must still start on a whole character */
+        {
+            gptps_event ev; tui_event re;
+            memset(&ev, 0, sizeof ev);
+            ev.struct_size = sizeof ev; ev.kind = GPTPS_EV_FAILED; ev.status = GPTPS_E_TASK;
+            ev.stderr_tail = tail; ev.stderr_tail_len = 599;    /* ends on a lone lead byte */
+            why_record(&ev, &re);
+            CHECK(re.tail_cut == 1 && re.tail_len > 0 && ((unsigned char)re.tail[0] & 0xc0u) != 0x80u);
+            ev.stderr_tail_len = 600 - 1 - 2 * 10;              /* and another odd one */
+            why_record(&ev, &re);
+            CHECK(re.tail_cut == 1 && re.tail_len > 0 && ((unsigned char)re.tail[0] & 0xc0u) != 0x80u);
+        }
+    }
+    /* a line that starts exactly where the window starts is whole: no ellipsis, its start kept */
+    {
+        size_t s0 = 0, e0 = 0;
+        memset(tail, 'y', sizeof tail);
+        tail[0] = 'x'; tail[1] = '\n';                         /* lo = 2: tail[lo - 1] is the line break */
+        memcpy(tail + 2, "FIRST", 5);
+        CHECK(why_tail(tail, 2 + TUI_WHY_SCAN, 80, &s0, &e0) == 0 && s0 == 2 && e0 == 82);
+        why_of(tail, 2 + TUI_WHY_SCAN, out, sizeof out);
+        CHECK(strstr(out, "\xe2\x80\xa6") == NULL && strstr(out, "FIRST") != NULL);
     }
 }
 
@@ -1612,6 +1640,110 @@ static void test_storage_storm(void)
 }
 #endif
 
+/* 31) the '>=' mark (a lower bound) is cleared only on the engine's word that nothing is
+ * queued or running, never from the counters: an always-up service's FINISHED per run
+ * (and no QUEUED) put term above q, so 'q <= term' called a table that had refused
+ * handles exact; a table built while work waited (a late install, a new window) was
+ * called exact with that work missing from it */
+static void test_lower_bound_sticks(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; gptps_handle h; gptps_tui_health_info hh;
+    static char frame[16384];
+    int i;
+    if (!e) return;
+    deftask(e, "job", ok_task);
+    log_begin();
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 2, 0);
+    CHECK(t != NULL && t->tab != NULL);
+    if (!t || !t->tab) { log_end(); gptps_shutdown(e); gptps_tui_close(t); return; }
+    CHECK(health(t).gauges == GPTPS_TUI_GAUGES_EXACT);    /* an idle engine: exact at once */
+    /* a service that has run 10 times: 10 FINISHED, no QUEUED (term 10, q 0) */
+    emit_a(t, GPTPS_EV_STARTED, "svc", 900000, GPTPS_OK, 1, 1);
+    for (i = 0; i < 10; ++i) {
+        emit_a(t, GPTPS_EV_FINISHED, "svc", 900000, GPTPS_OK, 2, 1);
+        emit_a(t, GPTPS_EV_STARTED, "svc", 900000, GPTPS_OK, 3, 1);
+    }
+    for (i = 0; i < 5; ++i) CHECK(gptps_submit(e, "job", NULL, 0, &h) == GPTPS_OK);   /* window 2: 1 has room */
+    CHECK(t->q == 5 && t->term == 10 && t->g_pend == 1 && t->g_run == 1);
+    hh = health(t);
+    CHECK(hh.gauges == GPTPS_TUI_GAUGES_LOWER_BOUND && hh.handles_untracked == 4);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "pending >=1  in-flight >=1") != NULL);
+    /* a new window, built while the 5 wait: none of them is in it */
+    CHECK(gptps_tui_set_latency_window(t, 64) == GPTPS_OK);
+    hh = health(t);
+    CHECK(hh.gauges == GPTPS_TUI_GAUGES_LOWER_BOUND && hh.pending == 0);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "pending >=0") != NULL);
+    drain(e);                                              /* all 5 run and end: the engine is idle */
+    hh = health(t);
+    CHECK(hh.gauges == GPTPS_TUI_GAUGES_EXACT && hh.pending == 0 && hh.in_flight == 0);
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    /* installed late: 5 already waiting, so a table built now is a lower bound */
+    e = open_manual();
+    if (!e) return;
+    deftask(e, "job", ok_task);
+    for (i = 0; i < 5; ++i) CHECK(gptps_submit(e, "job", NULL, 0, &h) == GPTPS_OK);
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 64, 0);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    hh = health(t);
+    CHECK(hh.gauges == GPTPS_TUI_GAUGES_LOWER_BOUND && hh.pending == 0);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "pending >=0") != NULL);
+    drain(e);
+    CHECK(health(t).gauges == GPTPS_TUI_GAUGES_EXACT);
+    /* raised to FULL while work waits: the same */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_OK);
+    CHECK(gptps_submit(e, "job", NULL, 0, &h) == GPTPS_OK);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK);
+    CHECK(health(t).gauges == GPTPS_TUI_GAUGES_LOWER_BOUND);
+    drain(e);
+    CHECK(health(t).gauges == GPTPS_TUI_GAUGES_EXACT);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+#if !defined(_WIN32)
+/* 32) POSIX: gptps_tui_health on another thread while the dashboard takes dead letters
+ * into its keeping (the array grows): held_cap is written under the lock health reads it
+ * under (a thread sanitizer flagged the pair) */
+static gptps_tui *dh_t;
+static int dh_stop;
+static void *dh_reader(void *a)
+{
+    (void)a;
+    while (!__atomic_load_n(&dh_stop, __ATOMIC_SEQ_CST)) (void)health(dh_t);
+    return NULL;
+}
+static void test_health_vs_dead_letters(void)
+{
+    gptps *e = open_manual(); pthread_t th; gptps_handle h;
+    int i, ok;
+    if (!e) return;
+    deftask(e, "bad", fail_task);
+    dh_t = install(e);
+    CHECK(dh_t != NULL);
+    if (!dh_t) { gptps_shutdown(e); return; }
+    __atomic_store_n(&dh_stop, 0, __ATOMIC_SEQ_CST);
+    ok = pthread_create(&th, NULL, dh_reader, NULL) == 0;
+    CHECK(ok);
+    gptps_tui_press(dh_t, 'l');
+    for (i = 0; i < 40; ++i) {
+        CHECK(gptps_submit(e, "bad", NULL, 0, &h) == GPTPS_OK);
+        drain(e);
+        gptps_tui_press(dh_t, 'g');                        /* take it: the array grows 16, 32, 64 */
+    }
+    __atomic_store_n(&dh_stop, 1, __ATOMIC_SEQ_CST);
+    if (ok) pthread_join(th, NULL);
+    CHECK(dh_t->nheld == 40 && health(dh_t).bytes_dead_letters == (uint64_t)dh_t->held_cap * sizeof(tui_held));
+    gptps_shutdown(e);
+    gptps_tui_close(dh_t);
+}
+#endif
+
 int main(void)
 {
     test_sanitiser();
@@ -1639,7 +1771,9 @@ int main(void)
     test_health_struct_size();
     test_name_index();
     test_config_abi();
+    test_lower_bound_sticks();
 #if !defined(_WIN32)
+    test_health_vs_dead_letters();
     test_storage_storm();
     test_run_without_stdin();
     test_render_while_unregistering();
