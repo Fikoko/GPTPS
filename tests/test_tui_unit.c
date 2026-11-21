@@ -112,6 +112,10 @@
  *     one line's bytes; a burst of 100k events at refresh 250 ms costs frames bounded by
  *     the time and at most one wake a frame; the wake pipe exists only while run runs,
  *     and a headless run makes none.
+ * 48) The tasks / settings / detail panes read the engine in one pass into a cache: none
+ *     between passes, one call per entry in a pass, a slow pass stretching the interval to
+ *     100x its cost, a change made from the pane or 'R' read at once, an edit landing on
+ *     the chosen key after the registry moved; trk_resync held back after a slow look.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -142,13 +146,41 @@ static void *tui_test_malloc(size_t n)
     if (tui_malloc_fail > 0) { --tui_malloc_fail; return NULL; }
     return malloc(n);
 }
+/* 48): every read the add-on makes of the engine's registry, counted - and, on demand,
+ * made slower (a busy engine's gptps_task_get_info walks every queue under its lock).
+ * gptps.h first, so its prototypes are not rewritten by the macros. */
+#include "gptps.h"
+static int tui_reads;               /* an int: as tui_allocs */
+static int tui_read_delay_us;       /* each read takes at least this long */
+static gptps_status tui_test_tgi(gptps *e, size_t i, gptps_task_info *o);
+static size_t tui_test_tc(gptps *e);
+static gptps_status tui_test_sgi(gptps *e, size_t i, gptps_setting_info *o);
+static size_t tui_test_sc(gptps *e);
 #define calloc(n, s) tui_test_calloc((n), (s))
 #define malloc(n) tui_test_malloc((n))
 #define realloc(p, n) tui_test_realloc((p), (n))
+#define gptps_task_get_info(e, i, o) tui_test_tgi((e), (i), (o))
+#define gptps_task_count(e) tui_test_tc((e))
+#define gptps_settings_get_info(e, i, o) tui_test_sgi((e), (i), (o))
+#define gptps_settings_count(e) tui_test_sc((e))
 #include "../addons/gptps_tui.c"
 #undef calloc
 #undef malloc
 #undef realloc
+#undef gptps_task_get_info
+#undef gptps_task_count
+#undef gptps_settings_get_info
+#undef gptps_settings_count
+static void tui_read_note(void)
+{
+    __atomic_add_fetch(&tui_reads, 1, __ATOMIC_SEQ_CST);
+    if (tui_read_delay_us > 0) { uint64_t end = tui_now_us() + (uint64_t)tui_read_delay_us; while (tui_now_us() < end) { } }
+}
+static gptps_status tui_test_tgi(gptps *e, size_t i, gptps_task_info *o) { tui_read_note(); return gptps_task_get_info(e, i, o); }
+static size_t tui_test_tc(gptps *e) { tui_read_note(); return gptps_task_count(e); }
+static gptps_status tui_test_sgi(gptps *e, size_t i, gptps_setting_info *o) { tui_read_note(); return gptps_settings_get_info(e, i, o); }
+static size_t tui_test_sc(gptps *e) { tui_read_note(); return gptps_settings_count(e); }
+static int reads(void) { return __atomic_load_n(&tui_reads, __ATOMIC_SEQ_CST); }
 #include <stdio.h>
 #if !defined(_WIN32)
 #  include <fcntl.h>
@@ -2536,6 +2568,137 @@ static void test_legend_cache(void)
     gptps_tui_close(t);
 }
 
+/* The index of `key` in the pane cache, -1 when it is not there. */
+static int pc_find(const gptps_tui *t, const char *key)
+{
+    size_t i;
+    for (i = 0; i < t->pc.n; ++i) if (strcmp(t->pc.pool + t->pc.sets[i].key, key) == 0) return (int)i;
+    return -1;
+}
+
+/* 48) The engine-reading panes (tasks, settings, detail) read the engine in one pass into
+ * a cache - on open, after a change made from the pane, on 'R', and when due - and their
+ * frames and j/k read only the cache: no engine call between passes. A pass is timed, and
+ * a slow one stretches the interval to 100x its cost (the engine's lock <= 1% of the time).
+ * trk_resync is held back the same way after a slow look. An edit reaches the key the
+ * operator chose even when the registry moved since the pass. */
+static void test_pane_cache(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; static char frame[32768];
+    gptps_tui_health_info h;
+    int i, k, r0, idx, ntask = 0;
+    size_t ns;
+    gptps_handle hd;
+    char key0[GPTPS_SETTINGS_VALUE_MAX];
+    if (!e) return;
+    for (i = 0; i < 8; ++i) { char nm[16]; snprintf(nm, sizeof nm, "pc_%d", i); deftask(e, nm, ok_task); }
+    t = install(e);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    /* tasks pane: one pass on open (a count, then one call per type), shown with its cost */
+    t->pane = TUI_PANE_TASKS;
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() - r0 == 1 + 8);
+    h = health(t);
+    CHECK(h.pane_reads == 1 && h.bytes_panes > 0 && h.pane_every_ms == 2000);
+    CHECK(strstr(frame, "core counts: ") != NULL && strstr(frame, "every 2.0 s, age 0 s") != NULL);
+    CHECK(strstr(frame, "pc_7") != NULL);
+    /* between passes, frames and keys cost the engine nothing */
+    r0 = reads();
+    for (k = 0; k < 20; ++k) gptps_tui_render(t, frame, sizeof frame);
+    gptps_tui_press(t, 'j'); gptps_tui_press(t, 'k');
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() == r0);
+    /* cached: work queued now shows at the next pass - 'R' makes it now */
+    CHECK(gptps_submit(e, "pc_0", NULL, 0, &hd) == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    for (i = 0; i < (int)t->pc.n; ++i) if (strcmp(t->pc.tasks[i].name, "pc_0") == 0) ntask = i;
+    CHECK(t->pc.tasks[ntask].queued == 0);
+    CHECK(gptps_tui_press(t, 'R') == 4);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->pc.tasks[ntask].queued == 1 && health(t).pane_reads == 2);
+    /* due again after pane_refresh_ms */
+    t->pc.read_ms -= 2001;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(health(t).pane_reads == 3);
+    /* a slow pass (9 reads of >= 4 ms) waits 100x its cost before the next, not 2 s */
+    tui_read_delay_us = 4000;
+    gptps_tui_press(t, 'R');
+    gptps_tui_render(t, frame, sizeof frame);
+    tui_read_delay_us = 0;
+    h = health(t);
+    CHECK(h.pane_reads == 4 && h.pane_read_us >= 9 * 4000);
+    CHECK(h.pane_every_ms * 1000 >= h.pane_read_us * 100 && h.pane_every_ms > 3000);
+    t->pc.read_ms -= 2001;                                 /* pane_refresh_ms is not enough now */
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() == r0 && health(t).pane_reads == 4);
+    /* settings pane: one call per setting, plus the selected one read to explain it */
+    t->pane = TUI_PANE_SETTINGS; t->sel = 0;
+    ns = gptps_settings_count(e);
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK((size_t)(reads() - r0) == 1 + ns + 1);
+    CHECK(t->pc.n == ns && strstr(frame, "settings read: ") != NULL);
+    r0 = reads();
+    for (k = 0; k < 10; ++k) gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() == r0);                                  /* 1.10: 2n calls a frame */
+    gptps_tui_press(t, 'j');
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() == r0 + 1);                              /* the new selection, read once */
+    /* a value set elsewhere shows at the next pass; one edited here at once */
+    CHECK(gptps_settings_set(e, "tui.refresh_ms", "777") == GPTPS_OK);
+    gptps_tui_render(t, frame, sizeof frame);
+    idx = pc_find(t, "tui.refresh_ms");
+    CHECK(idx >= 0 && idx < (int)t->pc.n && strcmp(t->pc.pool + t->pc.sets[idx].val, "777") != 0);
+    gptps_tui_press(t, 'R');
+    gptps_tui_render(t, frame, sizeof frame);
+    idx = pc_find(t, "tui.refresh_ms");
+    CHECK(idx >= 0 && strcmp(t->pc.pool + t->pc.sets[idx].val, "777") == 0);
+    t->sel = idx;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(gptps_tui_press(t, '\r') == 4 && t->editing);
+    for (k = 0; k < 4; ++k) gptps_tui_press(t, 127);
+    gptps_tui_press(t, '5'); gptps_tui_press(t, '5'); gptps_tui_press(t, '5');
+    gptps_tui_press(t, '\r');
+    gptps_tui_render(t, frame, sizeof frame);
+    idx = pc_find(t, "tui.refresh_ms");
+    CHECK(idx >= 0 && strcmp(t->pc.pool + t->pc.sets[idx].val, "555") == 0 && t->cfg.refresh_ms == 555);
+    /* detail pane: an edit goes to the key chosen, though the registry moved since the pass */
+    t->pane = TUI_PANE_DETAIL; t->detail_sel = 0;
+    copy_name(t->detail_task, sizeof t->detail_task, "pc_5");
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(t->pc.n > 0 && strstr(frame, "task 'pc_5'") != NULL);
+    copy_name(key0, sizeof key0, t->pc.n ? t->pc.pool + t->pc.sets[0].key : "");
+    CHECK(strncmp(key0, "tasks.pc_5.", 11) == 0);
+    CHECK(gptps_unregister_task(e, "pc_2", GPTPS_REMOVE_REJECT_IF_BUSY) == GPTPS_OK);   /* its settings go: indexes shift */
+    CHECK(gptps_tui_press(t, '\r') == 4);
+    CHECK(t->editing && strcmp(t->edit_key, key0) == 0);
+    gptps_tui_press(t, 27);
+    /* leaving them frees the cache */
+    t->pane = TUI_PANE_DASH;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(health(t).bytes_panes == 0 && t->pc.pane == -1);
+    /* trk_resync: a slow look (>= 200 us) holds the next back for 99x as long */
+    mu_lock(&t->mu); t->trk_lb = 1; t->lb_gen++; mu_unlock(&t->mu);   /* pc_0's item is queued: not idle */
+    tui_read_delay_us = 1000;
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    tui_read_delay_us = 0;
+    CHECK(reads() > r0 && t->rs_next_us > tui_now_us() && strstr(frame, ">=") != NULL);
+    r0 = reads();
+    gptps_tui_render(t, frame, sizeof frame);
+    (void)health(t);
+    CHECK(reads() == r0);                                  /* held back */
+    t->rs_next_us = 1;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(reads() > r0);                                   /* due again */
+    drain(e);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
 #if !defined(_WIN32)
 /* 46) the dashboard is formatted with the lock released: only the copy-out holds it (the
  * format would deadlock here, holding mu, if it took it) */
@@ -2907,6 +3070,7 @@ int main(void)
     test_frame_grows();
     test_height_fit();
     test_legend_cache();
+    test_pane_cache();
 #if !defined(_WIN32)
     test_format_unlocked();
     test_live_idle();

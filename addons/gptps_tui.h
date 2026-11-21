@@ -47,29 +47,34 @@ typedef struct gptps_tui gptps_tui;
  * every submitting thread), so dial it to what you can spare. Tunable at runtime
  * (gptps_tui_set_kpi, `tui.kpi`, the 'm' key).
  *
- *   tier  enum (tui.kpi)          adds                                 per event
- *   0     OFF      ("off")        leaves the event path: one flag      ~1 ns, no lock
+ *   tier  enum (tui.kpi)          adds                                 per event         measured  memory it adds
+ *   0     OFF      ("off")        leaves the event path: one flag      ~1 ns, no lock    2 ns      -
  *                                 read, no lock
- *   1     MINIMAL  ("minimal",    totals: queued, started, finished,   one lock +
+ *   1     MINIMAL  ("minimal",    totals: queued, started, finished,   one lock +        7 ns      -
  *                   or "count")   failed, retried, dead, dropped,      increments
  *                                 cancelled
- *   2     GAUGE    ("gauge")      the in-flight gauge (and pending     + ~0-2 ns
+ *   2     GAUGE    ("gauge")      the in-flight gauge (and pending     + ~0-2 ns         9 ns      -
  *                                 beside it), its bar and peak
- *   3     PROBLEMS ("problems")   the PROBLEMS journal: FAILED,        0 on a success;
- *                                 RETRIED, DEAD_LETTERED, DROPPED with a failure: a
+ *   3     PROBLEMS ("problems")   the PROBLEMS journal: FAILED,        0 on a success;   10 ns     recent_lines x ~300 B
+ *                                 RETRIED, DEAD_LETTERED, DROPPED      with a failure: a           (2.4 KiB)
  *                                 with why (exit code / signal /       copy + a <= 512 B
  *                                 start error + stderr's last line)    scan
- *   4     TASKS    ("tasks")      the per-task TASKS rows ('(other)'   one hash probe
- *                                 row past max_tasks) and mem.peak
- *   5     NORMAL   ("normal",     the ACTIVITY journal: QUEUED,        one 24 B store
+ *   4     TASKS    ("tasks")      the per-task TASKS rows ('(other)'   one hash probe    18 ns     (max_tasks + 1) x ~250 B
+ *                                 row past max_tasks) and mem.peak                                 + index (~19 KiB)
+ *   5     NORMAL   ("normal",     the ACTIVITY journal: QUEUED,        one 24 B store    18 ns     activity_lines x 24 B
  *                   or "activity") STARTED, FINISHED
- *   6     LATENCY  ("latency")    the handle table: avg ms queue to    one hash op
- *                                 finish, EXACT pending / in-flight
- *   7     FULL     ("full")       latency percentiles p50/p95/p99      one increment
+ *   6     LATENCY  ("latency")    the handle table: avg ms queue to    one hash op       23 ns     32 B x next_pow2(4/3 x
+ *                                 finish, EXACT pending / in-flight                                (window + 64)) (64 KiB)
+ *   7     FULL     ("full")       latency percentiles p50/p95/p99      one increment     23 ns     256 B a row (16 KiB)
  *                                 (a log2-ms histogram per row)
  *
+ * "measured": a QUEUED, STARTED, FINISHED mix of one task type, the observer called on
+ * one thread (gcc -O2, x86-64 Linux, 4 cores), the defaults; memory in brackets at the
+ * defaults. With several threads emitting, MINIMAL and up also wait for one another on
+ * the dashboard's one lock - the price of no atomics in the drop-in build; OFF never does.
  * No tier has a per-event term that grows with the window, the task types or a stderr
- * tail. A layer's memory exists only at its tier and up (see STORAGE at install).
+ * tail (tests/test_tui_perf.c gates each, as a ratio). A layer's memory exists only at its
+ * tier and up (see STORAGE at install).
  * Values are never renumbered (1.3.0 did once): the released DEFAULT..FULL keep theirs,
  * and the tiers 1.10 had no name for are appended. tui.kpi reads back the released name
  * where a tier has one ("minimal", "normal"); "count" and "activity" are accepted when
@@ -208,8 +213,9 @@ typedef struct {
                                 * snapshot to measure against, "n/a" at OFF (the totals stand
                                 * still). peak: the highest in-flight in the last one to two
                                 * windows (1.10: ever) */
-    int         pane_refresh_ms;/* the tasks / settings / detail panes re-read the engine at most this
-                                * often (0 => 2000; 100..600000) */
+    int         pane_refresh_ms;/* how often an open tasks / settings / detail pane reads the engine
+                                * again (0 => 2000; 100..600000; install-time) - or less often, when
+                                * a read is slow: see PANES at gptps_tui_run */
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
@@ -264,8 +270,10 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
  * live state - no terminal needed. The dashboard pane copies what it shows out under the
  * dashboard's lock - only the TASKS rows and RECENT lines that fit the terminal's height
  * (cols / rows: 80x24 headless) - and formats it with the lock released, so the engine's
- * threads wait for the copy, not the formatting. One render at a time per dashboard: a
- * second thread's render waits for the first. */
+ * threads wait for the copy, not the formatting. The tasks, settings and detail panes
+ * are formatted from their cache and read the engine only when a pass is due (see PANES
+ * at gptps_tui_run). One render at a time per dashboard: a second thread's render waits
+ * for the first. */
 size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
 
 /* Apply a key as if pressed: a bound hotkey submits its task (returns 1; if the engine
@@ -273,7 +281,9 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
  * denies it - the toast says why and it returns 0); 'q'/ESC
  * requests quit (returns -1); 'k'/'j' scroll the log (returns 2); 'm' steps the
  * KPI tier up (FULL wraps to MINIMAL; never into OFF) and 'p' toggles pause (returns 3, "reconfigured"); 's' opens the
- * settings editor and '?' toggles the help overlay (returns 4, "UI"); else 0. */
+ * settings editor and '?' toggles the help overlay (returns 4, "UI"); else 0. In the
+ * tasks, settings and detail panes 'R' (or 'r') reads the engine again now (returns 4;
+ * see PANES at gptps_tui_run) - in the dead-letter view 'r' still re-submits all. */
 int gptps_tui_press(gptps_tui *t, int key);
 
 /* Runtime reconfiguration (thread-safe; the live loop picks changes up next frame).
@@ -389,6 +399,12 @@ typedef struct {
     uint64_t problems_not_shown;  /* the PROBLEMS part of journal_not_shown */
     uint64_t problems_held, activity_held;   /* records each journal holds now */
     int      kpi;                 /* the tier in effect (gptps_tui_kpi, never DEFAULT / ACTIVITY) */
+    /* 1.11, the engine-reading panes (tasks, settings, detail; see PANES at gptps_tui_run) */
+    uint64_t pane_reads;          /* passes they made over the engine's registry */
+    uint64_t pane_read_us;        /* what the last pass took - in the engine's lock, call by call */
+    uint64_t pane_every_ms;       /* how often an open pane reads again: pane_refresh_ms, or
+                                   * 100 times the last pass when that is longer */
+    uint64_t bytes_panes;         /* the open pane's cache (0 on the dashboard) */
 } gptps_tui_health_info;
 
 /* Fill *out (struct_size bytes of it; the rest of a newer struct is left alone, and
@@ -435,17 +451,41 @@ void gptps_tui_snapshot(gptps_tui *t);
  * that it is cut at a line with a visible "[frame truncated]" line (counted). The TASKS
  * table and the tasks pane are fitted to the terminal's height ("+N more").
  *
+ * PANES (1.11). The tasks, settings and detail panes show what they read from the engine,
+ * and gptps_task_get_info holds the engine's lock while it walks every queue (1.10 read
+ * every row on every frame: 116 ms a frame at 64 types and 100k queued - 46% of the time at
+ * 250 ms, stalling submit and dispatch). Now an open pane reads the engine in ONE pass into
+ * a cache: when it opens, after a change made from it (an edit, pause, clone, new, delete),
+ * on 'R', and then every pane_refresh_ms (2 s) - or, when a pass took more than 1% of that,
+ * 100x what it took, so the panes hold the engine's lock at most 1% of the time. Its frames
+ * and j/k read only the cache (no engine call between passes), and a value set elsewhere
+ * shows at the next pass. The pane's last line says so: "core counts: 19.0 ms, every 2.0 s,
+ * age 1 s" (tasks), "settings read: ..." (settings, detail). One pass is one call per task
+ * type or setting (1.10: two or three walks of the registry a frame); the selected setting
+ * is read again, once, when the selection moves, to explain it, and an edit reads its
+ * setting fresh by key, so it lands on the setting chosen even when the registry changed
+ * since the pass. The cache is freed when the dashboard pane is back (bytes_panes in
+ * gptps_tui_health, with pane_reads, pane_read_us and pane_every_ms). The dashboard's own
+ * engine read - asking whether the engine is idle, to clear the gauges' '>=' - follows the
+ * same 1% rule once a look takes 200 us or more.
+ *
  * HOST PROFILES.
- *   - Embedded / MANUAL (no thread, render or snapshot only): no loop, no pipe, no timer -
+ *   - Embedded / MANUAL (no thread; render or snapshot only): no loop, no pipe, no timer -
  *     done/s, peak and the clock advance inside render. Pick the tier by what you can
- *     spare per event (MINIMAL or GAUGE); with the stub HAL's clock, cfg.clock = OFF.
- *   - A server at 100k events/s: every tier is O(1) an event, but MINIMAL and up take one
- *     mutex an event on every thread that emits; ON_DEMAND costs at most one wake a frame
- *     interval; size latency_window to the in-flight depth.
- *   - Task Scheduler / a service / headless: run returns at once (no console); only the
- *     observer's cost remains - set kpi to what snapshots need, or OFF.
+ *     spare per event - MINIMAL (totals) or GAUGE (+ in-flight and peak), which hold no
+ *     per-event memory; with the stub HAL's clock, cfg.clock = OFF.
+ *   - A server at 100k events/s: every tier is O(1) an event (23 ns at FULL on one
+ *     thread: ~0.2% of a core), but MINIMAL and up take one mutex an event on every thread
+ *     that emits. Prefer ON_DEMAND (at most one wake a frame interval); size
+ *     latency_window to the in-flight depth, not the rate; activity_lines = -1 (or
+ *     tui.activity = 0) when the lifecycle log is not read - failures stay in PROBLEMS.
+ *     The tasks pane is safe to leave open (<= 1% of the engine's lock).
+ *   - Task Scheduler / a service / headless: run returns at once (no console) and makes
+ *     no pipe; only the observer's cost remains - set kpi to what snapshots need, or OFF
+ *     (installed, ~2 ns an event, no lock; raise it when someone looks).
  *   - An operator's console: the defaults (FULL, CONTINUOUS, clock in minutes) - idle, it
- *     writes nothing and repaints the header once a minute.
+ *     writes nothing and repaints the header once a minute; ON_DEMAND to also make no
+ *     frame between changes.
  *
  * Typed text is
  * UTF-8 (on Windows the console's UTF-16 is converted, keys told apart by their

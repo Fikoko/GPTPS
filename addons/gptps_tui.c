@@ -77,6 +77,27 @@ static void sc_set(volatile long *p, long v) { *p = v; }
 static void sc_add(volatile long *p, long v) { *p += v; }
 #endif
 
+/* A monotonic clock in microseconds, to MEASURE what a read of the engine costs (the
+ * panes', trk_resync's): gptps_now_ms has millisecond resolution, and most of these reads
+ * take less. The platform's own clock - no HAL, so the drop-in build has it too. */
+#if defined(_WIN32)
+static uint64_t tui_now_us(void)
+{
+    LARGE_INTEGER f, c;
+    if (!QueryPerformanceFrequency(&f) || !QueryPerformanceCounter(&c) || f.QuadPart <= 0)
+        return gptps_now_ms(NULL) * 1000u;
+    return (uint64_t)(c.QuadPart / f.QuadPart) * 1000000u + (uint64_t)(c.QuadPart % f.QuadPart) * 1000000u / (uint64_t)f.QuadPart;
+}
+#else
+#  include <time.h>
+static uint64_t tui_now_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return gptps_now_ms(NULL) * 1000u;
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+#endif
+
 /* cfg.max_tasks: the TASKS rows (and gptps_tui_add_task entries) by default, and the most
  * an install may ask for. */
 #define TUI_MAX_TASKS 64
@@ -123,6 +144,13 @@ static void sc_add(volatile long *p, long v) { *p += v; }
 /* Latency percentiles (FULL): a log2-ms histogram per row - bucket 0 holds 0 ms, bucket b
  * (1..30) [2^(b-1), 2^b) ms, bucket 31 everything from 2^30 ms. */
 #define TUI_HIST_B    32
+/* The engine-reading panes (tasks, settings, detail) and trk_resync hold the engine's lock
+ * for each call they make (gptps_task_get_info walks every queue under it: 116 ms a pass
+ * at 64 types and 100k queued). A pass is timed, and the next waits at least this many
+ * times as long as the last one took - so they hold it at most 1/TUI_DUTY of the time. */
+#define TUI_DUTY      100u
+/* trk_resync is not held back when its last look took less than this (microseconds) */
+#define TUI_RESYNC_FREE_US 200u
 
 /* ---- the KPI ladder ----------------------------------------------------------------
  * The public gptps_tui_kpi values keep their 1.10 numbers, so they are not in ladder
@@ -596,6 +624,38 @@ typedef struct {
     int        rows_cap, recs_cap;
 } tui_view;
 
+/* ---- the engine-reading panes' cache (see "pane cache") ----
+ * The tasks pane read gptps_task_get_info for every row on every frame - each call holds
+ * the engine's lock while it walks every queue (116 ms a frame at 64 types and 100k
+ * queued: 46% of the time at 250 ms) - and the settings and detail panes walked the whole
+ * registry two or three times a frame. Now an open pane reads the engine in ONE pass into
+ * this cache, and its frames - and j/k - work from the cache. A pass is made when the pane
+ * opens, after a change made from it, on 'R', and then every pane_refresh_ms - or, when
+ * that is sooner than TUI_DUTY times what the last pass took (it is timed), only then, so
+ * the panes hold the engine's lock at most 1% of the time. The pane says how old what it
+ * shows is. Touched under rmu only (render, and press); freed when no such pane is shown. */
+typedef struct { char name[TUI_NAME_CAP]; int exec, enabled, removed; int32_t pri; uint32_t queued, running, dead; } tui_ctask;
+/* a setting: its key and value in `pool` (offsets), its index in the registry when read */
+typedef struct { size_t key, val, idx; int hot; } tui_cset;
+typedef struct {
+    int        pane;              /* the pane read for (TUI_PANE_*), -1: none */
+    char       task[128];         /* the detail pane's task, as read */
+    tui_ctask *tasks;
+    tui_cset  *sets;
+    char      *pool;
+    size_t     n, cap, pool_len, pool_cap;
+    size_t     total;             /* settings: the registry's size at the pass */
+    size_t     short_by;          /* entries the pass had no memory for (counted, shown) */
+    int        kw;                /* the key column's width */
+    int        stale;             /* a change made from the pane, or 'R': read at the next frame */
+    uint64_t   read_ms, cost_us, every_ms;
+    /* the selected setting, explained under the list: read (one call) when the selection
+     * moves; its kind ("one of: ...") formatted at once - the choices are borrowed */
+    int        sel_for, have_sel;
+    gptps_setting_info sel;
+    char       sel_kind[640];
+} tui_pcache;
+
 struct gptps_tui {
     gptps           *e;
     gptps_tui_config cfg;
@@ -705,6 +765,12 @@ struct gptps_tui {
     tui_mutex        rmu;
     tui_view        *view;
     int              view_warned;
+    tui_pcache       pc;            /* the engine-reading panes' cache (under rmu) */
+    /* their passes, for gptps_tui_health (under mu): count, the last one's cost, the
+     * interval it set, the cache's bytes; h_pane_us: every pass's cost, summed */
+    uint64_t         h_pane_reads, h_pane_us, pane_cost_us, pane_every_ms, pane_bytes;
+    /* trk_resync's own duty limit (under mu): no look before this (tui_now_us; 0: any time) */
+    uint64_t         rs_next_us, rs_cost_us;
     /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
      * all - taking a mutex to discover you have nothing to do is the entire cost this
      * tier exists to remove. Not the HAL's gptps_flag: the amalgamation ships gptps.c
@@ -1124,16 +1190,28 @@ static int engine_idle(gptps *e)
  * sends its events to the observer, which is registered. Any other moment is not
  * sound: an end still on its way to the observer can stand in for an item the table
  * never saw. So an engine that is never idle (an always-up service) keeps '>=', which
- * stays true. Called by render, gptps_tui_health and tui_reconfig, never under mu. */
+ * stays true. Called by render, gptps_tui_health and tui_reconfig, never under mu.
+ * The look holds the engine's lock (a busy engine's first type answers, but its
+ * gptps_task_get_info walks every queue: ~2 ms at 100k queued), so it is timed, and after
+ * one of TUI_RESYNC_FREE_US or more the next waits TUI_DUTY - 1 times as long: at most 1%
+ * of the time in the engine's lock, however often a host renders. */
 static void trk_resync(gptps_tui *t)
 {
-    uint64_t gen;
-    int cleared = 0;
+    uint64_t gen, t0, t1;
+    int cleared = 0, idle;
     mu_lock(&t->mu);
     if (!t->tab || !t->trk_lb || !t->observing) { mu_unlock(&t->mu); return; }
+    if (t->rs_next_us && tui_now_us() < t->rs_next_us) { mu_unlock(&t->mu); return; }
     gen = t->lb_gen;
     mu_unlock(&t->mu);
-    if (!engine_idle(t->e)) return;
+    t0 = tui_now_us();
+    idle = engine_idle(t->e);
+    t1 = tui_now_us();
+    mu_lock(&t->mu);
+    t->rs_cost_us = t1 > t0 ? t1 - t0 : 0;
+    t->rs_next_us = t->rs_cost_us >= TUI_RESYNC_FREE_US ? t1 + t->rs_cost_us * (TUI_DUTY - 1u) : 0;
+    mu_unlock(&t->mu);
+    if (!idle) return;
     mu_lock(&t->mu);
     if (t->tab && t->trk_lb && t->lb_gen == gen && t->tab_n == t->tab_done) { t->trk_lb = 0; tui_touch(t); cleared = 1; }
     mu_unlock(&t->mu);
@@ -1492,11 +1570,12 @@ static void bytes_hint(const char *key, const char *v, char *out, size_t cap)
 
 /* The selected setting, explained: its key, what it does (word-wrapped to the
  * width, three lines at most), what it takes, its default, and when it applies. */
-static size_t setting_details(gptps_tui *t, char *buf, size_t cap, size_t pos, const gptps_setting_info *in)
+static size_t setting_details(gptps_tui *t, char *buf, size_t cap, size_t pos, const gptps_setting_info *in,
+                              const char *kind)
 {
     int color = t->cfg.color, W = draw_width(t) - 4, lines = 0;
     const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
-    char desc[GPTPS_SETTINGS_VALUE_MAX * 2], key[GPTPS_SETTINGS_VALUE_MAX * 2], kind[320], ckind[640],
+    char desc[GPTPS_SETTINGS_VALUE_MAX * 2], key[GPTPS_SETTINGS_VALUE_MAX * 2], ckind[640],
          dv[GPTPS_SETTINGS_VALUE_MAX * 2];
     const char *p = tui_cl(in->desc_copy, desc, sizeof desc);
     if (W < 20) W = 20;
@@ -1518,7 +1597,6 @@ static size_t setting_details(gptps_tui *t, char *buf, size_t cap, size_t pos, c
         while (*p == ' ') ++p;
         ++lines;
     }
-    setting_kind(in, kind, sizeof kind);
     tui_cl(kind, ckind, sizeof ckind);              /* an enum's choices are the host's text */
     pos = appendf(buf, cap, pos, "  %s%s \xc2\xb7 default %s \xc2\xb7 %s%s\n", D, ckind,
                   in->defval[0] ? tui_cl(in->defval, dv, sizeof dv) : "(empty)",
@@ -1529,18 +1607,18 @@ static size_t setting_details(gptps_tui *t, char *buf, size_t cap, size_t pos, c
 /* One row of a settings list: "> key = value (46.9 GiB) (restart)", the key padded
  * to kw columns. Key and value are cleaned: a STRING setting can hold any byte the
  * host or a config file put there (TOML's \u001B is an ESC). */
-static size_t setting_row(char *buf, size_t cap, size_t pos, const gptps_setting_info *in, const char *key,
+static size_t setting_row(char *buf, size_t cap, size_t pos, const char *value, int hot, const char *key,
                           int kw, int selected, const char *INV, const char *X)
 {
     char k[GPTPS_SETTINGS_VALUE_MAX * 2], v[GPTPS_SETTINGS_VALUE_MAX * 2], hint[32];
     int pad;
     tui_cl(key, k, sizeof k);
-    tui_cl(in->value, v, sizeof v);
-    bytes_hint(k, in->value, hint, sizeof hint);
+    tui_cl(value, v, sizeof v);
+    bytes_hint(k, value, hint, sizeof hint);
     pad = kw - u8_cols(k);
     if (pad < 0) pad = 0;
     return appendf(buf, cap, pos, "%s%s%s%*s = %s%s%s %s%s\n", selected ? INV : "", selected ? "> " : "  ",
-                   k, pad, "", v, hint, X, in->hot ? "" : "(restart)", X);
+                   k, pad, "", v, hint, X, hot ? "" : "(restart)", X);
 }
 
 /* The status line of a pane, cleaned: set_status puts the committed value in it, and
@@ -1553,47 +1631,233 @@ static size_t status_line(gptps_tui *t, char *buf, size_t cap, size_t pos, const
 }
 
 /* The rows a settings list may use: what the terminal has, less the title, the
- * details, the edit and status lines and the key legend. */
+ * details, the edit and status lines, the age of what it shows and the key legend. */
 static int list_rows(const gptps_tui *t)
 {
-    int r = (t->rows > 0 ? t->rows : 24) - 13;
+    int r = (t->rows > 0 ? t->rows : 24) - 14;
     return r < 3 ? 3 : r;
 }
 
 static size_t edit_line(gptps_tui *t, char *buf, size_t cap, size_t pos, const char *B, const char *D, const char *X);
 
-/* Settings pane (no t->mu: reads only run-thread-local pane state + the registry,
- * whose get_info takes its own locks - holding t->mu here would deadlock the tui
- * read_fns). The list scrolls to keep the selection in view; the selected
- * setting is explained under it. */
+/* bounded name copy (avoids -Wformat-truncation and silent over-read) */
+static void copy_name(char *dst, size_t cap, const char *src)
+{ if (cap) snprintf(dst, cap, "%.*s", (int)(cap - 1), src ? src : ""); }
+
+/* ---- pane cache (tasks, settings, detail; see tui_pcache) --------------------------
+ * Everything here runs with rmu held and mu NOT held: a pass calls the engine (its locks,
+ * and the dashboard's own tui.* read callbacks, which take mu). */
+static int pc_kind(int pane) { return pane == TUI_PANE_TASKS || pane == TUI_PANE_SETTINGS || pane == TUI_PANE_DETAIL; }
+static size_t pc_bytes(const tui_pcache *c)
+{ return c->cap * (c->tasks ? sizeof(tui_ctask) : c->sets ? sizeof(tui_cset) : 0) + c->pool_cap; }
+
+static void pc_free(gptps_tui *t)
+{
+    tui_pcache *c = &t->pc;
+    free(c->tasks); free(c->sets); free(c->pool);
+    memset(c, 0, sizeof *c);
+    c->pane = -1; c->sel_for = -1;
+    mu_lock(&t->mu); t->pane_bytes = 0; mu_unlock(&t->mu);
+}
+
+static int pc_grow(tui_pcache *c, int tasks, size_t want)
+{
+    size_t nc = c->cap ? c->cap : 16;
+    if (want <= c->cap) return 1;
+    while (nc < want) nc *= 2;
+    if (tasks) { tui_ctask *n = (tui_ctask *)realloc(c->tasks, nc * sizeof *n); if (!n) return 0; c->tasks = n; }
+    else       { tui_cset *n = (tui_cset *)realloc(c->sets, nc * sizeof *n);   if (!n) return 0; c->sets = n; }
+    c->cap = nc;
+    return 1;
+}
+
+/* s into the pool: its offset, or (size_t)-1 with no memory */
+static size_t pc_str(tui_pcache *c, const char *s)
+{
+    size_t l = strlen(s) + 1, off;
+    if (c->pool_len + l > c->pool_cap) {
+        size_t nc = c->pool_cap ? c->pool_cap : 4096;
+        char *np;
+        while (nc < c->pool_len + l) nc *= 2;
+        if ((np = (char *)realloc(c->pool, nc)) == NULL) return (size_t)-1;
+        c->pool = np; c->pool_cap = nc;
+    }
+    off = c->pool_len;
+    memcpy(c->pool + off, s, l);
+    c->pool_len += l;
+    return off;
+}
+
+/* The detail pane's key prefix, "tasks.<name>.", and its length. */
+static size_t detail_prefix(const char *task, char *out, size_t cap)
+{
+    int n = snprintf(out, cap, "tasks.%s.", task);
+    return n < 0 ? 0 : (size_t)n >= cap ? cap - 1 : (size_t)n;
+}
+
+/* ONE pass over the engine for the pane shown: every task type (tasks), every setting
+ * (settings), or the settings of the detail pane's task. Timed: the next pass is due
+ * pane_refresh_ms later, or TUI_DUTY times what this one took when that is longer. */
+static void pc_read(gptps_tui *t, uint64_t now)
+{
+    tui_pcache *c = &t->pc;
+    int p = t->pane, nomem = 0, tasks = p == TUI_PANE_TASKS;
+    size_t i, n, plen = 0;
+    char prefix[160];
+    uint64_t t0 = tui_now_us(), t1, every;
+    if (tasks && c->sets)       { free(c->sets);  c->sets = NULL;  c->cap = 0; }
+    else if (!tasks && c->tasks) { free(c->tasks); c->tasks = NULL; c->cap = 0; }
+    c->n = 0; c->pool_len = 0; c->short_by = 0; c->kw = p == TUI_PANE_DETAIL ? 16 : 20;
+    if (p == TUI_PANE_DETAIL) plen = detail_prefix(t->detail_task, prefix, sizeof prefix);
+    n = tasks ? gptps_task_count(t->e) : gptps_settings_count(t->e);
+    c->total = n;
+    if (p != TUI_PANE_DETAIL && n > c->cap && !pc_grow(c, tasks, n)) nomem = 1;   /* then entry by entry */
+    for (i = 0; i < n; ++i) {
+        if (tasks) {
+            gptps_task_info info;
+            tui_ctask *k;
+            if (!tui_task_at(t->e, i, &info)) continue;          /* gone meanwhile */
+            if (c->n == c->cap && !pc_grow(c, 1, c->n + 1)) { c->short_by++; nomem = 1; continue; }
+            k = &c->tasks[c->n++];
+            copy_name(k->name, sizeof k->name, info.name_copy);
+            k->exec = (int)info.exec; k->pri = info.priority; k->enabled = info.enabled; k->removed = info.removed;
+            k->queued = info.queued; k->running = info.running; k->dead = info.dead;
+        } else {
+            gptps_setting_info info;
+            tui_cset *st;
+            size_t ko, vo = (size_t)-1;
+            int kc;
+            if (!tui_setting_at(t->e, i, &info)) continue;
+            if (plen && strncmp(info.key_copy, prefix, plen) != 0) continue;
+            if (c->n == c->cap && !pc_grow(c, 0, c->n + 1)) { c->short_by++; nomem = 1; continue; }
+            if ((ko = pc_str(c, skey(&info))) != (size_t)-1) vo = pc_str(c, info.value);
+            if (vo == (size_t)-1) { c->short_by++; nomem = 1; continue; }
+            st = &c->sets[c->n++];
+            st->key = ko; st->val = vo; st->idx = i; st->hot = info.hot;
+            kc = u8_cols(skey(&info) + plen);
+            if (kc > c->kw) c->kw = kc;
+        }
+    }
+    if (c->kw > (p == TUI_PANE_DETAIL ? 40 : 44)) c->kw = p == TUI_PANE_DETAIL ? 40 : 44;
+    t1 = tui_now_us();
+    c->cost_us = t1 > t0 ? t1 - t0 : 0;
+    every = (c->cost_us * TUI_DUTY + 999u) / 1000u;           /* ms: at most 1/TUI_DUTY of the time */
+    if (every < (uint64_t)t->cfg.pane_refresh_ms) every = t->cfg.pane_refresh_ms;
+    c->every_ms = every; c->read_ms = now; c->stale = 0; c->pane = p;
+    copy_name(c->task, sizeof c->task, p == TUI_PANE_DETAIL ? t->detail_task : "");
+    c->sel_for = -1; c->have_sel = 0;
+    mu_lock(&t->mu);
+    t->h_pane_reads++; t->h_pane_us += c->cost_us; t->pane_cost_us = c->cost_us; t->pane_every_ms = every;
+    t->pane_bytes = pc_bytes(c);
+    if (nomem) t->h_nomem++;                                  /* never silent: shown on the pane too */
+    mu_unlock(&t->mu);
+}
+
+/* Entry *k of the settings cache, read fresh from the registry into *out (one call) and
+ * checked to be the same key: the registry may have changed since the pass (a task
+ * unregistered shifts the indexes after its settings). If it has, the pane is read again
+ * and the key looked up - *k follows it. 0: it is gone. */
+static int pc_fetch(gptps_tui *t, int *k, gptps_setting_info *out, uint64_t now)
+{
+    tui_pcache *c = &t->pc;
+    char key[GPTPS_SETTINGS_VALUE_MAX];
+    int pass;
+    if (*k < 0 || (size_t)*k >= c->n || !c->sets) return 0;
+    copy_name(key, sizeof key, c->pool + c->sets[*k].key);
+    for (pass = 0; pass < 2; ++pass) {
+        if (pass) {
+            size_t i;
+            pc_read(t, now);
+            for (i = 0; i < c->n && strcmp(c->pool + c->sets[i].key, key) != 0; ++i) { }
+            if (i == c->n) return 0;
+            *k = (int)i;
+        }
+        if (tui_setting_at(t->e, c->sets[*k].idx, out) && strcmp(skey(out), key) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Make the cache match the pane shown at `now`: read it when it is for another pane or
+ * task, stale, or due; free it on a pane that reads nothing. Then the selection: kept
+ * inside the list, and the selected setting read (once per move) for its explanation. */
+static void pane_prepare(gptps_tui *t, uint64_t now)
+{
+    tui_pcache *c = &t->pc;
+    int p = t->pane;
+    if (!pc_kind(p)) { if (c->pane >= 0 || c->cap || c->pool_cap) pc_free(t); return; }
+    if (c->pane != p || c->stale || (p == TUI_PANE_DETAIL && strcmp(c->task, t->detail_task) != 0) ||
+        now < c->read_ms || now - c->read_ms >= c->every_ms)
+        pc_read(t, now);
+    if (p == TUI_PANE_TASKS) {
+        if (t->task_sel < 0) t->task_sel = 0;
+        if (c->n && (size_t)t->task_sel >= c->n) t->task_sel = (int)c->n - 1;
+    } else {
+        int *sel = p == TUI_PANE_SETTINGS ? &t->sel : &t->detail_sel;
+        if (*sel < 0) *sel = 0;
+        if (c->n && (size_t)*sel >= c->n) *sel = (int)c->n - 1;
+        if (c->sel_for != *sel || c->pane != p) {
+            c->have_sel = 0;
+            if (pc_fetch(t, sel, &c->sel, now)) {
+                setting_kind(&c->sel, c->sel_kind, sizeof c->sel_kind);
+                c->sel.choices = NULL;                         /* borrowed: formatted, then let go */
+                c->have_sel = 1;
+            }
+            c->sel_for = *sel;
+        }
+    }
+}
+
+/* When the pane shown next changes with no key (0: never): its age, a second on, or its
+ * next pass, whichever is first. */
+static uint64_t pc_next(const tui_pcache *c, uint64_t now)
+{
+    uint64_t due, tick;
+    if (c->pane < 0) return 0;
+    due = c->read_ms + c->every_ms;
+    tick = c->read_ms + ((now >= c->read_ms ? now - c->read_ms : 0) / 1000u + 1u) * 1000u;
+    return tick < due ? tick : due;
+}
+
+/* The pane's last line before its legend: what the pass cost, how often it is made, and
+ * how old what it shows is - "core counts: 116.2 ms, every 11.6 s, age 3 s". */
+static size_t pc_footer(gptps_tui *t, char *buf, size_t cap, size_t pos, const char *what, const char *D, const char *X)
+{
+    const tui_pcache *c = &t->pc;
+    uint64_t now = gptps_now_ms(NULL);
+    char ln[256], cost[32];
+    int n;
+    if (c->cost_us < 1000u) snprintf(cost, sizeof cost, "%llu us", (unsigned long long)c->cost_us);
+    else                    snprintf(cost, sizeof cost, "%.1f ms", (double)c->cost_us / 1000.0);
+    n = snprintf(ln, sizeof ln, "  %s: %s, every %.1f s, age %llu s (R reads now)", what, cost,
+                 (double)c->every_ms / 1000.0, (unsigned long long)(now > c->read_ms ? (now - c->read_ms) / 1000u : 0u));
+    if (c->short_by && n > 0 && (size_t)n < sizeof ln)
+        snprintf(ln + n, sizeof ln - (size_t)n, "; %lu not read: no memory", (unsigned long)c->short_by);
+    return appendf(buf, cap, pos, "%s%.*s%s\n", D, (int)u8_fit(ln, draw_width(t) - 1), ln, X);
+}
+
+/* Settings pane (no t->mu: reads run-thread-local pane state and the cache, which
+ * pane_prepare filled with rmu held). The list scrolls to keep the selection in view;
+ * the selected setting is explained under it. */
 static size_t render_settings(gptps_tui *t, char *buf, size_t cap)
 {
-    size_t pos = 0, i, n;
-    int color = t->cfg.color, kw = 20, rows = list_rows(t), first;
+    const tui_pcache *c = &t->pc;
+    size_t pos = 0, i, n = c->pane == TUI_PANE_SETTINGS ? c->n : 0;
+    int color = t->cfg.color, kw = c->kw, rows = list_rows(t), first;
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
-    gptps_setting_info info, sel;
-    int have_sel = 0;
-    memset(&sel, 0, sizeof sel);
-    n = gptps_settings_count(t->e);
-    if (t->sel < 0) t->sel = 0;
-    if (n && (size_t)t->sel >= n) t->sel = (int)n - 1;
-    for (i = 0; i < n; ++i)                         /* the key column fits the longest key */
-        if (tui_setting_at(t->e, i, &info) && u8_cols(skey(&info)) > kw) kw = u8_cols(skey(&info));
-    if (kw > 44) kw = 44;
     first = t->sel - rows / 2;
     if (first > (int)n - rows) first = (int)n - rows;
     if (first < 0) first = 0;
     pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 settings%s  %s(%d of %lu)%s\n\n", B, brand(t), t->cfg.title, X,
                   D, n ? t->sel + 1 : 0, (unsigned long)n, X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < rows; ++i) {
-        if (!tui_setting_at(t->e, i, &info)) continue;
-        if (i == (size_t)t->sel) { sel = info; have_sel = 1; }
-        pos = setting_row(buf, cap, pos, &info, skey(&info), kw, i == (size_t)t->sel, INV, X);
+        const tui_cset *st = &c->sets[i];
+        pos = setting_row(buf, cap, pos, c->pool + st->val, st->hot, c->pool + st->key, kw, i == (size_t)t->sel, INV, X);
     }
-    if (have_sel) pos = setting_details(t, buf, cap, pos, &sel);
+    if (n && c->have_sel) pos = setting_details(t, buf, cap, pos, &c->sel, c->sel_kind);
     if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     pos = status_line(t, buf, cap, pos, "", D, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
+    pos = pc_footer(t, buf, cap, pos, "settings read", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  R re-read  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
@@ -1665,9 +1929,13 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "  %-9s save the values you changed into the config file, in place\n", "w");
     pos = appendf(buf, cap, pos, "  %-9s %s(the file keeps its comments and the lines you did not change)%s\n", "", D, X);
     pos = appendf(buf, cap, pos, "  %-9s back to dashboard\n", "s / Esc");
+    pos = appendf(buf, cap, pos, "  %-9s read the settings again now (else every %.1f s, or less often when\n", "R",
+                  (double)t->cfg.pane_refresh_ms / 1000.0);
+    pos = appendf(buf, cap, pos, "  %-9s a read is slow: the pane shows what it costs and how old it is)\n", "");
     pos = appendf(buf, cap, pos, "\n%sTask manager%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s inspect a task's settings\n", "Enter");
     pos = appendf(buf, cap, pos, "  %-9s pause/resume \xc2\xb7 clone \xc2\xb7 new \xc2\xb7 delete\n", "a/c/n/d");
+    pos = appendf(buf, cap, pos, "  %-9s read the engine's counts again now (the same rule)\n", "R");
     pos = appendf(buf, cap, pos, "\n%sDead letters%s\n", B, X);
     pos = appendf(buf, cap, pos, "  %-9s load the engine's here (takes them), to see each one and why\n", "g");
     pos = appendf(buf, cap, pos, "  %-9s re-submit all \xc2\xb7 this one \xc2\xb7 discard this one \xc2\xb7 all\n", "r/e/x/D");
@@ -1679,65 +1947,25 @@ static size_t render_help(gptps_tui *t, char *buf, size_t cap)
 static const char *exec_str(int k)
 { return k == GPTPS_EXEC_OOP ? "oop" : k == GPTPS_EXEC_PROGRAM ? "program" : "inproc"; }
 
-/* bounded name copy (avoids -Wformat-truncation and silent over-read) */
-static void copy_name(char *dst, size_t cap, const char *src)
-{ if (cap) snprintf(dst, cap, "%.*s", (int)(cap - 1), src ? src : ""); }
 
-/* fill *out for the registered task named `name`; 1 if found */
-static int find_task_by_name(gptps_tui *t, const char *name, gptps_task_info *out)
-{
-    size_t i, n = gptps_task_count(t->e);
-    for (i = 0; i < n; ++i) {
-        if (tui_task_at(t->e, i, out) && strcmp(out->name_copy, name) == 0) return 1;
-    }
-    return 0;
-}
-
-/* count settings whose key begins with `prefix` */
-static int count_prefixed(gptps_tui *t, const char *prefix)
-{
-    size_t i, n = gptps_settings_count(t->e), plen = strlen(prefix);
-    int c = 0;
-    for (i = 0; i < n; ++i) {
-        gptps_setting_info info;
-        if (tui_setting_at(t->e, i, &info) && strncmp(info.key_copy, prefix, plen) == 0) ++c;
-    }
-    return c;
-}
-
-/* fill *out with the nth (0-based) setting whose key begins with `prefix`; 1 ok */
-static int nth_prefixed(gptps_tui *t, const char *prefix, int nth, gptps_setting_info *out)
-{
-    size_t i, n = gptps_settings_count(t->e), plen = strlen(prefix);
-    int c = 0;
-    for (i = 0; i < n; ++i) {
-        if (tui_setting_at(t->e, i, out) && strncmp(out->key_copy, prefix, plen) == 0) {
-            if (c == nth) return 1;
-            ++c;
-        }
-    }
-    return 0;
-}
-
-/* Tasks pane: the live registry as an editable list (no t->mu; reads engine state
- * through its own-locking APIs + run-thread-local pane fields). */
+/* Tasks pane: the registry as an editable list, from the cache (pane_prepare read it;
+ * no t->mu, no engine call: a frame between passes costs the engine nothing). */
 static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
 {
-    size_t pos = 0, i, n;
+    const tui_pcache *c = &t->pc;
+    size_t pos = 0, i, n = c->pane == TUI_PANE_TASKS ? c->n : 0;
     int color = t->cfg.color;
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "",
                *R = color ? "\x1b[31m" : "", *G = color ? "\x1b[32m" : "", *Y = color ? "\x1b[33m" : "", *X = color ? "\x1b[0m" : "";
     char pn[sizeof t->prompt_name * 2];
     int room, first, more;
-    n = gptps_task_count(t->e);
-    if (t->task_sel < 0) t->task_sel = 0;
-    if (n && (size_t)t->task_sel >= n) t->task_sel = (int)n - 1;
     /* Fitted to the terminal's height, around the selection, with "+N more" for the rest:
      * a list taller than the screen scrolled it on every paint. Rows: the title and its
-     * blank line, the column header, a prompt (2), the status, the legend and its blank
-     * line, and the frame's last newline. Only the rows shown are read from the engine. */
+     * blank line, the column header, a prompt (2), the status, the age line, the legend
+     * (two rows: one was wider than 80 columns) and its blank line, and the frame's last
+     * newline. */
     room = draw_rows(t) - 3 - (t->prompt_kind != TUI_PK_NONE ? 2 : 0) -
-           (status_live(t->status, t->status_ms, gptps_now_ms(NULL)) ? 1 : 0) - 2 - 1;
+           (status_live(t->status, t->status_ms, gptps_now_ms(NULL)) ? 1 : 0) - 1 - 3 - 1;
     if (room < 2) room = 2;
     if ((int)n > room) --room;                       /* the "+N more" line */
     first = t->task_sel - room / 2;
@@ -1748,21 +1976,23 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
     if (n == 0) pos = appendf(buf, cap, pos, "  %s(no task types registered)%s\n", D, X);
     else pos = appendf(buf, cap, pos, "%s  %-18s %-7s %4s %4s %4s %4s  %s%s\n", D, "name", "exec", "pri", "que", "run", "dl", "state", X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < room; ++i) {
-        gptps_task_info info; const char *st; const char *sc; char nm[GPTPS_TASK_NAME_MAX * 2 + 2];
-        if (!tui_task_at(t->e, i, &info)) continue;
-        st = info.removed ? "draining" : !info.enabled ? "paused" : "on";
-        sc = info.removed ? Y : !info.enabled ? D : G;
+        const tui_ctask *k = &c->tasks[i];
+        const char *st, *sc;
+        char nm[GPTPS_TASK_NAME_MAX * 2 + 2];
+        st = k->removed ? "draining" : !k->enabled ? "paused" : "on";
+        sc = k->removed ? Y : !k->enabled ? D : G;
         pos = appendf(buf, cap, pos, "%s%s%s %-7s %4d %4u %4u %4u  %s%s%s%s\n",
                       (i == (size_t)t->task_sel) ? INV : "", (i == (size_t)t->task_sel) ? "> " : "  ",
-                      tui_cell(info.name_copy, nm, sizeof nm, 18), exec_str(info.exec), info.priority, info.queued, info.running, info.dead,
+                      tui_cell(k->name, nm, sizeof nm, 18), exec_str(k->exec), (int)k->pri, k->queued, k->running, k->dead,
                       sc, st, color ? X : "", X);
     }
     if (more) pos = appendf(buf, cap, pos, "  %s+%d more (%s to scroll)%s\n", D, more, a_ud(t), X);
     if (t->prompt_kind == TUI_PK_CONFIRM_DELETE) {
-        gptps_task_info info;                 /* resolve by the captured NAME, not a stale index */
-        if (find_task_by_name(t, t->prompt_name, &info))
+        const tui_ctask *k = NULL;            /* resolve by the captured NAME, not a stale index */
+        for (i = 0; i < n && !k; ++i) if (strcmp(c->tasks[i].name, t->prompt_name) == 0) k = &c->tasks[i];
+        if (k)
             pos = appendf(buf, cap, pos, "\n%sDelete '%s'?%s  %u queued, %u in-flight.  %s[y]%s remove (pause+drain)  %s[x]%s cancel-force  %s[n]%s no\n",
-                          R, tui_cl(t->prompt_name, pn, sizeof pn), X, info.queued, info.running, B, X, B, X, B, X);
+                          R, tui_cl(t->prompt_name, pn, sizeof pn), X, k->queued, k->running, B, X, B, X, B, X);
         else
             pos = appendf(buf, cap, pos, "\n%s'%s' is gone.%s  any key to dismiss\n", R, tui_cl(t->prompt_name, pn, sizeof pn), X);
     } else if (t->prompt_kind == TUI_PK_CLONE_NAME || t->prompt_kind == TUI_PK_NEW_NAME || t->prompt_kind == TUI_PK_NEW_ARGV) {
@@ -1776,49 +2006,40 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
             pos = appendf(buf, cap, pos, "\n%snew task '%s' \xc2\xb7 argv:%s %s_  %s(space-separated; enter ok, esc cancel)%s\n", B, tui_cl(t->prompt_name, pn, sizeof pn), X, shown, D, X);
     }
     pos = status_line(t, buf, cap, pos, "", D, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s inspect  %s back  a pause  c clone  n new  d delete  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
+    pos = pc_footer(t, buf, cap, pos, "core counts", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s inspect  %s back  a pause  c clone  n new\n"
+                  "      d delete  R re-read  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
 /* Detail pane: one task's resolved settings (built-in policy + generic per-task),
- * inline-editable. Filtered view over the registry by the tasks.<name>. prefix. */
+ * inline-editable - the registry's tasks.<name>. keys, from the cache. */
 static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
 {
-    size_t pos = 0;
-    int color = t->cfg.color, c = 0, shown, kw = 16, rows = list_rows(t), first, have_sel = 0;
+    const tui_pcache *c = &t->pc;
+    size_t pos = 0, i, n = c->pane == TUI_PANE_DETAIL ? c->n : 0, plen;
+    int color = t->cfg.color, kw = c->kw, rows = list_rows(t), first;
     char prefix[160];   /* "tasks.<name>." - sized for the full detail_task buffer */
     char title[sizeof t->detail_task * 2];
     const char *B = color ? "\x1b[1m" : "", *INV = color ? "\x1b[7m" : "", *D = color ? "\x1b[2m" : "", *X = color ? "\x1b[0m" : "";
-    size_t i, n = gptps_settings_count(t->e), plen;
-    gptps_setting_info info, sel;
-    memset(&sel, 0, sizeof sel);
-    snprintf(prefix, sizeof prefix, "tasks.%s.", t->detail_task);
-    plen = strlen(prefix);
-    shown = count_prefixed(t, prefix);
-    if (t->detail_sel < 0) t->detail_sel = 0;
-    if (shown && t->detail_sel >= shown) t->detail_sel = shown - 1;
-    for (i = 0; i < n; ++i)
-        if (tui_setting_at(t->e, i, &info) && strncmp(info.key_copy, prefix, plen) == 0 &&
-            u8_cols(info.key_copy + plen) > kw) kw = u8_cols(info.key_copy + plen);
-    if (kw > 40) kw = 40;
+    plen = detail_prefix(t->detail_task, prefix, sizeof prefix);
     first = t->detail_sel - rows / 2;
-    if (first > shown - rows) first = shown - rows;
+    if (first > (int)n - rows) first = (int)n - rows;
     if (first < 0) first = 0;
-    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 task '%s'%s  %s(%d settings)%s\n\n", B,
-                  tui_cl(t->detail_task, title, sizeof title), X, D, shown, X);
-    if (shown == 0) pos = appendf(buf, cap, pos, "  %s(task no longer present)%s\n", D, X);
-    for (i = 0; i < n; ++i) {
-        if (!tui_setting_at(t->e, i, &info)) continue;
-        if (strncmp(info.key_copy, prefix, plen) != 0) continue;
-        if (c == t->detail_sel) { sel = info; have_sel = 1; }
-        if (c >= first && c < first + rows)
-            pos = setting_row(buf, cap, pos, &info, info.key_copy + plen, kw, c == t->detail_sel, INV, X);
-        ++c;
+    pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 task '%s'%s  %s(%lu settings)%s\n\n", B,
+                  tui_cl(t->detail_task, title, sizeof title), X, D, (unsigned long)n, X);
+    if (n == 0) pos = appendf(buf, cap, pos, "  %s(task no longer present)%s\n", D, X);
+    for (i = (size_t)first; i < n && (int)(i - (size_t)first) < rows; ++i) {
+        const tui_cset *st = &c->sets[i];
+        const char *k = c->pool + st->key;
+        pos = setting_row(buf, cap, pos, c->pool + st->val, st->hot, strlen(k) >= plen ? k + plen : k, kw,
+                          i == (size_t)t->detail_sel, INV, X);
     }
-    if (have_sel) pos = setting_details(t, buf, cap, pos, &sel);
+    if (n && c->have_sel) pos = setting_details(t, buf, cap, pos, &c->sel, c->sel_kind);
     if (t->editing) pos = edit_line(t, buf, cap, pos, B, D, X);
     pos = status_line(t, buf, cap, pos, "", D, X);
-    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
+    pos = pc_footer(t, buf, cap, pos, "settings read", D, X);
+    pos = appendf(buf, cap, pos, "\n%skeys:%s %s move  %s edit  %s back  w save  R re-read  q quit\n", D, X, a_ud(t), a_rt(t), a_lt(t));
     return pos;                           /* unclamped: gptps_tui_render / tui_frame finish it */
 }
 
@@ -2461,6 +2682,7 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
     if (dash) trk_resync(t);             /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
     now = gptps_now_ms(NULL);            /* under rmu: frames take their times in order */
+    pane_prepare(t, now);                /* the engine-reading panes: a pass only when due */
     if (!dash || !view_frame(t, now, loop, &warn)) {
         /* every pane's frame shows the state as of now: the next change is a 0 -> 1 again
          * (on the dashboard view_take clears it, under the same lock as the copy-out) */
@@ -2483,7 +2705,7 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
     if (meta) {
         meta->pane = t->pane;
         meta->gen = dash && t->view ? t->view->gen : 0;
-        meta->next_change = dash && t->view ? t->view->next_change : 0;
+        meta->next_change = dash ? (t->view ? t->view->next_change : 0) : pc_next(&t->pc, now);
     }
     mu_unlock(&t->rmu);
     warn_problems_lost(warn);
@@ -2497,6 +2719,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
     if (t->pane == TUI_PANE_DASH) trk_resync(t);   /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
+    pane_prepare(t, gptps_now_ms(NULL));
     if (t->pane == TUI_PANE_DASH) view_frame(t, gptps_now_ms(NULL), 0, &warn);
     n = tui_finish(t, buf, cap, pane_format(t, buf, cap));
     mu_unlock(&t->rmu);
@@ -2587,10 +2810,28 @@ static void edit_begin(gptps_tui *t, const gptps_setting_info *in)
     t->editlen = (int)strlen(t->editbuf); t->editing = 1; t->edit_need = 0;
 }
 
+/* The panes' keys work from the cache too: rmu taken and the cache made ready for the pane
+ * shown (a pass only when one is due) - pc_unlock gives rmu back. A change made from a pane
+ * (an edit, pause, clone, new, delete) and 'R' make it stale: the next frame reads again. */
+static tui_pcache *pc_lock(gptps_tui *t) { mu_lock(&t->rmu); pane_prepare(t, gptps_now_ms(NULL)); return &t->pc; }
+static void pc_unlock(gptps_tui *t) { mu_unlock(&t->rmu); }
+static void pc_stale(gptps_tui *t) { mu_lock(&t->rmu); t->pc.stale = 1; mu_unlock(&t->rmu); }
+
+/* Enter on a settings list: the selected setting read fresh (its key checked), to edit. */
+static void pc_edit(gptps_tui *t, int *sel)
+{
+    gptps_setting_info info;
+    int ok;
+    pc_lock(t);
+    ok = pc_fetch(t, sel, &info, gptps_now_ms(NULL));
+    pc_unlock(t);
+    if (ok) edit_begin(t, &info);
+    else toast(t, "that setting is gone (the registry changed); the list is read again");
+}
+
 /* Settings-pane key handling. Returns 4 (settings interaction) or -1 (quit). */
 static int settings_press(gptps_tui *t, int key)
 {
-    gptps_setting_info info;
     if (t->editing) {
         if (key == 27) { t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0; return 4; }   /* cancel */
         if (key == '\r' || key == '\n') {                                                 /* commit */
@@ -2602,6 +2843,7 @@ static int settings_press(gptps_tui *t, int key)
             gptps_status st = gptps_settings_set_ex(t->e, t->edit_key, t->editbuf, why, sizeof why);
             set_status(t, t->edit_key, t->editbuf, st, why);
             t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0;
+            pc_stale(t);                                          /* show the value it now has */
             return 4;
         }
         edit_input(t, key);
@@ -2610,11 +2852,10 @@ static int settings_press(gptps_tui *t, int key)
     switch (key) {
         case 'q': case 'Q': tui_quit(t); return -1;
         case 27: case 's': case 'S': case '\t': t->pane = 0; t->status[0] = 0; return 4;   /* back to dashboard */
-        case 'j': case 'J': { size_t n = gptps_settings_count(t->e); if (n && (size_t)t->sel + 1 < n) t->sel++; return 4; }
+        case 'j': case 'J': { tui_pcache *c = pc_lock(t); if (c->n && (size_t)t->sel + 1 < c->n) t->sel++; pc_unlock(t); return 4; }
         case 'k': case 'K': if (t->sel > 0) t->sel--; return 4;
-        case '\r': case '\n':                                                              /* start editing */
-            if (tui_setting_at(t->e, (size_t)t->sel, &info)) edit_begin(t, &info);
-            return 4;
+        case '\r': case '\n': pc_edit(t, &t->sel); return 4;                                /* start editing */
+        case 'R': case 'r': pc_stale(t); return 4;                                          /* read it again now */
         case 'w': case 'W': save_status(t, gptps_settings_save(t->e, t->cfg.settings_path)); return 4;
         default: return 4;
     }
@@ -2719,8 +2960,17 @@ static gptps_status tui_new_program(gptps *e, const char *name, char *argvstr)
 /* Tasks-pane key handling (returns 4 = UI, -1 = quit). */
 static int tasks_press(gptps_tui *t, int key)
 {
-    size_t n = gptps_task_count(t->e);
-    gptps_task_info info;
+    size_t n;
+    tui_ctask info;                                   /* the selected row, from the cache */
+    int have;
+    memset(&info, 0, sizeof info);
+    {
+        tui_pcache *c = pc_lock(t);
+        n = c->pane == TUI_PANE_TASKS ? c->n : 0;
+        have = t->task_sel >= 0 && (size_t)t->task_sel < n;
+        if (have) info = c->tasks[t->task_sel];
+        pc_unlock(t);
+    }
 
     if (t->prompt_kind == TUI_PK_CONFIRM_DELETE) {
         if (key == 'y' || key == 'Y') {
@@ -2741,6 +2991,7 @@ static int tasks_press(gptps_tui *t, int key)
             if (t->task_sel > 0) t->task_sel--;
         } else toast(t, "delete cancelled");
         t->prompt_kind = TUI_PK_NONE;
+        pc_stale(t);
         return 4;
     }
     if (t->prompt_kind == TUI_PK_CLONE_NAME || t->prompt_kind == TUI_PK_NEW_NAME || t->prompt_kind == TUI_PK_NEW_ARGV) {
@@ -2762,6 +3013,7 @@ static int tasks_press(gptps_tui *t, int key)
                 t->prompt_kind = TUI_PK_NONE;
             }
             t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0;
+            pc_stale(t);                                   /* a type made: list it */
             return 4;
         }
         edit_input(t, key);
@@ -2772,31 +3024,34 @@ static int tasks_press(gptps_tui *t, int key)
         case 27: case 's': case 'S': case 't': case 'T': case '\t': t->pane = TUI_PANE_DASH; t->status[0] = 0; return 4;
         case 'j': case 'J': if (n && (size_t)t->task_sel + 1 < n) t->task_sel++; return 4;
         case 'k': case 'K': if (t->task_sel > 0) t->task_sel--; return 4;
+        case 'R': case 'r': pc_stale(t); return 4;           /* read the engine again now */
         case '\r': case '\n':                              /* inspect: open the detail pane */
-            if (tui_task_at(t->e, (size_t)t->task_sel, &info)) {
-                copy_name(t->detail_task, sizeof t->detail_task, info.name_copy);
+            if (have) {
+                copy_name(t->detail_task, sizeof t->detail_task, info.name);
                 t->detail_sel = 0; t->status[0] = 0; t->pane = TUI_PANE_DETAIL;
             }
             return 4;
         case 'a': case 'A':                                /* pause / resume */
-            if (tui_task_at(t->e, (size_t)t->task_sel, &info)) {
-                char nm[128]; int en = info.enabled; copy_name(nm, sizeof nm, info.name_copy);
+            if (have) {
+                char nm[128]; int en = info.enabled; copy_name(nm, sizeof nm, info.name);
                 gptps_set_task_enabled(t->e, nm, !en);
                 toast(t, en ? "paused %s" : "resumed %s", nm);
+                pc_stale(t);
             }
             return 4;
         case 'c': case 'C':                                /* clone */
-            if (tui_task_at(t->e, (size_t)t->task_sel, &info)) {
-                copy_name(t->prompt_name, sizeof t->prompt_name, info.name_copy);
+            if (have) {
+                copy_name(t->prompt_name, sizeof t->prompt_name, info.name);
                 t->prompt_kind = TUI_PK_CLONE_NAME; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0; t->status[0] = 0;
             }
             return 4;
         case 'n': case 'N':                                /* new program task */
             t->prompt_kind = TUI_PK_NEW_NAME; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0; t->status[0] = 0; return 4;
         case 'd': case 'D':                                /* delete: capture the NAME now (index may shift) */
-            if (n && tui_task_at(t->e, (size_t)t->task_sel, &info)) {
-                copy_name(t->prompt_name, sizeof t->prompt_name, info.name_copy);
+            if (have) {
+                copy_name(t->prompt_name, sizeof t->prompt_name, info.name);
                 t->prompt_kind = TUI_PK_CONFIRM_DELETE; t->status[0] = 0;
+                pc_stale(t);                               /* its queued / in-flight, as they are now */
             }
             return 4;
         default: return 4;
@@ -2806,16 +3061,15 @@ static int tasks_press(gptps_tui *t, int key)
 /* Detail-pane key handling: edit one task's settings inline (returns 4 / -1). */
 static int detail_press(gptps_tui *t, int key)
 {
-    char prefix[160];   /* "tasks.<name>." - sized for the full detail_task buffer */
-    gptps_setting_info info;
-    snprintf(prefix, sizeof prefix, "tasks.%s.", t->detail_task);
     if (t->editing) {
         if (key == 27) { t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0; return 4; }
         if (key == '\r' || key == '\n') {
             char why[256];
             gptps_status st = gptps_settings_set_ex(t->e, t->edit_key, t->editbuf, why, sizeof why);
             set_status(t, t->edit_key, t->editbuf, st, why);
-            t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0; return 4;
+            t->editing = 0; t->editbuf[0] = 0; t->editlen = 0; t->edit_need = 0;
+            pc_stale(t);
+            return 4;
         }
         edit_input(t, key);
         return 4;
@@ -2823,11 +3077,10 @@ static int detail_press(gptps_tui *t, int key)
     switch (key) {
         case 'q': case 'Q': tui_quit(t); return -1;
         case 27: case 's': case 'S': case '\t': t->pane = TUI_PANE_TASKS; t->status[0] = 0; return 4;
-        case 'j': case 'J': { int c = count_prefixed(t, prefix); if (c && t->detail_sel + 1 < c) t->detail_sel++; return 4; }
+        case 'j': case 'J': { tui_pcache *c = pc_lock(t); if (c->n && (size_t)t->detail_sel + 1 < c->n) t->detail_sel++; pc_unlock(t); return 4; }
         case 'k': case 'K': if (t->detail_sel > 0) t->detail_sel--; return 4;
-        case '\r': case '\n':
-            if (nth_prefixed(t, prefix, t->detail_sel, &info)) edit_begin(t, &info);
-            return 4;
+        case 'R': case 'r': pc_stale(t); return 4;
+        case '\r': case '\n': pc_edit(t, &t->detail_sel); return 4;
         case 'w': case 'W': save_status(t, gptps_settings_save(t->e, t->cfg.settings_path)); return 4;
         default: return 4;
     }
@@ -3919,6 +4172,7 @@ static void tui_destroy(gptps_tui *t)
     parts_free(&p);
     free(t->held);
     if (t->view) { free(t->view->rows); free(t->view->recs); free(t->view); }
+    free(t->pc.tasks); free(t->pc.sets); free(t->pc.pool);
     mu_destroy(&t->rmu);
     mu_destroy(&t->smu);
     mu_destroy(&t->mu);
@@ -3947,6 +4201,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     mu_init(&t->smu);
     mu_init(&t->rmu);
     t->e = e;
+    t->pc.pane = -1; t->pc.sel_for = -1;    /* no pane read yet */
     /* As much as the caller's struct holds, the rest zero (its defaults): an older
      * caller's struct ends before the fields appended since, and what follows it in
      * its memory is not a config. 0 = the 1.10 layout (TUI_CFG_110). */
@@ -4182,6 +4437,10 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     h.handles_tracked   = t->tab ? (uint64_t)(t->tab_n - t->tab_done) : 0;
     h.handles_markers   = t->tab ? (uint64_t)t->tab_done : 0;
     h.task_rows         = t->tasks ? (uint64_t)(t->ntasks - 1) : 0;
+    h.pane_reads        = t->h_pane_reads;
+    h.pane_read_us      = t->pane_cost_us;
+    h.pane_every_ms     = t->pane_every_ms;
+    h.bytes_panes       = t->pane_bytes;
     mu_unlock(&t->mu);
     n = out->struct_size < sizeof h ? out->struct_size : sizeof h;   /* what the caller's struct has */
     memcpy((char *)out + sizeof(size_t), (char *)&h + sizeof(size_t), n - sizeof(size_t));

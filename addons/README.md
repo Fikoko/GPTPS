@@ -626,18 +626,22 @@ enabled automatically). Panes/metrics:
   - **KPI tier** (`gptps_tui_set_kpi`, `tui.kpi`, or `m` live) — a ladder, each tier the
     one below plus exactly one layer, in order of what it costs per event:
 
-    | tier | `tui.kpi` | adds | per event |
-    |---|---|---|---|
-    | 0 | `off` | leaves the event path: the observer returns *before* the lock, every part is freed | ~1 ns |
-    | 1 | `minimal` (or `count`) | totals: queued, started, finished, failed, retried, dead, dropped, cancelled | one mutex + increments |
-    | 2 | `gauge` | the in-flight / pending gauges (`~`), bar and peak | ~0-2 ns more |
-    | 3 | `problems` | the PROBLEMS journal, with why (≤ 512 B scanned) | 0 on a success |
-    | 4 | `tasks` | the per-task TASKS table (`(other)` row) and `peak MB` | one hash probe |
-    | 5 | `normal` (or `activity`) | the ACTIVITY journal | one 24 B store |
-    | 6 | `latency` | the handle table: avg ms, **exact** gauges | one hash op |
-    | 7 | `full` (the default) | latency percentiles p50/p95/p99 (log2-ms buckets, shown when the terminal is 100+ columns wide) | one increment |
+    | tier | `tui.kpi` | adds | per event | measured | memory it adds (default) |
+    |---|---|---|---|---|---|
+    | 0 | `off` | leaves the event path: the observer returns *before* the lock, every part is freed | ~1 ns | 2 ns | — |
+    | 1 | `minimal` (or `count`) | totals: queued, started, finished, failed, retried, dead, dropped, cancelled | one mutex + increments | 7 ns | — |
+    | 2 | `gauge` | the in-flight / pending gauges (`~`), bar and peak | ~0-2 ns more | 9 ns | — |
+    | 3 | `problems` | the PROBLEMS journal, with why (≤ 512 B scanned) | 0 on a success | 10 ns | `recent_lines` × ~300 B (2.4 KiB) |
+    | 4 | `tasks` | the per-task TASKS table (`(other)` row) and `peak MB` | one hash probe | 18 ns | (`max_tasks` + 1) × ~250 B + index (~19 KiB) |
+    | 5 | `normal` (or `activity`) | the ACTIVITY journal | one 24 B store | 18 ns | `activity_lines` × 24 B |
+    | 6 | `latency` | the handle table: avg ms, **exact** gauges | one hash op | 23 ns | 32 B a slot, ~4/3 × (window + 64) rounded up to a power of two (64 KiB) |
+    | 7 | `full` (the default) | latency percentiles p50/p95/p99 (log2-ms buckets, shown when the terminal is 100+ columns wide) | one increment | 23 ns | 256 B a row (16 KiB) |
 
-    No tier costs more per event as the window, the task types or a stderr tail grow.
+    *Measured*: a `QUEUED`/`STARTED`/`FINISHED` mix of one task type, the observer called
+    on one thread (gcc -O2, x86-64 Linux), the defaults. No tier costs more per event as
+    the window, the task types or a stderr tail grow (`tests/test_tui_perf.c` gates each
+    as a ratio, label `perf`). With several threads emitting, `minimal` and up also wait
+    for one another on the dashboard's one lock (no atomics in the drop-in build).
     `off` is the tier for leaving the dashboard in place after you have stopped looking
     at it (counters do not advance while off); `minimal` and up still take one mutex per
     event. The released names and values are kept (`gptps_tui_kpi` 0..4); the new tiers
@@ -691,13 +695,39 @@ enabled automatically). Panes/metrics:
     (which waits with no timeout) notices it only at its next frame — 1.10 looked every
     `refresh_ms` in every mode. On Windows a console resize repaints by itself (the loop
     turns on `ENABLE_WINDOW_INPUT` while it runs).
+  - **Engine-reading panes** (1.11). The tasks, settings and detail panes read the
+    engine — and `gptps_task_get_info` holds its lock while it walks every queue (1.10
+    read every row on every frame: 116 ms a frame at 64 types and 100k queued, 46% of the
+    time at 250 ms). Now an open pane reads the engine in **one pass into a cache**: when
+    it opens, after a change made from it, on `R`, and every `cfg.pane_refresh_ms` (2 s) —
+    or, when a pass is slow, 100× what the last one took, so the panes hold the engine's
+    lock **at most 1% of the time**. Frames and `j`/`k` read only the cache, and the pane
+    says how old it is: `core counts: 19.0 ms, every 2.0 s, age 1 s`. A pass is one call
+    per task type or setting (1.10 walked the settings registry two or three times a
+    frame); an edit reads its setting fresh by key, so it lands where you chose even when
+    the registry changed since the pass. The cache is freed back on the dashboard
+    (`gptps_tui_health`: `pane_reads`, `pane_read_us`, `pane_every_ms`, `bytes_panes`).
+    The dashboard's own look at the engine (to clear the gauges' `>=`) keeps the same 1%.
+- **Host profiles.**
+
+  | host | suggested | why |
+  |---|---|---|
+  | embedded / `GPTPS_RUN_MANUAL` (render or snapshot only) | `minimal` or `gauge`, `cfg.clock = OFF` with the stub HAL's clock | no thread, no pipe, no timer — `done/s`, `peak` and the clock advance inside render; neither tier holds per-event memory |
+  | a server at 100k events/s | `ON_DEMAND`; `latency_window` = the in-flight depth; `activity_lines = -1` when the lifecycle log is not read | every tier is O(1) an event (23 ns at `full`: ~0.2% of a core at 100k/s), but `minimal` and up take one mutex an event on every emitting thread; `ON_DEMAND` wakes at most once a frame interval; failures stay in PROBLEMS; the tasks pane is safe to leave open |
+  | Task Scheduler / a service / headless | `off`, or what `gptps_tui_snapshot` needs | `run` returns at once (no console) and makes no pipe; `off` costs ~2 ns an event and no lock — raise it when someone looks |
+  | an operator's console | the defaults (`full`, `CONTINUOUS`, clock in minutes), or `ON_DEMAND` | idle, it writes nothing and repaints the header once a minute; `ON_DEMAND` makes no frame between changes |
+
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and
   `gptps_tui_press()` applies a key — both unit-tested headlessly; `gptps_tui_run()` is
   the blocking live loop (and self-skips without a TTY).
 - **Ordering:** `gptps_tui_close()` after `gptps_shutdown()`.
 
 Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scroll ·
-`m` steps the KPI tier up (wrapping to minimal, never to off) · `p` pauses/resumes · `l` dead letters · `q` quits.
+`m` steps the KPI tier up, `minimal` → `gauge` → `problems` → `tasks` → `normal` →
+`latency` → `full` → `minimal` (the rule: up one tier, wrapping to `minimal`, never into
+`off`; from `off` it goes to `minimal`) · `p` pauses/resumes · `s` settings · `t` tasks ·
+`l` dead letters · `?` help · `q` quits. In the tasks, settings and detail panes `R` (or
+`r`) reads the engine again now; in the dead-letter view `r` re-submits all.
 
 - **Dead letters (`l`).** Draining is the only way to read the engine's dead letters, and
   it takes them, so the view shows their number until you load them (`g`; `r`/`D` load

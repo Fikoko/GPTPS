@@ -611,24 +611,33 @@ point it at your engine, and watch tasks flow in real time. Pure ANSI/VT (no ncu
 auto-enabled on a TTY, with the Windows console put into VT mode automatically.
 
 ```text
-GPTPS live demo   up <1m   28.6 done/s
-queued 18  started 8  pending 10  in-flight 4  [#######################] peak 4
-finished 4  failed 0  retried 0  dead 0  dropped 0
+GPTPS live demo   up 3m   28.6 done/s
+queued 1840  started 1830  pending 10  in-flight 4  [############......] peak 6
+finished 1826  failed 2  retried 2  dead 0  dropped 0
 kpi:full mode:realtime refresh:250ms
 
 TASKS
   label              run    ok  fail  dead  drop   ok%   avg ms  peak MB  key
-  Resize               8     4     0     0     0  100%     81.0       --  [r]
-  Thumbnail            0     0     0     0     0    --       --       --  [t]
+  Resize            1830  1826     2     0     0  100%     81.0       --  [r]
+  Thumbnail            0     0     0     0     0    --       --       --  [h]
 
 RECENT
-     0.1 FINISHED resize         #4
-     0.1 FINISHED resize         #1
-     0.1 STARTED  resize         #7
-     0.1 STARTED  resize         #8
+   181.9 FAILED   resize         #1797  exit 3 · convert: unable to open image
+   182.0 RETRIED  resize         #1797
+   182.1 FINISHED resize         #1838
+   182.1 STARTED  resize         #1840
 
-keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter  m kpi  p pause  q quit
+keys: [r] Resize  [h] Thumbnail  ·  Up/Dn scroll  s settings  t tasks
+      l dead-letter  m kpi  p pause  ? help  q quit
 ```
+
+The header's clock moves in whole minutes by default (`cfg.clock`: `off`, `minutes`,
+`seconds`), `done/s` is the rate over the last 10 s (`-` until there is anything to measure
+against, `n/a` at `off`) and `peak` the highest in-flight of the last one to two windows. A
+`lost:` line appears under the `kpi:` line only once something was lost (types folded into
+`(other)`, items the latency table could not track, problems overwritten before a frame
+showed them, frames truncated, allocations failed); `RECENT  N not shown` counts the lines
+that scrolled away between two frames.
 
 - **Live metrics:** throughput, pending and in-flight gauges (exact at `latency` and `full`, or `>=` while only a lower bound; marked `~`
   below), cumulative counts, failures kept apart from the lifecycle flood in the RECENT log (with an exact count of what scrolled away unseen), and a per-task
@@ -640,12 +649,16 @@ keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter
   **settings editor**, which explains the selected setting, says why it refuses a value,
   and saves your changes into the config file in place (`w`); `?` shows a help overlay of
   every key.
-- **Task control plane:** `t` opens a **task manager** — list every type with live
+- **Task control plane:** `t` opens a **task manager** — list every type with its
   queued/running/dead counts, inspect one to edit its settings inline, pause/resume (`a`),
   clone (`c`), create a `GPTPS_EXEC_PROGRAM` task from a typed name + argv (`n`), or delete
   with a confirm dialog (`d`) that shows the outstanding count and offers drain or
   cancel-force. `l` opens a **dead-letter** view to bulk re-submit or discard retained
-  failures.
+  failures. The task manager and the settings panes read the engine in one pass into a
+  cache — when they open, after a change made from them, on `R`, and every 2 s
+  (`cfg.pane_refresh_ms`), or less often when a pass is slow, so they hold the engine's
+  lock at most 1% of the time; the pane's last line says what a pass costs and how old the
+  counts are (`core counts: 19.0 ms, every 2.0 s, age 1 s`).
 - **Friendly:** adapts to the terminal size (the tables fit its height, `+N more`), redraws
   flicker-free — only the lines that changed, in one write — and costs nothing idle (it
   blocks until something it shows changes; see `gptps_tui_run` in `addons/gptps_tui.h`),
