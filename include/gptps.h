@@ -93,10 +93,11 @@ extern "C" {
  * `measures` / `n_measures` to gptps_dead_letter, `key_copy` / `desc_copy` to
  * gptps_setting_info and `name_copy` to gptps_task_info, adds GPTPS_TASK_DIE_WITH_HOST
  * and the start.error measurement, and appends `task_flags` and `event_measure` to the
- * host table (gptps_api_routines). Additive, and the loader compares
+ * host table (gptps_api_routines); 2.9 makes gptps_task_get_info's counters O(1) and
+ * adds gptps_engine_counts (gptps_engine_totals). Additive, and the loader compares
  * MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 8u
+#define GPTPS_ABI_VERSION_MINOR 9u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -837,6 +838,30 @@ GPTPS_API size_t       gptps_task_count(gptps *e);
 /* Fill *out for the task at `index` (0-based; order stable until the registry is
  * mutated). GPTPS_E_NOTFOUND past the end. */
 GPTPS_API gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out);
+/* Since ABI 2.9 the queued / running / dead counters above cost O(1): the engine
+ * keeps them per type as items move between its queues, where each call used to walk
+ * every item it held under the engine lock (116 ms a call at 64 types and 100k
+ * queued). The values are the same as the walk's, by construction. */
+
+/* ABI 2.9: the engine-wide totals, in O(1), under the engine lock (struct_size
+ * first). The struct is not called gptps_engine_counts because a C typedef and a
+ * function cannot share a name. Per type, gptps_task_get_info has the same split. */
+typedef struct {
+    size_t   struct_size;   /* = sizeof(gptps_engine_totals) */
+    uint64_t queued;        /* items waiting: intake + backoff (the sum of every
+                             * gptps_task_info.queued) */
+    uint64_t delayed;       /* of `queued`, those waiting out a retry backoff */
+    uint64_t running;       /* admitted / in flight, or run and awaiting accounting
+                             * (the sum of every gptps_task_info.running) */
+    uint64_t dead;          /* dead letters retained (= gptps_dead_letter_count), those
+                             * of types unregistered since included - which no
+                             * gptps_task_info row counts any more */
+} gptps_engine_totals;
+/* Fill *out. Fields appended later are written only if your struct_size covers them;
+ * nothing past your struct_size is touched. GPTPS_E_INVAL for a NULL argument or a
+ * struct_size below the 2.9 layout (which ends at `dead`); GPTPS_E_SHUTDOWN in a
+ * forked child (see FORK). */
+GPTPS_API gptps_status gptps_engine_counts(gptps *e, gptps_engine_totals *out);
 /* 1 if a task of this name is registered AND accepting submits (enabled, not draining,
  * not still being registered by another thread). */
 GPTPS_API int          gptps_task_exists(gptps *e, const char *task_name);
@@ -844,8 +869,8 @@ GPTPS_API int          gptps_task_exists(gptps *e, const char *task_name);
  * (0 = an ordinary one-shot). Matched by name and copied under the engine lock, so -
  * unlike walking gptps_task_get_info, whose `name` is borrowed until the registry
  * next changes - it is safe while other threads register or unregister types, and
- * it scans no queue, where each gptps_task_get_info call walks every item the engine
- * holds to fill its counters. A paused type still answers. GPTPS_E_NOTFOUND if no
+ * it scans no queue, where gptps_task_get_info before ABI 2.9 walked every item the
+ * engine holds to fill its counters. A paused type still answers. GPTPS_E_NOTFOUND if no
  * such type is registered (a type draining toward removal included, and one another
  * thread is still registering), GPTPS_E_INVAL for a NULL argument. */
 GPTPS_API gptps_status gptps_task_flags(gptps *e, const char *task_name, uint64_t *out_flags);

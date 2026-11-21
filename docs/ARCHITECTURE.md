@@ -608,7 +608,10 @@ delivery, the external-program executor, constraints/observers, task priority
 (`register_setting` appended to the host table, minor 3 → 4), and runtime task
 management + generic settings (new symbols, an appended `GPTPS_E_BUSY` status, a
 `struct_size`-fronted `gptps_task_info`, and four more host-table routines, minor
-7 → 8) — each a new symbol or an appended field, never a reshape.
+7 → 8) — each a new symbol or an appended field, never a reshape. ABI 2.9 is the
+same kind of step: `gptps_engine_counts` and its `gptps_engine_totals` are new, and
+`gptps_task_get_info` keeps its signature and values while its counters became O(1)
+(per-type counts the queue primitives keep - "per-type counts" in `src/engine.c`).
 
 ---
 

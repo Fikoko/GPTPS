@@ -469,6 +469,32 @@ target_link_libraries(test_hidx PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 add_test(NAME hidx COMMAND test_hidx)
 set_tests_properties(hidx PROPERTIES TIMEOUT 120)
 
+# White-box too: the per-type queue counts behind gptps_task_get_info (ABI 2.9),
+# re-counted by the old walk after every step of random runs - three seeds, and on
+# the simulation HAL its THREADED legs run on the seeded schedule.
+add_executable(test_counts tests/test_counts.c ${_gptps_src_but_engine})
+target_include_directories(test_counts
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_counts PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(GPTPS_HAL_SOURCE MATCHES "hal_sim\\.c$")
+    target_compile_definitions(test_counts PRIVATE GPTPS_TEST_HAL_SIM=1)
+endif()
+add_test(NAME counts COMMAND test_counts)
+add_test(NAME counts_seed2 COMMAND test_counts 2)
+add_test(NAME counts_seed3 COMMAND test_counts 3)
+set_tests_properties(counts counts_seed2 counts_seed3 PROPERTIES TIMEOUT 300)
+
+# gptps_task_get_info and gptps_engine_counts stay O(1) in queue depth: 64 types and
+# 100k queued against one type and a short queue, as a ratio.
+add_executable(test_counts_perf tests/test_counts_perf.c)
+target_include_directories(test_counts_perf
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_counts_perf PRIVATE gptps)
+add_test(NAME counts_perf COMMAND test_counts_perf)
+set_tests_properties(counts_perf PROPERTIES TIMEOUT 120)
+
 # The same kind of gate for gptps_cancel: finding and unlinking an item stays O(1) in
 # queue depth, in intake and in `delayed`, and a cancel never costs the next submit.
 add_executable(test_cancel_perf tests/test_cancel_perf.c)
