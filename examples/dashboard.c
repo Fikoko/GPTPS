@@ -5,7 +5,8 @@
  * tui add-on. On a real terminal it redraws continuously and takes hotkeys:
  *   [w] submit 'work'  [f] submit 'flaky'  |  [k]/[j] scroll  [m] KPI level
  *   [p] pause  [s] settings editor  [?] help  [q] quit
- * `m` cycles how much the dashboard computes (minimal/normal/full) at runtime, so
+ * `m` steps up the KPI ladder (minimal, gauge, problems, tasks, normal, latency,
+ * full, then minimal again) - how much the dashboard computes - at runtime, so
  * its own CPU/RAM cost is tunable live; `s` opens a live editor over the unified
  * settings registry (navigate with j/k, Enter to edit, w to save). Run it headless
  * (no TTY) and gptps_tui_run() simply returns - the engine still drains the work.

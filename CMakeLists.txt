@@ -1235,9 +1235,28 @@ add_test(NAME tui COMMAND test_tui)
 add_executable(test_tui_unit tests/test_tui_unit.c)
 target_include_directories(test_tui_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
 target_link_libraries(test_tui_unit PRIVATE gptps)
+# On the simulation HAL (tests/hal_sim.c) the live-loop check on a pseudo-terminal is
+# skipped, saying so: the loop waits in poll(), a real block the simulation does not
+# see, holding its baton (docs/HAL.md). Every other check runs, and replays by seed.
+if(GPTPS_HAL_SOURCE MATCHES "hal_sim\\.c$")
+    target_compile_definitions(test_tui_unit PRIVATE GPTPS_TEST_HAL_SIM=1)
+endif()
 add_test(NAME tui_unit COMMAND test_tui_unit)
 set_tests_properties(tui_unit PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
+# the handle table's exact gauges and latency vs every order one handle's events can
+# arrive in - tests/test_stats_order.c's scenarios, with gptps_stats fed beside it
+add_executable(test_tui_order tests/test_tui_order.c)
+target_include_directories(test_tui_order PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_tui_order PRIVATE gptps)
+add_test(NAME tui_order COMMAND test_tui_order)
+set_tests_properties(tui_order PROPERTIES TIMEOUT 60)
+# complexity gate on the dashboard's event path: ratios, never absolute ns (like cancel_perf)
+add_executable(test_tui_perf tests/test_tui_perf.c)
+target_include_directories(test_tui_perf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_tui_perf PRIVATE gptps)
+add_test(NAME tui_perf COMMAND test_tui_perf)
+set_tests_properties(tui_perf PROPERTIES TIMEOUT 300 LABELS perf)
 endif()
 
 # docs/CONFIG.md is generated from the settings registry (tools/gptps_config_reference.c);
