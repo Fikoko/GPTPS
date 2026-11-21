@@ -551,6 +551,9 @@ struct gptps_tui {
     int              acap, ahead, act_want;
     uint64_t         a_seq, a_seen, a_base, a_lost;
     uint64_t         frame_unseen;  /* records the last frame found overwritten (its RECENT line) */
+    uint64_t         drop_pend;     /* unseen records a resize / free / tier drop took out, not yet
+                                     * on a frame's RECENT line (added there by the next one) */
+    int              p_warned;      /* the WARN for the first PROBLEMS record lost has been logged */
     /* FULL: the percentile histograms, TUI_HIST_B buckets per TASKS row (NULL below) */
     uint64_t        *hist;
     uint64_t         cancel;        /* FAILED with GPTPS_E_CANCELLED (also in fail and term) */
@@ -1774,6 +1777,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     const char *B, *D, *R, *G, *X;
     double up, rate;
     char legend[TUI_LEGEND_CAP];
+    uint64_t warn_plost;
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
     if (t->pane == TUI_PANE_SETTINGS) return render_settings(t, buf, cap);
     if (t->pane == TUI_PANE_HELP)     return render_help(t, buf, cap);
@@ -1786,12 +1790,15 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
 
     trk_resync(t);                       /* before the lock: it asks the engine */
     mu_lock(&t->mu);
+    warn_plost = 0;
     /* This frame shows the journals: what left them since the last one was not shown. */
     {
         uint64_t lp = ring_unseen_lost(t->p_seq, t->p_seen, t->prob ? t->pcap : 0),
                  la = ring_unseen_lost(t->a_seq, t->a_seen, t->act ? t->acap : 0);
         t->p_lost += lp; t->a_lost += la; t->p_seen = t->p_seq; t->a_seen = t->a_seq;
         t->frame_unseen = lp + la;
+        if (t->prob || t->act) { t->frame_unseen += t->drop_pend; t->drop_pend = 0; }  /* RECENT is shown */
+        if (t->p_lost && !t->p_warned) { t->p_warned = 1; warn_plost = t->p_lost; }
     }
     toast_on = status_live(t->status, t->status_ms, gptps_now_ms(NULL));
     legrows = legend_text(t, W, legend, sizeof legend);
@@ -1803,10 +1810,11 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     else pos = appendf(buf, cap, pos, "GPTPS \xc2\xb7 %s   up %.1fs   %.1f done/s\n", t->cfg.title, up, rate);
 
     if (t->tier < TUI_T_GAUGE) {     /* MINIMAL keeps no gauge: what is alive, as one sum */
-        char pc[16];
+        char pc[16], gl[128];
         uint64_t alive = t->q > t->term ? t->q - t->term : 0;
-        pos = appendf(buf, cap, pos, "queued %llu  started %llu  pending+in-flight ~%s\n",
-                      (unsigned long long)t->q, (unsigned long long)t->s, fmt_count(pc, sizeof pc, alive));
+        snprintf(gl, sizeof gl, "queued %llu  started %llu  pending+in-flight ~%s",
+                 (unsigned long long)t->q, (unsigned long long)t->s, fmt_count(pc, sizeof pc, alive));
+        pos = appendf(buf, cap, pos, "%.*s\n", (int)u8_fit(gl, W - 1), gl);   /* one row: the fit counts '\n' */
     } else {   /* the gauges, and an in-flight bar fitted to what the line leaves of the width */
         /* EXACT from the handle table (LATENCY+); '>=' while that is a lower bound (see
          * trk_lb); '~' from the counters, which cannot be exact (see `inflight`) */
@@ -1834,13 +1842,20 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
         pos = appendf(buf, cap, pos, "%s%s]%s%s\n", X, D, X, right);
     }
     {
-        char cn[48];
+        char cn[48], pl[256];
+        int plen;
         cn[0] = 0;                                   /* cancelled: part of failed, named when any */
         if (t->cancel) snprintf(cn, sizeof cn, " (%llu cancelled)", (unsigned long long)t->cancel);
-        pos = appendf(buf, cap, pos, "%sfinished %llu%s  %sfailed %llu%s%s  retried %llu  %sdead %llu%s  %sdropped %llu%s\n",
-                      G, (unsigned long long)t->fin, X, (t->fail ? R : ""), (unsigned long long)t->fail, X, cn,
-                      (unsigned long long)t->retr, (t->dead ? R : ""), (unsigned long long)t->dead, X,
-                      (t->drop ? R : ""), (unsigned long long)t->drop, X);
+        plen = snprintf(pl, sizeof pl, "finished %llu  failed %llu%s  retried %llu  dead %llu  dropped %llu",
+                        (unsigned long long)t->fin, (unsigned long long)t->fail, cn, (unsigned long long)t->retr,
+                        (unsigned long long)t->dead, (unsigned long long)t->drop);
+        if (plen >= 0 && (size_t)plen < sizeof pl && (int)u8_fit(pl, W - 1) == plen)
+            pos = appendf(buf, cap, pos, "%sfinished %llu%s  %sfailed %llu%s%s  retried %llu  %sdead %llu%s  %sdropped %llu%s\n",
+                          G, (unsigned long long)t->fin, X, (t->fail ? R : ""), (unsigned long long)t->fail, X, cn,
+                          (unsigned long long)t->retr, (t->dead ? R : ""), (unsigned long long)t->dead, X,
+                          (t->drop ? R : ""), (unsigned long long)t->drop, X);
+        else   /* narrower than the line: one row, cut, without its colors (the fit counts '\n') */
+            pos = appendf(buf, cap, pos, "%.*s\n", (int)u8_fit(pl, W - 1), pl);
     }
     {   /* the tier, and the parts it runs without for want of memory (logged) */
         char kl[320];
@@ -2021,6 +2036,14 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     /* key legend: task hotkeys first, then the global keys, wrapped to the width */
     pos = appendf(buf, cap, pos, "\n%s%s%s\n", D, legend, X);
     mu_unlock(&t->mu);
+    if (warn_plost) {            /* never silent; once, and outside the lock, as the event path's WARNs */
+        char msg[384];
+        snprintf(msg, sizeof msg, "gptps_tui: %llu problem events (FAILED, RETRIED, DEAD_LETTERED, DROPPED) "
+                 "left the dashboard's PROBLEMS journal before a frame showed them; they are counted on the "
+                 "'lost:' line and in gptps_tui_health.problems_not_shown; raise tui.recent (cfg.recent_lines) "
+                 "or refresh more often to see them all", (unsigned long long)warn_plost);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
 
     return tui_finish(t, buf, cap, pos);
 }
@@ -2867,13 +2890,15 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
         { "tui.refresh_ms",     GPTPS_SETTING_UINT, "dashboard redraw interval (ms)",      NULL,             ts_rd_refresh, ts_wr_refresh, 0, 0, 0 },
         { "tui.kpi",            GPTPS_SETTING_ENUM, "KPI detail level",                    TUI_KPI_CHOICES,  ts_rd_kpi,     ts_wr_kpi, 0, 0, 0 },
         { "tui.mode",           GPTPS_SETTING_ENUM, "redraw cadence",                      TUI_MODE_CHOICES, ts_rd_mode,    ts_wr_mode, 0, 0, 0 },
-        { "tui.latency_window", GPTPS_SETTING_UINT, "handles tracked for latency at FULL", NULL,             ts_rd_latwin,  ts_wr_latwin, 0, 0, 0 },
+        { "tui.latency_window", GPTPS_SETTING_UINT, "handles tracked for latency at LATENCY and FULL", NULL,             ts_rd_latwin,  ts_wr_latwin, 0, 0, 0 },
         /* 1.11 */
         { "tui.recent",         GPTPS_SETTING_UINT, "failed/retried/dead/dropped events the RECENT log keeps "
-                                                    "(the PROBLEMS journal, kpi problems and up); 0 = none",
+                                                    "(the PROBLEMS journal, kpi problems and up); 0 = off, "
+                                                    "its memory freed",
                                                     NULL, ts_rd_recent, ts_wr_recent, 1, 0, TUI_JOURNAL_CAP },
         { "tui.activity",       GPTPS_SETTING_UINT, "queued/started/finished events the RECENT log keeps "
-                                                    "(the ACTIVITY journal, kpi normal and up); 0 = none",
+                                                    "(the ACTIVITY journal, kpi normal and up); by default "
+                                                    "as tui.recent; 0 = off, its memory freed",
                                                     NULL, ts_rd_activity, ts_wr_activity, 1, 0, TUI_JOURNAL_CAP },
     };
     size_t i;
@@ -2990,12 +3015,12 @@ static void tasks_seed(gptps_tui *t)
 /* mu held: take a journal out (into *old), counting what no frame showed of it. */
 static void prob_out(gptps_tui *t, tui_parts *old)
 {
-    t->p_lost += t->p_seq - t->p_seen; t->p_seen = t->p_base = t->p_seq;
+    t->p_lost += t->p_seq - t->p_seen; t->drop_pend += t->p_seq - t->p_seen; t->p_seen = t->p_base = t->p_seq;
     old->prob = t->prob; t->prob = NULL; t->pcap = t->phead = 0;
 }
 static void act_out(gptps_tui *t, tui_parts *old)
 {
-    t->a_lost += t->a_seq - t->a_seen; t->a_seen = t->a_base = t->a_seq;
+    t->a_lost += t->a_seq - t->a_seen; t->drop_pend += t->a_seq - t->a_seen; t->a_seen = t->a_base = t->a_seq;
     old->act = t->act; old->act_nm = t->act_nm; t->act = NULL; t->act_nm = NULL; t->acap = t->ahead = 0;
 }
 

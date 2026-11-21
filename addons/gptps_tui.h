@@ -179,9 +179,15 @@ typedef struct {
      * from NORMAL up. The pane merges them by time - so a 1.10 frame's FINISHED lines are
      * still there - and shows problems only when ACTIVITY is off. Each record has a sequence
      * number, so a frame knows exactly how many were overwritten before any frame showed
-     * them: "N not shown" on the RECENT line, gptps_tui_health.journal_not_shown, and for
-     * PROBLEMS the "lost:" line. Both resizable at runtime (gptps_tui_set_recent,
-     * `tui.recent`, `tui.activity`); a journal of 0 lines is off and holds no memory. */
+     * them: "N not shown" on the RECENT line (what left either journal since the last
+     * frame - overwritten, or dropped by a resize, a 0 or a tier below the journal's),
+     * gptps_tui_health.journal_not_shown (the running total), and for PROBLEMS the "lost:"
+     * line (its running total) and one WARN, from the first frame that finds one lost.
+     * Both resizable at runtime (gptps_tui_set_recent, `tui.recent`, `tui.activity`); a
+     * journal of 0 lines there is off and holds no memory - NOTE: here, in the config, 0
+     * means the default and -1 means off.
+     * An ACTIVITY record names its task by its TASKS row, so a type folded into '(other)'
+     * (past max_tasks) shows as '(other)' there; its PROBLEMS records keep the full name. */
     int         recent_lines;  /* PROBLEMS journal lines (0 => max_recent's value, by default 8;
                                 * -1 => off; 1..4096; else install returns NULL, with an ERROR) */
     int         activity_lines;/* ACTIVITY journal lines (0 => as recent_lines; -1 => off; 1..4096) */
@@ -261,7 +267,8 @@ int gptps_tui_press(gptps_tui *t, int key);
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level);
 /* Resize the RECENT journals (1.11): `problems` lines for the PROBLEMS journal, `activity`
  * lines for the ACTIVITY journal; -1 leaves one as it is, 0 turns it off and frees it,
- * 1..4096 sizes it (else GPTPS_E_INVAL, nothing changed). A resized journal starts empty;
+ * 1..4096 sizes it (else GPTPS_E_INVAL, nothing changed). NOTE: 0 here is off, while 0 in
+ * cfg.recent_lines / activity_lines is the default (-1 is off there). A resized journal starts empty;
  * the records it held that no frame had shown are counted as not shown. The sizes hold at
  * every tier and apply from the journal's tier up. Also `tui.recent` and `tui.activity`.
  * GPTPS_E_NOMEM (with a WARN) as gptps_tui_set_kpi. */

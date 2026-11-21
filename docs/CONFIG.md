@@ -63,8 +63,8 @@ The meanings are those the tables below give, from the same descriptions.
 | `tasks.<task>.stderr_tail_bytes` | not captured (stderr is the host's) | - |
 | `resources.<name>` | none: a submit that costs any is refused, and queued work that does is dead-lettered (GPTPS_E_BUDGET) - not a pause | - |
 | `tasks.<task>.resources.<name>` | none | - |
-| `tui.recent` | none | - |
-| `tui.activity` | none | - |
+| `tui.recent` | off, its memory freed | - |
+| `tui.activity` | off, its memory freed | - |
 
 ## Top level
 
@@ -185,9 +185,9 @@ key nothing claimed.
 | `refresh_ms` | whole number, 0 or more | `250` | at once | dashboard redraw interval (ms) |
 | `kpi` | one of `"off"`, `"minimal"`, `"normal"`, `"full"`, `"gauge"`, `"problems"`, `"tasks"`, `"activity"`, `"latency"`, `"count"` | `"full"` | at once | KPI detail level |
 | `mode` | one of `"realtime"`, `"on-demand"`, `"paused"` | `"realtime"` | at once | redraw cadence |
-| `latency_window` | whole number, 0 or more | `1024` | at once | handles tracked for latency at FULL |
-| `recent` | whole number, 0 to 4096 | `8` | at once | failed/retried/dead/dropped events the RECENT log keeps (the PROBLEMS journal, kpi problems and up); 0 = none |
-| `activity` | whole number, 0 to 4096 | `8` | at once | queued/started/finished events the RECENT log keeps (the ACTIVITY journal, kpi normal and up); 0 = none |
+| `latency_window` | whole number, 0 or more | `1024` | at once | handles tracked for latency at LATENCY and FULL |
+| `recent` | whole number, 0 to 4096 | `8` | at once | failed/retried/dead/dropped events the RECENT log keeps (the PROBLEMS journal, kpi problems and up); 0 = off, its memory freed |
+| `activity` | whole number, 0 to 4096 | `8` | at once | queued/started/finished events the RECENT log keeps (the ACTIVITY journal, kpi normal and up); by default as tui.recent; 0 = off, its memory freed |
 
 ### [gpu_quota]
 

@@ -2000,24 +2000,61 @@ static void test_journals(void)
     gptps_tui_render(t, frame, sizeof frame);            /* scrolled back: the failures, kept */
     CHECK(occurs(frame, "FAILED") == 3 && strstr(frame, "not shown") == NULL);
     CHECK(health(t).journal_not_shown == 996);
-    /* problems overflow: 10 more before a frame, 4 kept, 6 lost - counted, on the lost: line */
+    /* problems overflow: 10 more before a frame, 4 kept, 6 lost - counted, on the lost: line,
+     * and logged at WARN once (the first frame that finds one), not on every frame after */
+    log_begin();
     for (i = 0; i < 10; ++i) emit_a(t, GPTPS_EV_DROPPED, "jr", (gptps_handle)(2000 + i), GPTPS_E_TASK, 5000, 1);
     CHECK(health(t).problems_not_shown == 6 && health(t).journal_not_shown == 1002);
+    CHECK(log_count("problem events") == 0);             /* the event path logs nothing */
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(strstr(frame, "lost: 6 problem events not shown") != NULL);
     CHECK(health(t).problems_not_shown == 6);
+    CHECK(log_count("6 problem events") == 1 && log_count("tui.recent") == 1);
+    for (i = 0; i < 10; ++i) emit_a(t, GPTPS_EV_DROPPED, "jr", (gptps_handle)(2100 + i), GPTPS_E_TASK, 5001, 1);
+    gptps_tui_render(t, frame, sizeof frame);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "lost: 12 problem events not shown") != NULL);
+    CHECK(log_count("problem events") == 1);             /* once: no flood */
+    log_end();
+    /* ACTIVITY: the unseen records a resize, a 0 or a tier drop takes out count too - in
+     * health and on the next frame's RECENT line */
+    {
+        uint64_t a0;
+        h = health(t); a0 = h.journal_not_shown - h.problems_not_shown;
+        for (i = 0; i < 3; ++i) emit(t, GPTPS_EV_QUEUED, "jr", (gptps_handle)(2500 + i), GPTPS_OK, 5500);
+        h = health(t); CHECK(h.journal_not_shown - h.problems_not_shown == a0);   /* held, not lost */
+        CHECK(gptps_tui_set_recent(t, -1, 6) == GPTPS_OK && t->acap == 6);
+        h = health(t); CHECK(h.journal_not_shown - h.problems_not_shown == a0 + 3);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "RECENT  3 not shown") != NULL);
+        gptps_tui_render(t, frame, sizeof frame);       /* shown once: the next frame lost nothing */
+        CHECK(strstr(frame, "RECENT\n") != NULL);
+        for (i = 0; i < 2; ++i) emit(t, GPTPS_EV_QUEUED, "jr", (gptps_handle)(2600 + i), GPTPS_OK, 5600);
+        CHECK(gptps_tui_set_recent(t, -1, 0) == GPTPS_OK && t->act == NULL);
+        h = health(t); CHECK(h.journal_not_shown - h.problems_not_shown == a0 + 5);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "RECENT  2 not shown  problems only") != NULL);
+        CHECK(gptps_tui_set_recent(t, -1, 4) == GPTPS_OK && t->acap == 4);
+        for (i = 0; i < 2; ++i) emit(t, GPTPS_EV_STARTED, "jr", (gptps_handle)(2700 + i), GPTPS_OK, 5700);
+        CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_TASKS) == GPTPS_OK && t->act == NULL);
+        h = health(t); CHECK(h.journal_not_shown - h.problems_not_shown == a0 + 7);
+        CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_OK && t->acap == 4);
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "RECENT  2 not shown") != NULL);
+        CHECK(health(t).problems_not_shown == 12);       /* none of that was a problem */
+    }
     /* resized: what no frame showed counts; the new one starts empty */
     emit_a(t, GPTPS_EV_DROPPED, "jr", 3000, GPTPS_E_TASK, 6000, 1);
     emit_a(t, GPTPS_EV_DROPPED, "jr", 3001, GPTPS_E_TASK, 6000, 1);
     CHECK(gptps_tui_set_recent(t, 5, -1) == GPTPS_OK && t->pcap == 5 && t->acap == 4);
     h = health(t);
-    CHECK(h.problems_not_shown == 8 && h.problems_held == 0 && h.bytes_problems == 5 * sizeof(tui_event));
+    CHECK(h.problems_not_shown == 14 && h.problems_held == 0 && h.bytes_problems == 5 * sizeof(tui_event));
     /* 0 lines: off and freed */
     CHECK(gptps_tui_set_recent(t, 0, 0) == GPTPS_OK && t->prob == NULL && t->act == NULL);
     h = health(t);
     CHECK(h.bytes_problems == 0 && h.bytes_activity == 0);
     emit_a(t, GPTPS_EV_FAILED, "jr", 4000, GPTPS_E_TASK, 7000, 1);   /* written nowhere */
-    CHECK(t->p_seq == 15 && health(t).problems_not_shown == 8);
+    CHECK(t->p_seq == 25 && health(t).problems_not_shown == 14);
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(strstr(frame, "RECENT") == NULL);
     /* the settings, with ranges; tui.activity 0 leaves problems only */
@@ -2028,7 +2065,11 @@ static void test_journals(void)
     emit_a(t, GPTPS_EV_FAILED, "jr", 4001, GPTPS_E_TASK, 7001, 1);
     emit(t, GPTPS_EV_QUEUED, "jr", 4002, GPTPS_OK, 7002);
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "RECENT  problems only") != NULL && occurs(frame, "FAILED") == 1 && !strstr(frame, "QUEUED"));
+    /* the 2 unseen DROPPED the resize to 5 took out, on the first frame that has a RECENT line */
+    CHECK(strstr(frame, "RECENT  2 not shown  problems only") != NULL && occurs(frame, "FAILED") == 1 &&
+          !strstr(frame, "QUEUED"));
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "RECENT  problems only") != NULL);
     CHECK(gptps_settings_set(e, "tui.activity", "2") == GPTPS_OK && t->acap == 2);
     CHECK(gptps_settings_get(e, "tui.recent", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
     /* below its tier a journal holds nothing, whatever its size */
@@ -2164,6 +2205,45 @@ static void test_recent_merged(void)
     }
 }
 
+/* 40) every line of a narrow frame is one row: MINIMAL's sum line and the totals line are
+ * fitted to the width (the vertical fit counts rows by '\n'), at MINIMAL and at GAUGE */
+static void test_narrow_lines(void)
+{
+    static const int K[] = { GPTPS_TUI_KPI_MINIMAL, GPTPS_TUI_KPI_GAUGE };
+    gptps *e = open_manual(); gptps_tui *t; gptps_tui_config c;
+    static char frame[16384];
+    int i, k;
+    if (!e) return;
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.color = 0; c.unicode = 0; c.interactive = 0; c.kpi = GPTPS_TUI_KPI_MINIMAL;
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    t->rows = 40; t->cols = 40;
+    for (i = 0; i < 1500; ++i) emit(t, GPTPS_EV_QUEUED, "nw", (gptps_handle)(1 + i), GPTPS_OK, 10);
+    for (i = 0; i < 1200; ++i) emit(t, GPTPS_EV_STARTED, "nw", (gptps_handle)(1 + i), GPTPS_OK, 11);
+    for (i = 0; i < 1100; ++i) emit_a(t, GPTPS_EV_FAILED, "nw", (gptps_handle)(1 + i), GPTPS_E_CANCELLED, 12, 1);
+    for (k = 0; k < 2; ++k) {
+        const char *p, *q;
+        int found = 0;
+        CHECK(gptps_tui_set_kpi(t, (gptps_tui_kpi)K[k]) == GPTPS_OK);
+        gptps_tui_render(t, frame, sizeof frame);
+        for (p = frame; *p; p = q + 1) {
+            q = strchr(p, '\n');
+            if (!q) break;
+            if (strncmp(p, "queued ", 7) == 0 && k == 0) found |= 1;
+            if (strncmp(p, "finished ", 9) == 0) found |= 2;
+            if ((strncmp(p, "queued ", 7) == 0 && k == 0) || strncmp(p, "finished ", 9) == 0) {
+                if (!(q - p <= 39)) fprintf(stderr, "  wide line (%d cols): %.*s\n", (int)(q - p), (int)(q - p), p);
+                CHECK(q - p <= 39);
+            }
+        }
+        CHECK(found == (k == 0 ? 3 : 2));
+    }
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
 /* 39) */
 static void test_config_111(void)
 {
@@ -2234,6 +2314,7 @@ int main(void)
     test_percentiles();
     test_recent_merged();
     test_config_111();
+    test_narrow_lines();
 #if !defined(_WIN32)
     test_health_vs_dead_letters();
     test_storage_storm();
