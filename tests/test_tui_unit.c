@@ -79,6 +79,22 @@
  *     nothing live: an always-up service's restarts (FINISHED, no QUEUED), a late
  *     install and a table rebuilt while work waits no longer read EXACT.
  * 32) POSIX: gptps_tui_health races nothing while the dashboard takes dead letters.
+ * 1.11, the KPI ladder and the journals:
+ * 33) Each tier collects exactly its layers - nothing above it allocated or written -
+ *     installed at the tier or moved there; show_tasks / show_recent < 0 (a 1.10 caller's
+ *     struct) stop the collection too, not only the pane.
+ * 34) The released enum values and tui.kpi strings are unchanged and the appended ones
+ *     work ("count" and "activity" read back as "minimal" and "normal"); 'm' steps up
+ *     the ladder and wraps to minimal, never into off.
+ * 35) The journals: a failure is never pushed out by activity; what was overwritten
+ *     before a frame showed it is counted exactly ("N not shown", health, the lost:
+ *     line); 0 lines frees a journal; tui.recent / tui.activity have ranges.
+ * 36) A file saved with 'w' at each new tier and journal size reloads with 0 config errors.
+ * 37) Latency percentiles (FULL): the log2-ms buckets, p50/p95/p99 when the width has
+ *     room, nothing at LATENCY.
+ * 38) RECENT merges the journals by time (a problem after its activity at the same ms);
+ *     with ACTIVITY off it shows problems only.
+ * 39) The 1.11 config fields: out of range refused at install, with an ERROR.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -754,7 +770,10 @@ static void test_long_names(void)
     memset(name, 'n', 100); name[100] = 0;                 /* 100 bytes: over the old 63 */
     for (i = 0; i < 5; ++i) emit(t, GPTPS_EV_QUEUED, name, (gptps_handle)(10 + i), GPTPS_OK, gptps_now_ms(NULL));
     CHECK(nrows(t) == 1);                                  /* one row, not five */
-    CHECK(strcmp(t->recent[(t->rhead + t->rcap - 1) % t->rcap].name, name) == 0);   /* the whole name */
+    /* the whole name: the ACTIVITY record names it by its row, the PROBLEMS record keeps a copy */
+    CHECK(strcmp(t->tasks[t->act[(t->ahead + t->acap - 1) % t->acap].row].name, name) == 0);
+    emit(t, GPTPS_EV_DROPPED, name, 10, GPTPS_E_TASK, gptps_now_ms(NULL));
+    CHECK(strcmp(t->prob[(t->phead + t->pcap - 1) % t->pcap].name, name) == 0);
     for (k = 0; k < 63; ++k) { name[2 * k] = '\xc3'; name[2 * k + 1] = '\xa9'; }    /* 63 x U+00E9 */
     name[126] = 'x'; name[127] = 0;                        /* 127 bytes: GPTPS_TASK_NAME_MAX */
     emit(t, GPTPS_EV_QUEUED, name, 20, GPTPS_OK, gptps_now_ms(NULL));
@@ -778,48 +797,53 @@ static void test_no_memory(void)
     gptps *e = open_manual(); gptps_tui *t; static char frame[16384];
     if (!e) return;
     log_begin();
-    /* callocs at install: the dashboard, the TASKS rows, its fold set, the recent log,
-     * the latency table - the last two fail */
-    tui_calloc_skip = 3; tui_calloc_fail = 2;
+    /* callocs at install: the dashboard, the TASKS rows, its fold set, the PROBLEMS and
+     * ACTIVITY journals, the histograms, the latency table - the last four fail */
+    tui_calloc_skip = 3; tui_calloc_fail = 4;
     t = install_cfg(e, GPTPS_TUI_KPI_FULL, 64, 0);
     tui_calloc_skip = 0; tui_calloc_fail = 0;
     CHECK(t != NULL);                                      /* it installs anyway */
     if (!t) { log_end(); gptps_shutdown(e); return; }
-    CHECK(t->recent == NULL && t->tab == NULL && t->tasks != NULL);
-    CHECK(log_count("gptps_tui_install: no memory for the recent-events log") == 1);
+    CHECK(t->prob == NULL && t->act == NULL && t->hist == NULL && t->tab == NULL && t->tasks != NULL);
+    CHECK(log_count("gptps_tui_install: no memory for the PROBLEMS journal") == 1);
+    CHECK(log_count("and the ACTIVITY journal") == 1);
     CHECK(log_count("and the latency table") == 1);
+    CHECK(log_count("and the latency histograms") == 1);
     emit(t, GPTPS_EV_QUEUED, "job", 1, GPTPS_OK, 1);       /* and runs without them */
     emit(t, GPTPS_EV_STARTED, "job", 1, GPTPS_OK, 2);
     emit(t, GPTPS_EV_FINISHED, "job", 1, GPTPS_OK, 3);
     CHECK(t->fin == 1 && row(t, "job") != NULL && row(t, "job")->finished == 1);
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "latency off: no memory") != NULL);
-    CHECK(strstr(frame, "lost: 2 allocations failed") != NULL);   /* and on the frame, counted */
+    CHECK(strstr(frame, "no memory for: problems log, activity log, latency, percentiles") != NULL);
+    CHECK(strstr(frame, "lost: 4 allocations failed") != NULL);   /* and on the frame, counted */
     CHECK(strstr(frame, "in-flight ~0") != NULL);          /* no table: the approximate gauge, marked */
-    CHECK(health(t).alloc_failures == 2 && health(t).gauges == GPTPS_TUI_GAUGES_APPROX);
-    tui_calloc_skip = 1; tui_calloc_fail = 1;              /* the log goes through, the table not */
+    CHECK(health(t).alloc_failures == 4 && health(t).gauges == GPTPS_TUI_GAUGES_APPROX);
+    tui_calloc_skip = 3; tui_calloc_fail = 1;              /* the journals and histograms go through, the table not */
     CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_E_NOMEM);
     tui_calloc_skip = 0; tui_calloc_fail = 0;
-    CHECK(t->tab == NULL && t->recent != NULL);
+    CHECK(t->tab == NULL && t->prob != NULL && t->act != NULL && t->hist != NULL);
     tui_calloc_fail = 1;
     CHECK(gptps_tui_set_latency_window(t, 128) == GPTPS_E_NOMEM && t->tab == NULL);
     CHECK(gptps_tui_set_latency_window(t, 128) == GPTPS_OK && t->tab != NULL);   /* retried */
     CHECK(health(t).gauges == GPTPS_TUI_GAUGES_EXACT);
-    tui_calloc_fail = 1;                                   /* below FULL first, then up: the table fails */
-    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_OK && t->tab == NULL);
-    CHECK(gptps_tui_press(t, 'm') == 3 && t->kpi == GPTPS_TUI_KPI_FULL && t->tab == NULL);
+    tui_calloc_fail = 1;                                   /* below LATENCY first, then up: the table fails */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_OK && t->tab == NULL && t->hist == NULL);
+    CHECK(gptps_tui_press(t, 'm') == 3 && t->kpi == GPTPS_TUI_KPI_LATENCY && t->tab == NULL);
     CHECK(strstr(t->status, "no memory") != NULL);         /* the 'm' toast says so */
-    CHECK(log_count("gptps_tui_set_kpi(full): no memory") == 2);
+    CHECK(log_count("gptps_tui_set_kpi(full): no memory") == 1);
+    CHECK(log_count("gptps_tui_set_kpi(latency): no memory") == 1);
     CHECK(log_count("gptps_tui_set_latency_window: no memory") == 1);
     /* the TASKS table: down to MINIMAL frees it, back up without memory runs without it */
-    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_MINIMAL) == GPTPS_OK && t->tasks == NULL && t->recent == NULL);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_MINIMAL) == GPTPS_OK && t->tasks == NULL && t->prob == NULL && t->act == NULL);
     tui_calloc_fail = 1;
-    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_E_NOMEM && t->tasks == NULL && t->recent != NULL);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_NORMAL) == GPTPS_E_NOMEM && t->tasks == NULL && t->prob != NULL);
+    CHECK(t->act != NULL && t->act_nm != NULL);            /* no rows to name its tasks by: it keeps copies */
     CHECK(log_count("gptps_tui_set_kpi(normal): no memory for the TASKS table") == 1);
     emit(t, GPTPS_EV_QUEUED, "job", 2, GPTPS_OK, 10);      /* counted, no row to count it in */
     gptps_tui_render(t, frame, sizeof frame);
-    CHECK(strstr(frame, "(tasks off: no memory)") != NULL && strstr(frame, "TASKS") == NULL);
+    CHECK(strstr(frame, "no memory for: tasks") != NULL && strstr(frame, "TASKS") == NULL);
     CHECK(strstr(frame, "queued 2") != NULL);
+    CHECK(strstr(frame, "QUEUED") != NULL && strstr(frame, "job ") != NULL);   /* named from its copy */
     log_end();
     gptps_shutdown(e);
     gptps_tui_close(t);
@@ -1079,7 +1103,7 @@ static void test_counters_64(void)
         /* 1.11: below FULL the pending gauge is q - ends - in-flight, here 6e9: compact */
         CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_MINIMAL) == GPTPS_OK);
         gptps_tui_render(t, frame, sizeof frame);
-        CHECK(strstr(frame, "pending ~6.0G") != NULL && widest(frame) <= 80);
+        CHECK(strstr(frame, "pending+in-flight ~6.0G") != NULL && widest(frame) <= 80);   /* MINIMAL: one sum */
     }
     CHECK(strcmp(fmt_count(b, sizeof b, 99999u), "99999") == 0);
     CHECK(strcmp(fmt_count(b, sizeof b, 100000u), "100k") == 0);
@@ -1098,15 +1122,16 @@ static void test_clamps_logged(void)
     if (!e) return;
     log_begin();
     memset(&c, 0, sizeof c);
-    c.struct_size = sizeof c; c.max_recent = 100; c.kpi = 9; c.mode = 7; c.latency_window = (1 << 20) + 1;
+    /* 1.11: max_recent's cap is 4096 (was 64), and 9 is a tier (LATENCY) */
+    c.struct_size = sizeof c; c.max_recent = 5000; c.kpi = 12; c.mode = 7; c.latency_window = (1 << 20) + 1;
     t1 = gptps_tui_install(e, &c);
     CHECK(t1 != NULL);
-    CHECK(log_count("cfg.max_recent 100 is above the cap of 64") == 1);
-    CHECK(log_count("cfg.kpi 9 is not a gptps_tui_kpi") == 1);
+    CHECK(log_count("cfg.max_recent 5000 is above the cap of 4096") == 1);
+    CHECK(log_count("cfg.kpi 12 is not a gptps_tui_kpi") == 1);
     CHECK(log_count("cfg.mode 7 is not a gptps_tui_mode") == 1);
     CHECK(log_count("cfg.latency_window 1048577 is above the cap") == 1);
     if (t1) {
-        CHECK(t1->cfg.max_recent == 64 && t1->kpi == GPTPS_TUI_KPI_FULL && t1->mode == GPTPS_TUI_CONTINUOUS &&
+        CHECK(t1->cfg.max_recent == 4096 && t1->kpi == GPTPS_TUI_KPI_FULL && t1->mode == GPTPS_TUI_CONTINUOUS &&
               t1->lat_cap == (1 << 20));
         CHECK(gptps_tui_set_latency_window(t1, (1 << 20) + 5) == GPTPS_OK);
         CHECK(log_count("gptps_tui_set_latency_window: 1048581 is above the cap") == 1);
@@ -1359,7 +1384,8 @@ static void test_why_bounded(void)
  * markers expiring, a FAILED with a long tail, and every kind of event */
 static void test_event_path_no_alloc(void)
 {
-    static const int lv[] = { GPTPS_TUI_KPI_OFF, GPTPS_TUI_KPI_MINIMAL, GPTPS_TUI_KPI_NORMAL, GPTPS_TUI_KPI_FULL };
+    static const int lv[] = { GPTPS_TUI_KPI_OFF, GPTPS_TUI_KPI_MINIMAL, GPTPS_TUI_KPI_GAUGE, GPTPS_TUI_KPI_PROBLEMS,
+                              GPTPS_TUI_KPI_TASKS, GPTPS_TUI_KPI_NORMAL, GPTPS_TUI_KPI_LATENCY, GPTPS_TUI_KPI_FULL };
     static char tail[4096];
     gptps *e = open_manual(); gptps_tui *t; gptps_tui_config c;
     size_t l;
@@ -1521,6 +1547,24 @@ TUI_STATIC_ASSERT(kpi_off, GPTPS_TUI_KPI_OFF == 1);
 TUI_STATIC_ASSERT(kpi_minimal, GPTPS_TUI_KPI_MINIMAL == 2);
 TUI_STATIC_ASSERT(kpi_normal, GPTPS_TUI_KPI_NORMAL == 3);
 TUI_STATIC_ASSERT(kpi_full, GPTPS_TUI_KPI_FULL == 4);
+/* 1.11: appended, never renumbered */
+TUI_STATIC_ASSERT(kpi_gauge, GPTPS_TUI_KPI_GAUGE == 5);
+TUI_STATIC_ASSERT(kpi_problems, GPTPS_TUI_KPI_PROBLEMS == 6);
+TUI_STATIC_ASSERT(kpi_tasks, GPTPS_TUI_KPI_TASKS == 7);
+TUI_STATIC_ASSERT(kpi_activity, GPTPS_TUI_KPI_ACTIVITY == 8);
+TUI_STATIC_ASSERT(kpi_latency, GPTPS_TUI_KPI_LATENCY == 9);
+TUI_STATIC_ASSERT(kpi_count, GPTPS_TUI_KPI_COUNT == GPTPS_TUI_KPI_MINIMAL);
+TUI_STATIC_ASSERT(clock_vals, GPTPS_TUI_CLOCK_DEFAULT == 0 && GPTPS_TUI_CLOCK_OFF == 1 &&
+                              GPTPS_TUI_CLOCK_MINUTES == 2 && GPTPS_TUI_CLOCK_SECONDS == 3);
+TUI_STATIC_ASSERT(gauges_vals, GPTPS_TUI_GAUGES_APPROX == 0 && GPTPS_TUI_GAUGES_EXACT == 1 &&
+                               GPTPS_TUI_GAUGES_LOWER_BOUND == 2 && GPTPS_TUI_GAUGES_SUM == 3);
+/* the 1.11 fields, in their order after `reserved` */
+TUI_STATIC_ASSERT(f111_order, offsetof(gptps_tui_config, max_tasks) == offsetof(gptps_tui_config, reserved) + 4 &&
+                  offsetof(gptps_tui_config, recent_lines) == offsetof(gptps_tui_config, max_tasks) + 4 &&
+                  offsetof(gptps_tui_config, activity_lines) == offsetof(gptps_tui_config, recent_lines) + 4 &&
+                  offsetof(gptps_tui_config, clock) == offsetof(gptps_tui_config, activity_lines) + 4 &&
+                  offsetof(gptps_tui_config, rate_window_s) == offsetof(gptps_tui_config, clock) + 4 &&
+                  offsetof(gptps_tui_config, pane_refresh_ms) == offsetof(gptps_tui_config, rate_window_s) + 4);
 TUI_STATIC_ASSERT(mode_cont, GPTPS_TUI_CONTINUOUS == 0);
 TUI_STATIC_ASSERT(mode_od, GPTPS_TUI_ON_DEMAND == 1);
 TUI_STATIC_ASSERT(mode_paused, GPTPS_TUI_PAUSED == 2);
@@ -1536,6 +1580,11 @@ TUI_STATIC_ASSERT(lp64_out, offsetof(gptps_tui_config, out) == 56);
 TUI_STATIC_ASSERT(lp64_settings, offsetof(gptps_tui_config, settings_path) == 64);
 TUI_STATIC_ASSERT(lp64_unicode, offsetof(gptps_tui_config, unicode) == 72);
 TUI_STATIC_ASSERT(lp64_v110, TUI_V110_SIZE == 80);
+TUI_STATIC_ASSERT(lp64_reserved, offsetof(gptps_tui_config, reserved) == 76);
+TUI_STATIC_ASSERT(lp64_max_tasks, offsetof(gptps_tui_config, max_tasks) == 80);
+TUI_STATIC_ASSERT(lp64_recent_lines, offsetof(gptps_tui_config, recent_lines) == 84);
+TUI_STATIC_ASSERT(lp64_pane_refresh, offsetof(gptps_tui_config, pane_refresh_ms) == 100);
+TUI_STATIC_ASSERT(lp64_size111, sizeof(gptps_tui_config) == 104);
 #endif
 static void test_config_abi(void)
 {
@@ -1610,7 +1659,10 @@ static void *st_viewer(void *arg)
 static void test_storage_storm(void)
 {
     static const int lv[] = { GPTPS_TUI_KPI_FULL, GPTPS_TUI_KPI_OFF, GPTPS_TUI_KPI_NORMAL, GPTPS_TUI_KPI_MINIMAL,
-                              GPTPS_TUI_KPI_FULL, GPTPS_TUI_KPI_NORMAL };
+                              GPTPS_TUI_KPI_FULL, GPTPS_TUI_KPI_NORMAL,
+                              /* 1.11: every tier, up and down */
+                              GPTPS_TUI_KPI_GAUGE, GPTPS_TUI_KPI_LATENCY, GPTPS_TUI_KPI_PROBLEMS, GPTPS_TUI_KPI_TASKS,
+                              GPTPS_TUI_KPI_FULL, GPTPS_TUI_KPI_ACTIVITY, GPTPS_TUI_KPI_GAUGE };
     gptps *e = open_manual(); gptps_tui_config c;
     pthread_t th[6];
     int i, made = 0;
@@ -1628,6 +1680,7 @@ static void test_storage_storm(void)
     for (i = 0; gptps_now_ms(NULL) < until; ++i) {
         gptps_tui_set_kpi(st_t, (gptps_tui_kpi)lv[i % (int)(sizeof lv / sizeof lv[0])]);
         if (i % 3 == 0) gptps_tui_set_latency_window(st_t, i % 2 ? 16 : 64);
+        if (i % 5 == 0) gptps_tui_set_recent(st_t, i % 4, (i / 5) % 3 * 7);   /* 1.11: journals resized, off, on */
     }
     __atomic_store_n(&st_stop, 1, __ATOMIC_RELEASE);
     for (i = 0; i < made; ++i) pthread_join(th[i], NULL);
@@ -1744,6 +1797,408 @@ static void test_health_vs_dead_letters(void)
 }
 #endif
 
+
+/* ---- 1.11: the KPI ladder and the journals ----------------------------------------- */
+
+/* the same events at every tier: one item that finishes (5 ms), one that fails and is
+ * dead-lettered, one still running, one still waiting */
+static void ladder_events(gptps_tui *t)
+{
+    emit(t, GPTPS_EV_QUEUED, "lad", 1, GPTPS_OK, 10);
+    emit_a(t, GPTPS_EV_STARTED, "lad", 1, GPTPS_OK, 11, 1);
+    emit_a(t, GPTPS_EV_FINISHED, "lad", 1, GPTPS_OK, 15, 1);
+    emit(t, GPTPS_EV_QUEUED, "lad", 2, GPTPS_OK, 20);
+    emit_a(t, GPTPS_EV_STARTED, "lad", 2, GPTPS_OK, 21, 1);
+    emit_a(t, GPTPS_EV_FAILED, "lad", 2, GPTPS_E_TASK, 22, 1);
+    emit_a(t, GPTPS_EV_DEAD_LETTERED, "lad", 2, GPTPS_E_TASK, 22, 1);
+    emit(t, GPTPS_EV_QUEUED, "lad", 3, GPTPS_OK, 30);
+    emit_a(t, GPTPS_EV_STARTED, "lad", 3, GPTPS_OK, 31, 1);
+    emit(t, GPTPS_EV_QUEUED, "lad", 4, GPTPS_OK, 40);
+}
+
+/* what tier `r` (TUI_T_*) must hold and have written after ladder_events, nothing more */
+static int ladder_ok(gptps_tui *t, int r, int show_tasks, int show_recent)
+{
+    gptps_tui_health_info h = health(t);
+    tui_task *k = row(t, "lad");
+    int ok = 1;
+#define LCHK(c) do { if (!(c)) { printf("tier %d: %s\n", r, #c); ok = 0; } } while (0)
+    LCHK(t->tier == r && h.kpi == TUI_LADDER[r]);
+    LCHK(t->q == (r >= TUI_T_COUNT ? 4u : 0u) && t->fin == (r >= TUI_T_COUNT ? 1u : 0u));
+    LCHK(t->inflight == (r >= TUI_T_GAUGE ? 1u : 0u) && (r >= TUI_T_GAUGE || t->peak == 0));
+    LCHK(h.gauges == (r < TUI_T_GAUGE ? GPTPS_TUI_GAUGES_SUM : r < TUI_T_LATENCY ? GPTPS_TUI_GAUGES_APPROX
+                                                                                : GPTPS_TUI_GAUGES_EXACT));
+    LCHK(r < TUI_T_COUNT || (r < TUI_T_GAUGE ? h.pending == 2 && h.in_flight == 0 : h.in_flight == 1));
+    LCHK(r < TUI_T_LATENCY || (h.pending == 1 && h.in_flight == 1));
+    /* PROBLEMS: the FAILED and the DEAD, nothing else */
+    LCHK((t->prob != NULL) == (r >= TUI_T_PROBLEMS && show_recent) && (h.bytes_problems != 0) == (t->prob != NULL));
+    LCHK(t->p_seq == (r >= TUI_T_PROBLEMS && show_recent ? 2u : 0u));
+    /* TASKS */
+    LCHK((t->tasks != NULL) == (r >= TUI_T_TASKS && show_tasks) && (h.bytes_tasks != 0) == (t->tasks != NULL));
+    LCHK(!t->tasks || (k && k->finished == 1 && k->dead == 1 && k->started == 3));
+    /* ACTIVITY: 4 QUEUED, 3 STARTED, 1 FINISHED */
+    LCHK((t->act != NULL) == (r >= TUI_T_ACTIVITY && show_recent) && (h.bytes_activity != 0) == (t->act != NULL));
+    LCHK(t->a_seq == (r >= TUI_T_ACTIVITY && show_recent ? 8u : 0u));
+    LCHK(!t->act || t->act_nm == NULL || !t->tasks);    /* names copied only without rows */
+    /* LATENCY */
+    LCHK((t->tab != NULL) == (r >= TUI_T_LATENCY) && (h.bytes_handles != 0) == (t->tab != NULL));
+    LCHK(!k || k->lat_n == (r >= TUI_T_LATENCY ? 1u : 0u));
+    /* FULL */
+    LCHK((t->hist != NULL) == (r >= TUI_T_FULL && show_tasks) && (h.bytes_histogram != 0) == (t->hist != NULL));
+    LCHK(!t->hist || !k || t->hist[(size_t)(k - t->tasks) * TUI_HIST_B + 3] == 1);   /* 5 ms: [4, 8) */
+#undef LCHK
+    return ok;
+}
+
+/* 33) */
+static void test_ladder_layers(void)
+{
+    int r, pass;
+    for (r = TUI_T_OFF; r <= TUI_T_FULL; ++r) {          /* installed at each tier */
+        gptps *e = open_manual(); gptps_tui *t;
+        if (!e) return;
+        t = install_cfg(e, TUI_LADDER[r], 64, 0);
+        CHECK(t != NULL);
+        if (!t) { gptps_shutdown(e); return; }
+        ladder_events(t);
+        CHECK(ladder_ok(t, r, 1, 1));
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    for (pass = 0; pass < 2; ++pass) {                   /* moved there at runtime, down then up */
+        gptps *e = open_manual(); gptps_tui *t;
+        if (!e) return;
+        t = install_cfg(e, pass ? GPTPS_TUI_KPI_OFF : GPTPS_TUI_KPI_FULL, 64, 0);
+        CHECK(t != NULL);
+        if (!t) { gptps_shutdown(e); return; }
+        for (r = pass ? TUI_T_OFF : TUI_T_FULL; pass ? r <= TUI_T_FULL : r >= TUI_T_OFF; r += pass ? 1 : -1) {
+            CHECK(gptps_tui_set_kpi(t, (gptps_tui_kpi)TUI_LADDER[r]) == GPTPS_OK);
+            /* a fresh start for the counts this check reads: the dashboard's own, reset */
+            mu_lock(&t->mu);
+            t->q = t->s = t->fin = t->fail = t->retr = t->dead = t->drop = t->term = t->cancel = 0;
+            t->inflight = t->peak = 0;
+            t->p_seq = t->p_seen = t->p_base = 0; t->a_seq = t->a_seen = t->a_base = 0;
+            t->phead = t->ahead = 0;
+            mu_unlock(&t->mu);
+            if (t->tasks || t->tab) {                    /* rows and table start again: a new tier's state */
+                gptps_tui_set_kpi(t, GPTPS_TUI_KPI_GAUGE);
+                gptps_tui_set_kpi(t, (gptps_tui_kpi)TUI_LADDER[r]);
+                mu_lock(&t->mu); t->inflight = 0; mu_unlock(&t->mu);
+            }
+            ladder_events(t);
+            CHECK(ladder_ok(t, r, 1, 1));
+            emit_a(t, GPTPS_EV_FINISHED, "lad", 3, GPTPS_OK, 50, 1);   /* end what this round left alive */
+            emit_a(t, GPTPS_EV_STARTED, "lad", 4, GPTPS_OK, 51, 1);
+            emit_a(t, GPTPS_EV_FINISHED, "lad", 4, GPTPS_OK, 52, 1);
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    for (pass = 0; pass < 3; ++pass) {                   /* a 1.10 caller's struct hiding a pane: not collected */
+        union { gptps_tui_config c; unsigned char b[sizeof(gptps_tui_config) + 64]; } u;
+        gptps *e = open_manual(); gptps_tui *t;
+        static char frame[16384];
+        if (!e) return;
+        memset(&u, 0, sizeof u);
+        u.c.struct_size = TUI_V110_SIZE; u.c.max_recent = 8;
+        u.c.show_tasks = pass != 1 ? -1 : 0; u.c.show_recent = pass != 0 ? -1 : 0;
+        t = gptps_tui_install(e, &u.c);
+        CHECK(t != NULL);
+        if (!t) { gptps_shutdown(e); return; }
+        ladder_events(t);
+        CHECK(ladder_ok(t, TUI_T_FULL, pass == 1, pass == 0));
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK((strstr(frame, "TASKS") != NULL) == (pass == 1) && (strstr(frame, "RECENT") != NULL) == (pass == 0));
+        CHECK(strstr(frame, "no memory") == NULL);       /* hidden is not missing */
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+}
+
+/* 34) */
+static void test_ladder_names(void)
+{
+    static const struct { const char *set, *reads; int kpi; } N[] = {
+        { "off", "off", GPTPS_TUI_KPI_OFF }, { "minimal", "minimal", GPTPS_TUI_KPI_MINIMAL },
+        { "normal", "normal", GPTPS_TUI_KPI_NORMAL }, { "full", "full", GPTPS_TUI_KPI_FULL },
+        { "gauge", "gauge", GPTPS_TUI_KPI_GAUGE }, { "problems", "problems", GPTPS_TUI_KPI_PROBLEMS },
+        { "tasks", "tasks", GPTPS_TUI_KPI_TASKS }, { "activity", "normal", GPTPS_TUI_KPI_NORMAL },
+        { "latency", "latency", GPTPS_TUI_KPI_LATENCY }, { "count", "minimal", GPTPS_TUI_KPI_MINIMAL },
+    };
+    static const int up[] = { GPTPS_TUI_KPI_MINIMAL, GPTPS_TUI_KPI_GAUGE, GPTPS_TUI_KPI_PROBLEMS, GPTPS_TUI_KPI_TASKS,
+                              GPTPS_TUI_KPI_NORMAL, GPTPS_TUI_KPI_LATENCY, GPTPS_TUI_KPI_FULL, GPTPS_TUI_KPI_MINIMAL,
+                              GPTPS_TUI_KPI_GAUGE };
+    gptps *e = open_manual(); gptps_tui *t;
+    char b[GPTPS_SETTINGS_VALUE_MAX], want[32];
+    static char frame[16384];
+    size_t i;
+    if (!e) return;
+    t = install_cfg(e, GPTPS_TUI_KPI_OFF, 64, 0);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    for (i = 0; i < sizeof N / sizeof N[0]; ++i) {
+        CHECK(gptps_settings_set(e, "tui.kpi", N[i].set) == GPTPS_OK);
+        CHECK(gptps_settings_get(e, "tui.kpi", b, sizeof b) == GPTPS_OK && strcmp(b, N[i].reads) == 0);
+        CHECK(t->kpi == N[i].kpi);
+        gptps_tui_render(t, frame, sizeof frame);
+        snprintf(want, sizeof want, "kpi:%s mode:", N[i].reads);
+        CHECK(strstr(frame, want) != NULL);
+    }
+    CHECK(gptps_settings_set(e, "tui.kpi", "custom") == GPTPS_E_CONFIG);   /* no such tier */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_ACTIVITY) == GPTPS_OK && t->kpi == GPTPS_TUI_KPI_NORMAL);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_DEFAULT) == GPTPS_OK && t->kpi == GPTPS_TUI_KPI_FULL);
+    CHECK(gptps_tui_set_kpi(t, (gptps_tui_kpi)10) == GPTPS_E_INVAL && t->kpi == GPTPS_TUI_KPI_FULL);
+    CHECK(gptps_tui_set_kpi(t, (gptps_tui_kpi)-1) == GPTPS_E_INVAL);
+    /* 'm': from off to minimal, up one tier a press, from full back to minimal */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_OFF) == GPTPS_OK);
+    for (i = 0; i < sizeof up / sizeof up[0]; ++i) {
+        CHECK(gptps_tui_press(t, 'm') == 3);
+        CHECK(t->kpi == up[i]);
+        CHECK(t->kpi != GPTPS_TUI_KPI_OFF);
+    }
+    for (i = 0; i < 40; ++i) { gptps_tui_press(t, 'm'); CHECK(t->kpi != GPTPS_TUI_KPI_OFF); }
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* how many times needle occurs in s */
+static int occurs(const char *s, const char *needle)
+{
+    int c = 0;
+    while ((s = strstr(s, needle)) != NULL) { ++c; s += strlen(needle); }
+    return c;
+}
+
+/* 35) */
+static void test_journals(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; gptps_tui_config c;
+    static char frame[32768];
+    gptps_tui_health_info h;
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+    int i;
+    if (!e) return;
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.color = 0; c.interactive = 0; c.kpi = GPTPS_TUI_KPI_NORMAL;
+    c.recent_lines = 4; c.activity_lines = 4;
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    t->rows = 60;
+    for (i = 0; i < 3; ++i) emit_a(t, GPTPS_EV_FAILED, "jr", (gptps_handle)(1 + i), GPTPS_E_TASK, (uint64_t)(1 + i), 1);
+    gptps_tui_render(t, frame, sizeof frame);            /* seen: nothing lost */
+    CHECK(occurs(frame, "FAILED") == 3 && strstr(frame, "not shown") == NULL);
+    for (i = 0; i < 1000; ++i) emit(t, GPTPS_EV_QUEUED, "jr", (gptps_handle)(100 + i), GPTPS_OK, (uint64_t)(10 + i));
+    h = health(t);
+    CHECK(h.journal_not_shown == 996 && h.problems_not_shown == 0);   /* before a frame: exact already */
+    CHECK(h.problems_held == 3 && h.activity_held == 4);   /* the failures are still there */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "RECENT  996 not shown") != NULL);
+    CHECK(occurs(frame, "QUEUED") == 4 && occurs(frame, "FAILED") == 0);   /* newest 4 lines: activity */
+    CHECK(strstr(frame, "lost:") == NULL);               /* an activity loss is not a lost problem */
+    for (i = 0; i < 4; ++i) CHECK(gptps_tui_press(t, 'k') == 2);
+    gptps_tui_render(t, frame, sizeof frame);            /* scrolled back: the failures, kept */
+    CHECK(occurs(frame, "FAILED") == 3 && strstr(frame, "not shown") == NULL);
+    CHECK(health(t).journal_not_shown == 996);
+    /* problems overflow: 10 more before a frame, 4 kept, 6 lost - counted, on the lost: line */
+    for (i = 0; i < 10; ++i) emit_a(t, GPTPS_EV_DROPPED, "jr", (gptps_handle)(2000 + i), GPTPS_E_TASK, 5000, 1);
+    CHECK(health(t).problems_not_shown == 6 && health(t).journal_not_shown == 1002);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "lost: 6 problem events not shown") != NULL);
+    CHECK(health(t).problems_not_shown == 6);
+    /* resized: what no frame showed counts; the new one starts empty */
+    emit_a(t, GPTPS_EV_DROPPED, "jr", 3000, GPTPS_E_TASK, 6000, 1);
+    emit_a(t, GPTPS_EV_DROPPED, "jr", 3001, GPTPS_E_TASK, 6000, 1);
+    CHECK(gptps_tui_set_recent(t, 5, -1) == GPTPS_OK && t->pcap == 5 && t->acap == 4);
+    h = health(t);
+    CHECK(h.problems_not_shown == 8 && h.problems_held == 0 && h.bytes_problems == 5 * sizeof(tui_event));
+    /* 0 lines: off and freed */
+    CHECK(gptps_tui_set_recent(t, 0, 0) == GPTPS_OK && t->prob == NULL && t->act == NULL);
+    h = health(t);
+    CHECK(h.bytes_problems == 0 && h.bytes_activity == 0);
+    emit_a(t, GPTPS_EV_FAILED, "jr", 4000, GPTPS_E_TASK, 7000, 1);   /* written nowhere */
+    CHECK(t->p_seq == 15 && health(t).problems_not_shown == 8);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "RECENT") == NULL);
+    /* the settings, with ranges; tui.activity 0 leaves problems only */
+    CHECK(gptps_settings_set(e, "tui.recent", "4097") == GPTPS_E_CONFIG);
+    CHECK(gptps_settings_set(e, "tui.recent", "3") == GPTPS_OK && t->pcap == 3 && t->prob != NULL);
+    CHECK(gptps_settings_set(e, "tui.activity", "5000") == GPTPS_E_CONFIG && t->act == NULL);
+    CHECK(gptps_settings_get(e, "tui.activity", b, sizeof b) == GPTPS_OK && strcmp(b, "0") == 0);
+    emit_a(t, GPTPS_EV_FAILED, "jr", 4001, GPTPS_E_TASK, 7001, 1);
+    emit(t, GPTPS_EV_QUEUED, "jr", 4002, GPTPS_OK, 7002);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "RECENT  problems only") != NULL && occurs(frame, "FAILED") == 1 && !strstr(frame, "QUEUED"));
+    CHECK(gptps_settings_set(e, "tui.activity", "2") == GPTPS_OK && t->acap == 2);
+    CHECK(gptps_settings_get(e, "tui.recent", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
+    /* below its tier a journal holds nothing, whatever its size */
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_TASKS) == GPTPS_OK && t->act == NULL && t->prob != NULL);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_GAUGE) == GPTPS_OK && t->prob == NULL);
+    CHECK(gptps_settings_get(e, "tui.recent", b, sizeof b) == GPTPS_OK && strcmp(b, "3") == 0);
+    CHECK(gptps_tui_set_recent(t, -2, 1) == GPTPS_E_INVAL && gptps_tui_set_recent(t, 1, 4097) == GPTPS_E_INVAL);
+    CHECK(gptps_tui_set_recent(NULL, 1, 1) == GPTPS_E_INVAL);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 36) */
+static void test_save_reload(void)
+{
+    static const struct { const char *kpi, *reads, *recent, *activity; } W[] = {
+        { "gauge", "gauge", "5", "0" }, { "problems", "problems", "0", "7" }, { "tasks", "tasks", "4096", "1" },
+        { "activity", "normal", "9", "9" }, { "latency", "latency", "1", "4096" }, { "count", "minimal", "8", "8" },
+    };
+    const char *path = "tui_save_reload.toml";
+    size_t i;
+    for (i = 0; i < sizeof W / sizeof W[0]; ++i) {
+        FILE *f = fopen(path, "w");
+        gptps *e = NULL; gptps_tui *t; gptps_tui_config c;
+        char b[GPTPS_SETTINGS_VALUE_MAX];
+        if (!f) { printf("note: cannot write %s; 36) skipped\n", path); return; }
+        fputs("# saved by the dashboard\n[tui]\nkpi = \"full\"\n", f);
+        fclose(f);
+        CHECK(gptps_open(path, &e) == GPTPS_OK);
+        if (!e) break;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.color = 0; c.interactive = 0;
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        CHECK(gptps_settings_set(e, "tui.kpi", W[i].kpi) == GPTPS_OK);
+        CHECK(gptps_settings_set(e, "tui.recent", W[i].recent) == GPTPS_OK);
+        CHECK(gptps_settings_set(e, "tui.activity", W[i].activity) == GPTPS_OK);
+        if (t) {
+            CHECK(gptps_tui_press(t, 's') == 4 && gptps_tui_press(t, 'w') == 4);   /* the pane's own save */
+            CHECK(strstr(t->status, "saved your changes") != NULL);
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+        e = NULL;
+        CHECK(gptps_open(path, &e) == GPTPS_OK);           /* and back */
+        if (!e) break;
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        CHECK(gptps_config_check(e) == GPTPS_OK);           /* 0 config errors */
+        CHECK(gptps_settings_get(e, "tui.kpi", b, sizeof b) == GPTPS_OK && strcmp(b, W[i].reads) == 0);
+        CHECK(gptps_settings_get(e, "tui.recent", b, sizeof b) == GPTPS_OK && strcmp(b, W[i].recent) == 0);
+        CHECK(gptps_settings_get(e, "tui.activity", b, sizeof b) == GPTPS_OK && strcmp(b, W[i].activity) == 0);
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    remove(path);
+}
+
+/* 37) */
+static void test_percentiles(void)
+{
+    gptps *e = open_manual(); gptps_tui *t; char pq[16];
+    static char frame[16384];
+    static const uint64_t lat[] = { 0, 5, 100, 5000 };
+    static const int times[] = { 10, 80, 8, 2 };
+    uint64_t hb[TUI_HIST_B];
+    gptps_handle h = 1;
+    int i, j;
+    CHECK(hist_bucket(0) == 0 && hist_bucket(1) == 1 && hist_bucket(2) == 2 && hist_bucket(3) == 2);
+    CHECK(hist_bucket(4) == 3 && hist_bucket(((uint64_t)1 << 30) - 1) == 30 && hist_bucket((uint64_t)1 << 30) == 31);
+    CHECK(hist_bucket(UINT64_MAX) == 31);
+    memset(hb, 0, sizeof hb);
+    CHECK(strcmp(hist_pct(hb, 50, pq, sizeof pq), "--") == 0);
+    hb[31] = 1;
+    CHECK(strcmp(hist_pct(hb, 50, pq, sizeof pq), ">=1.1G") == 0);
+    if (!e) return;
+    t = install_cfg(e, GPTPS_TUI_KPI_FULL, 256, 0);
+    CHECK(t != NULL && t->hist != NULL);
+    if (!t || !t->hist) { gptps_shutdown(e); gptps_tui_close(t); return; }
+    for (i = 0; i < 4; ++i)
+        for (j = 0; j < times[i]; ++j, ++h) {
+            emit(t, GPTPS_EV_QUEUED, "pc", h, GPTPS_OK, 1000);
+            emit_a(t, GPTPS_EV_STARTED, "pc", h, GPTPS_OK, 1000, 1);
+            emit_a(t, GPTPS_EV_FINISHED, "pc", h, GPTPS_OK, 1000 + lat[i], 1);
+        }
+    t->cols = 120;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "    p50    p95    p99") != NULL);
+    CHECK(strstr(frame, "     <8   <128  <8192") != NULL);   /* 0,5 -> <8; 95th: 100 -> <128; 99th: 5000 -> <8192 */
+    CHECK(widest(frame) <= 120);
+    t->cols = 80;                                        /* no room: not shown, the table stays in the width */
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "p50") == NULL && widest(frame) <= 80);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_LATENCY) == GPTPS_OK && t->hist == NULL);
+    t->cols = 120;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "p50") == NULL && strstr(frame, "avg ms") != NULL);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 38) */
+static void test_recent_merged(void)
+{
+    int pass;
+    for (pass = 0; pass < 2; ++pass) {
+        gptps *e = open_manual(); gptps_tui *t; gptps_tui_config c;
+        static char frame[16384];
+        const char *q, *f, *s1, *d;
+        if (!e) return;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.color = 0; c.interactive = 0; c.kpi = GPTPS_TUI_KPI_NORMAL;
+        c.activity_lines = pass ? -1 : 0;                 /* 0: as recent_lines; -1: off */
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        if (!t) { gptps_shutdown(e); return; }
+        CHECK((t->act == NULL) == (pass == 1) && t->pcap == 8);
+        t->start_ms = 0;
+        emit(t, GPTPS_EV_QUEUED, "mg", 1, GPTPS_OK, 1000);
+        emit_a(t, GPTPS_EV_FAILED, "mg", 2, GPTPS_E_TASK, 1500, 1);
+        emit_a(t, GPTPS_EV_STARTED, "mg", 1, GPTPS_OK, 2000, 1);
+        emit_a(t, GPTPS_EV_DROPPED, "mg", 3, GPTPS_E_TASK, 2000, 1);   /* the same ms as the STARTED */
+        gptps_tui_render(t, frame, sizeof frame);
+        q = strstr(frame, "QUEUED"); f = strstr(frame, "FAILED"); s1 = strstr(frame, "STARTED"); d = strstr(frame, "DROPPED");
+        if (pass == 0) {
+            CHECK(q && f && s1 && d && q < f && f < s1 && s1 < d);
+            CHECK(strstr(frame, "problems only") == NULL);
+        } else {
+            CHECK(!q && !s1 && f && d && f < d && strstr(frame, "RECENT  problems only") != NULL);
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+}
+
+/* 39) */
+static void test_config_111(void)
+{
+    static const struct { int field; int v; const char *msg; } B[] = {
+        { 0, 4097, "cfg.recent_lines 4097 is out of range" }, { 0, -2, "cfg.recent_lines -2 is out of range" },
+        { 1, 5000, "cfg.activity_lines 5000 is out of range" }, { 2, 4, "cfg.clock 4 is out of range" },
+        { 3, 301, "cfg.rate_window_s 301 is out of range" }, { 4, 99, "cfg.pane_refresh_ms 99 is out of range" },
+        { 4, 600001, "cfg.pane_refresh_ms 600001 is out of range" },
+    };
+    size_t i;
+    gptps *e = open_manual(); gptps_tui *t; gptps_tui_config c;
+    if (!e) return;
+    log_begin();
+    for (i = 0; i < sizeof B / sizeof B[0]; ++i) {
+        memset(&c, 0, sizeof c); c.struct_size = sizeof c;
+        if (B[i].field == 0) c.recent_lines = B[i].v;
+        if (B[i].field == 1) c.activity_lines = B[i].v;
+        if (B[i].field == 2) c.clock = B[i].v;
+        if (B[i].field == 3) c.rate_window_s = B[i].v;
+        if (B[i].field == 4) c.pane_refresh_ms = B[i].v;
+        CHECK(gptps_tui_install(e, &c) == NULL);
+        CHECK(log_count(B[i].msg) == 1);
+    }
+    memset(&c, 0, sizeof c); c.struct_size = sizeof c; c.max_recent = 6;   /* the defaults */
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (t) {
+        CHECK(t->pcap == 6 && t->acap == 6 && t->cfg.recent_lines == 6 && t->cfg.activity_lines == 6);
+        CHECK(t->cfg.clock == GPTPS_TUI_CLOCK_MINUTES && t->cfg.rate_window_s == 10 && t->cfg.pane_refresh_ms == 2000);
+    }
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
 int main(void)
 {
     test_sanitiser();
@@ -1772,6 +2227,13 @@ int main(void)
     test_name_index();
     test_config_abi();
     test_lower_bound_sticks();
+    test_ladder_layers();
+    test_ladder_names();
+    test_journals();
+    test_save_reload();
+    test_percentiles();
+    test_recent_merged();
+    test_config_111();
 #if !defined(_WIN32)
     test_health_vs_dead_letters();
     test_storage_storm();

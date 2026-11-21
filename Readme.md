@@ -630,11 +630,13 @@ RECENT
 keys: [r] Resize  [t] Thumbnail   ·  ? help  s settings  t tasks  l dead-letter  m kpi  p pause  q quit
 ```
 
-- **Live metrics:** throughput, pending and in-flight gauges (exact at `full`, or `>=` while only a lower bound; marked `~`
-  below it), cumulative counts, and a per-task
+- **Live metrics:** throughput, pending and in-flight gauges (exact at `latency` and `full`, or `>=` while only a lower bound; marked `~`
+  below), cumulative counts, failures kept apart from the lifecycle flood in the RECENT log (with an exact count of what scrolled away unseen), and a per-task
   table (runs / ok / fail / dead / drop / success-rate / average latency).
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
-  dashboard's own CPU/RAM cost (minimal/normal/full) live; `p` pauses; `s` opens the live
+  dashboard's own CPU/RAM cost live, one tier up the ladder a press (minimal, gauge,
+  problems, tasks, normal, latency, full, then minimal again; `off` is set, never
+  stepped into); `p` pauses; `s` opens the live
   **settings editor**, which explains the selected setting, says why it refuses a value,
   and saves your changes into the config file in place (`w`); `?` shows a help overlay of
   every key.

@@ -607,23 +607,45 @@ enabled automatically). Panes/metrics:
   bar**;
 - per-task table: run / ok / fail / dead / drop, **success rate (ok%)**, and **average
   queue→finish latency (ms)**, plus the task's hotkey;
-- a **scrollable** recent-events log (timestamped) — `k`/`j` scroll older/newer.
+- a **scrollable** recent-events log (timestamped) — `k`/`j` scroll older/newer. It is
+  two journals merged by time: **PROBLEMS** (`FAILED`, `RETRIED`, `DEAD_LETTERED`,
+  `DROPPED`, each with why) and **ACTIVITY** (`QUEUED`, `STARTED`, `FINISHED`, 24 bytes a
+  record), so the lifecycle flood of a busy engine never pushes a failure out. Each
+  journal is sized on its own (`cfg.recent_lines` / `cfg.activity_lines`, at runtime
+  `gptps_tui_set_recent`, `tui.recent`, `tui.activity`: 0..4096, 0 = off and freed), and
+  what was overwritten before any frame showed it is counted exactly by sequence number
+  — `N not shown` on the RECENT line, `gptps_tui_health.journal_not_shown`, and the
+  `lost:` line for problems.
 
 - **Cost is a budgeted knob** — the dashboard runs on the engine's worker threads, so
   its own CPU/RAM is tunable **at runtime**:
-  - **KPI level** (`gptps_tui_set_kpi`, or `m` live): `OFF` = installed but off the
-    event path — the observer returns *before* it takes the dashboard lock and every
-    per-event part is freed, which is the tier for leaving the dashboard in place after
-    you have stopped looking at it (counters do not advance while off);
-    `MINIMAL` = counts only — cheap in work, but still one mutex per event;
-    `NORMAL` = + per-task table + recent log; `FULL` = + the handle table (latency and
-    exact gauges). Each part exists only at its level and up: it is allocated with the
-    lock released, swapped in under it, and **freed when you drop below its level** (the
-    per-task counts start again when the table is rebuilt); the event path never
-    allocates. `m` cycles `MINIMAL`→`NORMAL`→`FULL`
-    and never *into* `OFF`, so a stray keypress cannot blind the dashboard.
+  - **KPI tier** (`gptps_tui_set_kpi`, `tui.kpi`, or `m` live) — a ladder, each tier the
+    one below plus exactly one layer, in order of what it costs per event:
+
+    | tier | `tui.kpi` | adds | per event |
+    |---|---|---|---|
+    | 0 | `off` | leaves the event path: the observer returns *before* the lock, every part is freed | ~1 ns |
+    | 1 | `minimal` (or `count`) | totals: queued, started, finished, failed, retried, dead, dropped, cancelled | one mutex + increments |
+    | 2 | `gauge` | the in-flight / pending gauges (`~`), bar and peak | ~0-2 ns more |
+    | 3 | `problems` | the PROBLEMS journal, with why (≤ 512 B scanned) | 0 on a success |
+    | 4 | `tasks` | the per-task TASKS table (`(other)` row) and `peak MB` | one hash probe |
+    | 5 | `normal` (or `activity`) | the ACTIVITY journal | one 24 B store |
+    | 6 | `latency` | the handle table: avg ms, **exact** gauges | one hash op |
+    | 7 | `full` (the default) | latency percentiles p50/p95/p99 (log2-ms buckets, shown when the terminal is 100+ columns wide) | one increment |
+
+    No tier costs more per event as the window, the task types or a stderr tail grow.
+    `off` is the tier for leaving the dashboard in place after you have stopped looking
+    at it (counters do not advance while off); `minimal` and up still take one mutex per
+    event. The released names and values are kept (`gptps_tui_kpi` 0..4); the new tiers
+    are appended (`GAUGE` = 5 ... `LATENCY` = 9). Each part exists only at its tier and
+    up: it is allocated with the lock released, swapped in under it, and **freed when you
+    drop below its tier** (the per-task counts start again when the table is rebuilt); the
+    event path never allocates. `cfg.show_tasks` / `cfg.show_recent` < 0 also stop
+    collecting what they hide. `m` steps **up** the ladder, `minimal` → `gauge` → … →
+    `full`, then back to `minimal` — never *into* `off`, so a stray keypress cannot blind
+    the dashboard (from `off` it goes to `minimal`).
   - **Latency window** (`gptps_tui_set_latency_window`, or `tui.latency_window`): the
-    live handles FULL's **handle table** tracks (1.11: a hash table, one hash operation
+    live handles the **handle table** of `latency` and `full` tracks (1.11: a hash table, one hash operation
     an event at any size; 64 KiB at the default 1024, 64 MiB at the 1<<20 cap). Size it
     to your in-flight **depth**, not your throughput. An entry lives from `QUEUED` to the
     item's terminal event (`FINISHED`, `DEAD_LETTERED`, `DROPPED`, or `FAILED` with
@@ -631,9 +653,9 @@ enabled automatically). Panes/metrics:
     ever evicted — which is counted under the TASKS table and in `gptps_tui_health`, and
     logged (a WARN once per window size, naming the depth reached). `avg ms` covers
     `FINISHED` items only. The table also makes the **pending / in-flight gauges exact**
-    (below FULL they come from the counters, which cannot tell a cancelled attempt that
+    (below `latency` they come from the counters, which cannot tell a cancelled attempt that
     ran from an item cancelled while queued, and the frame marks them `~`). Exact covers
-    the work queued *after* the table was built: a new table (install, a raise to FULL, a
+    the work queued *after* the table was built: a new table (install, a raise to `latency`, a
     resize) and one a handle found full show `>=` (a lower bound) until the engine reports
     nothing queued or running — on an idle engine at once; an engine that is never idle,
     such as one with an always-up service, keeps `>=`, which stays true. Event-order inversions are handled with `gptps_stats`'
@@ -654,7 +676,7 @@ enabled automatically). Panes/metrics:
 - **Ordering:** `gptps_tui_close()` after `gptps_shutdown()`.
 
 Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scroll ·
-`m` cycles KPI level · `p` pauses/resumes · `l` dead letters · `q` quits.
+`m` steps the KPI tier up (wrapping to minimal, never to off) · `p` pauses/resumes · `l` dead letters · `q` quits.
 
 - **Dead letters (`l`).** Draining is the only way to read the engine's dead letters, and
   it takes them, so the view shows their number until you load them (`g`; `r`/`D` load
