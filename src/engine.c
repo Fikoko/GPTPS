@@ -301,10 +301,14 @@ typedef struct gptps_res_cell {
 
 /* A config file's value being written PROVISIONALLY (cfg_set_from_file): one record
  * per attempt, on the stack of the thread making it, linked under e->m while it runs -
- * what gptps_settings_provisional answers from. */
+ * what gptps_settings_provisional answers from. `writing` is 1 only while the write
+ * accessor itself runs (settings.c sets it around the call, on this thread): a live
+ * set that a watcher of this very value makes, after the accessor returned, is a live
+ * set, not this provisional try. Only the owning thread reads or writes it. */
 typedef struct cfg_prov {
     uint64_t         tid;
     const char      *key;
+    int              writing;
     struct cfg_prov *next;
 } cfg_prov;
 
@@ -464,6 +468,8 @@ struct gptps {
     cfg_prov      *cfg_prov;      /* the provisional writes running now (gptps_settings_provisional) */
     unsigned       hold_depth;    /* gptps_settings_hold on hold_tid: the file's values for what */
     uint64_t       hold_tid;      /* that thread defines wait until it lets go, then apply together */
+    uint64_t       hold_mark;     /* ... marked with this (cfg_apply_pending), 0 while nobody holds */
+    uint64_t       cfg_mark_seq;  /* the last mark made (cfg_new_mark): applies' and holds' marks */
     uintptr_t      load_seq;      /* makes each load's tag unique: a library handle is not */
     uint32_t       reserve_after_skips; /* starvation guard: reserve a budget-blocked top task after this many backfill skips */
     gptps_settings *settings;     /* unified settings registry */
@@ -3359,11 +3365,12 @@ static int cfg_set_from_file(gptps *e, const cfg_item *it, int provisional, gptp
                                              * a gptps_shutdown from either is refused */
         cfg_prov me;
         int wrote = 0;
-        if (provisional) {                  /* gptps_settings_provisional(e, key) says 1 meanwhile */
-            me.tid = gptps_hal_thread_id(); me.key = it->key;
+        if (provisional) {                  /* gptps_settings_provisional(e, key) says 1 while */
+            me.tid = gptps_hal_thread_id(); me.key = it->key; me.writing = 0;   /* the accessor runs */
             gptps_mutex_lock(e->m); me.next = e->cfg_prov; e->cfg_prov = &me; gptps_mutex_unlock(e->m);
         }
-        *st = gptps_settings_set_file(e->settings, it->key, it->text, why, cap, &wrote);
+        *st = gptps_settings_set_file(e->settings, it->key, it->text, why, cap, &wrote,
+                                      provisional ? &me.writing : NULL);
         if (provisional) {
             cfg_prov **pp;
             gptps_mutex_lock(e->m);
@@ -3584,6 +3591,37 @@ static void cfg_defer(gptps *e, gptps_toml *t, size_t i, uint64_t by)
     gptps_mutex_unlock(e->m);
 }
 
+/* A mark for what one apply puts off, or one hold keeps waiting: never 0, never
+ * reused in this engine, so no two of them running at once share it. */
+static uint64_t cfg_new_mark(gptps *e)
+{
+    uint64_t m;
+    gptps_mutex_lock(e->m);
+    m = ++e->cfg_mark_seq;
+    gptps_mutex_unlock(e->m);
+    return m;
+}
+
+/* cfg_apply: the index of the last key a pass will try - one naming a setting, not
+ * claimed, and on a later pass one this apply put off (`me`). (size_t)-1 for none.
+ * Takes e->m and the registry in turn. */
+static size_t cfg_last_try(gptps *e, const gptps_toml *t, size_t n, int pass, uint64_t me)
+{
+    char key[CFG_KEY_MAX];
+    gptps_setting_type ty;
+    size_t i = n;
+    while (i-- > 0) {
+        int skip;
+        gptps_mutex_lock(e->m);
+        skip = gptps_toml_claimed_at(t, i) || (pass && gptps_toml_deferred_at(t, i) != me);
+        if (!skip) gptps_toml_dotted_at(t, i, key, sizeof key);
+        gptps_mutex_unlock(e->m);
+        if (skip) continue;
+        if (pass || gptps_settings_type_of(e->settings, key, &ty)) return i;
+    }
+    return (size_t)-1;
+}
+
 /* A value refused, marked in the file it came from: a save that copies the file
  * writes the engine's own value in its place (cfg_refused). */
 static void cfg_refuse(gptps *e, gptps_toml *t, const cfg_item *it)
@@ -3693,8 +3731,9 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open, int *oom)
      * one of them applies after a refusal in the pass - at most one pass per key the
      * file has, so O(n^2) accessor calls at worst, O(n) for a file whose keys all
      * apply (one pass) or that has no such checks. Every try before the last is
-     * provisional: the accessor can tell (gptps_settings_provisional), and a refusal
-     * then changes nothing, counts nothing and logs nothing - and no watcher fires. A
+     * provisional (but see `lastkey` below): the accessor can tell
+     * (gptps_settings_provisional, while it runs), and a refusal then changes
+     * nothing, counts nothing and logs nothing - and no watcher fires. A
      * value still refused when no pass applies anything more gets one more, ordinary
      * try, and is refused as it always was: logged once, counted once, marked refused.
      * A greedy fixpoint: a file some order applies whole is applied whole when each
@@ -3702,25 +3741,30 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open, int *oom)
      * another key sets is that kind) - not if applying one key makes another refused
      * that a different order would have taken (include/gptps.h, gptps_settings_reload). */
     {
-        char tag;                    /* this apply's mark on what it put off: unique while it runs,
-                                      * so another apply - another thread's, or one a watcher
-                                      * starts on this thread - leaves it alone */
-        uint64_t me = (uint64_t)(uintptr_t)&tag;
+        uint64_t me = cfg_new_mark(e);   /* this apply's mark on what it put off: unique, so
+                                          * another apply - another thread's, or one a watcher
+                                          * starts on this thread - leaves it alone */
         size_t pending = 0;          /* keys put off by this apply, not yet decided */
         int pass = 0, last = 0;      /* last: the ordinary try of what is still put off */
         for (;;) {
             int refused = 0, again = 0;
+            /* The pass's last key to try. Tried when nothing has applied after a refusal
+             * in the pass, its try is the last it gets - nothing can change before a
+             * retry - so it is made ordinary: a file with one such key, or with one
+             * refusal at its end, calls that accessor once, as before 1.13. */
+            size_t lastkey = last ? (size_t)-1 : cfg_last_try(e, t, n, pass, me);
             for (i = 0; i < n; ++i) {
                 gptps_status st;
-                int dep;
+                int dep, prov;
                 if (cfg_claimed(e, t, i)) continue;
                 if (pass && cfg_deferred(e, t, i) != me) continue;
                 cfg_item_at(t, i, &it);
-                if (!cfg_set_from_file(e, &it, !last, &st, &dep, why, sizeof why)) {
+                prov = !last && !(i == lastkey && !again);
+                if (!cfg_set_from_file(e, &it, prov, &st, &dep, why, sizeof why)) {
                     if (pass) { cfg_defer(e, t, i, 0); --pending; }   /* no such setting now: as below */
                     continue;
                 }
-                if (st != GPTPS_OK && dep && !last) {
+                if (st != GPTPS_OK && dep && prov) {
                     if (!pass) { cfg_defer(e, t, i, me); ++pending; }
                     refused = 1;
                     continue;
@@ -3859,6 +3903,58 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open, int *oom)
     return bad;
 }
 
+/* What a cfg_apply_pending call is for. PLAIN: a task's or a resource's settings
+ * just made, a reload's or a loader's sweep - applied now, whatever holds: an item of
+ * a task never runs without its per-task settings (gptps.h THREADING). DEFINE: a
+ * setting just defined (gptps_register_setting, gptps_define_global,
+ * gptps_define_task_setting) - while its thread holds (gptps_settings_hold) the file's
+ * value is marked with the hold's mark and waits. LETGO: the hold's let-go - the first
+ * pass takes what that hold's mark kept waiting, and nothing else (not another
+ * thread's add-on setup's values, which its loader applies). */
+enum { CFG_PEND_PLAIN, CFG_PEND_DEFINE, CFG_PEND_LETGO };
+
+static int cfg_pending_match(const char *key, const char *prefix, size_t pl, int all, int subtree)
+{
+    return all || (subtree ? strncmp(key, prefix, pl) == 0 : strcmp(key, prefix) == 0);
+}
+
+/* cfg_apply_pending: the index of the last entry of e->toml (generation `gen`) a pass
+ * will try - not claimed, marked `sel`, matching the prefix and naming a setting.
+ * (size_t)-1 for none, or when a reload swaps the file meanwhile. Takes e->m and the
+ * registry in turn. */
+static size_t cfg_pending_last(gptps *e, uint32_t gen, uint64_t sel, const char *prefix, size_t pl,
+                               int all, int subtree)
+{
+    char key[CFG_KEY_MAX];
+    gptps_setting_type ty;
+    size_t i;
+    gptps_mutex_lock(e->m);
+    i = e->toml_gen == gen ? gptps_toml_count(e->toml) : 0;
+    gptps_mutex_unlock(e->m);
+    while (i-- > 0) {
+        int skip;
+        gptps_mutex_lock(e->m);
+        if (e->toml_gen != gen || i >= gptps_toml_count(e->toml)) { gptps_mutex_unlock(e->m); return (size_t)-1; }
+        skip = gptps_toml_claimed_at(e->toml, i) || gptps_toml_deferred_at(e->toml, i) != sel;
+        if (!skip) {
+            gptps_toml_dotted_at(e->toml, i, key, sizeof key);
+            skip = !cfg_pending_match(key, prefix, pl, all, subtree);
+        }
+        gptps_mutex_unlock(e->m);
+        if (!skip && gptps_settings_type_of(e->settings, key, &ty)) return i;
+    }
+    return (size_t)-1;
+}
+
+/* Unmark every entry of the current file marked `m` (caller holds e->m): it waits
+ * again, for whichever apply comes next. */
+static void cfg_unmark_locked(gptps *e, uint64_t m)
+{
+    size_t i, n = gptps_toml_count(e->toml);
+    for (i = 0; i < n; ++i)
+        if (gptps_toml_deferred_at(e->toml, i) == m) gptps_toml_defer_at(e->toml, i, 0);
+}
+
 /* Apply the file's values for settings that exist now - a task just registered, a
  * plug-in's or the host's setting just defined. `prefix` is one key, a subtree when
  * it ends in '.', or every key when it is "". An entry that names no setting yet
@@ -3867,80 +3963,108 @@ static unsigned cfg_apply(gptps *e, gptps_toml *t, int at_open, int *oom)
  * As in cfg_apply, a value its write accessor refuses is put off and tried again
  * while another applies after it - which matters for definitions made together (an
  * add-on's setup, gptps_settings_hold): one key at a time, a value checked against a
- * setting not defined yet is checked against what that setting holds now. */
-static void cfg_apply_pending(gptps *e, const char *prefix)
+ * setting not defined yet is checked against what that setting holds now. `mode`:
+ * CFG_PEND_*, above; `hm`: for LETGO, the hold's mark. */
+static void cfg_apply_pending(gptps *e, const char *prefix, int mode, uint64_t hm)
 {
-    size_t from = 0, pl = strlen(prefix), pending = 0;
+    size_t from = 0, pl = strlen(prefix), pending = 0, lastkey = (size_t)-1;
     int all = pl == 0, subtree = pl && prefix[pl - 1] == '.';
     uint32_t seen = 0;
     uint64_t tid = gptps_hal_thread_id();
-    char tag;                       /* this call's mark on what it put off (cfg_apply) */
-    uint64_t me = (uint64_t)(uintptr_t)&tag;
-    int started = 0, pass = 0, last = 0, refused = 0, again = 0;
+    uint64_t me = 0;                /* this call's mark on what it put off (cfg_new_mark) */
+    uint64_t sel0 = mode == CFG_PEND_LETGO ? hm : 0;   /* what the first pass takes */
+    int started = 0, pass = 0, last = 0, refused = 0, again = 0, holding = 0, scan = 1;
+    if (mode == CFG_PEND_LETGO && !hm) return;
     for (;;) {
         cfg_item it;
         char why[512];
         size_t i = 0, n;
         uint32_t gen;
-        int found = 0, dep, put_off = 0;
+        int found = 0, dep, put_off = 0, prov;
         gptps_status st;
         gptps_mutex_lock(e->m);
         /* The reload applies its file. What this call put off goes back to waiting,
          * unmarked: a reload that swaps the file takes it with the old one (and applies
          * and reports its own); one that fails leaves it for the next apply (the
          * reload's own, of everything pending). Never left marked, which no apply or
-         * report would look at again. */
+         * report would look at again - nor what a hold kept waiting, at its let-go. */
         if (e->toml_reloading) {
-            if (started && pending && e->toml_gen == seen) {
-                for (i = 0; i < gptps_toml_count(e->toml); ++i)
-                    if (gptps_toml_deferred_at(e->toml, i) == me) gptps_toml_defer_at(e->toml, i, 0);
-            }
+            if (started && pending && e->toml_gen == seen) cfg_unmark_locked(e, me);
+            if (mode == CFG_PEND_LETGO) cfg_unmark_locked(e, hm);
             gptps_mutex_unlock(e->m);
             return;
         }
-        /* Inside an add-on's setup, its file values wait: the loader applies them when
-         * it returns, so the watcher the add-on registers hears them. Only on the setup
-         * thread - another thread's definitions keep their values, as a task's costs
-         * must (setup-time calls on other threads meanwhile are outside the contract,
-         * gptps.h THREADING). So do they while this thread holds the settings
-         * (gptps_settings_hold): it applies them when it lets go. Looked at once, as the
-         * call starts: one that began goes on to the end. */
-        if (!started && ((e->setup_on && e->setup_tid == tid) || (e->hold_depth && e->hold_tid == tid))) {
-            gptps_mutex_unlock(e->m);
-            return;
+        if (!started) {
+            /* Inside an add-on's setup, its file values wait: the loader applies them
+             * when it returns, so the watcher the add-on registers hears them. Only on
+             * the setup thread - another thread's definitions keep their values, as a
+             * task's costs must (setup-time calls on other threads meanwhile are outside
+             * the contract, gptps.h THREADING). A hold let go inside one leaves what it
+             * kept to that loader's apply. Looked at once, as the call starts: one that
+             * began goes on to the end. */
+            if (e->setup_on && e->setup_tid == tid) {
+                if (mode == CFG_PEND_LETGO) cfg_unmark_locked(e, hm);
+                gptps_mutex_unlock(e->m);
+                return;
+            }
+            /* While this thread holds (gptps_settings_hold), a definition's file value
+             * is marked with the hold's mark: no other apply takes it (they take
+             * unmarked entries), and the let-go applies what carries it, together. */
+            if (mode == CFG_PEND_DEFINE && e->hold_depth && e->hold_tid == tid) {
+                holding = 1; hm = e->hold_mark;
+            } else if (!me) {
+                me = ++e->cfg_mark_seq;            /* cfg_new_mark, under the lock held here */
+            }
         }
         n = gptps_toml_count(e->toml);
         gen = e->toml_gen;
         if (started && gen != seen) {              /* a reload swapped the file: its indexes are new */
             from = 0; pending = 0; pass = 0; last = 0; refused = 0; again = 0;   /* our marks went with it */
+            scan = 1;
         }
         seen = gen; started = 1;
         for (i = from; i < n; ++i) {
             if (gptps_toml_claimed_at(e->toml, i)) continue;
             /* the first pass: what nobody has put off (another thread's apply decides
-             * its own); later passes: what this one put off */
-            if (gptps_toml_deferred_at(e->toml, i) != (pass ? me : 0)) continue;
+             * its own), or at a let-go what the hold kept; later passes: what this one
+             * put off */
+            if (gptps_toml_deferred_at(e->toml, i) != (pass ? me : sel0)) continue;
             cfg_item_at(e->toml, i, &it);
-            if (all || (subtree ? strncmp(it.key, prefix, pl) == 0 : strcmp(it.key, prefix) == 0)) { found = 1; break; }
+            if (cfg_pending_match(it.key, prefix, pl, all, subtree)) { found = 1; break; }
         }
         gptps_mutex_unlock(e->m);
         if (!found) {
-            if (last || !pending) return;
+            if (holding || last || !pending) return;
             if (!again) last = 1;                  /* nothing applied after a refusal */
-            pass += 1; from = 0; refused = 0; again = 0;
+            pass += 1; from = 0; refused = 0; again = 0; scan = 1;
             continue;
         }
         from = i + 1;
-        if (!cfg_set_from_file(e, &it, !last, &st, &dep, why, sizeof why)) {
-            if (pass) {                            /* removed meanwhile: it waits again */
+        if (holding) {                             /* it waits for the let-go, marked */
+            gptps_setting_type ty;
+            if (!gptps_settings_type_of(e->settings, it.key, &ty)) continue;   /* no setting yet */
+            gptps_mutex_lock(e->m);
+            if (e->toml_gen == gen && i < gptps_toml_count(e->toml) && !gptps_toml_claimed_at(e->toml, i)
+                && !gptps_toml_deferred_at(e->toml, i))
+                gptps_toml_defer_at(e->toml, i, hm);
+            gptps_mutex_unlock(e->m);
+            continue;
+        }
+        /* As in cfg_apply: the pass's last entry, tried when nothing applied after a
+         * refusal in the pass, gets an ordinary try - nothing could change before a
+         * retry. So a setting defined alone calls its accessor once, as before 1.13. */
+        if (scan && !last) { lastkey = cfg_pending_last(e, gen, pass ? me : sel0, prefix, pl, all, subtree); scan = 0; }
+        prov = !last && !(i == lastkey && !again);
+        if (!cfg_set_from_file(e, &it, prov, &st, &dep, why, sizeof why)) {
+            if (pass || mode == CFG_PEND_LETGO) {  /* removed meanwhile: it waits again, unmarked */
                 gptps_mutex_lock(e->m);
                 if (e->toml_gen == gen && i < gptps_toml_count(e->toml)) gptps_toml_defer_at(e->toml, i, 0);
                 gptps_mutex_unlock(e->m);
-                pending -= 1;
+                if (pass) pending -= 1;
             }
             continue;
         }
-        put_off = st != GPTPS_OK && dep && !last;
+        put_off = st != GPTPS_OK && dep && prov;
         gptps_mutex_lock(e->m);
         if (e->toml_gen == gen && i < gptps_toml_count(e->toml)) {
             if (put_off) {
@@ -4421,7 +4545,7 @@ gptps_status gptps_register_task(gptps *e, const gptps_task_def *def)
     {   /* the file's values for this task's settings that only exist now */
         char pre[320];
         snprintf(pre, sizeof pre, "tasks.%s.", name);
-        cfg_apply_pending(e, pre);
+        cfg_apply_pending(e, pre, CFG_PEND_PLAIN, 0);   /* never held: a task is usable now */
     }
     gptps_mutex_lock(e->m);
     r->settling = false;                  /* set up: from here on it is there for every call */
@@ -4585,8 +4709,8 @@ gptps_status gptps_define_resource(gptps *e, const char *name, uint64_t budget)
     {   /* the file's values for the settings just made */
         char key[320];
         snprintf(key, sizeof key, "resources.%s", name);
-        cfg_apply_pending(e, key);
-        cfg_apply_pending(e, "tasks.");
+        cfg_apply_pending(e, key, CFG_PEND_PLAIN, 0);
+        cfg_apply_pending(e, "tasks.", CFG_PEND_PLAIN, 0);   /* costs: never held */
     }
     return GPTPS_OK;
 }
@@ -5388,7 +5512,7 @@ gptps_status gptps_define_task_setting(gptps *e, const char *leaf, gptps_setting
         gptps_free(sc->leaf); gptps_free(sc->defval); gptps_free(sc); free_choices(choices);
         return st;
     }
-    cfg_apply_pending(e, "tasks.");      /* the file's values for the settings it made */
+    cfg_apply_pending(e, "tasks.", CFG_PEND_DEFINE, 0);      /* the file's values for the settings it made */
     return GPTPS_OK;
 }
 
@@ -5449,7 +5573,7 @@ gptps_status gptps_register_setting(gptps *e, const gptps_setting_def *def)
             if (e->setup_on && e->setup_tid == gptps_hal_thread_id()) tag = e->setup_tag;
             gptps_mutex_unlock(e->m);
             if (tag) gptps_settings_set_tag(e->settings, def->key, tag);
-            cfg_apply_pending(e, def->key);   /* the file's value for it, if any */
+            cfg_apply_pending(e, def->key, CFG_PEND_DEFINE, 0);   /* the file's value for it, if any */
         }
         return st;
     }
@@ -5621,7 +5745,7 @@ gptps_status gptps_settings_reload(gptps *e, const char *path)
         gptps_mutex_lock(e->m);
         e->toml_reloading = 0;
         gptps_mutex_unlock(e->m);
-        cfg_apply_pending(e, "");        /* what was defined meanwhile, from the file that stands */
+        cfg_apply_pending(e, "", CFG_PEND_PLAIN, 0);        /* what was defined meanwhile, from the file that stands */
         return why == GPTPS_TOML_NOMEM ? GPTPS_E_NOMEM : GPTPS_E_CONFIG;
     }
     gptps_mutex_lock(e->m);
@@ -5636,7 +5760,7 @@ gptps_status gptps_settings_reload(gptps *e, const char *path)
     e->cfg_late_errors += bad;           /* gptps_config_check reports them while this file stands */
     gptps_mutex_unlock(e->m);
     gptps_toml_free(old);
-    cfg_apply_pending(e, "");            /* anything defined while it was being applied */
+    cfg_apply_pending(e, "", CFG_PEND_PLAIN, 0);            /* anything defined while it was being applied */
     if (bad) {
         char msg[400];
         snprintf(msg, sizeof msg, "config %s: %u error%s in the reload; the valid values were applied",
@@ -5659,20 +5783,22 @@ int gptps_settings_provisional(gptps *e, const char *key)
     GPTPS_REFUSE_AFTER_FORK(e, 0);
     me = gptps_hal_thread_id();
     gptps_mutex_lock(e->m);
-    for (p = e->cfg_prov; p; p = p->next)
-        if (p->tid == me && !strcmp(p->key, key)) { yes = 1; break; }
+    for (p = e->cfg_prov; p; p = p->next)   /* writing: in its accessor, not in a watcher after */
+        if (p->tid == me && p->writing && !strcmp(p->key, key)) { yes = 1; break; }
     gptps_mutex_unlock(e->m);
     return yes;
 }
 
 /* ABI 2.10. While this thread holds, the file's values for the settings it defines
- * wait, as an add-on's do during its setup; letting go applies them together
- * (cfg_apply_pending: a value checked against another setting is tried again once
- * that one has its value). Nested on the one thread; another thread is told BUSY. */
+ * wait, marked with this hold's mark, as an add-on's do during its setup; letting go
+ * applies what carries the mark, together (cfg_apply_pending LETGO: a value checked
+ * against another setting is tried again once that one has its value) - and nothing
+ * else, so another thread's add-on setup keeps its values for its loader. Nested on
+ * the one thread; another thread is told BUSY. A task registered, or a resource
+ * defined, while holding takes the file's values at once (CFG_PEND_PLAIN). */
 gptps_status gptps_settings_hold(gptps *e, int hold)
 {
-    uint64_t me;
-    int apply = 0;
+    uint64_t me, mark = 0;
     if (!e) return GPTPS_E_INVAL;
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     me = gptps_hal_thread_id();
@@ -5680,14 +5806,15 @@ gptps_status gptps_settings_hold(gptps *e, int hold)
     if (hold) {
         if (e->hold_depth && e->hold_tid != me) { gptps_mutex_unlock(e->m); return GPTPS_E_BUSY; }
         if (e->hold_depth == (unsigned)-1) { gptps_mutex_unlock(e->m); return GPTPS_E_INVAL; }
+        if (!e->hold_depth) e->hold_mark = ++e->cfg_mark_seq;   /* this hold's, never reused */
         e->hold_tid = me; e->hold_depth += 1;
     } else {
         if (!e->hold_depth || e->hold_tid != me) { gptps_mutex_unlock(e->m); return GPTPS_E_INVAL; }
         e->hold_depth -= 1;
-        if (!e->hold_depth) { e->hold_tid = 0; apply = 1; }
+        if (!e->hold_depth) { e->hold_tid = 0; mark = e->hold_mark; e->hold_mark = 0; }
     }
     gptps_mutex_unlock(e->m);
-    if (apply) cfg_apply_pending(e, "");     /* what was defined meanwhile, together */
+    if (mark) cfg_apply_pending(e, "", CFG_PEND_LETGO, mark);   /* what was defined meanwhile, together */
     return GPTPS_OK;
 }
 
@@ -6049,7 +6176,7 @@ gptps_status gptps_load_addon(gptps *e, const char *path)
          * in setup (addons/gptps_gpu_quota_plugin.c), and a value applied while setup
          * still ran would have reached no watcher - and for whatever another thread
          * defined meanwhile. */
-        cfg_apply_pending(e, "");
+        cfg_apply_pending(e, "", CFG_PEND_PLAIN, 0);
 
         if (s != GPTPS_OK) {
             addon_unwind(e, tag);

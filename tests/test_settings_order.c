@@ -12,7 +12,9 @@
  *     state, no refusal counted or logged, each key's accessor applied once, no ERROR.
  *  3) A file no order applies (lo above the file's own hi): lo is refused ONCE - one
  *     count, one WARN from the accessor, one ERROR, GPTPS_E_CONFIG - the same state in
- *     either order; hi is applied. The accessor's calls: provisional tries, then one.
+ *     either order; hi is applied. The accessor's calls: a provisional try, then the
+ *     last - or one ordinary try only, when nothing can change before a retry (the
+ *     last key of a pass, nothing applied after a refusal in it).
  *  4) A cycle (c taken only when d already holds the value, and d only when c does):
  *     both refused, once each, in either order. A chain x <= y <= z raised in the worst
  *     order (x, y, z) takes a pass per link: applied whole, nothing counted.
@@ -23,7 +25,12 @@
  *  7) A host watcher hears none of a file's values (as before) - and the live set once.
  *  8) A binary plug-in (addon_order) through the host table: at open (its setup's
  *     values) and at reloads, either order, its watcher hears each applied key once and
- *     its provisional-aware accessors count only the refusal that stands.
+ *     its provisional-aware accessors count only the refusal that stands. A live set its
+ *     watcher makes while hearing a provisional try that applied is NOT provisional: its
+ *     refusal is counted.
+ *  9) Under a hold, a task registered (or a resource defined) takes the file's values
+ *     at once - its resource cost is in force before the let-go; a per-task setting
+ *     defined under the hold waits for it, as a setting does.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -229,14 +236,16 @@ static void test_host(int o)
     CHECK(lo_v == 5 && hi_v == 150 && applied_hi == 1 && applied_lo == 0 && refusals == 1);
     CHECK(log_count("app accessor: app.lo refused") == 1 && log_count("app.lo: 200 was refused") == 1);
     CHECK(log_count("refused") == 2 && log_count("1 error in the reload") == 1);
-    /* lo first: a try, a try after hi applied, the last; hi first: a try, the last */
-    CHECK(calls_lo == (o == 0 ? 3u : 2u) && calls_hi == 1);
+    /* lo first: a provisional try, then the last (after hi applied); hi first: lo is the
+     * pass's last key and nothing applied after a refusal - one ordinary try, as in 1.12 */
+    CHECK(calls_lo == (o == 0 ? 2u : 1u) && calls_hi == 1);
     CHECK(gptps_config_check(e) == GPTPS_E_CONFIG);
 
     /* 4) a cycle: neither can go first */
     reset(); lo_v = 5; hi_v = 150;
     CHECK(reload(e, CYCLE[o]) == GPTPS_E_CONFIG);
-    CHECK(c_v == 0 && d_v == 0 && refusals == 2 && calls_c == 2 && calls_d == 2);
+    /* the first listed: provisional, then the last; the second: the pass's last, ordinary */
+    CHECK(c_v == 0 && d_v == 0 && refusals == 2 && calls_c + calls_d == 3 && (o == 0 ? calls_c : calls_d) == 2);
     CHECK(log_count("app.c: 5 was refused") == 1 && log_count("app.d: 5 was refused") == 1 &&
           log_count("2 errors in the reload") == 1);
 
@@ -271,7 +280,9 @@ static void test_host(int o)
     gptps_shutdown(e);
 
     /* 1) again, without the hold: one key at a time, lo meets hi's default (10) - refused
-     * (a provisional try, then the last), the definition-time order the hold removes */
+     * with ONE ordinary try (a setting defined alone: no other key can apply before a
+     * retry, so its accessor is called once, as before 1.13), the definition-time order
+     * the hold removes */
     reset();
     e = open_with(RAISE[o]);
     if (!e) return;
@@ -280,8 +291,41 @@ static void test_host(int o)
     cl = calls_lo; ch = calls_hi;
     define(e, "app.lo", rd_lo, wr_lo);
     define(e, "app.hi", rd_hi, wr_hi);
-    CHECK(lo_v == 1 && hi_v == 100 && refusals == 1 && calls_lo - cl == 2 && calls_hi - ch == 1);
+    CHECK(lo_v == 1 && hi_v == 100 && refusals == 1 && calls_lo - cl == 1 && calls_hi - ch == 1 && prov_seen == 0);
     CHECK(log_count("app.lo: 50 was refused") == 1 && gptps_config_check(e) == GPTPS_E_CONFIG);
+    gptps_shutdown(e);
+}
+
+/* ---- 9) a hold does not keep a task's values ---- */
+static gptps_status noop_run(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_OK; }
+static void test_hold_task(int o)
+{
+    gptps *e;
+    gptps_task_def d;
+    char b[64];
+    reset();
+    e = open_with(o ? "[resources]\ngpu = 4\n[tasks.t]\nknob = 7\n[tasks.t.resources]\ngpu = 2\n[app]\nhi = 100\nlo = 50\n"
+                    : "[resources]\ngpu = 4\n[tasks.t]\nknob = 7\n[tasks.t.resources]\ngpu = 2\n[app]\nlo = 50\nhi = 100\n");
+    if (!e) return;
+    g_e = e;
+    log_clear();
+    CHECK(gptps_settings_hold(e, 1) == GPTPS_OK);
+    define(e, "app.lo", rd_lo, wr_lo);
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "t"; d.run = noop_run; d.exec = GPTPS_EXEC_INPROC;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    /* the task's resource cost is in force at once, while the hold is on */
+    CHECK(gptps_settings_get(e, "tasks.t.resources.gpu", b, sizeof b) == GPTPS_OK && !strcmp(b, "2"));
+    /* a per-task setting defined under the hold: its value waits, as a setting's does */
+    CHECK(gptps_define_task_setting(e, "knob", GPTPS_SETTING_UINT, "1", NULL, 0) == GPTPS_OK);
+    CHECK(gptps_settings_get(e, "tasks.t.knob", b, sizeof b) == GPTPS_OK && !strcmp(b, "1"));
+    define(e, "app.hi", rd_hi, wr_hi);
+    CHECK(lo_v == 1 && hi_v == 10);
+    CHECK(gptps_settings_hold(e, 0) == GPTPS_OK);
+    CHECK(lo_v == 50 && hi_v == 100 && refusals == 0);
+    CHECK(gptps_settings_get(e, "tasks.t.knob", b, sizeof b) == GPTPS_OK && !strcmp(b, "7"));
+    CHECK(gptps_settings_get(e, "tasks.t.resources.gpu", b, sizeof b) == GPTPS_OK && !strcmp(b, "2"));
+    CHECK(log_count("refused") == 0 && gptps_config_check(e) == GPTPS_OK);
     gptps_shutdown(e);
 }
 
@@ -299,17 +343,27 @@ static int lohi(gptps *e, const char *lo, const char *hi)
     return gptps_settings_get(e, "order.lo", a, sizeof a) == GPTPS_OK &&
            gptps_settings_get(e, "order.hi", b, sizeof b) == GPTPS_OK && !strcmp(a, lo) && !strcmp(b, hi);
 }
+static int leak(gptps *e, unsigned *refusals_n, int *nested_st, unsigned *nested_prov)
+{
+    char b[GPTPS_SETTINGS_VALUE_MAX];
+    if (gptps_settings_get(e, "order.leak", b, sizeof b) != GPTPS_OK) return 0;
+    return sscanf(b, "%u %d %u", refusals_n, nested_st, nested_prov) == 3;
+}
 static void test_plugin(int o)
 {
     char text[1024];
     gptps *e;
-    unsigned v[6];
+    unsigned v[6], nr = 0, np = 0;
+    int ns = -1;
+    /* order.n first: its try is provisional (other keys follow it in the pass), it
+     * applies, and the watcher live-sets n = 77 - refused, and counted */
     snprintf(text, sizeof text, "addons = [\"%s\"]\n%s", ADDON_ORDER_PATH,
-             o ? "[order]\nhi = 100\nlo = 50\n" : "[order]\nlo = 50\nhi = 100\n");
+             o ? "[order]\nn = 50\nhi = 100\nlo = 50\n" : "[order]\nn = 50\nlo = 50\nhi = 100\n");
     log_clear();
     e = open_with(text);
     if (!e) return;
     CHECK(lohi(e, "50", "100"));
+    CHECK(leak(e, &nr, &ns, &np) && nr == 1 && ns != GPTPS_OK && ns != -1 && np == 0);
     CHECK(stats(e, v) && v[2] == 0 && v[3] == 1 && v[4] == 1 && v[5] == (o ? 0u : 1u));
     CHECK(log_count("refused") == 0 && gptps_config_check(e) == GPTPS_OK);
     /* reloads, either order */
@@ -327,6 +381,12 @@ static void test_plugin(int o)
     CHECK(reload(e, text) == GPTPS_E_CONFIG && lohi(e, "5", "150"));
     CHECK(stats(e, v) && v[2] == 1 && v[3] == 3 && v[4] == 4);
     CHECK(log_count("addon_order: order.lo refused") == 1 && log_count("order.lo: 200 was refused") == 1);
+    /* the watcher's live set at a reload, too: n back to 5, then 50 listed first */
+    snprintf(text, sizeof text, "addons = [\"%s\"]\n[order]\nn = 5\nlo = 5\nhi = 150\n", ADDON_ORDER_PATH);
+    CHECK(reload(e, text) == GPTPS_OK);
+    snprintf(text, sizeof text, "addons = [\"%s\"]\n[order]\nn = 50\nlo = 5\nhi = 150\n", ADDON_ORDER_PATH);
+    CHECK(reload(e, text) == GPTPS_OK);
+    CHECK(leak(e, &nr, &ns, &np) && nr == 2 && ns != GPTPS_OK && np == 0);
     gptps_shutdown(e);
 }
 #endif
@@ -337,6 +397,7 @@ int main(void)
     gptps_set_log_sink(sink, NULL);
     for (o = 0; o < 2; ++o) {
         test_host(o);
+        test_hold_task(o);
 #ifdef ADDON_ORDER_PATH
         test_plugin(o);
 #endif

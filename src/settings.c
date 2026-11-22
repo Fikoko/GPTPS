@@ -487,9 +487,10 @@ gptps_status gptps_settings_get_by(gptps_settings *r, const char *key, char *buf
 }
 
 /* validate + apply one entry; caller holds r->m. *by_write: the write accessor
- * answered (the value passed the registry's own checks). */
+ * answered (the value passed the registry's own checks). *writing (may be NULL) is 1
+ * exactly while the write accessor runs - not while the watchers run after it. */
 static gptps_status apply_entry(gptps_setting_entry *e, const char *value, char *why, size_t whylen,
-                                int *by_write)
+                                int *by_write, int *writing)
 {
     gptps_status st;
     if (!valid_value(e, value)) {
@@ -497,7 +498,9 @@ static gptps_status apply_entry(gptps_setting_entry *e, const char *value, char 
         return GPTPS_E_CONFIG;
     }
     *by_write = 1;
+    if (writing) *writing = 1;
     st = e->write(e->target, value);     /* write_fn takes the target's own lock */
+    if (writing) *writing = 0;
     if (st != GPTPS_OK && why && whylen) snprintf(why, whylen, "%s was refused (%s)", value, gptps_strerror(st));
     return st;
 }
@@ -506,7 +509,7 @@ static gptps_status apply_entry(gptps_setting_entry *e, const char *value, char 
  * which, for save: a value set live is the operator's change, one a file set is
  * already in a file. */
 static gptps_status set_value(gptps_settings *r, const char *key, const char *value,
-                              char *why, size_t whylen, int live, int *by_write)
+                              char *why, size_t whylen, int live, int *by_write, int *writing)
 {
     gptps_setting_entry *e;
     gptps_setting_watcher *head = NULL;
@@ -530,7 +533,7 @@ static gptps_status set_value(gptps_settings *r, const char *key, const char *va
         memcpy(typed, value, n); typed[n] = 0;
         value = typed;
     }
-    st = apply_entry(e, value, why, whylen, &wrote);
+    st = apply_entry(e, value, why, whylen, &wrote, writing);
     if (by_write) *by_write = wrote;
     if (st == GPTPS_OK) { applied[0] = 0; e->read(e->target, applied, sizeof applied); ok = 1; e->dirty = live; }
     head = r->watchers;                 /* the list as it is now: watchers are prepended, and a */
@@ -549,25 +552,25 @@ static gptps_status set_value(gptps_settings *r, const char *key, const char *va
 
 gptps_status gptps_settings_set_by(gptps_settings *r, const char *key, const char *value)
 {
-    return set_value(r, key, value, NULL, 0, 1, NULL);
+    return set_value(r, key, value, NULL, 0, 1, NULL, NULL);
 }
 
 gptps_status gptps_settings_set_live(gptps_settings *r, const char *key, const char *value,
                                      char *why, size_t whylen)
 {
-    return set_value(r, key, value, why, whylen, 1, NULL);
+    return set_value(r, key, value, why, whylen, 1, NULL, NULL);
 }
 
 gptps_status gptps_settings_set_text(gptps_settings *r, const char *key, const char *value,
                                      char *why, size_t whylen)
 {
-    return set_value(r, key, value, why, whylen, 0, NULL);
+    return set_value(r, key, value, why, whylen, 0, NULL, NULL);
 }
 
 gptps_status gptps_settings_set_file(gptps_settings *r, const char *key, const char *value,
-                                     char *why, size_t whylen, int *by_write)
+                                     char *why, size_t whylen, int *by_write, int *writing)
 {
-    return set_value(r, key, value, why, whylen, 0, by_write);
+    return set_value(r, key, value, why, whylen, 0, by_write, writing);
 }
 
 void gptps_settings_nosave(gptps_settings *r, const char *key)

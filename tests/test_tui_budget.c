@@ -1007,6 +1007,105 @@ static void test_reload(void)
     remove(RL_PATH);
 }
 
+/* 5d) The same for the other footprint keys: tui.recent, tui.activity and
+ * tui.latency_window raised or lowered together with tui.budget_kb, in either order - the
+ * one listed first, refused provisionally, counts and logs nothing. And a latency window
+ * above the cap (clamped, with a WARN) that is refused provisionally and then taken logs
+ * that WARN exactly once. */
+static void test_reload_sizes(void)
+{
+    static const struct { const char *key; int small, big; } K[] = {
+        { "recent", 8, 4096 }, { "activity", 8, 4096 }, { "latency_window", 1024, 65536 },
+    };
+    gptps *e;
+    gptps_tui *t;
+    gptps_tui_config c;
+    char text[256];
+    size_t k;
+    int o;
+    e = rl_open("");
+    if (!e) return;
+    base_cfg(&c, GPTPS_TUI_KPI_FULL, 0);
+    log_begin();
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (!t) { log_end(); gptps_shutdown(e); remove(RL_PATH); return; }
+    for (k = 0; k < sizeof K / sizeof K[0]; ++k) {
+        char v[64];
+        int lo_kb, hi_kb, cap_kb = 0;
+        uint64_t f_small, f_big, r0;
+        gptps_tui_health_info h;
+        /* calibrate: the footprint at each size, with no budget */
+        CHECK(gptps_settings_set(e, "tui.budget_kb", "0") == GPTPS_OK);
+        snprintf(v, sizeof v, "%d", K[k].big);
+        CHECK(gptps_settings_set(e, k == 0 ? "tui.recent" : k == 1 ? "tui.activity" : "tui.latency_window", v) == GPTPS_OK);
+        h = health(t); f_big = h.footprint_bytes + h.runtime_bytes;
+        if (k == 2) {                    /* and at the cap */
+            CHECK(gptps_tui_set_latency_window(t, TUI_LAT_CAP) == GPTPS_OK);
+            h = health(t); cap_kb = (int)((h.footprint_bytes + h.runtime_bytes) / 1024) + 2;
+        }
+        snprintf(v, sizeof v, "%d", K[k].small);
+        CHECK(gptps_settings_set(e, k == 0 ? "tui.recent" : k == 1 ? "tui.activity" : "tui.latency_window", v) == GPTPS_OK);
+        h = health(t); f_small = h.footprint_bytes + h.runtime_bytes;
+        lo_kb = (int)(f_small / 1024) + 2; hi_kb = (int)(f_big / 1024) + 2;
+        CHECK((uint64_t)lo_kb * 1024u < f_big);   /* the big size does not fit the small budget */
+        snprintf(v, sizeof v, "%d", lo_kb);
+        CHECK(gptps_settings_set(e, "tui.budget_kb", v) == GPTPS_OK);
+        r0 = health(t).budget_refusals;
+        for (o = 0; o < 2; ++o) {
+            char want[64], got[64], bk[64], key[64];
+            snprintf(key, sizeof key, "tui.%s", K[k].key);
+            /* raise both: the size listed first is refused provisionally, then taken */
+            if (o == 0) snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\n%s = %d\nbudget_kb = %d\n", K[k].key, K[k].big, hi_kb);
+            else        snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nbudget_kb = %d\n%s = %d\n", hi_kb, K[k].key, K[k].big);
+            CHECK(rl_reload(e, text) == GPTPS_OK);
+            snprintf(want, sizeof want, "%d", K[k].big);
+            CHECK(gptps_settings_get(e, key, got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+            snprintf(want, sizeof want, "%d", hi_kb);
+            CHECK(gptps_settings_get(e, "tui.budget_kb", bk, sizeof bk) == GPTPS_OK && !strcmp(bk, want));
+            CHECK(health(t).budget_refusals == r0 && rl_quiet());
+            /* lower both: the budget listed first is refused provisionally, then taken */
+            if (o == 0) snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nbudget_kb = %d\n%s = %d\n", lo_kb, K[k].key, K[k].small);
+            else        snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\n%s = %d\nbudget_kb = %d\n", K[k].key, K[k].small, lo_kb);
+            CHECK(rl_reload(e, text) == GPTPS_OK);
+            snprintf(want, sizeof want, "%d", K[k].small);
+            CHECK(gptps_settings_get(e, key, got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+            snprintf(want, sizeof want, "%d", lo_kb);
+            CHECK(gptps_settings_get(e, "tui.budget_kb", bk, sizeof bk) == GPTPS_OK && !strcmp(bk, want));
+            CHECK(health(t).budget_refusals == r0 && rl_quiet());
+        }
+        if (k == 2) {
+            /* above the cap, listed first: refused provisionally (no WARN, no count), taken
+             * after the budget - clamped, one cap WARN; listed last: one WARN too */
+            for (o = 0; o < 2; ++o) {
+                char got[64], want[64];
+                if (o == 0) snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nlatency_window = %d\nbudget_kb = %d\n", TUI_LAT_CAP + 1, cap_kb);
+                else        snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nbudget_kb = %d\nlatency_window = %d\n", cap_kb, TUI_LAT_CAP + 1);
+                CHECK(rl_reload(e, text) == GPTPS_OK);
+                snprintf(want, sizeof want, "%d", TUI_LAT_CAP);
+                CHECK(gptps_settings_get(e, "tui.latency_window", got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+                CHECK(log_count("is above the cap of") == 1 && log_count("needs") == 0 && log_count("refused") == 0);
+                CHECK(health(t).budget_refusals == r0);
+                /* a provisional try that is TAKEN (it fits the budget the file already has,
+                 * and another key follows it): the clamp's WARN, once */
+                snprintf(text, sizeof text, "[tui]\nlatency_window = %d\n", K[k].small);
+                CHECK(rl_reload(e, text) == GPTPS_OK);
+                snprintf(text, sizeof text, "[tui]\nlatency_window = %d\nkpi = \"full\"\n", TUI_LAT_CAP + 1);
+                CHECK(rl_reload(e, text) == GPTPS_OK);
+                CHECK(gptps_settings_get(e, "tui.latency_window", got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+                CHECK(log_count("is above the cap of") == 1 && log_count("needs") == 0 && log_count("refused") == 0);
+                CHECK(health(t).budget_refusals == r0);
+                snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nlatency_window = %d\nbudget_kb = %d\n", K[k].small, lo_kb);
+                CHECK(rl_reload(e, text) == GPTPS_OK && health(t).budget_refusals == r0 && rl_quiet());
+            }
+        }
+    }
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    remove(RL_PATH);
+}
+
 /* 7) */
 static void test_health_layout(void)
 {
@@ -1041,6 +1140,7 @@ int main(void)
     test_buffer_stops();
     test_pane_one_stop();
     test_reload();
+    test_reload_sizes();
 #if !defined(_WIN32)
     test_run_stopped();
 #  if !defined(GPTPS_TEST_HAL_SIM)

@@ -308,9 +308,12 @@ gptps_status    gptps_settings_set_text(gptps_settings *r, const char *key, cons
                                         char *why, size_t whylen);
 /* As set_text, and *by_write says whether the setting's write accessor answered: a
  * value the registry's own checks (type, range, choices) let through. 0 when they
- * refused it, or no setting has the key. */
+ * refused it, or no setting has the key. *writing (may be NULL) is 1 exactly while
+ * the write accessor runs, 0 before and after it (while watchers run): what
+ * gptps_settings_provisional answers from, so a live set a watcher makes meanwhile
+ * is never taken for the file's provisional try. */
 gptps_status    gptps_settings_set_file(gptps_settings *r, const char *key, const char *value,
-                                        char *why, size_t whylen, int *by_write);
+                                        char *why, size_t whylen, int *by_write, int *writing);
 void            gptps_settings_nosave(gptps_settings *r, const char *key);  /* a statistic: never saved */
 int             gptps_settings_has(gptps_settings *r, const char *key);
 int             gptps_settings_type_of(gptps_settings *r, const char *key, gptps_setting_type *out);

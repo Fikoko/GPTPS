@@ -1568,14 +1568,21 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * before: a value of the wrong type, out of range or not a choice (no other key
  * changes that), and GPTPS_E_NOMEM from an accessor (memory, not the file: it is not
  * retried, and the result is GPTPS_E_NOMEM). The cost: one pass when every key
- * applies; a key refused for good is tried at least twice (provisionally, then a last
- * time), once more for each pass in which another key applied after it; at worst a
- * pass per key, O(n^2) accessor calls for n keys. Every try but the last is PROVISIONAL: the
- * accessor can ask gptps_settings_provisional, and should then refuse without
- * counting or logging the refusal - the last try, which is not provisional, reports
- * it. A provisional try that applies is an ordinary set (a watcher hears it once); one
- * that refuses must change nothing, so nothing fires. An accessor that does not ask
- * reports each try as it comes: the same refusal, more than once.
+ * applies; a key refused for good is tried once more for each pass in which another
+ * key applied after it, plus its last try; at worst a pass per key, O(n^2) accessor
+ * calls for n keys. A try that nothing could change before a retry - the last key a
+ * pass tries, when no key applied after a refusal in that pass: a setting defined on
+ * its own, or a file's one refused key at its end - is the last try at once, so such a
+ * key's accessor is called once, as before 2.10. Every other try but the last is
+ * PROVISIONAL: the accessor can ask gptps_settings_provisional, and should then refuse
+ * without counting or logging the refusal - the last try, which is not provisional,
+ * reports it. A provisional try that applies is an ordinary set: whatever hears a
+ * file's value (an add-on's watcher - a host watcher hears none) hears it once, and a
+ * set that watcher makes is a live set, not provisional. One that refuses must change
+ * nothing, so nothing fires. An accessor that does not ask reports each try as it
+ * comes: the same refusal, more than once. A refusal put off is reported at its last
+ * try, so its ERROR line follows those of the file's other keys rather than sitting in
+ * line order; the messages, the count and the result are as before.
  * On Windows a file cannot be replaced while another handle has it open, nor opened
  * while it is being replaced. A save that lands while something else reads the file
  * fails with GPTPS_E_IO. A reload, or an open, that lands while an editor or another
@@ -1590,8 +1597,10 @@ GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
  * FILE'S ORDER, above), and a later try reports it. An accessor that counts or logs a
  * refusal skips that while this says 1, and refuses as usual (changing nothing); a
  * loss that is not a refusal of the value - memory that ran out - it reports as ever.
- * 0 for a live set, for the last try of a file's value, on any other thread, and for
- * NULL arguments. Cheap: the engine lock, a short list. Also in the host table. */
+ * 1 only while that write accessor runs: 0 for a live set - one a watcher makes on
+ * hearing the provisional value applied included - for the last try of a file's
+ * value, on any other thread, and for NULL arguments. Cheap: the engine lock, a short
+ * list. Also in the host table. */
 GPTPS_API int gptps_settings_provisional(gptps *e, const char *key);
 
 /* ABI 2.10. Define settings together: while the calling thread holds (hold != 0), the
@@ -1601,9 +1610,18 @@ GPTPS_API int gptps_settings_provisional(gptps *e, const char *key);
  * checked against a setting defined after it is checked against that setting's value
  * from the file, not its default. Holds nest on one thread (each hold needs its let-go;
  * the last applies); GPTPS_E_BUSY while another thread holds, GPTPS_E_INVAL to let go
- * of a hold this thread does not have. Only the file's values wait: a definition, a
- * live set and a reload go ahead. A dashboard or other module that defines several
- * settings checked against each other holds around them (addons/gptps_tui does). */
+ * of a hold this thread does not have. Only the file's values for SETTING DEFINITIONS
+ * wait (gptps_register_setting, gptps_define_global, gptps_define_task_setting - the
+ * last one's values for the tasks already registered too): a task registered or a
+ * resource defined while holding takes the file's values at once - its per-task
+ * settings and resource costs are in force before the let-go, so an item of it never
+ * runs without them. The let-go applies only what this hold kept waiting, not another
+ * thread's (an add-on's setup's values wait for its loader). A definition, a live set
+ * and a reload go ahead; a reload meanwhile applies its file to every setting defined,
+ * held or not. Inside an add-on's setup the setup's own waiting applies instead, and
+ * its loader applies everything when the setup returns. A dashboard or other module
+ * that defines several settings checked against each other holds around them
+ * (addons/gptps_tui does). */
 GPTPS_API gptps_status gptps_settings_hold(gptps *e, int hold);
 
 /* Watch for changes: `cb` fires (with the settings lock RELEASED) after each

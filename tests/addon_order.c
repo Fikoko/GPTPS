@@ -8,6 +8,11 @@
  * (settings_watch: it hears a config file's values) counts what each key applied.
  * order.stats reads the counts back: "calls_lo calls_hi refusals heard_lo heard_hi
  * provisional".
+ * order.n: refused at 77 (counted unless provisional); its watcher, hearing n = 50,
+ * live-sets n = 77 through the host table - a live set made from a watcher of a
+ * provisional try that applied, which must count its refusal (the provisional state
+ * covers the accessor's call only). order.leak reads "n_refusals nested_status
+ * nested_provisional".
  */
 #include "gptps.h"
 #include <stddef.h>
@@ -19,6 +24,9 @@ static const gptps_api_routines *g_api;
 static gptps *g_e;
 static unsigned long g_lo = 1, g_hi = 10;
 static unsigned g_calls_lo, g_calls_hi, g_refusals, g_heard_lo, g_heard_hi, g_prov;
+static unsigned long g_n;
+static unsigned g_n_refusals, g_nested_prov;
+static int g_nested_st = -1, g_in_nested;
 
 static int prov(const char *key)
 {
@@ -64,12 +72,36 @@ static size_t rd_stats(void *t, char *b, size_t c)
     return (size_t)snprintf(b, c, "%u %u %u %u %u %u", g_calls_lo, g_calls_hi, g_refusals, g_heard_lo, g_heard_hi, g_prov);
 }
 static gptps_status wr_stats(void *t, const char *v) { (void)t; (void)v; return GPTPS_E_INVAL; }
+static size_t rd_n(void *t, char *b, size_t c) { (void)t; return (size_t)snprintf(b, c, "%lu", g_n); }
+static gptps_status wr_n(void *t, const char *v)
+{
+    unsigned long n = strtoul(v, NULL, 10);
+    (void)t;
+    if (n == 77) {
+        int p = g_api->settings_provisional(g_e, "order.n");
+        if (g_in_nested && p) ++g_nested_prov;
+        if (!p) ++g_n_refusals;
+        return GPTPS_E_INVAL;
+    }
+    g_n = n;
+    return GPTPS_OK;
+}
+static size_t rd_leak(void *t, char *b, size_t c)
+{
+    (void)t;
+    return (size_t)snprintf(b, c, "%u %d %u", g_n_refusals, g_nested_st, g_nested_prov);
+}
 
 static void heard(const char *key, const char *value, void *ud)
 {
-    (void)value; (void)ud;
+    (void)ud;
     if (!strcmp(key, "order.lo")) ++g_heard_lo;
     else if (!strcmp(key, "order.hi")) ++g_heard_hi;
+    else if (!strcmp(key, "order.n") && !strcmp(value, "50") && !g_in_nested) {
+        g_in_nested = 1;
+        g_nested_st = (int)g_api->settings_set(g_e, "order.n", "77");
+        g_in_nested = 0;
+    }
 }
 
 static gptps_status setup(gptps *e, const gptps_api_routines *api, char **err)
@@ -79,6 +111,8 @@ static gptps_status setup(gptps *e, const gptps_api_routines *api, char **err)
         { "order.lo", GPTPS_SETTING_UINT, rd_lo, wr_lo },
         { "order.hi", GPTPS_SETTING_UINT, rd_hi, wr_hi },
         { "order.stats", GPTPS_SETTING_STRING, rd_stats, wr_stats },
+        { "order.n", GPTPS_SETTING_UINT, rd_n, wr_n },
+        { "order.leak", GPTPS_SETTING_STRING, rd_leak, wr_stats },
     };
     size_t i;
     (void)err;
@@ -88,6 +122,7 @@ static gptps_status setup(gptps *e, const gptps_api_routines *api, char **err)
     g_api = api; g_e = e;
     g_lo = 1; g_hi = 10;          /* a library a load left mapped keeps its statics: start over */
     g_calls_lo = g_calls_hi = g_refusals = g_heard_lo = g_heard_hi = g_prov = 0;
+    g_n = 0; g_n_refusals = g_nested_prov = 0; g_nested_st = -1; g_in_nested = 0;
     if (api->settings_watch(e, heard, NULL) != GPTPS_OK) return GPTPS_E_NOMEM;
     for (i = 0; i < sizeof S / sizeof S[0]; ++i) {
         gptps_setting_def d;
