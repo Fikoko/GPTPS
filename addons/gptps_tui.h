@@ -239,6 +239,12 @@ typedef struct {
     int         cost_budget_pct;/* the observer's ESTIMATED cost, in percent of one core, above which
                                 * it is a pressure condition (0 => 5; 1..100; else install returns
                                 * NULL, with an ERROR). Also `tui.cost_budget_pct` */
+    /* ---- 1.13: read only when struct_size covers them (0 = the default each) ---- */
+    int         budget_kb;     /* a MEMORY budget for the dashboard, in KiB (1024 bytes): 0 => none (the
+                                * default, as before 1.13); 1..2147483647; negative => install returns
+                                * NULL, with an ERROR. A configuration whose footprint (see MEMORY at
+                                * install) is over it is refused - install returns NULL with a WARN
+                                * naming the figure needed. Also `tui.budget_kb`, gptps_tui_set_budget_kb */
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
@@ -265,7 +271,67 @@ typedef struct {
  * allocated with the dashboard's lock released, swapped in under it, and freed after it
  * has been swapped out - never on the event path, which allocates nothing at any level.
  * Lowering the level frees what the new level does not hold; the per-task counts start
- * again when the TASKS table is built again. */
+ * again when the TASKS table is built again.
+ *
+ * MEMORY (1.13). Everything the dashboard allocates is one of three kinds, and
+ * gptps_tui_health reports each exactly (tests/test_tui_budget.c holds the formula to the
+ * allocator, byte for byte, at every tier):
+ *  1. The FOOTPRINT (health.footprint_bytes): what the configuration holds - exact, from
+ *     the sizes alone:
+ *       footprint = D + U x ui_cap + payloads                         (the dashboard)
+ *                 + [TASKS]    R x (max_tasks + 1) + 4 x max(8, next_pow2(2 x max_tasks)) + 2048
+ *                 + [PROBLEMS] E x recent_lines
+ *                 + [NORMAL]   A x activity_lines ((A + 64) x when there is no TASKS table)
+ *                 + [LATENCY]  S x next_pow2((latency_window + 64) x 4/3 + 1)
+ *                 + [FULL]     256 x (max_tasks + 1)
+ *     a [part] counted only where it is held: at its tier and up (the tier that RUNS, the
+ *     request minus what ADAPT shed), its pane shown (show_tasks / show_recent), a journal
+ *     of more than 0 lines, the ACTIVITY journal not shed. ui_cap: the gptps_tui_add_task
+ *     entries' array (8, then doubling, at most max_tasks; 0 before the first); payloads:
+ *     the bytes of their payload copies. The struct sizes on x86-64 Linux (other targets
+ *     differ a little - health has the exact figure on every one; tests/test_tui_budget.c
+ *     holds these to the code): D = 7080 (the dashboard itself), U = 280 (an add_task
+ *     entry), R = 264 (a TASKS row), E = 304 (a PROBLEMS record), A = 24 (an ACTIVITY
+ *     record), S = 32 (a handle-table slot; 28 on i386). At the defaults (FULL,
+ *     max_tasks 64, 8 + 8 journal lines, window 1024): 7080 + 19720 + 2432 + 192 + 65536 +
+ *     16640 = 111600 bytes, 109 KiB.
+ *  2. The BUFFERS (health.runtime_bytes) a frame is made in, held while they are used and
+ *     grown as a frame needs: the dashboard frame's copy-out (the view: 13560 B, plus 560 B
+ *     a row of the terminal's height - 208 B more with a source - kept once made), the open
+ *     tasks / settings / detail pane's cache (bytes_panes), gptps_tui_run's two frame
+ *     buffers and its output buffer (16 KiB to 256 KiB each, while it runs) and
+ *     gptps_tui_snapshot's frame buffer (16 KiB up, during the call).
+ *  3. Outside both, and outside the budget: the dead letters the dead-letter view HOLDS
+ *     (bytes_dead_letters and their copies - the engine's items in the dashboard's keeping
+ *     on an operator's key: refusing them memory would lose them), the copy of a hotkey's
+ *     payload while its submit is made, and - while a part is rebuilt - the old part, freed
+ *     as soon as the new one is in. The engine's own memory for the observer and the
+ *     tui.* settings is the engine's.
+ * BUDGET (cfg.budget_kb / tui.budget_kb / gptps_tui_set_budget_kb; 0 = none, the default).
+ * Every change that would make the footprint of the REQUEST (the formula for what was asked
+ * for, nothing shed - health.footprint_request_bytes) exceed the budget is REFUSED, and
+ * changes nothing: install (NULL), gptps_tui_set_kpi, set_recent, set_latency_window,
+ * add_task / add_task_ex (a new entry, a bigger payload), the 'm' key, a tui.kpi /
+ * tui.recent / tui.activity / tui.latency_window write - each GPTPS_E_INVAL with one WARN
+ * naming what it needs ("tui.kpi=full needs 109 KiB (111600 bytes: ...), over tui.budget_kb
+ * 64 (65536 bytes): refused, nothing changed"), counted in health.budget_refusals and budget_need_bytes - and
+ * so is a budget below the footprint already asked for. Never a silent clamp. A change that
+ * does not grow the footprint is never refused. The BUFFERS are not refused - a frame is
+ * always attempted - but they grow only while footprint + buffers stays within the budget:
+ * past it a growth STOPS (health.budget_stops; a WARN once a minute naming the budget that
+ * would fit): the frame is cut where its buffer ends ("[frame truncated]"), a pane's cache
+ * reads fewer entries (it says so), a dashboard frame with no room for its view says so,
+ * and gptps_tui_run / gptps_tui_snapshot without room for their first 16 KiB make no frame
+ * (gptps_tui_run's output buffer, when it has no room, writes the frame whole, in pieces).
+ * So leave room for them over the footprint: about 27 KiB for gptps_tui_render at 24 rows
+ * (the view), 16 KiB more for gptps_tui_snapshot, 32 KiB more for gptps_tui_run (and its
+ * output buffer, a little more than a frame), and more for a tall frame or an open pane.
+ * With ADAPT (see gptps_tui_health): a STOP is a pressure condition (GPTPS_TUI_P_BUDGET) -
+ * REPORT shows it and WARNs; DEGRADE sheds for it like NOMEM, as every tier step lowers the
+ * footprint and so makes room for the buffers. A REFUSAL never sheds (it changed nothing),
+ * and a shed never lowers the request, so a budget set under DEGRADE is checked against
+ * the request ('u' must fit). Settings files: tui.budget_kb is the last tui key, so a file
+ * is applied with the footprint it sets and then its budget. */
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 
 /* LOCAL per-task settings. `label` (NULL => task name) is shown in the table;
@@ -274,7 +340,9 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
  * type is registered, and at any KPI level (the bindings are kept at every level).
  * GPTPS_E_FULL past cfg.max_tasks names, or when the TASKS table exists and every row
  * is taken by the types its events brought; GPTPS_E_INVAL for a name longer than
- * GPTPS_TASK_NAME_MAX. */
+ * GPTPS_TASK_NAME_MAX, or (1.13) when the entry - its room in the entries' array, its
+ * payload's copy - would take the footprint past tui.budget_kb (a WARN says what it needs;
+ * see BUDGET at gptps_tui_install). */
 gptps_status gptps_tui_add_task(gptps_tui *t, const char *task_name, const char *label,
                                 int hotkey, const void *payload, size_t len);
 
@@ -318,7 +386,9 @@ int gptps_tui_press(gptps_tui *t, int key);
  * without that part (a journal, the TASKS table, the latency table and so avg ms and
  * the exact gauges, or the percentiles), and a WARN says so. It is the operator's word on
  * the tier: it clears what tui.adapt = degrade shed (see ADAPT at gptps_tui_health) and
- * becomes the requested tier, which tui.kpi reads back. */
+ * becomes the requested tier, which tui.kpi reads back. 1.13: GPTPS_E_INVAL, nothing changed,
+ * when the tier's footprint is over tui.budget_kb (see BUDGET at gptps_tui_install) - as for
+ * gptps_tui_set_recent and gptps_tui_set_latency_window. */
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level);
 /* Resize the RECENT journals (1.11): `problems` lines for the PROBLEMS journal, `activity`
  * lines for the ACTIVITY journal; -1 leaves one as it is, 0 turns it off and frees it,
@@ -463,6 +533,16 @@ typedef struct {
                                    * set (0: not shed; pane_refresh_ms is the floor then) */
     uint64_t shed_pressure_all;   /* GPTPS_TUI_P_* bits: the conditions behind every step shed
                                    * since an operator last cleared it (the DEGRADED line's) */
+    /* 1.13, MEMORY and BUDGET (see gptps_tui_install) */
+    uint64_t budget_bytes;        /* tui.budget_kb x 1024 (0: no budget) */
+    uint64_t footprint_bytes;     /* the footprint held now: the formula for what runs (less a
+                                   * part an allocation failure left out) */
+    uint64_t footprint_request_bytes; /* the formula for the request, nothing shed: what every
+                                   * change is checked against */
+    uint64_t runtime_bytes;       /* the frame buffers, view and pane cache held now */
+    uint64_t budget_refusals;     /* changes refused as over the budget, since install */
+    uint64_t budget_stops;        /* buffer growths stopped at the budget, since install */
+    uint64_t budget_need_bytes;   /* the footprint the last refused change needed (0: none) */
 } gptps_tui_health_info;
 
 /* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
@@ -475,13 +555,15 @@ typedef struct {
 #define GPTPS_TUI_P_RENDER        0x040u  /* a frame took more than a tenth of refresh_ms to make */
 #define GPTPS_TUI_P_PANE          0x080u  /* an engine read was slow enough to stretch its interval */
 #define GPTPS_TUI_P_COST          0x100u  /* the estimated observer cost is over cost_budget_pct */
+#define GPTPS_TUI_P_BUDGET        0x200u  /* 1.13: a buffer's growth stopped at tui.budget_kb */
 /* The conditions a DEGRADE step relieves - the ones DEGRADE acts on (see ADAPT below for
  * which step relieves which). 1.12: ACTIVITY_LOST | RENDER | COST (0x142). 1.13 adds
- * UNTRACKED, TRUNCATED (dashboard frames only), NOMEM and PANE (0x1f6). It is a macro: a
- * caller built against 1.12's header still sees 0x142; what the dashboard acts on is the
- * library's. */
+ * UNTRACKED, TRUNCATED (dashboard frames only), NOMEM, PANE and BUDGET (0x3f6). It is a
+ * macro: a caller built against 1.12's header still sees 0x142; what the dashboard acts on
+ * is the library's. */
 #define GPTPS_TUI_P_SHEDDABLE (GPTPS_TUI_P_ACTIVITY_LOST | GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_TRUNCATED | \
-                               GPTPS_TUI_P_NOMEM | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_PANE | GPTPS_TUI_P_COST)
+                               GPTPS_TUI_P_NOMEM | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_PANE | GPTPS_TUI_P_COST | \
+                               GPTPS_TUI_P_BUDGET)
 /* 1.13: the conditions no step relieves - reported, never acted on (see ADAPT for why) */
 #define GPTPS_TUI_P_REPORT_ONLY (GPTPS_TUI_P_PROBLEMS_LOST | GPTPS_TUI_P_FOLDED)
 /* GPTPS_TUI_SHED_*: a DEGRADE step (gptps_tui_health_info.shed). The bits keep their 1.12
@@ -523,6 +605,8 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  *                  cfg.pane_refresh_ms (the 1% rule)
  *   COST           the ESTIMATED observer cost over         -> the highest tui.kpi that fits
  *                  cost_budget_pct (5% of one core)
+ *   BUDGET         a buffer's growth stopped at            -> raise tui.budget_kb, or a lower
+ *                  tui.budget_kb (1.13; see BUDGET)           tui.kpi
  * The cost is an estimate, labelled "est" wherever it is shown: the event rate (from the
  * totals) times a unit cost per tier - OFF 3, MINIMAL 9, GAUGE 10, PROBLEMS 10, TASKS 21,
  * NORMAL 24, LATENCY 38, FULL 38 ns (35 at LATENCY / FULL with the ACTIVITY journal off),
@@ -543,14 +627,15 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  *                              pane_every_ms) doubled, up to 60 s - their hold on the engine's
  *                              lock halved. Repeatable while under 60 s; no data is lost
  *   ACTIVITY    "-activity"    ACTIVITY_LOST, COST (3 ns of the estimate), RENDER and TRUNCATED
- *                              (the RECENT rows a frame merges and prints), NOMEM (its memory)
- *   PERCENTILES "-percentiles" RENDER (the per-row p50/p95/p99), NOMEM - not COST: FULL and
- *                              LATENCY estimate the same 38 ns
- *   LATENCY     "-latency"     UNTRACKED (the table is gone), COST (38 -> 24 ns), NOMEM; it
- *                              also takes the percentiles, and runs NORMAL while the ACTIVITY
+ *                              (the RECENT rows a frame merges and prints), NOMEM and BUDGET
+ *                              (its memory)
+ *   PERCENTILES "-percentiles" RENDER (the per-row p50/p95/p99), NOMEM, BUDGET - not COST: FULL
+ *                              and LATENCY estimate the same 38 ns
+ *   LATENCY     "-latency"     UNTRACKED (the table is gone), COST (38 -> 24 ns), NOMEM, BUDGET;
+ *                              it also takes the percentiles, and runs NORMAL while the ACTIVITY
  *                              journal does (TASKS once it is shed, as in 1.12)
- *   TASKS       "-tasks"       COST, RENDER, TRUNCATED (the TASKS rows), NOMEM; it also takes
- *                              what runs above PROBLEMS (journal, percentiles, table)
+ *   TASKS       "-tasks"       COST, RENDER, TRUNCATED (the TASKS rows), NOMEM, BUDGET; it also
+ *                              takes what runs above PROBLEMS (journal, percentiles, table)
  * TRUNCATED acts only for dashboard frames (a frame is rows of at most the width, so only
  * fewer rows shorten it; a frame cut on another pane is reported only), and only for those
  * cut after the header, where the rows begin, in any buffer (run's / snapshot's, or a
@@ -583,6 +668,10 @@ gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode);   /* DEFAU
 /* The estimated-cost budget, in percent of one core: 1..100 (else GPTPS_E_INVAL). Also
  * `tui.cost_budget_pct`. */
 gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct);
+/* The memory budget (1.13), in KiB: 0 = none, 1..2147483647; else - or below the footprint the
+ * request holds - GPTPS_E_INVAL with a WARN naming the footprint, and nothing changed. See
+ * MEMORY and BUDGET at gptps_tui_install. Also `tui.budget_kb`. */
+gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb);
 
 /* SOURCE (1.12). A host that already aggregates - it runs gptps_stats, say - can let the
  * dashboard SHOW its numbers instead of collecting its own: the header's totals and gauges

@@ -1676,6 +1676,8 @@ TUI_STATIC_ASSERT(f111_order, offsetof(gptps_tui_config, max_tasks) == offsetof(
 /* 1.12: appended after pane_refresh_ms, and the 1.11 struct (its sizeof) ends before them */
 TUI_STATIC_ASSERT(f112_order, offsetof(gptps_tui_config, adapt) == offsetof(gptps_tui_config, pane_refresh_ms) + 4 &&
                   offsetof(gptps_tui_config, cost_budget_pct) == offsetof(gptps_tui_config, adapt) + 4);
+/* 1.13: appended after cost_budget_pct */
+TUI_STATIC_ASSERT(f113_order, offsetof(gptps_tui_config, budget_kb) == offsetof(gptps_tui_config, cost_budget_pct) + 4);
 TUI_STATIC_ASSERT(adapt_vals, GPTPS_TUI_ADAPT_DEFAULT == 0 && GPTPS_TUI_ADAPT_OFF == 1 &&
                               GPTPS_TUI_ADAPT_REPORT == 2 && GPTPS_TUI_ADAPT_DEGRADE == 3);
 TUI_STATIC_ASSERT(health112, offsetof(gptps_tui_health_info, adapt) == offsetof(gptps_tui_health_info, bytes_panes) + 8 &&
@@ -1722,7 +1724,8 @@ TUI_STATIC_ASSERT(lp64_max_tasks, offsetof(gptps_tui_config, max_tasks) == 80);
 TUI_STATIC_ASSERT(lp64_recent_lines, offsetof(gptps_tui_config, recent_lines) == 84);
 TUI_STATIC_ASSERT(lp64_pane_refresh, offsetof(gptps_tui_config, pane_refresh_ms) == 100);
 TUI_STATIC_ASSERT(lp64_end111, offsetof(gptps_tui_config, adapt) == 104);   /* a 1.11 sizeof */
-TUI_STATIC_ASSERT(lp64_size112, sizeof(gptps_tui_config) == 112);
+TUI_STATIC_ASSERT(lp64_end112, offsetof(gptps_tui_config, budget_kb) == 112);   /* a 1.12 sizeof: no tail padding */
+TUI_STATIC_ASSERT(lp64_size113, sizeof(gptps_tui_config) == 120);   /* 1.13 so far: a later field fills its padding */
 #endif
 static void test_config_abi(void)
 {
@@ -3801,9 +3804,9 @@ static void test_adapt_acting(void)
     int w, a0, i;
     char nm[24];
     /* the masks: released bits kept, every condition either acting or report-only */
-    CHECK(GPTPS_TUI_P_SHEDDABLE == 0x1f6u && GPTPS_TUI_P_REPORT_ONLY == 0x009u &&
+    CHECK(GPTPS_TUI_P_SHEDDABLE == 0x3f6u && GPTPS_TUI_P_REPORT_ONLY == 0x009u &&   /* 1.13 K: + BUDGET 0x200 */
           (GPTPS_TUI_P_SHEDDABLE & GPTPS_TUI_P_REPORT_ONLY) == 0 &&
-          (GPTPS_TUI_P_SHEDDABLE | GPTPS_TUI_P_REPORT_ONLY) == 0x1ffu && GPTPS_TUI_SHED_PANE == 0x10u &&
+          (GPTPS_TUI_P_SHEDDABLE | GPTPS_TUI_P_REPORT_ONLY) == 0x3ffu && GPTPS_TUI_SHED_PANE == 0x10u &&
           GPTPS_TUI_SHED_ACTIVITY == 1u && GPTPS_TUI_SHED_PERCENTILES == 2u && GPTPS_TUI_SHED_LATENCY == 4u &&
           GPTPS_TUI_SHED_TASKS == 8u);
 

@@ -1283,6 +1283,19 @@ target_include_directories(test_tui_source PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_link_libraries(test_tui_source PRIVATE gptps)
 add_test(NAME tui_source COMMAND test_tui_source)
 set_tests_properties(tui_source PROPERTIES TIMEOUT 60)
+# tui.budget_kb (1.13): the footprint formula held to the allocator, byte for byte, and
+# every refusal and buffer stop
+add_executable(test_tui_budget tests/test_tui_budget.c)
+target_include_directories(test_tui_budget PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_tui_budget PRIVATE gptps)
+if(GPTPS_HAL_SOURCE MATCHES "hal_sim\\.c$")
+    target_compile_definitions(test_tui_budget PRIVATE GPTPS_TEST_HAL_SIM=1)   # its live loop waits in poll()
+endif()
+if(NOT WIN32)
+    target_link_libraries(test_tui_budget PRIVATE Threads::Threads)
+endif()
+add_test(NAME tui_budget COMMAND test_tui_budget)
+set_tests_properties(tui_budget PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 # the handle table's exact gauges and latency vs every order one handle's events can
 # arrive in - tests/test_stats_order.c's scenarios, with gptps_stats fed beside it

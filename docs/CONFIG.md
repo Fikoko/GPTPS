@@ -65,6 +65,7 @@ The meanings are those the tables below give, from the same descriptions.
 | `tasks.<task>.resources.<name>` | none | - |
 | `tui.recent` | off, its memory freed | - |
 | `tui.activity` | off, its memory freed | - |
+| `tui.budget_kb` | no budget | - |
 
 ## Top level
 
@@ -191,6 +192,7 @@ key nothing claimed.
 | `clock` | one of `"off"`, `"minutes"`, `"seconds"` | `"minutes"` | at once | the header's uptime: off, whole minutes (an idle dashboard repaints once a minute) or seconds (once a second) |
 | `adapt` | one of `"off"`, `"report"`, `"degrade"` | `"report"` | at once | what the dashboard does about its own pressure (its cost and losses, checked once a rate window when a frame is made): off; report - a PRESSURE line and a WARN naming the setting to change; degrade - also shed collection a step at a time (sticky: tui.kpi or 'u' restores) |
 | `cost_budget_pct` | whole number, 1 to 100 | `5` | at once | the dashboard observer's estimated cost (event rate x a measured cost per kpi tier), in percent of one core, past which tui.adapt reports pressure |
+| `budget_kb` | whole number, 0 to 2147483647 | `0` | at once | a memory budget for the dashboard, in KiB: a change whose footprint (gptps_tui.h, MEMORY) would exceed it is refused with a WARN naming what it needs, and frame buffers stop growing at it (counted); 0 = no budget |
 
 ### [gpu_quota]
 

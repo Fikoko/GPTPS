@@ -118,6 +118,8 @@ static uint64_t tui_now_us(void)
 #define TUI_TASKS_CAP 4096
 /* The latency window's cap (cfg.latency_window / tui.latency_window). */
 #define TUI_LAT_CAP   (1 << 20)
+/* tui.budget_kb's range (cfg.budget_kb): 0 none, 1..this many KiB */
+#define TUI_BUDGET_KB_MAX 2147483647
 /* Terminal events that outran the event they are owed (their QUEUED, or a RETRIED) are
  * kept as markers in the handle table, and the newest this many are remembered in a FIFO:
  * the oldest marker is dropped (and counted) when a newer one needs the room, so markers
@@ -174,7 +176,7 @@ static uint64_t tui_now_us(void)
 #define TUI_ACT_FLOOD    1000u
 #define TUI_RENDER_DIV   10u
 #define TUI_COST_DEF     5
-#define TUI_P_N          9          /* GPTPS_TUI_P_* bits */
+#define TUI_P_N          10         /* GPTPS_TUI_P_* bits */
 /* ADAPT, GPTPS_TUI_SHED_PANE (1.13): each such step doubles the engine-reading panes' interval
  * (what runs, pane_every_ms), up to this (ms) - past a minute a pane is no longer read live */
 #define TUI_PANE_SHED_MAX 60000u
@@ -712,6 +714,7 @@ typedef struct {
     size_t     n, cap, pool_len, pool_cap;
     size_t     total;             /* settings: the registry's size at the pass */
     size_t     short_by;          /* entries the pass had no memory for (counted, shown) */
+    int        short_budget;      /* ... or no room for in tui.budget_kb (1.13: a budget stop) */
     int        kw;                /* the key column's width */
     int        stale;             /* a change made from the pane, or 'R': read at the next frame */
     uint64_t   read_ms, cost_us, every_ms;
@@ -832,6 +835,7 @@ struct gptps_tui {
     tui_mutex        rmu;
     tui_view        *view;
     int              view_warned;
+    int              view_stop;     /* the last frame had no room for its view in tui.budget_kb (1.13) */
     tui_pcache       pc;            /* the engine-reading panes' cache (under rmu) */
     /* their passes, for gptps_tui_health (under mu): count, the last one's cost, the
      * interval it set, the cache's bytes; h_pane_us: every pass's cost, summed */
@@ -856,8 +860,15 @@ struct gptps_tui {
     unsigned         shed;
     uint64_t         ad_ms, ad_ev, ad_plost, ad_alost, ad_untr, ad_fold, ad_trunc, ad_nomem, ad_preads, ad_rmax_us;
     uint64_t         pressure, pr_seen, p_row, shed_why, ad_windows, ad_steps, ad_warns, ad_rate, ad_ppm, ad_rmax_last;
-    uint64_t         shed_whys, pane_shed_ms, ad_trd;
+    uint64_t         shed_whys, pane_shed_ms, ad_trd, ad_bstop;
     uint64_t         ad_warn_ms[TUI_P_N], ad_floor_ms, ad_gen;
+    /* ---- MEMORY and BUDGET (1.13; see "budget"), under mu ----
+     * budget: tui.budget_kb x 1024 (0: none). ui_pl: the bytes of the add_task payload copies.
+     * rt_bytes: the BUFFERS held now (the view, the pane cache, run's and snapshot's frame
+     * buffers), counted by rt_realloc / rt_free as they are made and freed. h_bref / h_bstop:
+     * changes refused, growths stopped; b_need: what the last refusal needed; b_warn_ms: the
+     * last stop's WARN (once a minute). */
+    uint64_t         budget, ui_pl, rt_bytes, h_bref, h_bstop, b_need, b_warn_ms;
     char             ad_line[1280];   /* one line a condition, '\n' between */
     /* ---- SOURCE (1.12; gptps_tui_set_source) ----
      * src: the host's source (src.read NULL: none; src.name not kept - src_name is the copy).
@@ -918,6 +929,15 @@ struct gptps_tui {
     HANDLE           wake_ev;       /* the live loop's event (see wake_h) */
 #endif
 };
+
+/* ---- budget (1.13), defined with the storage: see "budget" there ---- */
+static uint64_t foot_held(const gptps_tui *t);
+static int budget_refuses(gptps_tui *t, int ui_cap, uint64_t ui_pl, char *why, size_t cap);
+static void *rt_realloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop);
+static void *rt_new(gptps_tui *t, size_t n, int zero, const char *what, int *stop);
+static void rt_free(gptps_tui *t, void *p, size_t n);
+static void tui_logf(gptps_log_level lvl, const char *fmt, ...);
+static gptps_status reconf_said(const char *who, const char *setting, gptps_status st, const char *what);
 
 /* ---- state (under mu) ---- */
 
@@ -1807,35 +1827,55 @@ static int pc_kind(int pane) { return pane == TUI_PANE_TASKS || pane == TUI_PANE
 static size_t pc_bytes(const tui_pcache *c)
 { return c->cap * (c->tasks ? sizeof(tui_ctask) : c->sets ? sizeof(tui_cset) : 0) + c->pool_cap; }
 
+/* what the pane says it lacked for the entries it could not read */
+#define PC_SHORT(c) ((c)->short_budget ? "no room in tui.budget_kb" : "no memory")
+
 static void pc_free(gptps_tui *t)
 {
     tui_pcache *c = &t->pc;
-    free(c->tasks); free(c->sets); free(c->pool);
+    rt_free(t, c->tasks, c->tasks ? c->cap * sizeof(tui_ctask) : 0);
+    rt_free(t, c->sets, c->sets ? c->cap * sizeof(tui_cset) : 0);
+    rt_free(t, c->pool, c->pool_cap);
     memset(c, 0, sizeof *c);
     c->pane = -1; c->sel_for = -1;
     mu_lock(&t->mu); t->pane_bytes = 0; mu_unlock(&t->mu);
 }
 
-static int pc_grow(tui_pcache *c, int tasks, size_t want)
+/* rmu held: room for `want` entries (a BUFFER: within tui.budget_kb - a stop sets short_budget) */
+static int pc_grow(gptps_tui *t, int tasks, size_t want)
 {
+    tui_pcache *c = &t->pc;
     size_t nc = c->cap ? c->cap : 16;
+    int stop = 0;
     if (want <= c->cap) return 1;
     while (nc < want) nc *= 2;
-    if (tasks) { tui_ctask *n = (tui_ctask *)realloc(c->tasks, nc * sizeof *n); if (!n) return 0; c->tasks = n; }
-    else       { tui_cset *n = (tui_cset *)realloc(c->sets, nc * sizeof *n);   if (!n) return 0; c->sets = n; }
+    if (tasks) {
+        tui_ctask *n = (tui_ctask *)rt_realloc(t, c->tasks, c->cap * sizeof *n, nc * sizeof *n,
+                                               "the tasks pane's cache (fewer task types listed)", &stop);
+        if (!n) { c->short_budget |= stop; return 0; }
+        c->tasks = n;
+    } else {
+        tui_cset *n = (tui_cset *)rt_realloc(t, c->sets, c->cap * sizeof *n, nc * sizeof *n,
+                                             "the settings pane's cache (fewer settings listed)", &stop);
+        if (!n) { c->short_budget |= stop; return 0; }
+        c->sets = n;
+    }
     c->cap = nc;
     return 1;
 }
 
-/* s into the pool: its offset, or (size_t)-1 with no memory */
-static size_t pc_str(tui_pcache *c, const char *s)
+/* rmu held: s into the pool: its offset, or (size_t)-1 with no memory (or no room in the budget) */
+static size_t pc_str(gptps_tui *t, const char *s)
 {
+    tui_pcache *c = &t->pc;
     size_t l = strlen(s) + 1, off;
     if (c->pool_len + l > c->pool_cap) {
         size_t nc = c->pool_cap ? c->pool_cap : 4096;
         char *np;
+        int stop = 0;
         while (nc < c->pool_len + l) nc *= 2;
-        if ((np = (char *)realloc(c->pool, nc)) == NULL) return (size_t)-1;
+        np = (char *)rt_realloc(t, c->pool, c->pool_cap, nc, "the settings pane's cache (fewer settings listed)", &stop);
+        if (np == NULL) { c->short_budget |= stop; return (size_t)-1; }
         c->pool = np; c->pool_cap = nc;
     }
     off = c->pool_len;
@@ -1861,19 +1901,19 @@ static void pc_read(gptps_tui *t, uint64_t now)
     size_t i, n, plen = 0;
     char prefix[160];
     uint64_t t0 = tui_now_us(), t1, every;
-    if (tasks && c->sets)       { free(c->sets);  c->sets = NULL;  c->cap = 0; }
-    else if (!tasks && c->tasks) { free(c->tasks); c->tasks = NULL; c->cap = 0; }
-    c->n = 0; c->pool_len = 0; c->short_by = 0; c->kw = p == TUI_PANE_DETAIL ? 16 : 20;
+    if (tasks && c->sets)       { rt_free(t, c->sets, c->cap * sizeof(tui_cset));   c->sets = NULL;  c->cap = 0; }
+    else if (!tasks && c->tasks) { rt_free(t, c->tasks, c->cap * sizeof(tui_ctask)); c->tasks = NULL; c->cap = 0; }
+    c->n = 0; c->pool_len = 0; c->short_by = 0; c->short_budget = 0; c->kw = p == TUI_PANE_DETAIL ? 16 : 20;
     if (p == TUI_PANE_DETAIL) plen = detail_prefix(t->detail_task, prefix, sizeof prefix);
     n = tasks ? gptps_task_count(t->e) : gptps_settings_count(t->e);
     c->total = n;
-    if (p != TUI_PANE_DETAIL && n > c->cap && !pc_grow(c, tasks, n)) nomem = 1;   /* then entry by entry */
+    if (p != TUI_PANE_DETAIL && n > c->cap && !pc_grow(t, tasks, n)) nomem = 1;   /* then entry by entry */
     for (i = 0; i < n; ++i) {
         if (tasks) {
             gptps_task_info info;
             tui_ctask *k;
             if (!tui_task_at(t->e, i, &info)) continue;          /* gone meanwhile */
-            if (c->n == c->cap && !pc_grow(c, 1, c->n + 1)) { c->short_by++; nomem = 1; continue; }
+            if (c->n == c->cap && !pc_grow(t, 1, c->n + 1)) { c->short_by++; nomem = 1; continue; }
             k = &c->tasks[c->n++];
             copy_name(k->name, sizeof k->name, info.name_copy);
             k->exec = (int)info.exec; k->pri = info.priority; k->enabled = info.enabled; k->removed = info.removed;
@@ -1885,8 +1925,8 @@ static void pc_read(gptps_tui *t, uint64_t now)
             int kc;
             if (!tui_setting_at(t->e, i, &info)) continue;
             if (plen && strncmp(info.key_copy, prefix, plen) != 0) continue;
-            if (c->n == c->cap && !pc_grow(c, 0, c->n + 1)) { c->short_by++; nomem = 1; continue; }
-            if ((ko = pc_str(c, skey(&info))) != (size_t)-1) vo = pc_str(c, info.value);
+            if (c->n == c->cap && !pc_grow(t, 0, c->n + 1)) { c->short_by++; nomem = 1; continue; }
+            if ((ko = pc_str(t, skey(&info))) != (size_t)-1) vo = pc_str(t, info.value);
             if (vo == (size_t)-1) { c->short_by++; nomem = 1; continue; }
             st = &c->sets[c->n++];
             st->key = ko; st->val = vo; st->idx = i; st->hot = info.hot;
@@ -1909,7 +1949,8 @@ static void pc_read(gptps_tui *t, uint64_t now)
     c->sel_for = -1; c->have_sel = 0;
     t->h_pane_reads++; t->h_pane_us += c->cost_us; t->pane_cost_us = c->cost_us; t->pane_every_ms = every;
     t->pane_bytes = pc_bytes(c);
-    if (nomem) t->h_nomem++;                                  /* never silent: shown on the pane too */
+    if (nomem && !c->short_budget) t->h_nomem++;              /* never silent: shown on the pane too (a
+                                                               * budget stop is counted as one: rt_realloc) */
     mu_unlock(&t->mu);
 }
 
@@ -1990,7 +2031,7 @@ static size_t pc_footer(gptps_tui *t, char *buf, size_t cap, size_t pos, const c
     else                    snprintf(cost, sizeof cost, "%.1f ms", (double)c->cost_us / 1000.0);
     /* what was not read comes first: the line is cut to the width, and a loss is the part
      * that must show (at the end, 80 columns cut it once a pass took a millisecond) */
-    n = c->short_by ? snprintf(ln, sizeof ln, "  %s: %lu not read: no memory; ", what, (unsigned long)c->short_by)
+    n = c->short_by ? snprintf(ln, sizeof ln, "  %s: %lu not read: %s; ", what, (unsigned long)c->short_by, PC_SHORT(c))
                     : snprintf(ln, sizeof ln, "  %s: ", what);
     if (n > 0 && (size_t)n < sizeof ln)
         snprintf(ln + n, sizeof ln - (size_t)n, "%s, every %.1f s, age %llu s (R reads now)", cost,
@@ -2138,7 +2179,7 @@ static size_t render_tasks(gptps_tui *t, char *buf, size_t cap)
     more = (int)n > room ? (int)n - room : 0;
     pos = appendf(buf, cap, pos, "%s%s%s \xc2\xb7 tasks%s  (%lu)\n\n", B, brand(t), t->cfg.title, X, (unsigned long)n);
     if (n == 0 && c->short_by)            /* not "none": they could not be read */
-        pos = appendf(buf, cap, pos, "  %sno memory to list %lu task types%s\n", D, (unsigned long)c->short_by, X);
+        pos = appendf(buf, cap, pos, "  %s%s to list %lu task types%s\n", D, PC_SHORT(c), (unsigned long)c->short_by, X);
     else if (n == 0) pos = appendf(buf, cap, pos, "  %s(no task types registered)%s\n", D, X);
     else pos = appendf(buf, cap, pos, "%s  %-18s %-7s %4s %4s %4s %4s  %s%s\n", D, "name", "exec", "pri", "que", "run", "dl", "state", X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < room; ++i) {
@@ -2195,7 +2236,7 @@ static size_t render_detail(gptps_tui *t, char *buf, size_t cap)
     pos = appendf(buf, cap, pos, "%sGPTPS \xc2\xb7 task '%s'%s  %s(%lu settings)%s\n\n", B,
                   tui_cl(t->detail_task, title, sizeof title), X, D, (unsigned long)n, X);
     if (n == 0 && c->pane == TUI_PANE_DETAIL && c->short_by)
-        pos = appendf(buf, cap, pos, "  %sno memory to list its %lu settings%s\n", D, (unsigned long)c->short_by, X);
+        pos = appendf(buf, cap, pos, "  %s%s to list its %lu settings%s\n", D, PC_SHORT(c), (unsigned long)c->short_by, X);
     else if (n == 0) pos = appendf(buf, cap, pos, "  %s(task no longer present)%s\n", D, X);
     for (i = (size_t)first; i < n && (int)(i - (size_t)first) < rows; ++i) {
         const tui_cset *st = &c->sets[i];
@@ -2415,23 +2456,28 @@ static int legend_text(gptps_tui *t, int W, char *out, size_t cap)
 static int view_ready(gptps_tui *t, int R)
 {
     tui_view *v = t->view;
-    int nomem = 0;
-    if (!v) {
-        v = (tui_view *)calloc(1, sizeof *v);
-        if (!v) nomem = 1;
+    int nomem = 0, stop = 0;
+    t->view_stop = 0;
+    if (!v) {                            /* a BUFFER (gptps_tui.h, MEMORY): within tui.budget_kb */
+        v = (tui_view *)rt_new(t, sizeof *v, 1, "the dashboard frame's view (no dashboard frame)", &stop);
+        if (!v) { if (stop) t->view_stop = 1; else nomem = 1; }
         else { v->rule_W = -1; t->view = v; }
     }
     if (v && v->rows_cap < R) {
-        tui_vrow *r = (tui_vrow *)realloc(v->rows, (size_t)R * sizeof *r);
-        if (r) { v->rows = r; v->rows_cap = R; } else nomem = 1;
+        tui_vrow *r = (tui_vrow *)rt_realloc(t, v->rows, (size_t)v->rows_cap * sizeof *r, (size_t)R * sizeof *r,
+                                             "the dashboard frame's rows (fewer shown, '+N more')", &stop);
+        if (r) { v->rows = r; v->rows_cap = R; } else if (!stop) nomem = 1;
     }
     if (v && v->recs_cap < R) {
-        tui_event *r = (tui_event *)realloc(v->recs, (size_t)R * sizeof *r);
-        if (r) { v->recs = r; v->recs_cap = R; } else nomem = 1;
+        tui_event *r = (tui_event *)rt_realloc(t, v->recs, (size_t)v->recs_cap * sizeof *r, (size_t)R * sizeof *r,
+                                               "the dashboard frame's RECENT lines (fewer shown)", &stop);
+        if (r) { v->recs = r; v->recs_cap = R; } else if (!stop) nomem = 1;
     }
     if (v && t->src.read && v->srows_cap < v->rows_cap) {   /* a source's rows: as many as the frame's */
-        gptps_tui_source_row *r = (gptps_tui_source_row *)realloc(v->srows, (size_t)v->rows_cap * sizeof *r);
-        if (r) { v->srows = r; v->srows_cap = v->rows_cap; } else nomem = 1;
+        gptps_tui_source_row *r = (gptps_tui_source_row *)rt_realloc(t, v->srows, (size_t)v->srows_cap * sizeof *r,
+                                                                     (size_t)v->rows_cap * sizeof *r,
+                                                                     "the source's rows (fewer shown)", &stop);
+        if (r) { v->srows = r; v->srows_cap = v->rows_cap; } else if (!stop) nomem = 1;
     }
     if (nomem) { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
     return v != NULL;
@@ -2691,16 +2737,19 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
 #define TUI_SHED_N 5
 static const struct { unsigned bit; const char *name; uint64_t relieves; } TUI_SHED[TUI_SHED_N] = {
     { GPTPS_TUI_SHED_PANE,        "pane",        GPTPS_TUI_P_PANE },
+    /* NOMEM and BUDGET (1.13): every tier step frees heap - and lowers the footprint, so the
+     * frame buffers get the room the budget stopped them at */
     { GPTPS_TUI_SHED_ACTIVITY,    "activity",    GPTPS_TUI_P_ACTIVITY_LOST | GPTPS_TUI_P_COST | GPTPS_TUI_P_RENDER |
-                                                 GPTPS_TUI_P_TRUNCATED | GPTPS_TUI_P_NOMEM },
-    { GPTPS_TUI_SHED_PERCENTILES, "percentiles", GPTPS_TUI_P_RENDER | GPTPS_TUI_P_NOMEM },
-    { GPTPS_TUI_SHED_LATENCY,     "latency",     GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_COST | GPTPS_TUI_P_NOMEM },
+                                                 GPTPS_TUI_P_TRUNCATED | GPTPS_TUI_P_NOMEM | GPTPS_TUI_P_BUDGET },
+    { GPTPS_TUI_SHED_PERCENTILES, "percentiles", GPTPS_TUI_P_RENDER | GPTPS_TUI_P_NOMEM | GPTPS_TUI_P_BUDGET },
+    { GPTPS_TUI_SHED_LATENCY,     "latency",     GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_COST | GPTPS_TUI_P_NOMEM |
+                                                 GPTPS_TUI_P_BUDGET },
     { GPTPS_TUI_SHED_TASKS,       "tasks",       GPTPS_TUI_P_COST | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_TRUNCATED |
-                                                 GPTPS_TUI_P_NOMEM }
+                                                 GPTPS_TUI_P_NOMEM | GPTPS_TUI_P_BUDGET }
 };
 /* the conditions, named as the DEGRADED line's "(pressure: ...)" and the WARNs show them */
 static const char *const TUI_P_NAME[TUI_P_N] = { "problems lost", "activity lost", "untracked", "folded",
-                                                 "truncated", "no memory", "render", "pane", "cost" };
+                                                 "truncated", "no memory", "render", "pane", "cost", "budget" };
 static const char *adapt_str(int a)
 { return a == GPTPS_TUI_ADAPT_OFF ? "off" : a == GPTPS_TUI_ADAPT_DEGRADE ? "degrade" : "report"; }
 
@@ -2791,6 +2840,7 @@ typedef struct {
     unsigned unit;
     uint32_t refresh;
     int      tier, fit, budget, lat_cap, max_tasks, prob_want, pane_cfg, adapt, kpi_req;
+    uint64_t bud_kb;                   /* tui.budget_kb (BUDGET) */
 } tui_adsnap;
 
 /* Condition k of a window in one phrase: what, then the setting to change, then detail -
@@ -2817,6 +2867,8 @@ static void adapt_phrase(const tui_adsnap *a, int k, char *out, size_t cap)
                          "every %llu.%u s)", (unsigned long long)(a->d[7] / 1000u), (unsigned)(a->d[7] / 100u % 10u),
                          a->pane_cfg, (unsigned long long)(a->pane_every / 1000u), (unsigned)(a->pane_every / 100u % 10u));
                 break;
+        case 9:  snprintf(out, cap, "%s buffer growths stopped at tui.budget_kb %llu: raise it, or a lower "
+                          "tui.kpi", fmt_count(c, sizeof c, a->d[9]), (unsigned long long)a->bud_kb); break;
         default: snprintf(out, cap, "est. cost %llu.%u%% of a core > tui.cost_budget_pct %d: tui.kpi=%s (%s ev/s x %u ns "
                           "at %s)", (unsigned long long)(a->ppm / 10000u), (unsigned)(a->ppm / 1000u % 10u), a->budget,
                           a->fit >= 0 ? kpi_str(TUI_LADDER[a->fit]) : "off", fmt_count(c, sizeof c, a->rate), a->unit,
@@ -2833,7 +2885,8 @@ static void adapt_base(gptps_tui *t, uint64_t now)
 {
     t->ad_ms = now; t->ad_ev = adapt_events(t); t->ad_plost = adapt_plost(t); t->ad_alost = adapt_alost(t);
     t->ad_untr = t->h_untracked; t->ad_fold = t->h_folded; t->ad_trunc = t->h_trunc; t->ad_nomem = t->h_nomem;
-    t->ad_preads = t->h_pane_reads; t->ad_rmax_us = 0; t->ad_trd = t->h_trunc_dash; t->ad_gen++;
+    t->ad_preads = t->h_pane_reads; t->ad_rmax_us = 0; t->ad_trd = t->h_trunc_dash; t->ad_bstop = t->h_bstop;
+    t->ad_gen++;
 }
 
 /* Evaluate the window, if one has passed (see above). `now`: TUI_NOW_MS. Never under a lock. */
@@ -2858,6 +2911,8 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
     a.d[4] = t->h_trunc - t->ad_trunc;
     a.d[5] = t->h_nomem - t->ad_nomem;
     a.d[6] = t->ad_rmax_us;
+    a.d[9] = t->h_bstop - t->ad_bstop;
+    a.bud_kb = t->budget / 1024u;
     {   /* PANE: a pass in the window, and its interval stretched past its floor - pane_refresh_ms,
          * or what GPTPS_TUI_SHED_PANE raised it to (so a step that covers the pass relieves it) */
         uint64_t base = t->cfg.pane_refresh_ms;
@@ -2878,6 +2933,7 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
     if (a.d[6] * TUI_RENDER_DIV > (uint64_t)a.refresh * 1000u) a.flags |= GPTPS_TUI_P_RENDER;
     if (a.d[7]) a.flags |= GPTPS_TUI_P_PANE;
     if (a.ppm > (uint64_t)a.budget * 10000u) a.flags |= GPTPS_TUI_P_COST;
+    if (a.d[9]) a.flags |= GPTPS_TUI_P_BUDGET;
     t->pressure = a.flags; t->pr_seen |= a.flags; t->ad_windows++;
     t->ad_rate = a.rate; t->ad_ppm = a.ppm; t->ad_rmax_last = a.d[6];
     /* What counts toward DEGRADE (1.13: every condition a step relieves - TUI_SHED). Frames cut
@@ -2971,9 +3027,8 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
          * allocate before is tried again here (tui_reconfig builds what is missing) - and
          * may fail again, which is said, as every caller of tui_reconfig does. */
         char what[400];
-        (void)tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what);
-        if (what[0]) tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: no memory for %s; the dashboard runs "
-                              "without it", what);
+        (void)reconf_said("gptps_tui: tui.adapt=degrade", "a shed", tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what),
+                          what);                        /* the request is unchanged: never refused */
     }
 }
 
@@ -3250,8 +3305,9 @@ static size_t pane_format(gptps_tui *t, char *buf, size_t cap)
         case TUI_PANE_DETAIL:   return render_detail(t, buf, cap);
         case TUI_PANE_DL:       return render_deadletter(t, buf, cap);
         default:                return t->view ? dash_format(t, t->view, buf, cap)
-                                               : appendf(buf, cap, 0, "%s%s: no memory for the frame (see the log)\n",
-                                                         brand(t), t->cfg.title);
+                                               : appendf(buf, cap, 0, "%s%s: %s for the frame (see the log)\n",
+                                                         brand(t), t->cfg.title,
+                                                         t->view_stop ? "no room in tui.budget_kb" : "no memory");
     }
 }
 
@@ -3293,7 +3349,7 @@ static int view_frame(gptps_tui *t, uint64_t now, int loop, uint64_t *warn_plost
     int R = draw_rows(t);
     *warn_plost = 0;
     if (!view_ready(t, R)) {
-        if (!t->view_warned) {
+        if (!t->view_warned && !t->view_stop) {   /* a budget stop is WARNed by rt_realloc */
             t->view_warned = 1;
             gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui: no memory for the dashboard frame's view; the frame "
                       "says so until there is");
@@ -3348,12 +3404,13 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
     if (pos >= f->cap && f->cap < TUI_FRAME_MAX) {   /* grow to what it needs, then format it again */
         size_t want = next_pow2(pos + 1);
         char *nb;
+        int stop = 0;
         if (want > TUI_FRAME_MAX) want = TUI_FRAME_MAX;
-        nb = (char *)realloc(f->b, want);
+        nb = (char *)rt_realloc(t, f->b, f->cap, want, "the frame buffer (the frame is cut where it ends)", &stop);
         if (nb) {
             f->b = nb; f->cap = want;
             pos = pane_format(t, f->b, f->cap);
-        } else {
+        } else if (!stop) {
             mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
         }
     }
@@ -3871,15 +3928,23 @@ int gptps_tui_press(gptps_tui *t, int key)
     if (key == 'm' || key == 'M') {                 /* cycle KPI level (configure cost live) */
         /* one tier up the ladder, and from FULL back to MINIMAL: never into OFF */
         int nk; mu_lock(&t->mu); nk = TUI_LADDER[t->tier >= TUI_T_FULL ? TUI_T_COUNT : t->tier + 1]; mu_unlock(&t->mu);
-        if (gptps_tui_set_kpi(t, (gptps_tui_kpi)nk) == GPTPS_OK) toast(t, "kpi -> %s", kpi_str(nk));
-        else toast(t, "kpi -> %s, without its buffers: no memory (see the log)", kpi_str(nk));
+        {
+            gptps_status st = gptps_tui_set_kpi(t, (gptps_tui_kpi)nk);
+            if (st == GPTPS_OK) toast(t, "kpi -> %s", kpi_str(nk));
+            else if (st == GPTPS_E_INVAL) toast(t, "kpi stays: %s is over tui.budget_kb (see the log)", kpi_str(nk));
+            else toast(t, "kpi -> %s, without its buffers: no memory (see the log)", kpi_str(nk));
+        }
         return 3;
     }
     if (key == 'u' || key == 'U') {                 /* ADAPT: undo a degrade - the requested tier again */
         int rk, sh; mu_lock(&t->mu); rk = t->kpi_req; sh = t->shed != 0; mu_unlock(&t->mu);
         if (!sh) { toast(t, "nothing is degraded (kpi %s)", kpi_str(rk)); return 3; }
-        if (gptps_tui_set_kpi(t, (gptps_tui_kpi)rk) == GPTPS_OK) toast(t, "restored kpi %s", kpi_str(rk));
-        else toast(t, "restored kpi %s, without its buffers: no memory (see the log)", kpi_str(rk));
+        {
+            gptps_status st = gptps_tui_set_kpi(t, (gptps_tui_kpi)rk);   /* the request: within the budget */
+            if (st == GPTPS_OK) toast(t, "restored kpi %s", kpi_str(rk));
+            else if (st == GPTPS_E_INVAL) toast(t, "kpi %s is over tui.budget_kb (see the log)", kpi_str(rk));
+            else toast(t, "restored kpi %s, without its buffers: no memory (see the log)", kpi_str(rk));
+        }
         return 3;
     }
     if (key == 'p' || key == 'P') {                 /* toggle pause */
@@ -3910,6 +3975,8 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
     gptps_status st = GPTPS_OK;
     uint64_t h;
     int grown_for = -1;
+    char bwhy[400];
+    bwhy[0] = 0;
     if (!t || !task_name) return GPTPS_E_INVAL;
     if (strlen(task_name) > GPTPS_TASK_NAME_MAX) return GPTPS_E_INVAL;   /* never a task's name */
     if (opts) {                        /* an older caller's struct: copy what it has, the rest 0 */
@@ -3931,6 +3998,14 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
         mu_lock(&t->mu);
         for (k = 0; k < t->nui; ++k) if (strcmp(t->ui[k].name, task_name) == 0) { u = &t->ui[k]; break; }
         if (t->tasks) r = row_lookup(t, task_name, h);
+        if (u || !(t->nui >= t->max_tasks || (t->tasks && r < 0 && t->ntasks >= t->tasks_cap))) {
+            /* BUDGET (1.13): a new entry's room (8, then doubling) and a bigger payload grow the footprint */
+            int ncap = !u && t->nui == t->ui_cap ? (t->ui_cap ? t->ui_cap * 2 : 8) : t->ui_cap;
+            if (ncap > t->max_tasks) ncap = t->max_tasks;
+            if (budget_refuses(t, ncap, t->ui_pl - (u ? u->plen : 0) + len, bwhy, sizeof bwhy)) {
+                st = GPTPS_E_INVAL; mu_unlock(&t->mu); break;
+            }
+        }
         if (!u) {
             /* no room: max_tasks entries, or a TASKS table whose every row is taken by
              * the types its events brought (GPTPS_E_FULL, as when the table was the list) */
@@ -3960,6 +4035,7 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
         }
         if (label) copy_u8(u->label, sizeof u->label, label);   /* display only: cut at a character */
         u->hotkey = hotkey;
+        t->ui_pl = t->ui_pl - u->plen + len;              /* the footprint's payload bytes */
         old_pl = u->payload; u->payload = cp; u->plen = len; cp = NULL;
         u->has_opts = opts != NULL;
         if (opts) u->opts = o;
@@ -3977,6 +4053,9 @@ gptps_status gptps_tui_add_task_ex(gptps_tui *t, const char *task_name, const ch
     free(old_ui);
     free(old_pl);
     free(cp);
+    if (bwhy[0])
+        tui_logf(GPTPS_LOG_WARN, "gptps_tui_add_task(%.128s): the entry %s (gptps_tui_health.budget_refusals)",
+                 task_name, bwhy);
     return st;
 }
 
@@ -4378,14 +4457,20 @@ void gptps_tui_run(gptps_tui *t)
                   "the live dashboard does not run (gptps_tui_snapshot renders a frame)");
         return;
     }
-    fb.b = (char *)malloc(TUI_FRAME_MIN);
-    pv.b = fb.b ? (char *)malloc(TUI_FRAME_MIN) : NULL;
-    if (!pv.b) {
-        free(fb.b);
-        mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
-        gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: no memory for the 16 KiB frame buffer; "
-                  "the live dashboard does not run");
-        return;
+    {   /* BUFFERS (gptps_tui.h, MEMORY): within tui.budget_kb */
+        int stop = 0;
+        fb.b = (char *)rt_new(t, TUI_FRAME_MIN, 0, "gptps_tui_run's frame buffer (the live dashboard does not "
+                              "run)", &stop);
+        pv.b = fb.b ? (char *)rt_new(t, TUI_FRAME_MIN, 0, "gptps_tui_run's second frame buffer (the live "
+                                     "dashboard does not run)", &stop) : NULL;
+        if (!pv.b) {
+            rt_free(t, fb.b, fb.b ? TUI_FRAME_MIN : 0);
+            if (stop) return;                   /* counted and WARNed by rt_realloc */
+            mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
+            gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: no memory for the 16 KiB frame buffer; "
+                      "the live dashboard does not run");
+            return;
+        }
     }
     fb.cap = pv.cap = TUI_FRAME_MIN;
     pv.b[0] = 0;
@@ -4433,9 +4518,11 @@ void gptps_tui_run(gptps_tui *t)
             asked = first || (resized & 1) || meta.pane != painted_pane;
             full = asked || (int)nl > draw_rows(t);     /* taller than the screen: scrolled, so redraw it all */
             if (ocap < hdr + frame_out_cap(n, nl)) {   /* the output buffer, grown with the frame */
-                char *nb = (char *)realloc(ob, hdr + frame_out_cap(n, nl));
+                int stop = 0;
+                char *nb = (char *)rt_realloc(t, ob, ocap, hdr + frame_out_cap(n, nl), "gptps_tui_run's output "
+                                              "buffer (the frame is written whole, in pieces)", &stop);
                 if (nb) { ob = nb; ocap = hdr + frame_out_cap(n, nl); }
-                else { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
+                else if (!stop) { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
             }
             if (!asked && strcmp(fb.b, pv.b) == 0) {
                 olen = 0;                       /* the same frame, even one taller than the screen */
@@ -4501,7 +4588,7 @@ void gptps_tui_run(gptps_tui *t)
     term_restore(t);
     if (have_wake) wake_close(t, rfd);
     mu_lock(&t->mu); t->frame_bytes = 0; t->waiting = 0; mu_unlock(&t->mu);
-    free(fb.b); free(pv.b); free(ob);
+    rt_free(t, fb.b, fb.cap); rt_free(t, pv.b, pv.cap); rt_free(t, ob, ocap);
 }
 
 /* ---- settings registry bindings (target = the gptps_tui) ---- */
@@ -4560,6 +4647,8 @@ static gptps_status ts_wr_adapt(void *p, const char *v)
 }
 static size_t ts_rd_budget(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->cost_pct; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
 static gptps_status ts_wr_budget(void *p, const char *v) { return gptps_tui_set_cost_budget((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
+static size_t ts_rd_budget_kb(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->cfg.budget_kb; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
+static gptps_status ts_wr_budget_kb(void *p, const char *v) { return gptps_tui_set_budget_kb((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
 static size_t ts_rd_mode(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int m; mu_lock(&t->mu); m = t->mode; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", mode_str(m)); }
 static gptps_status ts_wr_mode(void *p, const char *v) { int m = (strcmp(v, "realtime") == 0) ? GPTPS_TUI_CONTINUOUS : (strcmp(v, "on-demand") == 0) ? GPTPS_TUI_ON_DEMAND : GPTPS_TUI_PAUSED; return gptps_tui_set_mode((gptps_tui *)p, (gptps_tui_mode)m); }
 
@@ -4610,6 +4699,12 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
                                                     "measured cost per kpi tier), in percent of one core, past "
                                                     "which tui.adapt reports pressure",
                                                     NULL, ts_rd_budget, ts_wr_budget, 1, 1, 100 },
+        /* 1.13 - LAST, so a settings file is applied with the footprint it sets, then its budget */
+        { "tui.budget_kb",      GPTPS_SETTING_UINT, "a memory budget for the dashboard, in KiB: a change whose "
+                                                    "footprint (gptps_tui.h, MEMORY) would exceed it is refused "
+                                                    "with a WARN naming what it needs, and frame buffers stop "
+                                                    "growing at it (counted); 0 = no budget",
+                                                    NULL, ts_rd_budget_kb, ts_wr_budget_kb, 1, 0, TUI_BUDGET_KB_MAX },
     };
     size_t i;
     gptps_setting_def d;
@@ -4710,6 +4805,151 @@ static void parts_make(tui_parts *p, const tui_plan *w)
     }
 }
 
+/* ---- budget (1.13; gptps_tui.h, MEMORY and BUDGET) ---------------------------------
+ * The FOOTPRINT is a formula of the sizes (foot_calc), the one tui_reconfig builds to: what
+ * the configuration holds. foot_held is the same sum over what IS held (they differ only by
+ * a part an allocation failure left out). Changes are checked against the formula for the
+ * REQUEST (nothing shed: a shed must never make room for a request that 'u' then rebuilds
+ * past the budget). The BUFFERS a frame is made in go through rt_realloc / rt_free, which
+ * keep rt_bytes and stop a growth that would take footprint + buffers past the budget. */
+typedef struct { uint64_t base, tasks, prob, act, tab, hist, total; } tui_foot;
+
+/* mu held: the footprint formula for running `tier` with these sizes (act_shed: the ACTIVITY
+ * journal shed). Mirrors tui_reconfig's want_* and parts_make, part by part. */
+static void foot_calc(tui_foot *f, const gptps_tui *t, int tier, int prob_want, int act_want, int act_shed,
+                      int win, int ui_cap, uint64_t ui_pl)
+{
+    int tasks = tier >= TUI_T_TASKS && t->show_tasks;
+    memset(f, 0, sizeof *f);
+    f->base = sizeof *t + (uint64_t)ui_cap * sizeof(tui_ui) + ui_pl;
+    if (tasks) f->tasks = tasks_bytes(t->max_tasks);
+    if (tier >= TUI_T_PROBLEMS && t->show_recent && prob_want > 0) f->prob = (uint64_t)prob_want * sizeof(tui_event);
+    if (tier >= TUI_T_ACTIVITY && t->show_recent && act_want > 0 && !act_shed) f->act = act_bytes(act_want, !tasks);
+    if (tier >= TUI_T_LATENCY) f->tab = (uint64_t)trk_slots(win) * sizeof(tui_slot);
+    if (tier >= TUI_T_FULL && tasks) f->hist = hist_bytes(t->max_tasks);
+    f->total = f->base + f->tasks + f->prob + f->act + f->tab + f->hist;
+}
+/* mu held: the formula for the request (nothing shed) */
+static uint64_t foot_req(const gptps_tui *t)
+{
+    tui_foot f;
+    foot_calc(&f, t, kpi_tier(t->kpi_req), t->prob_want, t->act_want, 0, t->lat_cap, t->ui_cap, t->ui_pl);
+    return f.total;
+}
+/* mu held: the footprint held now, part by part (health's bytes_*) */
+static uint64_t foot_held(const gptps_tui *t)
+{
+    return sizeof *t + (uint64_t)t->ui_cap * sizeof(tui_ui) + t->ui_pl
+         + (t->tasks ? tasks_bytes(t->max_tasks) : 0)
+         + (t->prob ? (uint64_t)t->pcap * sizeof(tui_event) : 0)
+         + (t->act ? (uint64_t)act_bytes(t->acap, t->act_nm != NULL) : 0)
+         + (t->hist ? (uint64_t)hist_bytes(t->max_tasks) : 0)
+         + (t->tab ? (uint64_t)(t->tab_mask + 1) * sizeof(tui_slot) : 0);
+}
+static uint64_t kib_up(uint64_t b) { return (b + 1023u) / 1024u; }
+/* "needs 109 KiB (111520 bytes: the dashboard 7000, TASKS 19720, ...), over tui.budget_kb 64 (65536
+ * bytes): refused, nothing changed" */
+/* (each piece formatted into a buffer it provably fits - a 20-digit number, a name of at most
+ * 16 bytes - and appended whole while it fits `cap`) */
+static void foot_add(char *out, size_t cap, size_t *p, const char *s)
+{
+    size_t n = strlen(s);
+    if (*p + n < cap) { memcpy(out + *p, s, n + 1); *p += n; }
+}
+static void foot_text(const tui_foot *f, uint64_t budget, char *out, size_t cap)
+{
+    static const char *const N[] = { "the dashboard", "TASKS", "PROBLEMS", "ACTIVITY", "the handle table",
+                                     "the percentiles" };
+    uint64_t v[6];
+    char piece[128];
+    size_t p = 0;
+    int k, n = 0;
+    if (!cap) return;
+    out[0] = 0;
+    v[0] = f->base; v[1] = f->tasks; v[2] = f->prob; v[3] = f->act; v[4] = f->tab; v[5] = f->hist;
+    snprintf(piece, sizeof piece, "needs %llu KiB (%llu bytes: ", (unsigned long long)kib_up(f->total),
+             (unsigned long long)f->total);
+    foot_add(out, cap, &p, piece);
+    for (k = 0; k < 6; ++k)
+        if (v[k]) {
+            snprintf(piece, sizeof piece, "%s%s %llu", n++ ? ", " : "", N[k], (unsigned long long)v[k]);
+            foot_add(out, cap, &p, piece);
+        }
+    snprintf(piece, sizeof piece, "), over tui.budget_kb %llu (%llu bytes): refused, nothing changed",
+             (unsigned long long)(budget / 1024u), (unsigned long long)budget);
+    foot_add(out, cap, &p, piece);
+}
+/* mu held: whether a change to the request - the formula `nw` - is over the budget; if so it
+ * is counted and *why says what it needs. The request's footprint is never over the budget
+ * (install, set_budget_kb and every change are checked), so a change that does not grow it
+ * is never refused. */
+static int foot_refuses(gptps_tui *t, const tui_foot *nw, char *why, size_t cap)
+{
+    if (!t->budget || nw->total <= t->budget) return 0;
+    t->h_bref++; t->b_need = nw->total;
+    foot_text(nw, t->budget, why, cap);
+    return 1;
+}
+/* mu held: add_task's check - the request with this many entries and payload bytes */
+static int budget_refuses(gptps_tui *t, int ui_cap, uint64_t ui_pl, char *why, size_t cap)
+{
+    tui_foot f;
+    foot_calc(&f, t, kpi_tier(t->kpi_req), t->prob_want, t->act_want, 0, t->lat_cap, ui_cap, ui_pl);
+    return foot_refuses(t, &f, why, cap);
+}
+
+/* mu NOT held: grow a BUFFER from `old` to `nw` bytes (make one: p NULL, old 0; shrink it: nw <
+ * old), within the budget. NULL, p untouched, when the budget stops it (*stop = 1: counted, a
+ * WARN at most once a minute naming the budget that fits; `what` says what it is and what the
+ * frame does without it) or when there is no memory (*stop = 0: the caller counts it, as before
+ * 1.13). The bytes are reserved under mu before the allocation, so two growths racing cannot
+ * both take the last room. */
+static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop, int how)
+{
+    uint64_t fp = 0, rt = 0, bud = 0, now = TUI_NOW_MS(), n = 0;
+    void *np;
+    int warn = 0;
+    *stop = 0;
+    mu_lock(&t->mu);
+    if (nw > old && t->budget) {
+        fp = foot_held(t); rt = t->rt_bytes; bud = t->budget;
+        if (fp + rt + (nw - old) > bud) {
+            *stop = 1; t->h_bstop++; n = t->h_bstop;
+            if (!t->b_warn_ms || now - t->b_warn_ms >= TUI_WARN_GAP_MS) { t->b_warn_ms = now ? now : 1; warn = 1; }
+        }
+    }
+    if (!*stop && nw > old) t->rt_bytes += nw - old;
+    mu_unlock(&t->mu);
+    if (*stop) {
+        if (warn)
+            tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.budget_kb %llu: %s not grown to %lu bytes - the footprint (%llu "
+                     "bytes) and the buffers held (%llu) would need %llu KiB; raise tui.budget_kb to at least "
+                     "that, or lower tui.kpi (gptps_tui_health.budget_stops: %llu; this WARN at most once a minute)",
+                     (unsigned long long)(bud / 1024u), what, (unsigned long)nw, (unsigned long long)fp,
+                     (unsigned long long)rt, (unsigned long long)kib_up(fp + rt + (nw - old)), (unsigned long long)n);
+        return NULL;
+    }
+    np = how == 1 ? malloc(nw) : how == 2 ? calloc(1, nw) : realloc(p, nw);   /* each as before 1.13 */
+    if (!np) {
+        if (nw > old) { mu_lock(&t->mu); t->rt_bytes -= nw - old; mu_unlock(&t->mu); }
+        return NULL;
+    }
+    if (nw < old) { mu_lock(&t->mu); t->rt_bytes -= old - nw; mu_unlock(&t->mu); }
+    return np;
+}
+static void *rt_realloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop)
+{ return rt_alloc(t, p, old, nw, what, stop, 0); }
+/* a new BUFFER, by malloc (1) or zeroed by calloc (2) */
+static void *rt_new(gptps_tui *t, size_t n, int zero, const char *what, int *stop)
+{ return rt_alloc(t, NULL, 0, n, what, stop, zero ? 2 : 1); }
+/* mu NOT held: free a BUFFER of `n` bytes made by rt_realloc */
+static void rt_free(gptps_tui *t, void *p, size_t n)
+{
+    if (!p) return;
+    free(p);
+    mu_lock(&t->mu); t->rt_bytes -= n; mu_unlock(&t->mu);
+}
+
 /* mu held, the TASKS table just swapped in: a row for every add_task entry, in its order. */
 static void tasks_seed(gptps_tui *t)
 {
@@ -4737,6 +4977,8 @@ static void act_out(gptps_tui *t, tui_parts *old)
 /* Make the storage match KPI level `lvl` (-1: keep; a gptps_tui_kpi, DEFAULT and ACTIVITY
  * already resolved), latency window `win` (0: keep) and journal sizes `plines` / `alines`
  * (-1: keep; 0: off): build what they need and is missing, drop what they do not hold.
+ * 1.13: a request whose footprint is over tui.budget_kb changes nothing: GPTPS_E_INVAL, and
+ * `what` says what it needs (foot_text), for the caller to log.
  * `lvl` and the sizes are what is REQUESTED; what runs is that minus what DEGRADE shed
  * (t->shed; `unshed`: the operator's word - clear it first). A
  * part that cannot be allocated is left out - the dashboard runs without it (a journal
@@ -4745,6 +4987,7 @@ static void act_out(gptps_tui *t, tui_parts *old)
 static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int alines, int unshed,
                                  char *what, size_t cap)
 {
+    tui_foot fn;
     tui_parts nw, old;
     tui_plan w;
     int tier, cur_win, want_tasks, want_prob, want_act, want_hist, want_tab, otier;
@@ -4755,6 +4998,11 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
     memset(&w, 0, sizeof w);
     mu_lock(&t->smu);
     mu_lock(&t->mu);
+    /* BUDGET (1.13): the request this makes, by the formula - over the budget, nothing changes
+     * (GPTPS_E_INVAL; `what` says what it needs) */
+    foot_calc(&fn, t, kpi_tier(lvl < 0 ? t->kpi_req : lvl), plines >= 0 ? plines : t->prob_want,
+              alines >= 0 ? alines : t->act_want, 0, win <= 0 ? t->lat_cap : win, t->ui_cap, t->ui_pl);
+    if (foot_refuses(t, &fn, what, cap)) { mu_unlock(&t->mu); mu_unlock(&t->smu); return GPTPS_E_INVAL; }
     if (unshed) { t->shed = 0; t->shed_why = 0; t->shed_whys = 0; t->pane_shed_ms = 0; t->p_row = 0; }
     if (lvl < 0) lvl = t->kpi_req;
     t->kpi_req = lvl;
@@ -4936,6 +5184,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
             { "pane_refresh_ms", offsetof(gptps_tui_config, pane_refresh_ms),  0, 600000 },
             { "adapt",           offsetof(gptps_tui_config, adapt),            0, GPTPS_TUI_ADAPT_DEGRADE },
             { "cost_budget_pct", offsetof(gptps_tui_config, cost_budget_pct),  0, 100 },
+            { "budget_kb",       offsetof(gptps_tui_config, budget_kb),        0, TUI_BUDGET_KB_MAX },
         };
         size_t k;
         for (k = 0; k < sizeof F / sizeof F[0]; ++k) {
@@ -4955,6 +5204,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         if (!t->cfg.adapt)           t->cfg.adapt = GPTPS_TUI_ADAPT_REPORT;
         if (!t->cfg.cost_budget_pct) t->cfg.cost_budget_pct = TUI_COST_DEF;
         t->adapt = t->cfg.adapt; t->cost_pct = t->cfg.cost_budget_pct;
+        t->budget = (uint64_t)t->cfg.budget_kb * 1024u;
     }
     if (!t->cfg.title) t->cfg.title = "tasks";   /* every pane prints it */
     if (!t->cfg.out) t->cfg.out = stdout;
@@ -5014,6 +5264,18 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
      * memory for a part, the dashboard runs without it and says so. */
     t->kpi = t->kpi_req = GPTPS_TUI_KPI_OFF;
     TUI_FLAG_SET(&t->off, 1);
+    if (t->budget) {   /* BUDGET (1.13): the configuration's footprint, by the formula, before any of it */
+        tui_foot f;
+        foot_calc(&f, t, kpi_tier(kpi), t->prob_want, t->act_want, 0, t->lat_cap, 0, 0);
+        if (f.total > t->budget) {
+            foot_text(&f, t->budget, what, sizeof what);
+            tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: the configuration (kpi %s, max_tasks %d, recent_lines %d, "
+                     "activity_lines %d, latency_window %d) %s: the dashboard was not installed", kpi_str(kpi),
+                     t->max_tasks, t->prob_want, t->act_want, t->lat_cap, what);
+            tui_destroy(t);
+            return NULL;
+        }
+    }
     if (tui_reconfig(t, kpi, 0, -1, -1, 1, what, sizeof what) != GPTPS_OK)
         tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: no memory for %s; the dashboard runs without it", what);
     t->start_ms = TUI_NOW_MS();
@@ -5049,6 +5311,18 @@ void gptps_tui_close(gptps_tui *t)
 
 /* ---- runtime reconfiguration ---- */
 
+/* What tui_reconfig said, logged for `who` changing `setting` ("tui.kpi=full"): a budget
+ * refusal (GPTPS_E_INVAL, nothing changed) or the parts it had no memory for. */
+static gptps_status reconf_said(const char *who, const char *setting, gptps_status st, const char *what)
+{
+    if (!what[0]) return st;
+    if (st == GPTPS_E_INVAL)
+        tui_logf(GPTPS_LOG_WARN, "%s: %s %s (gptps_tui_health.budget_refusals)", who, setting, what);
+    else
+        tui_logf(GPTPS_LOG_WARN, "%s: no memory for %s; the dashboard runs without it", who, what);
+    return st;
+}
+
 /* Resize the latency (handle) table at runtime. The old contents are dropped rather than
  * copied: every entry is an in-flight handle awaiting its terminal event, and a resize is
  * an admission that the window was wrong. The gauges are a lower bound ('>=') until the
@@ -5056,7 +5330,7 @@ void gptps_tui_close(gptps_tui *t)
 gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
 {
     gptps_status st;
-    char what[300];
+    char what[400], set[48];
     int changed;
     if (!t || handles < 0) return GPTPS_E_INVAL;
     if (handles == 0) handles = 1024;
@@ -5071,9 +5345,8 @@ gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
     mu_unlock(&t->mu);
     if (!changed) return GPTPS_OK;
     st = tui_reconfig(t, -1, handles, -1, -1, 0, what, sizeof what);
-    if (what[0]) tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_latency_window: no memory for %s; the dashboard runs "
-                          "without it", what);
-    return st;
+    snprintf(set, sizeof set, "tui.latency_window=%d", handles);
+    return reconf_said("gptps_tui_set_latency_window", set, st, what);
 }
 
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
@@ -5085,10 +5358,12 @@ gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
     level = (gptps_tui_kpi)TUI_LADDER[kpi_tier((int)level)];   /* DEFAULT is FULL, ACTIVITY is NORMAL */
     st = tui_reconfig(t, (int)level, 0, -1, -1, 1, what, sizeof what);   /* build what the tier needs, free the rest;
                                                                           * the operator's word: nothing shed */
-    if (what[0])
-        tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_kpi(%s): no memory for %s; the dashboard runs without it",
-                 kpi_str(level), what);
-    return st;
+    {
+        char who[48], set[48];
+        snprintf(who, sizeof who, "gptps_tui_set_kpi(%s)", kpi_str(level));
+        snprintf(set, sizeof set, "tui.kpi=%s", kpi_str(level));
+        return reconf_said(who, set, st, what);
+    }
 }
 
 gptps_status gptps_tui_set_recent(gptps_tui *t, int problems, int activity)
@@ -5098,9 +5373,13 @@ gptps_status gptps_tui_set_recent(gptps_tui *t, int problems, int activity)
     if (!t || problems < -1 || problems > TUI_JOURNAL_CAP || activity < -1 || activity > TUI_JOURNAL_CAP)
         return GPTPS_E_INVAL;
     st = tui_reconfig(t, -1, 0, problems, activity, 0, what, sizeof what);
-    if (what[0])
-        tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_recent: no memory for %s; the dashboard runs without it", what);
-    return st;
+    {
+        char set[64];
+        if (problems >= 0 && activity >= 0) snprintf(set, sizeof set, "tui.recent=%d, tui.activity=%d", problems, activity);
+        else if (problems >= 0) snprintf(set, sizeof set, "tui.recent=%d", problems);
+        else snprintf(set, sizeof set, "tui.activity=%d", activity);
+        return reconf_said("gptps_tui_set_recent", set, st, what);
+    }
 }
 
 gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
@@ -5175,6 +5454,13 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     h.source_rows       = t->src_rows;
     h.pane_shed_ms      = t->pane_shed_ms;
     h.shed_pressure_all = t->shed_whys;
+    h.budget_bytes      = t->budget;
+    h.footprint_bytes   = foot_held(t);
+    h.footprint_request_bytes = foot_req(t);
+    h.runtime_bytes     = t->rt_bytes;
+    h.budget_refusals   = t->h_bref;
+    h.budget_stops      = t->h_bstop;
+    h.budget_need_bytes = t->b_need;
     mu_unlock(&t->mu);
     n = out->struct_size < sizeof h ? out->struct_size : sizeof h;   /* what the caller's struct has */
     memcpy((char *)out + sizeof(size_t), (char *)&h + sizeof(size_t), n - sizeof(size_t));
@@ -5195,9 +5481,8 @@ gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode)
     adapt_base(t, TUI_NOW_MS());          /* a fresh window from now */
     mu_unlock(&t->mu);
     /* the operator's word: what DEGRADE shed comes back (built again: it may allocate) */
-    st = tui_reconfig(t, -1, 0, -1, -1, 1, what, sizeof what);
-    if (what[0]) tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_adapt: no memory for %s; the dashboard runs without it", what);
-    return st;
+    st = tui_reconfig(t, -1, 0, -1, -1, 1, what, sizeof what);   /* the request: never over the budget */
+    return reconf_said("gptps_tui_set_adapt", "tui.adapt", st, what);
 }
 
 gptps_status gptps_tui_set_source(gptps_tui *t, const gptps_tui_source *src)
@@ -5232,6 +5517,29 @@ gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct)
     return GPTPS_OK;
 }
 
+gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb)
+{
+    tui_foot f;
+    char why[400];
+    int refused = 0;
+    if (!t || kb < 0) return GPTPS_E_INVAL;
+    mu_lock(&t->smu);                    /* as tui_reconfig: no request changes under the check */
+    mu_lock(&t->mu);
+    foot_calc(&f, t, kpi_tier(t->kpi_req), t->prob_want, t->act_want, 0, t->lat_cap, t->ui_cap, t->ui_pl);
+    if (kb && f.total > (uint64_t)kb * 1024u) {
+        refused = 1; t->h_bref++; t->b_need = f.total;
+        foot_text(&f, (uint64_t)kb * 1024u, why, sizeof why);
+    } else {
+        t->budget = (uint64_t)kb * 1024u; t->cfg.budget_kb = kb;
+    }
+    mu_unlock(&t->mu);
+    mu_unlock(&t->smu);
+    if (!refused) return GPTPS_OK;
+    tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_budget_kb: tui.budget_kb=%d is below the footprint the configuration "
+             "holds - it %s (gptps_tui_health.budget_refusals)", kb, why);
+    return GPTPS_E_INVAL;
+}
+
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode)
 {
     if (!t) return GPTPS_E_INVAL;
@@ -5263,15 +5571,17 @@ gptps_status gptps_tui_set_clock(gptps_tui *t, gptps_tui_clock clock)
 void gptps_tui_snapshot(gptps_tui *t)
 {
     tui_fbuf f;
+    int stop = 0;
     if (!t) return;
-    f.cap = TUI_FRAME_MIN;
-    f.b = (char *)malloc(f.cap);
+    f.cap = TUI_FRAME_MIN;             /* a BUFFER (gptps_tui.h, MEMORY): within tui.budget_kb */
+    f.b = (char *)rt_new(t, f.cap, 0, "gptps_tui_snapshot's frame buffer (no frame)", &stop);
     if (!f.b) {
+        if (stop) return;              /* counted and WARNed by rt_realloc */
         mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu);
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_snapshot: no memory for the 16 KiB frame buffer; no frame");
         return;
     }
     tui_frame(t, &f, 0, NULL);         /* one frame, right now, regardless of mode; grown to fit */
     fputs(f.b, t->cfg.out); fputc('\n', t->cfg.out); fflush(t->cfg.out);
-    free(f.b);
+    rt_free(t, f.b, f.cap);
 }

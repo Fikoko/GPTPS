@@ -781,6 +781,7 @@ enabled automatically). Panes/metrics:
     | render | a frame took more than 1/10 of `refresh_ms` to make | raise `tui.refresh_ms` |
     | pane | a pane pass slow enough to stretch past `cfg.pane_refresh_ms` | raise it, or leave the pane |
     | cost | the **estimated** observer cost over `tui.cost_budget_pct` (default 5% of one core) | the highest `tui.kpi` that fits |
+    | budget (1.13) | a frame buffer's growth stopped at `tui.budget_kb` (see the memory budget below) | raise `tui.budget_kb`, or a lower `tui.kpi` |
 
     The cost is an estimate, labelled `est.`: the window's event rate × a unit cost per tier
     (off 3, minimal 9, gauge 10, problems 10, tasks 21, normal 24, latency 38, full 38 ns;
@@ -798,10 +799,10 @@ enabled automatically). Panes/metrics:
     | step | what goes | relieves |
     |---|---|---|
     | `-pane` (1.13) | the tasks / settings / detail panes read the engine half as often (doubled from what runs, up to 60 s; repeatable) — no data is lost | pane |
-    | `-activity` | the ACTIVITY journal | activity lost, cost (3 ns of the estimate), render and truncated (its RECENT rows), no memory |
-    | `-percentiles` | the histograms (`full` → `latency`) | render (the per-row p50/p95/p99), no memory — not cost: `full` and `latency` estimate the same 38 ns |
-    | `-latency` | the handle table, and the percentiles with it (→ `normal` while the journal runs, else `tasks`) | untracked, cost (38 → 24 ns), no memory |
-    | `-tasks` | the TASKS rows and all above `problems` | cost, render, truncated (the TASKS rows), no memory |
+    | `-activity` | the ACTIVITY journal | activity lost, cost (3 ns of the estimate), render and truncated (its RECENT rows), no memory, budget |
+    | `-percentiles` | the histograms (`full` → `latency`) | render (the per-row p50/p95/p99), no memory, budget — not cost: `full` and `latency` estimate the same 38 ns |
+    | `-latency` | the handle table, and the percentiles with it (→ `normal` while the journal runs, else `tasks`) | untracked, cost (38 → 24 ns), no memory, budget |
+    | `-tasks` | the TASKS rows and all above `problems` | cost, render, truncated (the TASKS rows), no memory, budget |
 
     Truncated acts for dashboard frames only (a frame is rows of at most the width, so only
     fewer rows shorten it), and only for frames cut after the header, where the rows begin —
@@ -818,7 +819,7 @@ enabled automatically). Panes/metrics:
     arrive: raise `tui.recent` or look more often) and *folded* (folding into `(other)` is
     already the cheap fallback, the totals stay exact; the only step that would end it,
     `-tasks`, drops every row to save merging a few). `GPTPS_TUI_P_SHEDDABLE` grew from
-    `0x142` to `0x1f6` (`GPTPS_TUI_P_REPORT_ONLY` is the rest); it is a macro, so a caller
+    `0x142` to `0x3f6` (budget, `0x200`, included; `GPTPS_TUI_P_REPORT_ONLY` is the rest); it is a macro, so a caller
     built against 1.12's header sees the old mask. A step that would change nothing is
     passed over; `problems` is the floor (the totals, gauges and PROBLEMS journal are never
     shed; a WARN says when nothing left relieves the pressure). **Sticky**: nothing comes
@@ -831,6 +832,27 @@ enabled automatically). Panes/metrics:
     level), a `tui.kpi` write, `gptps_tui_set_adapt` or a `tui.adapt` write build the request
     again; `m` clears it too but steps up one tier from what runs (`full` degraded to
     `problems`, then `m`, gives `tasks`).
+- **A memory budget: `tui.budget_kb`** (1.13; `cfg.budget_kb`, `gptps_tui_set_budget_kb`; 0,
+  the default, is none). What the dashboard holds is computed by an exact formula from its
+  sizes — the dashboard itself, its `add_task` entries and their payloads, and each tier's
+  parts (TASKS rows, the journals, the handle table, the percentiles) as they are held; 109
+  KiB at the defaults — documented under MEMORY in `gptps_tui.h` and reported as
+  `gptps_tui_health.footprint_bytes` (`tests/test_tui_budget.c` holds it to the allocator,
+  byte for byte, at every tier). With a budget, every change that would take the footprint
+  of the *request* past it is **refused** — `GPTPS_E_INVAL`, one WARN naming what it needs
+  (`tui.kpi=full needs 109 KiB (111600 bytes: the dashboard 7080, TASKS 19720, ...), over
+  tui.budget_kb 64 (65536 bytes): refused, nothing changed`), counted
+  (`budget_refusals`, `budget_need_bytes`) and nothing changed: install (NULL), `set_kpi`,
+  `set_recent`, `set_latency_window`, `add_task`, `m`, the `tui.*` writes, and a budget below
+  the footprint. Never a silent clamp. The buffers a frame is made in (the view, a pane's
+  cache, `run`'s and `snapshot`'s frame buffers: `runtime_bytes`) grow only while footprint +
+  buffers stays within the budget; past it a growth **stops**, counted (`budget_stops`), a
+  WARN once a minute naming the budget that would fit, and the frame says what it lacks (cut,
+  "no room in tui.budget_kb"). The dead letters the dead-letter view holds are outside the
+  budget (refusing them would lose them). With `tui.adapt`, a stop is the *budget* pressure
+  condition: `report` shows it, `degrade` sheds for it like *no memory* — every tier step
+  lowers the footprint, making room for the buffers. A refusal never sheds, and a budget is
+  checked against the request, not what a degrade left running, so `u` always fits.
 - **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
   runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
   instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back
