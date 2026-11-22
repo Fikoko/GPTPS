@@ -202,7 +202,7 @@ static int fail(char *errbuf, size_t errlen, const char *path, int line, const c
 {
     if (errbuf && errlen) {
         va_list ap;
-        int k = line ? snprintf(errbuf, errlen, "%s:%d: ", path, line) : snprintf(errbuf, errlen, "%s: ", path);
+        int k = line ? gptps_fmt_cut(errbuf, errlen, "%s:%d: ", path, line) : gptps_fmt_cut(errbuf, errlen, "%s: ", path);
         if (k < 0) k = 0;
         if ((size_t)k < errlen) {
             va_start(ap, fmt);
@@ -396,7 +396,12 @@ static int parse_value(struct gptps_toml *t, const char *section, const char *ke
     char *dotted = (char *)gptps_malloc(n);
     int rc;
     if (!dotted) { t->oom = 1; return fail(errbuf, errlen, t->path, line, "out of memory"); }
-    snprintf(dotted, n, "%s%s%s", section, *section ? "." : "", key);
+    {                                   /* section "." key NUL, or key NUL: n is exactly enough */
+        size_t sl = strlen(section), w = sl;
+        memcpy(dotted, section, sl);
+        if (sl) dotted[w++] = '.';
+        memcpy(dotted + w, key, strlen(key) + 1);
+    }
     rc = parse_dotted_value(t, section, key, dotted, val, line, errbuf, errlen);
     gptps_free(dotted);
     return rc;
@@ -869,8 +874,8 @@ void        gptps_toml_defer_at(gptps_toml *t, size_t i, uint64_t by) { t->e[i].
 void gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap)
 {
     const toml_entry *e = &t->e[i];
-    if (*e->section) snprintf(buf, cap, "%s.%s", e->section, e->key);
-    else             snprintf(buf, cap, "%s", e->key);
+    if (*e->section) gptps_fmt_cut(buf, cap, "%s.%s", e->section, e->key);
+    else             gptps_copy_cut(buf, cap, e->key);
 }
 
 /* A dotted settings key matches section + "." + key wherever the dots fall, so

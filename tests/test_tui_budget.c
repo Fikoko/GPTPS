@@ -754,7 +754,7 @@ static void test_run_output_stopped(void)
     gptps_tui_config c;
     pthread_t th;
     struct winsize ws;
-    int m = posix_openpt(O_RDWR | O_NOCTTY), s, in0, k;
+    int m = posix_openpt(O_RDWR | O_NOCTTY), s, in0;
     FILE *out;
     gptps_tui_health_info h;
     uint64_t sum, pad;
@@ -791,7 +791,7 @@ static void test_run_output_stopped(void)
     if (pthread_create(&th, NULL, ob_run, NULL) == 0) {
         char b[4096];
         alarm(60);                                      /* the only bound: no wall-clock limit to miss */
-        for (k = 0; health(ob_t).frames_painted == 0; ++k) {
+        while (health(ob_t).frames_painted == 0) {
             struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 5000;
             select(0, NULL, NULL, NULL, &tv);
             while (read(m, b, sizeof b) > 0) { }

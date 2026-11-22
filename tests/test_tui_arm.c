@@ -21,16 +21,23 @@
  *     when it returns (POSIX, a pty; not on the simulation HAL: the loop waits in poll()).
  *  6) with DEGRADE: a shed survives a disarm and an arm (the arm builds the request less the
  *     shed), no tier step is shed while disarmed, and 'u' restores the request.
+ * 6b) with DEGRADE and BUDGET: a snapshot buffer stopped at the budget is relieved by the shed
+ *     that makes room for it - as with ALWAYS, the same shed, and the stops end.
  *  7) with BUDGET: install and every check are against the request, so an arm is never refused
  *     and never passes the budget; a budget below the request is refused while disarmed too.
  *  8) OOM on arm: counted (arm_failures, alloc_failures), shown ("no memory for:"), WARNed; the
  *     next arm builds it.
  *  9) setters, settings (tui.arm, tui.disarm_ms: readback, choices, range), install refusals,
- *     set_arm(always) arms at once, set_arm(on_view) counts as a view.
+ *     set_arm(always) arms at once, set_arm(on_view) counts as a view - after one; before any
+ *     view since install it starts disarmed (test_hold: a settings file's on_view applied at a
+ *     host's outer gptps_settings_hold let-go, after install returned).
  * 10) the header line follows the clock's unit (and says a fixed point with clock OFF).
  * 11) HINT: FULL with no terminal logs one WARN at install (not at a lower tier, not with
  *     on_view); gptps_tui_run with interactive 0 says so - once - and counts every call; with
  *     no terminal it says so at most once a minute, and counts every call.
+ * 12) a host's outer gptps_settings_hold around gptps_tui_install: the file's tui.arm=on_view
+ *     arrives at the let-go, after install returned, and still starts the dashboard disarmed
+ *     (no arm or disarm counted, nothing held above GAUGE); the hint goes by cfg (documented).
  * Throughout 3) and 4): an arm (render, snapshot, key) and a disarm (health) allocate nothing
  * while the dashboard's lock is held (TUI_LOCK_HOOK follows it).
  */
@@ -482,6 +489,58 @@ static void test_degrade(void)
     gptps_tui_close(t);
 }
 
+/* 6b) DEGRADE x BUDGET x ON_VIEW: a snapshot buffer stopped at tui.budget_kb is the BUDGET
+ * pressure condition, and DEGRADE sheds for it. The buffers of an ON_VIEW dashboard are checked
+ * against what an arm builds - the request LESS the shed - so the shed that makes room ends the
+ * stops, as under ALWAYS (checked against the unshed request, no shed ever made room: DEGRADE
+ * shed every tier and the stops went on). Returns the shed it settled on; *stops: budget_stops
+ * at the last 3 windows (they must not move), *press: the pressure at the end. */
+static uint64_t degrade_budget_run(int arm, uint64_t *stops, uint64_t *press, int *armed)
+{
+    gptps *e = open_manual();
+    gptps_tui *t;
+    gptps_tui_config c;
+    gptps_tui_health_info h;
+    FILE *o = tmpfile();
+    uint64_t shed = 0;
+    int k;
+    stops[0] = stops[1] = stops[2] = 0; *press = 0; *armed = -1;
+    if (!e || !o) { if (o) fclose(o); if (e) gptps_shutdown(e); return 0; }
+    tui_fake_ms = 7000000;
+    base_cfg(&c, GPTPS_TUI_KPI_FULL, arm); c.out = o;
+    c.adapt = GPTPS_TUI_ADAPT_DEGRADE;
+    c.budget_kb = (int)((formula(TUI_T_FULL, 0) + view_bytes(24) + 1023u) / 1024u) + 8;   /* < + 16 KiB */
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); fclose(o); return 0; }
+    log_begin();
+    for (k = 0; k < 16; ++k) {
+        tui_fake_ms += 11000;                             /* a rate window (10 s) each */
+        gptps_tui_snapshot(t);
+        gptps_tui_render(t, frame, sizeof frame);
+        h = health(t);
+        if (k >= 13) stops[k - 13] = h.budget_stops;
+        shed = h.shed; *press = h.pressure; *armed = h.armed;
+    }
+    CHECK(health(t).budget_stops > 0 && log_count("tui.budget_kb") > 0);   /* it was stopped, at first */
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    fclose(o);
+    return shed;
+}
+static void test_degrade_budget(void)
+{
+    uint64_t sa[3], so[3], pa, po, ha, ho;
+    int aa, ao;
+    ha = degrade_budget_run(GPTPS_TUI_ARM_ALWAYS, sa, &pa, &aa);
+    ho = degrade_budget_run(GPTPS_TUI_ARM_ON_VIEW, so, &po, &ao);
+    CHECK(aa == 1 && ao == 1);
+    CHECK(ha != 0 && !(ha & GPTPS_TUI_SHED_TASKS) && sa[0] == sa[2] && !(pa & GPTPS_TUI_P_BUDGET));   /* relieved */
+    CHECK(ho == ha);                                      /* the same shed made room, no more */
+    CHECK(so[0] == so[2] && !(po & GPTPS_TUI_P_BUDGET));  /* and the stops ended */
+}
+
 /* 7) */
 static void test_budget(void)
 {
@@ -675,7 +734,9 @@ static void test_settings(void)
     CHECK(gptps_tui_set_disarm_ms(t, 99) == GPTPS_E_INVAL && gptps_tui_set_disarm_ms(t, 86400001) == GPTPS_E_INVAL);
     CHECK(gptps_tui_set_disarm_ms(t, 0) == GPTPS_OK && health(t).disarm_ms == 60000);
     CHECK(gptps_tui_set_arm(t, (gptps_tui_arm)3) == GPTPS_E_INVAL && gptps_tui_set_arm(NULL, GPTPS_TUI_ARM_ALWAYS) == GPTPS_E_INVAL);
-    /* to on_view: counts as a view - armed now, disarmed disarm_ms later */
+    /* to on_view after a view: counts as a view - armed now, disarmed disarm_ms later (before
+     * any view it starts disarmed: test_hold) */
+    gptps_tui_render(t, frame, sizeof frame);
     tui_fake_ms += 1000;
     CHECK(gptps_settings_set(e, "tui.arm", "on_view") == GPTPS_OK);
     CHECK(gptps_settings_get(e, "tui.arm", v, sizeof v) == GPTPS_OK && strcmp(v, "on_view") == 0);
@@ -783,8 +844,12 @@ static void test_hint(void)
     t = gptps_tui_install(e, &c);
     CHECK(t != NULL);
     CHECK(log_count("gptps_tui_install: no terminal to run the live dashboard on") == 1);
-    CHECK(log_count("kpi full collects everything from now on - about 38 ns and one lock an event, 110 KiB held") == 1 ||
-          sizeof(gptps_tui) != 7184);                     /* the figure: the formula at the defaults */
+    {   /* the figure: the formula at the defaults, on every target (110 KiB on Linux x86-64) */
+        char want[160];
+        snprintf(want, sizeof want, "kpi full collects everything from now on - about 38 ns and one lock an event, "
+                 "%llu KiB held", (unsigned long long)((formula(TUI_T_FULL, 0) + 1023u) / 1024u));
+        CHECK(log_count(want) == 1);
+    }
     CHECK(log_count("tui.arm=on_view") == 1);
     loglen = 0; logbuf[0] = 0;
     gptps_tui_run(t);                                     /* interactive 0: said, once */
@@ -862,6 +927,62 @@ static void test_hint(void)
     fclose(o);
 }
 
+/* 12) */
+static void test_hold(void)
+{
+    const char *path = "test_tui_arm_hold.toml";
+    FILE *f = fopen(path, "w"), *o = tmpfile();
+    gptps_config ec;
+    gptps_tui_config c;
+    gptps_tui_health_info h;
+    gptps *e = NULL;
+    gptps_tui *t;
+    int pass;
+    if (!f || !o) {
+        printf("note: no settings file or tmpfile here; the hold check skipped\n");
+        if (f) { fclose(f); remove(path); }
+        if (o) fclose(o);
+        return;
+    }
+    fputs("[tui]\narm = \"on_view\"\n", f); fclose(f);
+    for (pass = 0; pass < 2; ++pass) {                    /* 0: cfg.arm always (the hint), 1: cfg on_view */
+        memset(&ec, 0, sizeof ec);
+        ec.struct_size = sizeof ec; ec.limits.struct_size = sizeof ec.limits;
+        ec.limits.max_concurrent_tasks = 1; ec.limits.max_memory_bytes = 1u << 20;
+        ec.mode = GPTPS_RUN_MANUAL; ec.config_path = path;
+        e = NULL;
+        CHECK(gptps_open_ex(&ec, &e) == GPTPS_OK);
+        if (!e) break;
+        tui_fake_ms = 9500000;
+        log_begin();
+        base_cfg(&c, GPTPS_TUI_KPI_FULL, pass ? GPTPS_TUI_ARM_ON_VIEW : 0); c.out = o;
+        CHECK(gptps_settings_hold(e, 1) == GPTPS_OK);     /* the host's: the file's tui values wait */
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        if (!t) { CHECK(gptps_settings_hold(e, 0) == GPTPS_OK); log_end(); gptps_shutdown(e); break; }
+        CHECK(health(t).arm == (pass ? GPTPS_TUI_ARM_ON_VIEW : GPTPS_TUI_ARM_ALWAYS));   /* not applied yet */
+        /* the hint is decided at install, by cfg (gptps_tui.h, HINT) */
+        CHECK(log_count("no terminal to run the live dashboard on") == (pass ? 0 : 1));
+        CHECK(gptps_settings_hold(e, 0) == GPTPS_OK);     /* the let-go applies tui.arm = on_view */
+        h = health(t);
+        CHECK(h.arm == GPTPS_TUI_ARM_ON_VIEW && h.armed == 0 && h.kpi == GPTPS_TUI_KPI_GAUGE &&
+              h.kpi_requested == GPTPS_TUI_KPI_FULL && h.footprint_bytes == formula(TUI_T_GAUGE, 0) &&
+              h.arms == 0 && h.disarms == 0 && h.record_ms == 0);
+        CHECK(ta_live == h.footprint_bytes);              /* nothing above GAUGE held */
+        CHECK(log_count("no terminal to run the live dashboard on") == (pass ? 0 : 1));   /* nothing more said */
+        tui_fake_ms += 1000;
+        gptps_tui_render(t, frame, sizeof frame);         /* the first view arms */
+        h = health(t);
+        CHECK(h.armed == 1 && h.arms == 1 && h.footprint_bytes == formula(TUI_T_FULL, 0) &&
+              strstr(frame, "recording since first view") != NULL);
+        log_end();
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    remove(path);
+    fclose(o);
+}
+
 int main(void)
 {
     test_always();
@@ -870,12 +991,14 @@ int main(void)
     test_run_is_a_view();
 #endif
     test_degrade();
+    test_degrade_budget();
     test_budget();
     test_arm_oom();
     test_settings();
     test_line();
     test_line_height();
     test_hint();
+    test_hold();
     if (fails) { printf("test_tui_arm: %d FAILED\n", fails); return 1; }
     printf("test_tui_arm: OK\n");
     return 0;

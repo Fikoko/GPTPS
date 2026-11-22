@@ -407,19 +407,29 @@ typedef struct {
  *   against the REQUEST, which is what an arm builds, so an arm is never refused and never goes
  *   past it; disarmed, the footprint held (health.footprint_bytes) is the formula at GAUGE,
  *   footprint_request_bytes is unchanged, and every change is checked as when armed. The
- *   BUFFERS (MEMORY) of an ON_VIEW dashboard are checked against the request too, not against
- *   what is held: gptps_tui_snapshot and gptps_tui_run make theirs before the frame that arms,
- *   so footprint plus buffers stays within the budget across the arm. Switching an ALWAYS
- *   dashboard to ON_VIEW at runtime counts as a view (it stays armed and disarms disarm_ms
- *   later with none); on an ON_VIEW dashboard it only restarts the disarm_ms timer (it does
- *   not arm one that is disarmed). ON_VIEW from a settings file (read while gptps_tui_install
- *   defines the tui keys) starts disarmed, as cfg.arm = ON_VIEW does. To ALWAYS arms at once.
+ *   BUFFERS (MEMORY) of an ON_VIEW dashboard are checked against what an arm builds - the
+ *   request less what DEGRADE shed - not against what is held: gptps_tui_snapshot and
+ *   gptps_tui_run make theirs before the frame that arms, so footprint plus buffers stays
+ *   within the budget across the arm, and a shed for a buffer stopped at the budget
+ *   makes room for it, as under ALWAYS. Switching an ALWAYS dashboard to ON_VIEW at runtime
+ *   after a view counts as a view (it stays armed and disarms disarm_ms later with none);
+ *   before any view since install it starts disarmed, as cfg.arm = ON_VIEW does (nobody has
+ *   looked yet: no record from install, no disarm counted). So ON_VIEW from a settings file
+ *   starts disarmed whenever its value comes - as gptps_tui_install defines the tui keys, or
+ *   later, at a host's outer gptps_settings_hold let-go or an add-on setup's loader. On an
+ *   ON_VIEW dashboard it only restarts the disarm_ms timer (it does not arm one that is
+ *   disarmed). To ALWAYS arms at once.
  *
  * HINT (1.13): an install that runs FULL (tui.arm = always) with no terminal to show the live
  * dashboard on - the output or stdin is not one, so gptps_tui_run will not run - logs one WARN
  * naming what it collects for frames only gptps_tui_render / gptps_tui_snapshot can show (the
  * per-event cost and the bytes held) and the settings that lower it (tui.arm = on_view, a lower
- * tui.kpi). WARN, not INFO: gptps_log passes WARN and up only. */
+ * tui.kpi). WARN, not INFO: gptps_log passes WARN and up only. It is decided at install from
+ * what is in force then: cfg, and a settings file's tui values when they apply as install
+ * defines the tui keys. A host that holds settings (gptps_settings_hold) around
+ * gptps_tui_install, or installs the dashboard inside an add-on's setup, has the file's tui
+ * values applied after install returns - so the hint goes by cfg alone; set cfg.arm (or
+ * cfg.kpi) to keep it quiet there. (The arming itself does not depend on it: see ARM.) */
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 
 /* LOCAL per-task settings. `label` (NULL => task name) is shown in the table;
@@ -643,7 +653,7 @@ typedef struct {
     uint64_t arm_failures;        /* arms that had no memory for a part (also in alloc_failures) */
     uint64_t run_noops;           /* gptps_tui_run calls that returned at once: cfg.interactive 0, or
                                    * no terminal (interactive 0: WARNed once a dashboard; no
-                                   * terminal: WARNed each call) */
+                                   * terminal: WARNed at most once a minute; every call counted) */
 } gptps_tui_health_info;
 
 /* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
@@ -864,7 +874,8 @@ void gptps_tui_snapshot(gptps_tui *t);
 /* Blocking live loop: clear screen, then redraw (see the modes) and dispatch keystrokes
  * until quit. No-op (returns immediately) unless cfg.interactive is on and both the output
  * and stdin are terminals - with a WARN (1.13: also for interactive 0, which 1.12 returned
- * from silently - that one once a dashboard), each counted in health.run_noops. While it runs it is a
+ * from silently - that one once a dashboard; the not-a-terminal WARN at most once a minute),
+ * each call counted in health.run_noops. While it runs it is a
  * VIEW (ARM at gptps_tui_install): an ON_VIEW dashboard stays armed, idle or not, and its
  * disarm_ms counts from when it returns.
  *

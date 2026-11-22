@@ -300,6 +300,20 @@ int             gptps_settings_plain_number(const char *v, int whole);
 /* strtod and %.17g as the C locale has them, whatever LC_NUMERIC the host set. */
 double          gptps_strtod_c(const char *s, char **end);
 void            gptps_fmt_double_c(char *buf, size_t cap, double v);
+/* Into a buffer whose size the CALLER chose (a `why`, an error buffer, a value
+ * buffer of the API): the text cut to cap - 1 bytes and terminated, as snprintf
+ * cuts it - cutting is the contract there, never an accident. They exist so the
+ * flow-sensitive -Wformat-truncation=2 (which assumes a 1-byte buffer for every such
+ * cap) can tell those writes from ones into fixed buffers, where it is kept clean.
+ * cap 0 writes nothing. fmt_cut returns what vsnprintf returns; copy_cut the bytes
+ * written. */
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+#define GPTPS_PRINTF_LIKE(f, a) __attribute__((format(printf, f, a)))
+#else
+#define GPTPS_PRINTF_LIKE(f, a)
+#endif
+int             gptps_fmt_cut(char *buf, size_t cap, const char *fmt, ...) GPTPS_PRINTF_LIKE(3, 4);
+size_t          gptps_copy_cut(char *buf, size_t cap, const char *src);
 /* set_by and set_live are live sets; set_text is a file's. The last two say why on
  * GPTPS_E_CONFIG. */
 gptps_status    gptps_settings_set_live(gptps_settings *r, const char *key, const char *value,
