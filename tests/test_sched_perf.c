@@ -61,6 +61,8 @@ static double drain(int kind, int n, int reps)
     size_t ran;
     int i, r;
 
+    if (g_overtime) return 0.0;   /* out of budget already: the caller reports it */
+
     memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
     cfg.limits.struct_size = sizeof cfg.limits;
     cfg.limits.max_concurrent_tasks = 8;
@@ -86,8 +88,10 @@ static double drain(int kind, int n, int reps)
             o.deadline_in_ms = ((uint64_t)i * 7919u) % 50000u;   /* 64-bit: i * 7919 overflows an int past ~271k items */
             o.priority = (int32_t)(i % 5);
             if (gptps_submit_ex(e, "n", &b, 1, &o, NULL) != GPTPS_OK) { ++fails; break; }
+            /* the budget covers submission too: an O(n) insert makes this loop the slow part */
+            if ((i & 255) == 255 && gptps_hal_monotonic_ms() - t0 > BUDGET_MS) { g_overtime = 1; break; }
         }
-        {
+        if (!g_overtime) {
             unsigned steps = 0;
             while (gptps_step(e, &ran) == GPTPS_OK && ran)
                 if ((++steps & 255u) == 0 && gptps_hal_monotonic_ms() - t0 > BUDGET_MS) { g_overtime = 1; break; }
@@ -105,14 +109,14 @@ int main(void)
         double a, b, ratio;
         for (;;) {                                 /* grow until clock noise cannot dominate */
             a = drain(k, n, reps);
-            if (fails) break;
+            if (fails || g_overtime) break;
             if (a >= 100.0) break;
             if (n < 160000) n *= 2; else if (reps < 32) reps *= 2; else break;
         }
         if (fails) break;
         b = drain(k, SCALE * n, reps);
         if (g_overtime) {
-            printf("%-10s a drain of %d items ran past %u ms: admission is super-linear\n",
+            printf("%-10s a drain of up to %d items ran past %u ms: admission is super-linear\n",
                    NAMES[k], SCALE * n, BUDGET_MS);
             ++fails;
             break;

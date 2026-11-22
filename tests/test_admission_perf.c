@@ -105,11 +105,15 @@ int main(void)
     /* Confirm before failing, as in test_cancel_perf: a shared runner that stalls during
      * the bigger drain can push even the best of three past the bar, but a stall does not
      * repeat and a scan of the queue is slow in EVERY run. So over the bar, measure again, up to six more
-     * pairs, keeping the best of each size; it fails only if the curve stays super-linear. */
-    for (i = 0; i < 6 && ratio >= MAX_RATIO && !fails; ++i) {
+     * pairs, keeping the best of each size; it fails only if the curve stays super-linear.
+     * Not when the ratio is already twice the bar, as in test_sched_perf: no stall reads
+     * like that, and a strongly super-linear path would spend minutes on the repeats and
+     * reach ctest's timeout instead of failing here with its diagnostic. */
+    for (i = 0; i < 6 && ratio >= MAX_RATIO && ratio < 2.0 * MAX_RATIO && !fails; ++i) {
         double a2 = drain(n, reps), b2 = fails ? 0.0 : drain(2 * n, reps);
         if (fails) break;
         printf("  over the bar (%.2f): measuring again - %.0fms / %.0fms\n", ratio, a2, b2);
+        fflush(stdout);   /* the ctest pipe is fully buffered: keep progress visible on a timeout */
         if (a2 < a) a = a2;
         if (b2 < b) b = b2;
         ratio = (a > 0.0) ? b / a : 0.0;
