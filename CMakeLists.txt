@@ -1291,6 +1291,13 @@ target_include_directories(test_tui_perf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc
 target_link_libraries(test_tui_perf PRIVATE gptps)
 add_test(NAME tui_perf COMMAND test_tui_perf)
 set_tests_properties(tui_perf PROPERTIES TIMEOUT 300 LABELS perf)
+# 1.12: the measurement behind "no lock stripes" (docs/MEASUREMENTS.md). Not built by
+# default and not a test: cmake --build . --target gptps_bench_tui_stripes
+if(UNIX AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_executable(gptps_bench_tui_stripes EXCLUDE_FROM_ALL tools/bench_tui_stripes.c)
+    target_include_directories(gptps_bench_tui_stripes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+    target_link_libraries(gptps_bench_tui_stripes PRIVATE gptps Threads::Threads)
+endif()
 endif()
 
 # docs/CONFIG.md is generated from the settings registry (tools/gptps_config_reference.c);

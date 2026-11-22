@@ -686,7 +686,12 @@ enabled automatically). Panes/metrics:
     each as a ratio, label `perf`), but cache misses still show: ~50-70 ns at 500k in
     flight in a 1<<20 window, ~50-60 ns at 1000 task types, ~90-170 ns for a FAILED
     event with a stderr tail. With several threads emitting, `minimal` and up also wait
-    for one another on the dashboard's one lock (no atomics in the drop-in build).
+    for one another on the dashboard's one lock (no atomics in the drop-in build). 1.12
+    measured lock stripes as the remedy and did not ship them: through a real engine at 8
+    threads the whole dashboard costs under 1% (`minimal`) to 9% (`normal`) of
+    throughput, and an upper-bound model of stripes won none of it back, because the
+    engine's own lock serializes first
+    (docs/MEASUREMENTS.md, "Dashboard lock stripes").
     `off` is the tier for leaving the dashboard in place after you have stopped looking
     at it (counters do not advance while off); `minimal` and up still take one mutex per
     event. The released names and values are kept (`gptps_tui_kpi` 0..4); the new tiers

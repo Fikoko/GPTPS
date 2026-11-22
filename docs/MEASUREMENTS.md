@@ -286,3 +286,66 @@ history, and history belongs to the host, which keeps its own ledger.
 
 No step touches `gptps_measure`, `gptps_event`, the stats add-on or the transports: they
 carry any name.
+
+## Dashboard lock stripes (1.12): measured, not shipped
+
+Every event the dashboard (`gptps_tui`) observes at `minimal` and up takes its one lock.
+The 1.11 design left a remedy open: install-time lock stripes, a handle's events going to
+stripe `mix(handle) & (S-1)`, with counters, rows and handle-table slices per stripe.
+1.12 measured it first, against a gate written down before any run:
+
+> Ship `cfg.stripes` only if, end to end (a THREADED engine, N workers running no-op
+> in-process items, the dashboard observing), 8 emitting threads at 4 or 8 stripes give
+> **at least 1.5x** the items a second of 1 stripe at `normal` or `full`: the median of 5
+> interleaved runs, and every run at least 1.3x. The calls of threads straight into the
+> observer, with no engine, are reported as the ceiling but do not gate: no host does that.
+
+**What was measured.** `tools/bench_tui_stripes.c` (`cmake --build . --target
+gptps_bench_tui_stripes`) models the stripes by their upper bound: S complete,
+independent dashboards behind a router observer, so nothing at all is shared between
+stripes - not even the journals and the name index, which the real design shares. A real
+implementation could only do worse. 1 stripe runs through the same router. In the engine
+run every item submits its successor, so all three of its events come from the N workers,
+and the engine holds N x 8 items queued. Medians of 5 rounds, 1 s each (the direct calls
+0.5 s), on a 4-core x86-64 KVM guest, gcc -O2, glibc; 8 threads is twice the cores.
+
+End to end, items finished a second (thousands):
+
+| threads | no dashboard | `minimal` 1 / 4 / 8 stripes | `normal` 1 / 4 / 8 | `full` 1 / 4 / 8 |
+|---|---|---|---|---|
+| 1 | 40.9 | 40.5 / 38.7 / 36.8 | 37.6 / 38.4 / 42.8 | 40.2 / 41.3 / 40.0 |
+| 4 | 62.1 | 59.5 / 55.8 / 55.6 | 60.4 / 52.5 / 54.6 | 57.4 / 57.7 / 54.2 |
+| 8 | 87.2 | 86.8 / 86.3 / 88.4 | 79.9 / 79.3 / 79.1 | 80.6 / 77.3 / 78.5 |
+
+The gate's ratio at 8 threads, the better of 4 and 8 stripes over 1, per round: `normal`
+0.97 - 1.21 (median 1.06), `full` 0.89 - 1.22 (median 1.03).
+
+Threads calling the observer directly, 512 handles in flight each (millions of events a
+second; the ceiling):
+
+| threads | `minimal` 1 / 4 / 8 | `normal` 1 / 4 / 8 | `full` 1 / 4 / 8 |
+|---|---|---|---|
+| 1 | 71.3 / 66.1 / 65.3 | 48.5 / 44.6 / 47.8 | 37.9 / 33.1 / 28.7 |
+| 4 | 21.4 / 16.1 / 14.9 | 11.0 / 9.4 / 9.5 | 6.1 / 5.9 / 5.7 |
+| 8 | 28.2 / 22.7 / 23.0 | 18.9 / 17.2 / 14.5 | 5.8 / 8.9 / 6.5 |
+
+**The decision: no stripes.** The gate fails by a wide margin, and the reason is in the
+first column: with no dashboard at all the engine finishes 87 thousand items a second at
+8 threads, and with a 1-stripe `full` dashboard 81 thousand. Stripes can win back at most
+that gap - about 8% at `full`, 9% at `normal`, under 1% at `minimal` - the dashboard's whole
+cost, its lock's contention included; and they did not win back even that (the 4 and 8
+stripe columns sit within the run-to-run noise of the 1 stripe one). The engine's own lock,
+taken several times per item, is the serialization point long before the dashboard's is:
+an item costs the dashboard 3 events, about 0.1 us at `full` on one thread, of the roughly
+100 us of thread time an item takes at 8 threads (8 threads / 80 thousand items a second).
+Only threads hammering the observer with no engine between them see a win, at `full` and 8
+threads (1.55x at 4 stripes); at `minimal` and `normal` stripes lose even there, since S
+locks and S copies of the counters put every thread on every stripe's cache lines. The stripe code was therefore never written
+into the add-on; the dashboard keeps its single lock, `gptps_tui_config` gains no
+`stripes` field, and nothing in its memory, ABI or behaviour changes.
+
+What would reopen it: a host whose events do not each pass through one engine lock - a
+dashboard fed by several engines at once, or an engine whose hot path stops serializing.
+Run the benchmark there first (`e2e none` against `e2e full <threads> 1` gives the ceiling
+in two runs) and apply the same gate; on a bigger machine the numbers will differ, the
+argument - stripes cannot beat "no dashboard" - will not.

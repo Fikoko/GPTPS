@@ -93,7 +93,9 @@ typedef enum {
      * is freed. MINIMAL and up are
      * cheap in work but NOT free in contention - each acquires one global
      * mutex per event, on every worker, the dispatcher and every submitting
-     * thread. This tier is for leaving the dashboard installed after you are done
+     * thread (1.12 measured lock stripes and did not ship them: through a real
+     * engine the engine's own lock serializes first - docs/MEASUREMENTS.md,
+     * "Dashboard lock stripes"). This tier is for leaving the dashboard installed after you are done
      * looking at it: the handle, the settings and the per-task labels all stay
      * valid, so raising the tier again costs nothing but the re-allocation.
      * Counters do not advance while OFF, so totals resume from where they stopped
