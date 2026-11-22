@@ -304,18 +304,29 @@ stripe `mix(handle) & (S-1)`, with counters, rows and handle-table slices per st
 gptps_bench_tui_stripes`) models the stripes by their upper bound: S complete,
 independent dashboards behind a router observer, so nothing at all is shared between
 stripes - not even the journals and the name index, which the real design shares. A real
-implementation could only do worse. 1 stripe runs through the same router. In the engine
+implementation could only do worse. Each stripe is a dashboard installed on its own idle
+MANUAL engine, fed by the router observer on the measured engine; 1 stripe runs through
+the same router, so it is not the shipped configuration. The shipped one - a single
+dashboard installed directly on the measured engine - is the "installed" column
+(`e2e <kpi> <threads> 0`), and the gap between it and 1 stripe is the router model's own
+overhead, not the dashboard's. In the engine
 run every item submits its successor, so all three of its events come from the N workers,
 and the engine holds N x 8 items queued. Medians of 5 rounds, 1 s each (the direct calls
 0.5 s), on a 4-core x86-64 KVM guest, gcc -O2, glibc; 8 threads is twice the cores.
 
 End to end, items finished a second (thousands):
 
-| threads | no dashboard | `minimal` 1 / 4 / 8 stripes | `normal` 1 / 4 / 8 | `full` 1 / 4 / 8 |
+| threads | no dashboard | `minimal` installed; 1 / 4 / 8 stripes | `normal` installed; 1 / 4 / 8 | `full` installed; 1 / 4 / 8 |
 |---|---|---|---|---|
-| 1 | 40.9 | 40.5 / 38.7 / 36.8 | 37.6 / 38.4 / 42.8 | 40.2 / 41.3 / 40.0 |
-| 4 | 62.1 | 59.5 / 55.8 / 55.6 | 60.4 / 52.5 / 54.6 | 57.4 / 57.7 / 54.2 |
-| 8 | 87.2 | 86.8 / 86.3 / 88.4 | 79.9 / 79.3 / 79.1 | 80.6 / 77.3 / 78.5 |
+| 1 | 40.9 | 36.1; 40.5 / 38.7 / 36.8 | 37.1; 37.6 / 38.4 / 42.8 | 42.8; 40.2 / 41.3 / 40.0 |
+| 4 | 62.1 | 58.2; 59.5 / 55.8 / 55.6 | 54.9; 60.4 / 52.5 / 54.6 | 59.8; 57.4 / 57.7 / 54.2 |
+| 8 | 87.2 | 84.4; 86.8 / 86.3 / 88.4 | 86.4; 79.9 / 79.3 / 79.1 | 82.6; 80.6 / 77.3 / 78.5 |
+
+These are medians of runs that scatter widely: at 8 threads the 5 rounds of no dashboard
+span 75.3 - 105.4, `minimal` installed 74.6 - 92.9, `normal` installed 74.1 - 90.0 and
+`full` installed 62.4 - 86.3 (thousands a second), and at 1 thread `full` installed and
+`normal` at 8 stripes both come out above no dashboard. Differences of a few percent
+between cells, in either direction, are noise.
 
 The gate's ratio at 8 threads, the better of 4 and 8 stripes over 1, per round: `normal`
 0.97 - 1.21 (median 1.06), `full` 0.89 - 1.22 (median 1.03).
@@ -331,10 +342,13 @@ second; the ceiling):
 
 **The decision: no stripes.** The gate fails by a wide margin, and the reason is in the
 first column: with no dashboard at all the engine finishes 87 thousand items a second at
-8 threads, and with a 1-stripe `full` dashboard 81 thousand. Stripes can win back at most
-that gap - about 8% at `full`, 9% at `normal`, under 1% at `minimal` - the dashboard's whole
-cost, its lock's contention included; and they did not win back even that (the 4 and 8
-stripe columns sit within the run-to-run noise of the 1 stripe one). The engine's own lock,
+8 threads, and with the shipped single-lock dashboard installed 82.6 thousand at `full`
+and 86.4 thousand at `normal` (84.4 at `minimal`; the tiers' order here is noise). Stripes
+can win back at most that gap - the dashboard's whole end-to-end cost, its lock's
+contention included - and at every tier the gap is within the run-to-run noise (+-15-20%
+at 8 threads), so a 1.5x gain is out of reach before any stripe code exists. Nor did the
+model win back anything against its own 1-stripe baseline: the 4 and 8 stripe columns sit
+within the noise of the 1 stripe one. The engine's own lock,
 taken several times per item, is the serialization point long before the dashboard's is:
 an item costs the dashboard 3 events, about 0.1 us at `full` on one thread, of the roughly
 100 us of thread time an item takes at 8 threads (8 threads / 80 thousand items a second).
