@@ -192,6 +192,8 @@ key nothing claimed.
 | `clock` | one of `"off"`, `"minutes"`, `"seconds"` | `"minutes"` | at once | the header's uptime: off, whole minutes (an idle dashboard repaints once a minute) or seconds (once a second) |
 | `adapt` | one of `"off"`, `"report"`, `"degrade"` | `"report"` | at once | what the dashboard does about its own pressure (its cost and losses, checked once a rate window when a frame is made): off; report - a PRESSURE line and a WARN naming the setting to change; degrade - also shed collection a step at a time (sticky: tui.kpi or 'u' restores) |
 | `cost_budget_pct` | whole number, 1 to 100 | `5` | at once | the dashboard observer's estimated cost (event rate x a measured cost per kpi tier), in percent of one core, past which tui.adapt reports pressure |
+| `arm` | one of `"always"`, `"on_view"` | `"always"` | at once | when the layers above gauge collect (problems, tasks, activity, latency, percentiles): always; on_view - from the first frame or key until tui.disarm_ms without one (the totals and gauges always) |
+| `disarm_ms` | whole number, 100 to 86400000 | `60000` | at once | with tui.arm=on_view: ms after the last view at which a health call stops the layers above gauge |
 | `budget_kb` | whole number, 0 to 2147483647 | `0` | at once | a memory budget for the dashboard, in KiB: a change whose footprint (gptps_tui.h, MEMORY) would exceed it is refused with a WARN naming what it needs, and frame buffers stop growing at it (counted); 0 = no budget |
 
 ### [gpu_quota]

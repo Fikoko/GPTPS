@@ -1677,7 +1677,10 @@ TUI_STATIC_ASSERT(f111_order, offsetof(gptps_tui_config, max_tasks) == offsetof(
 TUI_STATIC_ASSERT(f112_order, offsetof(gptps_tui_config, adapt) == offsetof(gptps_tui_config, pane_refresh_ms) + 4 &&
                   offsetof(gptps_tui_config, cost_budget_pct) == offsetof(gptps_tui_config, adapt) + 4);
 /* 1.13: appended after cost_budget_pct */
-TUI_STATIC_ASSERT(f113_order, offsetof(gptps_tui_config, budget_kb) == offsetof(gptps_tui_config, cost_budget_pct) + 4);
+TUI_STATIC_ASSERT(f113_order, offsetof(gptps_tui_config, budget_kb) == offsetof(gptps_tui_config, cost_budget_pct) + 4 &&
+                  offsetof(gptps_tui_config, arm) == offsetof(gptps_tui_config, budget_kb) + 4 &&
+                  offsetof(gptps_tui_config, disarm_ms) == offsetof(gptps_tui_config, arm) + 4);
+TUI_STATIC_ASSERT(arm_vals, GPTPS_TUI_ARM_DEFAULT == 0 && GPTPS_TUI_ARM_ALWAYS == 1 && GPTPS_TUI_ARM_ON_VIEW == 2);
 TUI_STATIC_ASSERT(adapt_vals, GPTPS_TUI_ADAPT_DEFAULT == 0 && GPTPS_TUI_ADAPT_OFF == 1 &&
                               GPTPS_TUI_ADAPT_REPORT == 2 && GPTPS_TUI_ADAPT_DEGRADE == 3);
 TUI_STATIC_ASSERT(health112, offsetof(gptps_tui_health_info, adapt) == offsetof(gptps_tui_health_info, bytes_panes) + 8 &&
@@ -1725,7 +1728,8 @@ TUI_STATIC_ASSERT(lp64_recent_lines, offsetof(gptps_tui_config, recent_lines) ==
 TUI_STATIC_ASSERT(lp64_pane_refresh, offsetof(gptps_tui_config, pane_refresh_ms) == 100);
 TUI_STATIC_ASSERT(lp64_end111, offsetof(gptps_tui_config, adapt) == 104);   /* a 1.11 sizeof */
 TUI_STATIC_ASSERT(lp64_end112, offsetof(gptps_tui_config, budget_kb) == 112);   /* a 1.12 sizeof: no tail padding */
-TUI_STATIC_ASSERT(lp64_size113, sizeof(gptps_tui_config) == 120);   /* 1.13 so far: a later field fills its padding */
+TUI_STATIC_ASSERT(lp64_arm113, offsetof(gptps_tui_config, arm) == 116 && offsetof(gptps_tui_config, disarm_ms) == 120);
+TUI_STATIC_ASSERT(lp64_size113, sizeof(gptps_tui_config) == 128);   /* 1.13 so far: a later field fills its padding */
 #endif
 static void test_config_abi(void)
 {

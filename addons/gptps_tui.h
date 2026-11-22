@@ -136,6 +136,15 @@ typedef enum {
                                    * while the pressure lasts (STICKY: only an operator undoes it) */
 } gptps_tui_adapt;
 
+/* cfg.arm / tui.arm (1.13): WHEN the layers above GAUGE collect - see ARM at
+ * gptps_tui_install. 0 = the default. */
+typedef enum {
+    GPTPS_TUI_ARM_DEFAULT = 0,    /* = ALWAYS (also for a 1.12-layout caller) */
+    GPTPS_TUI_ARM_ALWAYS,         /* from install, as before 1.13 */
+    GPTPS_TUI_ARM_ON_VIEW         /* opt-in: from the first view (a frame, a key) until disarm_ms
+                                   * without one; the totals and gauges always */
+} gptps_tui_arm;
+
 /* When the live loop (gptps_tui_run) repaints. Tunable at runtime. See IDLE at
  * gptps_tui_run for what each costs when nothing happens. */
 typedef enum {
@@ -245,6 +254,11 @@ typedef struct {
                                 * NULL, with an ERROR. A configuration whose footprint (see MEMORY at
                                 * install) is over it is refused - install returns NULL with a WARN
                                 * naming the figure needed. Also `tui.budget_kb`, gptps_tui_set_budget_kb */
+    int         arm;           /* gptps_tui_arm (0 => ALWAYS; out of range => install returns NULL, with
+                                * an ERROR). Also `tui.arm`, gptps_tui_set_arm. See ARM at install */
+    int         disarm_ms;     /* with ON_VIEW: how long after the last view the layers above GAUGE
+                                * stop (0 => 60000; 100..86400000; else install returns NULL, with an
+                                * ERROR). Also `tui.disarm_ms`, gptps_tui_set_disarm_ms */
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
@@ -290,13 +304,13 @@ typedef struct {
  *     entries' array (8, then doubling, at most max_tasks; 0 before the first); payloads:
  *     the bytes of their payload copies. The struct sizes on x86-64 Linux (other targets
  *     differ a little - health has the exact figure on every one; tests/test_tui_budget.c
- *     holds these to the code): D = 7080 (the dashboard itself), U = 280 (an add_task
+ *     holds these to the code): D = 7168 (the dashboard itself), U = 280 (an add_task
  *     entry), R = 264 (a TASKS row), E = 304 (a PROBLEMS record), A = 24 (an ACTIVITY
  *     record), S = 32 (a handle-table slot; 28 on i386). At the defaults (FULL,
- *     max_tasks 64, 8 + 8 journal lines, window 1024): 7080 + 19720 + 2432 + 192 + 65536 +
- *     16640 = 111600 bytes, 109 KiB.
+ *     max_tasks 64, 8 + 8 journal lines, window 1024): 7168 + 19720 + 2432 + 192 + 65536 +
+ *     16640 = 111688 bytes, 110 KiB (rounded up).
  *  2. The BUFFERS (health.runtime_bytes) a frame is made in, held while they are used and
- *     grown as a frame needs: the dashboard frame's copy-out (the view: 13560 B, plus 560 B
+ *     grown as a frame needs: the dashboard frame's copy-out (the view: 13600 B, plus 560 B
  *     a row of the terminal's height - 208 B more with a source - kept once made), the open
  *     tasks / settings / detail pane's cache (bytes_panes), gptps_tui_run's two frame
  *     buffers and its output buffer (16 KiB to 256 KiB each, while it runs) and
@@ -313,7 +327,7 @@ typedef struct {
  * changes nothing: install (NULL), gptps_tui_set_kpi, set_recent, set_latency_window,
  * add_task / add_task_ex (a new entry, a bigger payload), the 'm' key, a tui.kpi /
  * tui.recent / tui.activity / tui.latency_window write - each GPTPS_E_INVAL with one WARN
- * naming what it needs ("tui.kpi=full needs 109 KiB (111600 bytes: ...), over tui.budget_kb
+ * naming what it needs ("tui.kpi=full needs 110 KiB (111688 bytes: ...), over tui.budget_kb
  * 64 (65536 bytes): refused, nothing changed"), counted in health.budget_refusals and budget_need_bytes - and
  * so is a budget below the footprint already asked for. Never a silent clamp. A change that
  * does not grow the footprint is never refused. The BUFFERS are not refused - a frame is
@@ -338,7 +352,62 @@ typedef struct {
  * that RAISES the footprint and the budget must list tui.budget_kb before the tui keys that
  * raise it, and one that LOWERS both must list it after them. In the other order the first
  * key is refused (an ERROR naming it, the reload returns GPTPS_E_CONFIG) and the rest are
- * applied - the old tier with the new budget, say; reload again, or set them in that order. */
+ * applied - the old tier with the new budget, say; reload again, or set them in that order.
+ *
+ * ARM (1.13; cfg.arm / tui.arm / gptps_tui_set_arm, cfg.disarm_ms / tui.disarm_ms /
+ * gptps_tui_set_disarm_ms). ALWAYS (the default): what tui.kpi asks for collects from install,
+ * as before 1.13. ON_VIEW (opt-in, for a headless host that rarely looks): the layers above
+ * GAUGE - the PROBLEMS journal, the TASKS rows (and mem.peak), the ACTIVITY journal, the
+ * handle table (avg ms, the exact gauges) and the percentiles - collect only while someone
+ * looks; the totals (queued .. dropped, cancelled) and the gauges (in-flight, pending, peak:
+ * approximate, '~', while disarmed) ALWAYS run. Why exactly these: each layer above GAUGE
+ * holds per-event memory (STORAGE) and adds work to every event (TASKS: a hash probe, 18-21
+ * ns against GAUGE's 9-10; LATENCY: a hash op; a FAILED's why copy and its bounded scan at
+ * PROBLEMS), while the totals and gauges hold nothing, cost a lock and a few increments, and are
+ * what a host's health checks and the frame's header need to be true from install - a layer
+ * collected only from the first view would undercount for good (the totals never catch up).
+ * Disarmed, the dashboard RUNS at min(GAUGE, what is asked for, less what ADAPT shed): health.kpi
+ * says so, while tui.kpi and health.kpi_requested read back the request, unchanged.
+ *   ARMING: a VIEW - a frame (gptps_tui_render, gptps_tui_snapshot, each frame of gptps_tui_run,
+ *   on any pane) or a key (gptps_tui_press) - arms a disarmed dashboard before it is made: the
+ *   request (less what ADAPT shed) is built through the STORAGE protocol (allocated with the
+ *   lock released, swapped in under it), never on the event path and never under the lock, and
+ *   that frame shows it - new and empty: per-task counts, the journals, avg ms and percentiles
+ *   start at the arm, and the gauges are a lower bound ('>=') until the work then in flight
+ *   has ended. An arm with no memory for a part runs without it, as gptps_tui_set_kpi does
+ *   (counted: health.arm_failures and alloc_failures; the frame's "no memory for:" line; a
+ *   WARN), and a later arm or set_kpi tries again.
+ *   DISARMING is decided only when the dashboard is asked - with no timer and no thread: by
+ *   gptps_tui_health, once no view has come for disarm_ms (60 s) and no gptps_tui_run loop
+ *   runs (a live loop is a view while it runs, even idle). It only FREES (the swap under the
+ *   lock, the free after it). A frame never disarms (it is a view), so a host that views and
+ *   never calls gptps_tui_health stays armed: call health on the host's own cadence, or lower
+ *   tui.kpi yourself.
+ *   NOT RECORDED while disarmed: failures' why (the PROBLEMS journal - FAILED / RETRIED /
+ *   DEAD_LETTERED / DROPPED are still in the totals), per-task counts, the lifecycle log, avg ms,
+ *   percentiles, the exact gauges. Records a disarm frees before a frame showed them are counted
+ *   as not shown (journal_not_shown, the PROBLEMS "lost:" line and its WARN) - never silent.
+ *   Transitions are counted (health.arms, disarms, views) and shown, not logged (INFO is
+ *   filtered; WARN is for losses): health.armed, health.record_ms, and a line under the header
+ *   while the record is younger than the session - "recording since first view (4m ago) -
+ *   tui.arm=on_view, off 60.0 s after the last view, 2 disarms so far" (fitted to the width; with
+ *   cfg.clock = OFF the age is said as "N s after install", which never changes; else it follows
+ *   the clock's unit).
+ *   With ADAPT: what DEGRADE shed stays shed through a disarm and an arm (the arm builds the
+ *   request less the shed; only an operator clears it); while disarmed only GPTPS_TUI_SHED_PANE
+ *   can be shed (nothing above GAUGE runs), and an arm restarts the rate window, since one
+ *   measured with the layers off says nothing about them. With BUDGET: the budget is checked
+ *   against the REQUEST, which is what an arm builds, so an arm is never refused and never goes
+ *   past it; disarmed, the footprint held (health.footprint_bytes) is the formula at GAUGE,
+ *   footprint_request_bytes is unchanged, and every change is checked as when armed. Switching
+ *   to ON_VIEW at runtime counts as a view (it disarms disarm_ms later with none); to ALWAYS
+ *   arms at once.
+ *
+ * HINT (1.13): an install that runs FULL (tui.arm = always) with no terminal to show the live
+ * dashboard on - the output or stdin is not one, so gptps_tui_run will not run - logs one WARN
+ * naming what it collects for frames only gptps_tui_render / gptps_tui_snapshot can show (the
+ * per-event cost and the bytes held) and the settings that lower it (tui.arm = on_view, a lower
+ * tui.kpi). WARN, not INFO: gptps_log passes WARN and up only. */
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 
 /* LOCAL per-task settings. `label` (NULL => task name) is shown in the table;
@@ -550,6 +619,18 @@ typedef struct {
     uint64_t budget_refusals;     /* changes refused as over the budget, since install */
     uint64_t budget_stops;        /* buffer growths stopped at the budget, since install */
     uint64_t budget_need_bytes;   /* the footprint the last refused change needed (0: none) */
+    /* 1.13, ARM (see gptps_tui_install) */
+    int      arm;                 /* the gptps_tui_arm in effect (never DEFAULT) */
+    int      armed;               /* 1: the layers above GAUGE may run (always 1 with ALWAYS); 0: disarmed */
+    uint64_t disarm_ms;           /* tui.disarm_ms */
+    uint64_t record_ms;           /* how long the layers above GAUGE have been recording: since install
+                                   * (ALWAYS from the start), or since the arm (0 while disarmed) */
+    uint64_t views;               /* views since install: frames made and keys pressed */
+    uint64_t view_age_ms;         /* since the last view (0: none since install) */
+    uint64_t arms, disarms;       /* transitions since install */
+    uint64_t arm_failures;        /* arms that had no memory for a part (also in alloc_failures) */
+    uint64_t run_noops;           /* gptps_tui_run calls that returned at once: cfg.interactive 0, or
+                                   * no terminal (each WARNed once a dashboard) */
 } gptps_tui_health_info;
 
 /* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
@@ -680,6 +761,15 @@ gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct);
  * MEMORY and BUDGET at gptps_tui_install. Also `tui.budget_kb`. */
 gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb);
 
+/* ARM (1.13; see gptps_tui_install): ALWAYS or ON_VIEW (DEFAULT => ALWAYS); else
+ * GPTPS_E_INVAL. Also `tui.arm` ("always", "on_view"). To ON_VIEW: counts as a view, so it
+ * disarms disarm_ms later with none; to ALWAYS: a disarmed dashboard arms at once (it may
+ * allocate; GPTPS_E_NOMEM, with a WARN, as gptps_tui_set_kpi). Never refused by the budget. */
+gptps_status gptps_tui_set_arm(gptps_tui *t, gptps_tui_arm mode);
+/* How long after the last view ON_VIEW disarms, in ms: 0 => 60000, 100..86400000; else
+ * GPTPS_E_INVAL. Also `tui.disarm_ms`. */
+gptps_status gptps_tui_set_disarm_ms(gptps_tui *t, uint32_t ms);
+
 /* SOURCE (1.12). A host that already aggregates - it runs gptps_stats, say - can let the
  * dashboard SHOW its numbers instead of collecting its own: the header's totals and gauges
  * (and so done/s and peak) and the TASKS rows then come from the source, and the dashboard's
@@ -758,8 +848,11 @@ gptps_status gptps_tui_set_source(gptps_tui *t, const gptps_tui_source *src);
 void gptps_tui_snapshot(gptps_tui *t);
 
 /* Blocking live loop: clear screen, then redraw (see the modes) and dispatch keystrokes
- * until quit. No-op (returns immediately) unless both the output and stdin
- * are terminals - with a WARN when cfg.interactive asked for it anyway.
+ * until quit. No-op (returns immediately) unless cfg.interactive is on and both the output
+ * and stdin are terminals - with a WARN (1.13: also for interactive 0, which 1.12 returned
+ * from silently - that one once a dashboard), each counted in health.run_noops. While it runs it is a
+ * VIEW (ARM at gptps_tui_install): an ON_VIEW dashboard stays armed, idle or not, and its
+ * disarm_ms counts from when it returns.
  *
  * IDLE (1.11). Nothing happening costs nothing: the loop blocks on {stdin, a wake handle}
  * until the earliest deadline of what it shows, and with none, for good - PAUSED and an idle
@@ -824,9 +917,11 @@ void gptps_tui_snapshot(gptps_tui *t);
  *     latency_window to the in-flight depth, not the rate; activity_lines = -1 (or
  *     tui.activity = 0) when the lifecycle log is not read - failures stay in PROBLEMS.
  *     The tasks pane is safe to leave open (<= 1% of the engine's lock).
- *   - Task Scheduler / a service / headless: run returns at once (no console) and makes
- *     no pipe; only the observer's cost remains - set kpi to what snapshots need, or OFF
- *     (installed, ~2 ns an event, no lock; raise it when someone looks).
+ *   - Task Scheduler / a service / headless: run returns at once (no console; a WARN, once)
+ *     and makes no pipe; only the observer's cost remains - set kpi to what snapshots need, or
+ *     OFF (installed, ~2 ns an event, no lock; raise it when someone looks), or (1.13) tui.arm
+ *     = on_view: the totals and gauges always, the rest from the first snapshot until
+ *     disarm_ms after the last (with a health call on the host's cadence to disarm).
  *   - An operator's console: the defaults (FULL, CONTINUOUS, clock in minutes) - idle, it
  *     writes nothing and repaints the header once a minute; ON_DEMAND to also make no
  *     frame between changes.

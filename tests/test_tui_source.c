@@ -612,8 +612,13 @@ SRC_ASSERT(h_budget, offsetof(gptps_tui_health_info, budget_bytes) == offsetof(g
                      offsetof(gptps_tui_health_info, budget_refusals) == offsetof(gptps_tui_health_info, runtime_bytes) + 8 &&
                      offsetof(gptps_tui_health_info, budget_stops) == offsetof(gptps_tui_health_info, budget_refusals) + 8 &&
                      offsetof(gptps_tui_health_info, budget_need_bytes) == offsetof(gptps_tui_health_info, budget_stops) + 8);
-/* 1.13's end so far: a later field appends after budget_need_bytes and moves this */
-SRC_ASSERT(h_size, sizeof(gptps_tui_health_info) == offsetof(gptps_tui_health_info, budget_need_bytes) + 8);
+/* 1.13, ARM: appended after budget_need_bytes */
+SRC_ASSERT(h_arm, offsetof(gptps_tui_health_info, arm) == offsetof(gptps_tui_health_info, budget_need_bytes) + 8 &&
+                  offsetof(gptps_tui_health_info, armed) == offsetof(gptps_tui_health_info, arm) + 4 &&
+                  offsetof(gptps_tui_health_info, disarm_ms) == offsetof(gptps_tui_health_info, arm) + 8 &&
+                  offsetof(gptps_tui_health_info, run_noops) == offsetof(gptps_tui_health_info, disarm_ms) + 56);
+/* 1.13's end so far: a later field appends after run_noops and moves this */
+SRC_ASSERT(h_size, sizeof(gptps_tui_health_info) == offsetof(gptps_tui_health_info, run_noops) + 8);
 SRC_ASSERT(src_ss, offsetof(gptps_tui_source, struct_size) == 0 && offsetof(gptps_tui_source_totals, struct_size) == 0 &&
                    offsetof(gptps_tui_source_row, struct_size) == 0);
 static void test_health_size(void)

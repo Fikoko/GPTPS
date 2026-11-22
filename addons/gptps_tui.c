@@ -180,6 +180,10 @@ static uint64_t tui_now_us(void)
 /* ADAPT, GPTPS_TUI_SHED_PANE (1.13): each such step doubles the engine-reading panes' interval
  * (what runs, pane_every_ms), up to this (ms) - past a minute a pane is no longer read live */
 #define TUI_PANE_SHED_MAX 60000u
+/* ARM (1.13): tui.disarm_ms's default and range (ms) */
+#define TUI_DISARM_DEF 60000u
+#define TUI_DISARM_MIN 100
+#define TUI_DISARM_MAX 86400000
 
 /* ---- the KPI ladder ----------------------------------------------------------------
  * The public gptps_tui_kpi values keep their 1.10 numbers, so they are not in ladder
@@ -665,6 +669,10 @@ typedef struct {
     unsigned shed;
     uint64_t shed_why;
     int      kpi_req;
+    /* ARM (1.13): the "recording since first view" line - shown while the record is younger
+     * than the session; its age, when it began after install, the disarms so far, disarm_ms */
+    int      arm_show, arm_mode;
+    uint64_t arm_age, arm_after, arm_disarms, arm_dms;
     /* the live loop: when this frame next changes with no event (0: never), and the state
      * generation it shows */
     uint64_t next_change, gen;
@@ -870,6 +878,14 @@ struct gptps_tui {
      * changes refused, growths stopped; b_need: what the last refusal needed; b_warn_ms: the
      * last stop's WARN (once a minute). */
     uint64_t         budget, ui_pl, rt_bytes, h_bref, h_bstop, b_need, b_warn_ms;
+    /* ---- ARM (1.13; see "arm"), under mu ----
+     * arm_mode: GPTPS_TUI_ARM_ALWAYS / ON_VIEW; armed: the tiers above GAUGE may run (shed_tier
+     * caps at GAUGE while 0; always 1 with ALWAYS); run_on: gptps_tui_run is in its loop - a
+     * view the whole time; run_said: its "does not run" WARN was logged. view_ms: the last view
+     * (a frame, a key; 0: none yet); arm_ms: when the record began (install with ALWAYS, else the
+     * arm; 0: never armed). h_*: counted since install. */
+    int              arm_mode, armed, run_on, run_said;
+    uint64_t         disarm_ms, view_ms, arm_ms, h_views, h_arms, h_disarms, h_arm_fail, h_run_noop;
     char             ad_line[1280];   /* one line a condition, '\n' between */
     /* ---- SOURCE (1.12; gptps_tui_set_source) ----
      * src: the host's source (src.read NULL: none; src.name not kept - src_name is the copy).
@@ -2497,7 +2513,7 @@ static int view_ready(gptps_tui *t, int R)
 static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_t *warn_plost)
 {
     int R = v->R, W = v->W, i, k, n;
-    uint64_t nx_rate = 0, nx_peak = 0, nx_clock, nx_adapt = 0, nx_src = 0;
+    uint64_t nx_rate = 0, nx_peak = 0, nx_clock, nx_adapt = 0, nx_src = 0, nx_arm = 0;
     mu_lock(&t->mu);
     *warn_plost = 0;
     /* This frame shows the journals: what left them since the last one was not shown. */
@@ -2542,6 +2558,13 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     if (v->pline[0]) { const char *c = v->pline; v->nplines = 1; while ((c = strchr(c, '\n')) != NULL) { ++c; ++v->nplines; } }
     if (v->pline[0] && t->adapt != GPTPS_TUI_ADAPT_OFF) nx_adapt = t->ad_ms + (uint64_t)t->cfg.rate_window_s * 1000u;
     v->shed = t->shed; v->shed_why = t->shed_whys; v->kpi_req = t->kpi_req;
+    /* ARM: the record is younger than the session once it began after install */
+    v->arm_show = t->armed && t->arm_ms > t->start_ms;
+    v->arm_mode = t->arm_mode; v->arm_disarms = t->h_disarms; v->arm_dms = t->disarm_ms;
+    v->arm_age = now >= t->arm_ms ? now - t->arm_ms : 0;
+    v->arm_after = t->arm_ms - t->start_ms;
+    if (v->arm_show && v->clock != GPTPS_TUI_CLOCK_OFF)   /* its age changes as the clock's unit does */
+        nx_arm = t->arm_ms + clock_next(v->arm_age, v->clock);
     if (!v->leg_ok || v->leg_gen != t->ui_gen || v->leg_W != W || v->leg_uni != v->uni) {
         v->legrows = legend_text(t, W, v->legend, sizeof v->legend);
         v->leg_ok = 1; v->leg_gen = t->ui_gen; v->leg_W = W; v->leg_uni = v->uni; v->leg_builds++;
@@ -2599,6 +2622,7 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     {   /* the layout: every line of the frame is one terminal row (each is fitted to W), and
          * the frame's last newline must not scroll the screen */
         int budget = R - 1 - (v->color ? 2 : 1) - 3 - (v->miss ? 1 : 0) - v->nplines - (v->shed ? 1 : 0)
+                   - (v->arm_show ? 1 : 0)
                    - (v->src == 2 ? 1 : 0)
                    - ((v->l_folded || v->l_untracked || v->l_plost || v->l_trunc || v->l_nomem) ? 1 : 0)
                    - (v->toast_on ? 2 : 0) - 1 - v->legrows;
@@ -2708,6 +2732,7 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     if (nx_peak && (!v->next_change || nx_peak < v->next_change)) v->next_change = nx_peak;
     if (nx_clock && (!v->next_change || nx_clock < v->next_change)) v->next_change = nx_clock;
     if (nx_adapt && (!v->next_change || nx_adapt < v->next_change)) v->next_change = nx_adapt;
+    if (nx_arm && (!v->next_change || nx_arm < v->next_change)) v->next_change = nx_arm;
 }
 
 static void tui_logf(gptps_log_level lvl, const char *fmt, ...);
@@ -2769,8 +2794,13 @@ static unsigned cost_ns(int tier, int act_on)
 
 /* mu held: whether the ACTIVITY journal is wanted (shed_cap's `act`) */
 static int act_wanted(const gptps_tui *t) { return t->show_recent && t->act_want > 0; }
-/* mu held: the tier that runs, the request minus what is shed */
-static int shed_tier(const gptps_tui *t) { return shed_cap(kpi_tier(t->kpi_req), t->shed, act_wanted(t)); }
+/* mu held: the tier that runs, the request minus what is shed - and (ARM, 1.13) at most GAUGE
+ * while disarmed: the totals and the gauges always run */
+static int shed_tier(const gptps_tui *t)
+{
+    int r = shed_cap(kpi_tier(t->kpi_req), t->shed, act_wanted(t));
+    return !t->armed && r > TUI_T_GAUGE ? TUI_T_GAUGE : r;
+}
 /* mu held: the pane interval GPTPS_TUI_SHED_PANE would set next - twice what runs, up to
  * TUI_PANE_SHED_MAX - or 0 when it would change nothing (at the cap) */
 static uint64_t pane_shed_next(const gptps_tui *t)
@@ -3039,6 +3069,40 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
     }
 }
 
+/* ---- arm (gptps_tui.h, ARM at gptps_tui_install) ---------------------------------------
+ * tui.arm = on_view: the tiers above GAUGE run only while someone looks. Decided here, at
+ * render / snapshot / run / press / health time - never on the event path, and with no timer:
+ * a VIEW (`view` 1: a frame, a key) arms a disarmed dashboard; gptps_tui_health (`view` 0)
+ * disarms one that no view has reached for disarm_ms while no live loop runs. The flag flips
+ * under mu, then tui_reconfig makes the storage match it (built with mu released, swapped
+ * under it, freed after: a disarm only frees). Two racing are safe: tui_reconfig builds from
+ * the state it finds under smu, so the last one leaves what the last flag says. An arm keeps
+ * what ADAPT shed (unshed 0) and is never refused: the request is within the budget. Never
+ * under mu or smu (rmu may be held: health from a source's read). */
+static void tui_arm(gptps_tui *t, uint64_t now, int view)
+{
+    int act = 0;
+    mu_lock(&t->mu);
+    if (view) { t->h_views++; t->view_ms = now ? now : 1; }
+    if (t->arm_mode == GPTPS_TUI_ARM_ON_VIEW) {
+        if (view && !t->armed) {
+            t->armed = 1; t->arm_ms = now ? now : 1; t->h_arms++; act = 1;
+        } else if (!view && t->armed && !t->run_on && now >= t->view_ms && now - t->view_ms >= t->disarm_ms) {
+            t->armed = 0; t->h_disarms++; act = -1;
+        }
+        /* a window measured with the layers on (off) says nothing of them off (on) */
+        if (act && t->adapt != GPTPS_TUI_ADAPT_OFF) adapt_base(t, now);
+    }
+    mu_unlock(&t->mu);
+    if (act) {
+        char what[400];
+        gptps_status st = tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what);   /* the request: never refused */
+        if (act > 0 && st == GPTPS_E_NOMEM) { mu_lock(&t->mu); t->h_arm_fail++; mu_unlock(&t->mu); }
+        (void)reconf_said(act > 0 ? "gptps_tui: tui.arm=on_view: arming on a view" : "gptps_tui: tui.arm=on_view: "
+                          "disarming", "tui.arm=on_view", st, what);
+    }
+}
+
 /* A frame was made in `us` microseconds: the window's slowest (ADAPT's RENDER). */
 static void adapt_frame_us(gptps_tui *t, uint64_t us)
 {
@@ -3103,6 +3167,27 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
         pnames(v->shed_why, wn, sizeof wn);
         snprintf(dl, sizeof dl, "DEGRADED: %s (pressure: %s) - 'u' restores %s", sn, wn, kpi_str(v->kpi_req));
         pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(dl, W - 1), dl, X);
+    }
+    if (v->arm_show) {                   /* ARM: the record is younger than the session */
+        /* in pieces, each formatted into a buffer it provably fits, then joined */
+        char al[320], hd[96], tl[160], ag[48], dn[48];
+        dn[0] = 0;
+        if (v->arm_disarms) snprintf(dn, sizeof dn, ", %llu disarm%s so far", (unsigned long long)v->arm_disarms,
+                                     v->arm_disarms == 1 ? "" : "s");
+        if (v->clock != GPTPS_TUI_CLOCK_OFF) {
+            fmt_up(ag, sizeof ag, v->arm_age, v->clock);   /* "up 4m": the age, said as the clock says it */
+            snprintf(hd, sizeof hd, "recording since first view (%.40s ago) - ", ag + 3);
+        } else {                         /* no clock: a fixed point, so the line never changes */
+            snprintf(hd, sizeof hd, "recording since first view (%llu s after install) - ",
+                     (unsigned long long)(v->arm_after / 1000u));
+        }
+        if (v->arm_mode == GPTPS_TUI_ARM_ON_VIEW)
+            snprintf(tl, sizeof tl, "tui.arm=on_view, off %llu.%u s after the last view%s",
+                     (unsigned long long)(v->arm_dms / 1000u), (unsigned)(v->arm_dms / 100u % 10u), dn);
+        else
+            snprintf(tl, sizeof tl, "tui.arm=always now%s", dn);
+        snprintf(al, sizeof al, "%s%s", hd, tl);
+        pos = appendf(buf, cap, pos, "%s%.*s%s\n", D, (int)u8_fit(al, W - 1), al, X);
     }
 
     if (!v->gline) {                 /* MINIMAL keeps no gauge (nor a SUM source): what is alive, as one sum */
@@ -3396,6 +3481,7 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
     uint64_t warn = 0, now, t0;
     size_t pos, n;
     int dash = t->pane == TUI_PANE_DASH;
+    tui_arm(t, TUI_NOW_MS(), 1);         /* before any lock: a view arms (ARM; it may allocate) */
     tui_adapt(t, TUI_NOW_MS());          /* before any lock: a window's ADAPT (it may shed) */
     if (dash) trk_resync(t, 0);          /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
@@ -3442,6 +3528,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     uint64_t warn = 0, t0;
     size_t n;
     if (!t || !buf || cap == 0) { if (buf && cap) buf[0] = 0; return 0; }
+    tui_arm(t, TUI_NOW_MS(), 1);                      /* before any lock: a view arms (ARM) */
     tui_adapt(t, TUI_NOW_MS());                       /* before any lock: a window's ADAPT */
     if (t->pane == TUI_PANE_DASH) trk_resync(t, 0);   /* before any lock: it asks the engine */
     mu_lock(&t->rmu);
@@ -3882,6 +3969,7 @@ int gptps_tui_press(gptps_tui *t, int key)
     gptps_submit_options ko;
     int has_ko = 0;
     if (!t) return 0;
+    tui_arm(t, TUI_NOW_MS(), 1);                        /* a key is a view (ARM): 'm' steps from what runs armed */
     if (t->pane == TUI_PANE_SETTINGS) return settings_press(t, key);   /* settings editor handles its own keys */
     if (t->pane == TUI_PANE_TASKS)    return tasks_press(t, key);
     if (t->pane == TUI_PANE_DETAIL)   return detail_press(t, key);
@@ -4455,11 +4543,21 @@ void gptps_tui_run(gptps_tui *t)
     size_t ocap = 0;
     int first = 1, kp = 0, rfd = -1, have_wake, use_stdin = 1, resized = 0, painted_pane = -1;
     uint64_t last = 0, painted_gen = 0, painted_lost = 0, vis = 0;
-    if (!t || !t->cfg.interactive) return;
+    if (!t) return;
+    if (!t->cfg.interactive) {           /* 1.13: said, not silent - once a dashboard, counted always */
+        int say;
+        mu_lock(&t->mu); t->h_run_noop++; say = !t->run_said; t->run_said = 1; mu_unlock(&t->mu);
+        if (say)
+            gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: cfg.interactive is 0, so the live dashboard does not "
+                      "run (gptps_tui_render / gptps_tui_snapshot make a frame; gptps_tui_health.run_noops counts "
+                      "these calls; this WARN once a dashboard)");
+        return;
+    }
     /* Needs a terminal both ways: frames out, keys in. With stdin at end of input
      * (</dev/null, a closed pipe, a launcher that gives it none) the key poll returned
      * at once and the loop repainted tens of thousands of frames a second. */
     if (!fd_is_tty(t->cfg.out) || !fd_is_tty(stdin)) {
+        mu_lock(&t->mu); t->h_run_noop++; mu_unlock(&t->mu);
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: stdin or the output is not a terminal; "
                   "the live dashboard does not run (gptps_tui_snapshot renders a frame)");
         return;
@@ -4487,6 +4585,7 @@ void gptps_tui_run(gptps_tui *t)
         gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: could not make the live loop's wake handle (a pipe / "
                   "an event); it wakes every refresh_ms to look for changes instead of only when there is one");
     }
+    mu_lock(&t->mu); t->run_on = 1; mu_unlock(&t->mu);   /* ARM: a view while it runs, idle or not */
     term_enable(t);
     for (;;) {
         int q, md, dirty, paint, eof = 0, rz = 0, w;
@@ -4594,7 +4693,10 @@ void gptps_tui_run(gptps_tui *t)
     }
     term_restore(t);
     if (have_wake) wake_close(t, rfd);
-    mu_lock(&t->mu); t->frame_bytes = 0; t->waiting = 0; mu_unlock(&t->mu);
+    mu_lock(&t->mu);
+    t->frame_bytes = 0; t->waiting = 0;
+    t->run_on = 0; t->view_ms = TUI_NOW_MS(); if (!t->view_ms) t->view_ms = 1;   /* ARM: disarm_ms from now */
+    mu_unlock(&t->mu);
     rt_free(t, fb.b, fb.cap); rt_free(t, pv.b, pv.cap); rt_free(t, ob, ocap);
 }
 
@@ -4608,6 +4710,7 @@ static const int TUI_KPI_CHOICE_VAL[] = { GPTPS_TUI_KPI_OFF, GPTPS_TUI_KPI_MINIM
 static const char *const TUI_MODE_CHOICES[] = { "realtime", "on-demand", "paused", 0 };
 static const char *const TUI_CLOCK_CHOICES[] = { "off", "minutes", "seconds", 0 };   /* GPTPS_TUI_CLOCK_* - 1 */
 static const char *const TUI_ADAPT_CHOICES[] = { "off", "report", "degrade", 0 };     /* GPTPS_TUI_ADAPT_* - 1 */
+static const char *const TUI_ARM_CHOICES[] = { "always", "on_view", 0 };              /* GPTPS_TUI_ARM_* - 1 */
 
 static size_t ts_rd_refresh(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; unsigned ms; mu_lock(&t->mu); ms = t->cfg.refresh_ms; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%u", ms); }
 static gptps_status ts_wr_refresh(void *p, const char *v) { return gptps_tui_set_refresh((gptps_tui *)p, (uint32_t)strtoul(v, NULL, 10)); }
@@ -4656,6 +4759,21 @@ static size_t ts_rd_budget(void *p, char *b, size_t c) { gptps_tui *t = (gptps_t
 static gptps_status ts_wr_budget(void *p, const char *v) { return gptps_tui_set_cost_budget((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
 static size_t ts_rd_budget_kb(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->cfg.budget_kb; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
 static gptps_status ts_wr_budget_kb(void *p, const char *v) { return gptps_tui_set_budget_kb((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
+static size_t ts_rd_arm(void *p, char *b, size_t c)
+{
+    gptps_tui *t = (gptps_tui *)p; int k;
+    mu_lock(&t->mu); k = t->arm_mode; mu_unlock(&t->mu);
+    return (size_t)snprintf(b, c, "%s", k == GPTPS_TUI_ARM_ON_VIEW ? "on_view" : "always");
+}
+static gptps_status ts_wr_arm(void *p, const char *v)
+{
+    int k;
+    for (k = 0; TUI_ARM_CHOICES[k]; ++k)
+        if (strcmp(v, TUI_ARM_CHOICES[k]) == 0) return gptps_tui_set_arm((gptps_tui *)p, (gptps_tui_arm)(k + 1));
+    return GPTPS_E_INVAL;              /* the registry checks the choices first: not reached */
+}
+static size_t ts_rd_disarm(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; unsigned long long n; mu_lock(&t->mu); n = (unsigned long long)t->disarm_ms; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%llu", n); }
+static gptps_status ts_wr_disarm(void *p, const char *v) { return gptps_tui_set_disarm_ms((gptps_tui *)p, (uint32_t)strtoul(v, NULL, 10)); }
 static size_t ts_rd_mode(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int m; mu_lock(&t->mu); m = t->mode; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%s", mode_str(m)); }
 static gptps_status ts_wr_mode(void *p, const char *v) { int m = (strcmp(v, "realtime") == 0) ? GPTPS_TUI_CONTINUOUS : (strcmp(v, "on-demand") == 0) ? GPTPS_TUI_ON_DEMAND : GPTPS_TUI_PAUSED; return gptps_tui_set_mode((gptps_tui *)p, (gptps_tui_mode)m); }
 
@@ -4706,6 +4824,15 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
                                                     "measured cost per kpi tier), in percent of one core, past "
                                                     "which tui.adapt reports pressure",
                                                     NULL, ts_rd_budget, ts_wr_budget, 1, 1, 100 },
+        /* 1.13 */
+        { "tui.arm",            GPTPS_SETTING_ENUM, "when the layers above gauge collect (problems, tasks, "
+                                                    "activity, latency, percentiles): always; on_view - from "
+                                                    "the first frame or key until tui.disarm_ms without one "
+                                                    "(the totals and gauges always)",
+                                                    TUI_ARM_CHOICES, ts_rd_arm, ts_wr_arm, 0, 0, 0 },
+        { "tui.disarm_ms",      GPTPS_SETTING_UINT, "with tui.arm=on_view: ms after the last view at which a "
+                                                    "health call stops the layers above gauge",
+                                                    NULL, ts_rd_disarm, ts_wr_disarm, 1, TUI_DISARM_MIN, TUI_DISARM_MAX },
         /* 1.13 - LAST, so a settings file is applied with the footprint it sets, then its budget */
         { "tui.budget_kb",      GPTPS_SETTING_UINT, "a memory budget for the dashboard, in KiB: a change whose "
                                                     "footprint (gptps_tui.h, MEMORY) would exceed it is refused "
@@ -4854,7 +4981,7 @@ static uint64_t foot_held(const gptps_tui *t)
          + (t->tab ? (uint64_t)(t->tab_mask + 1) * sizeof(tui_slot) : 0);
 }
 static uint64_t kib_up(uint64_t b) { return (b + 1023u) / 1024u; }
-/* "needs 109 KiB (111520 bytes: the dashboard 7000, TASKS 19720, ...), over tui.budget_kb 64 (65536
+/* "needs 110 KiB (111688 bytes: the dashboard 7168, TASKS 19720, ...), over tui.budget_kb 64 (65536
  * bytes): refused, nothing changed" */
 /* (each piece formatted into a buffer it provably fits - a 20-digit number, a name of at most
  * 16 bytes - and appended whole while it fits `cap`) */
@@ -5146,6 +5273,24 @@ static void tui_destroy(gptps_tui *t)
     free(t);
 }
 
+/* HINT (gptps_tui.h, at gptps_tui_install; kpi_verdict item 4): FULL running from install
+ * (tui.arm = always) with no terminal to show the live dashboard on - gptps_tui_run needs the
+ * output and stdin to be terminals - collects everything for frames only render / snapshot
+ * show. One WARN (gptps_log drops INFO), naming the cost and the settings that lower it. */
+static void tui_hint(gptps_tui *t)
+{
+    uint64_t held;
+    int tier;
+    if (fd_is_tty(t->cfg.out) && fd_is_tty(stdin)) return;
+    mu_lock(&t->mu); tier = t->tier; held = foot_held(t); mu_unlock(&t->mu);
+    if (tier != TUI_T_FULL) return;
+    tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: no terminal to run the live dashboard on (the output or stdin is "
+             "not one), and kpi full collects everything from now on - about %u ns and one lock an event, %llu KiB "
+             "held - for frames only gptps_tui_render / gptps_tui_snapshot show. tui.arm=on_view collects above "
+             "gauge only while someone looks (the totals and gauges always); or set a lower tui.kpi. This WARN "
+             "once, at install", TUI_COST_NS[TUI_T_FULL], (unsigned long long)kib_up(held));
+}
+
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
 {
     gptps_tui *t;
@@ -5199,12 +5344,15 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
             { "adapt",           offsetof(gptps_tui_config, adapt),            0, GPTPS_TUI_ADAPT_DEGRADE },
             { "cost_budget_pct", offsetof(gptps_tui_config, cost_budget_pct),  0, 100 },
             { "budget_kb",       offsetof(gptps_tui_config, budget_kb),        0, TUI_BUDGET_KB_MAX },
+            { "arm",             offsetof(gptps_tui_config, arm),              0, GPTPS_TUI_ARM_ON_VIEW },
+            { "disarm_ms",       offsetof(gptps_tui_config, disarm_ms),        0, TUI_DISARM_MAX },
         };
         size_t k;
         for (k = 0; k < sizeof F / sizeof F[0]; ++k) {
             int v;
             memcpy(&v, (const char *)&t->cfg + F[k].off, sizeof v);
-            if (v < F[k].lo || v > F[k].hi || (F[k].off == offsetof(gptps_tui_config, pane_refresh_ms) && v && v < 100)) {
+            if (v < F[k].lo || v > F[k].hi || (F[k].off == offsetof(gptps_tui_config, pane_refresh_ms) && v && v < 100) ||
+                (F[k].off == offsetof(gptps_tui_config, disarm_ms) && v && v < TUI_DISARM_MIN)) {
                 tui_logf(GPTPS_LOG_ERROR, "gptps_tui_install: cfg.%s %d is out of range (see gptps_tui.h); the "
                          "dashboard was not installed", F[k].name, v);
                 tui_destroy(t);
@@ -5219,6 +5367,10 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         if (!t->cfg.cost_budget_pct) t->cfg.cost_budget_pct = TUI_COST_DEF;
         t->adapt = t->cfg.adapt; t->cost_pct = t->cfg.cost_budget_pct;
         t->budget = (uint64_t)t->cfg.budget_kb * 1024u;
+        if (!t->cfg.arm)             t->cfg.arm = GPTPS_TUI_ARM_ALWAYS;
+        if (!t->cfg.disarm_ms)       t->cfg.disarm_ms = (int)TUI_DISARM_DEF;
+        t->arm_mode = t->cfg.arm; t->disarm_ms = (uint64_t)t->cfg.disarm_ms;
+        t->armed = t->arm_mode == GPTPS_TUI_ARM_ALWAYS;   /* ON_VIEW: totals and gauges until the first view */
     }
     if (!t->cfg.title) t->cfg.title = "tasks";   /* every pane prints it */
     if (!t->cfg.out) t->cfg.out = stdout;
@@ -5294,6 +5446,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
         tui_logf(GPTPS_LOG_WARN, "gptps_tui_install: no memory for %s; the dashboard runs without it", what);
     t->start_ms = TUI_NOW_MS();
     t->ad_ms = t->start_ms;               /* ADAPT's first window starts with the dashboard */
+    if (t->armed) t->arm_ms = t->start_ms ? t->start_ms : 1;   /* ALWAYS: the record is the session */
     if ((st = gptps_register_observer(e, tui_on_event, t)) != GPTPS_OK) {
         /* everything, the handle table too (64 KiB by default, 64 MiB at the cap): the
          * caller gets NULL back and has no handle to reclaim it with */
@@ -5305,6 +5458,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     mu_lock(&t->mu); t->observing = 1; mu_unlock(&t->mu);
     trk_resync(t, 1);              /* only now: an item queued before this is missed by the table */
     tui_register_settings(e, t);   /* expose tui.refresh_ms / kpi / mode / latency_window / recent / activity */
+    tui_hint(t);                   /* HINT (1.13): FULL with no terminal to show it on - said once */
     return t;
 }
 
@@ -5403,6 +5557,7 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     if (!t || !out || out->struct_size < offsetof(gptps_tui_health_info, journal_not_shown) + sizeof(uint64_t))
         return GPTPS_E_INVAL;
     memset(&h, 0, sizeof h);
+    tui_arm(t, TUI_NOW_MS(), 0);         /* before any lock: no view for disarm_ms disarms (ARM) */
     tui_adapt(t, TUI_NOW_MS());          /* before any lock: a window's ADAPT (it may shed) */
     trk_resync(t, 1);                    /* before the lock: it asks the engine - every call: the
                                           * host's own question, at the host's own rate */
@@ -5475,6 +5630,19 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     h.budget_refusals   = t->h_bref;
     h.budget_stops      = t->h_bstop;
     h.budget_need_bytes = t->b_need;
+    {   /* ARM (1.13) */
+        uint64_t now = TUI_NOW_MS();
+        h.arm           = t->arm_mode;
+        h.armed         = t->armed;
+        h.disarm_ms     = t->disarm_ms;
+        h.record_ms     = t->armed && now >= t->arm_ms ? now - t->arm_ms : 0;
+        h.views         = t->h_views;
+        h.view_age_ms   = t->view_ms && now >= t->view_ms ? now - t->view_ms : 0;
+        h.arms          = t->h_arms;
+        h.disarms       = t->h_disarms;
+        h.arm_failures  = t->h_arm_fail;
+        h.run_noops     = t->h_run_noop;
+    }
     mu_unlock(&t->mu);
     n = out->struct_size < sizeof h ? out->struct_size : sizeof h;   /* what the caller's struct has */
     memcpy((char *)out + sizeof(size_t), (char *)&h + sizeof(size_t), n - sizeof(size_t));
@@ -5552,6 +5720,41 @@ gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb)
     tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_budget_kb: tui.budget_kb=%d is below the footprint the configuration "
              "holds - it %s (gptps_tui_health.budget_refusals)", kb, why);
     return GPTPS_E_INVAL;
+}
+
+gptps_status gptps_tui_set_arm(gptps_tui *t, gptps_tui_arm mode)
+{
+    char what[400];
+    int arm = 0;
+    uint64_t now;
+    if (!t) return GPTPS_E_INVAL;
+    if (mode == GPTPS_TUI_ARM_DEFAULT) mode = GPTPS_TUI_ARM_ALWAYS;
+    if (mode != GPTPS_TUI_ARM_ALWAYS && mode != GPTPS_TUI_ARM_ON_VIEW) return GPTPS_E_INVAL;
+    now = TUI_NOW_MS();
+    mu_lock(&t->mu);
+    t->arm_mode = mode; t->cfg.arm = mode;
+    if (mode == GPTPS_TUI_ARM_ON_VIEW) t->view_ms = now ? now : 1;     /* counts as a view */
+    else if (!t->armed) { t->armed = 1; t->arm_ms = now ? now : 1; t->h_arms++; arm = 1; }
+    if (arm && t->adapt != GPTPS_TUI_ADAPT_OFF) adapt_base(t, now);
+    tui_touch(t);
+    mu_unlock(&t->mu);
+    tui_kick(t);
+    if (!arm) return GPTPS_OK;
+    {
+        gptps_status st = tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what);   /* the request: never refused */
+        if (st == GPTPS_E_NOMEM) { mu_lock(&t->mu); t->h_arm_fail++; mu_unlock(&t->mu); }
+        return reconf_said("gptps_tui_set_arm(always)", "tui.arm=always", st, what);
+    }
+}
+
+gptps_status gptps_tui_set_disarm_ms(gptps_tui *t, uint32_t ms)
+{
+    if (!t) return GPTPS_E_INVAL;
+    if (ms == 0) ms = TUI_DISARM_DEF;
+    if (ms < (uint32_t)TUI_DISARM_MIN || ms > (uint32_t)TUI_DISARM_MAX) return GPTPS_E_INVAL;
+    mu_lock(&t->mu); t->disarm_ms = ms; t->cfg.disarm_ms = (int)ms; tui_touch(t); mu_unlock(&t->mu);
+    tui_kick(t);
+    return GPTPS_OK;
 }
 
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode)

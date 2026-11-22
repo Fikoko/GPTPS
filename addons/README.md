@@ -835,12 +835,12 @@ enabled automatically). Panes/metrics:
 - **A memory budget: `tui.budget_kb`** (1.13; `cfg.budget_kb`, `gptps_tui_set_budget_kb`; 0,
   the default, is none). What the dashboard holds is computed by an exact formula from its
   sizes — the dashboard itself, its `add_task` entries and their payloads, and each tier's
-  parts (TASKS rows, the journals, the handle table, the percentiles) as they are held; 109
+  parts (TASKS rows, the journals, the handle table, the percentiles) as they are held; 110
   KiB at the defaults — documented under MEMORY in `gptps_tui.h` and reported as
   `gptps_tui_health.footprint_bytes` (`tests/test_tui_budget.c` holds it to the allocator,
   byte for byte, at every tier). With a budget, every change that would take the footprint
   of the *request* past it is **refused** — `GPTPS_E_INVAL`, one WARN naming what it needs
-  (`tui.kpi=full needs 109 KiB (111600 bytes: the dashboard 7080, TASKS 19720, ...), over
+  (`tui.kpi=full needs 110 KiB (111688 bytes: the dashboard 7168, TASKS 19720, ...), over
   tui.budget_kb 64 (65536 bytes): refused, nothing changed`), counted
   (`budget_refusals`, `budget_need_bytes`) and nothing changed: install (NULL), `set_kpi`,
   `set_recent`, `set_latency_window`, `add_task`, `m`, the `tui.*` writes, and a budget below
@@ -858,6 +858,33 @@ enabled automatically). Panes/metrics:
   the file's order, so a reload that raises both the footprint and the budget lists
   `budget_kb` first, and one that lowers both lists it last (in the other order the first
   key is refused with an ERROR and the reload returns `GPTPS_E_CONFIG`).
+- **Collect only while someone looks: `tui.arm = on_view`** (1.13; `cfg.arm`,
+  `gptps_tui_set_arm`; `always`, the default, is 1.12's behaviour). For a headless host
+  that rarely looks: the totals and the gauges always run, and the layers above `gauge` —
+  the PROBLEMS journal, the TASKS rows, the ACTIVITY journal, the handle table and the
+  percentiles, each of which holds per-event memory and adds work to every event — run only
+  from a view (a frame: `render`, `snapshot`, each frame of `run`; or a key) until
+  `tui.disarm_ms` (`cfg.disarm_ms`, `gptps_tui_set_disarm_ms`; 60000 by default) after the
+  last one. The totals stay on because they cannot catch up later. Arming builds the request
+  (less what `tui.adapt = degrade` shed) through the storage protocol — allocated with the
+  lock released, swapped in under it — never on the event path; an arm with no memory for a
+  part runs without it, counted (`arm_failures`, `alloc_failures`), shown ("no memory for:")
+  and WARNed. Disarming is decided only by `gptps_tui_health` (no timer, no thread), once no
+  view has come for `disarm_ms` and no `gptps_tui_run` loop runs (a live loop is a view while
+  it runs); it only frees, and journal records no frame showed are counted as not shown.
+  While disarmed nothing of the layers above `gauge` is recorded: no failure's why (the
+  totals still count it), no per-task counts, no lifecycle log, no avg ms, no percentiles,
+  and the gauges are approximate (`~`). Transitions are in `gptps_tui_health` (`armed`,
+  `record_ms`, `views`, `view_age_ms`, `arms`, `disarms`) and on the frame: "recording since
+  first view (4m ago) - tui.arm=on_view, off 60.0 s after the last view". A shed survives a
+  disarm and an arm (only the operator clears it), and the budget is checked against the
+  request, so an arm is never refused and never passes `tui.budget_kb`.
+- **A hint for a headless FULL install** (1.13). An install that runs `full` with
+  `tui.arm = always` and no terminal for the live dashboard (the output or stdin is not one)
+  logs one WARN naming what it collects for frames only `render` / `snapshot` show and the
+  settings that lower it; `gptps_tui_run` with `cfg.interactive = 0`, which returned
+  silently, now says so (one WARN a dashboard), and every `run` that returns at once is
+  counted in `gptps_tui_health.run_noops`.
 - **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
   runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
   instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back
@@ -883,7 +910,7 @@ enabled automatically). Panes/metrics:
   |---|---|---|
   | embedded / `GPTPS_RUN_MANUAL` (render or snapshot only) | `minimal` or `gauge`, `cfg.clock = OFF` with the stub HAL's clock | no thread, no pipe, no timer — `done/s`, `peak` and the clock advance inside render; neither tier holds per-event memory |
   | a server at 100k events/s | `ON_DEMAND`; `latency_window` = the in-flight depth; `activity_lines = -1` when the lifecycle log is not read | every tier is O(1) an event (23-38 ns at `full`: ~0.2-0.4% of a core at 100k/s), but `minimal` and up take one mutex an event on every emitting thread; `ON_DEMAND` wakes at most once a frame interval; failures stay in PROBLEMS; the tasks pane is safe to leave open |
-  | Task Scheduler / a service / headless | `off`, or what `gptps_tui_snapshot` needs | `run` returns at once (no console) and makes no pipe; `off` costs ~2 ns an event and no lock — raise it when someone looks |
+  | Task Scheduler / a service / headless | `off`, or what `gptps_tui_snapshot` needs, or `tui.arm = on_view` (1.13) | `run` returns at once (no console) and makes no pipe; `off` costs ~2 ns an event and no lock — raise it when someone looks; `on_view` keeps the totals and gauges and collects the rest from the first snapshot until `disarm_ms` after the last (a health call on the host's cadence disarms) |
   | an operator's console | the defaults (`full`, `CONTINUOUS`, clock in minutes), or `ON_DEMAND` | idle, it writes nothing and repaints the header once a minute; `ON_DEMAND` makes no frame between changes |
 
 - **Testable split:** `gptps_tui_render()` returns the frame as a string and
