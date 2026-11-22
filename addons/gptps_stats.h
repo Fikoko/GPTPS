@@ -43,9 +43,11 @@
  * or a reader (total / task / task_at / snapshot / health) that finds it more than half
  * full, up to cfg.handles_max - allocated with the lock released, swapped (rehashed) in
  * under it, the old one freed after. A host that never reads should size it at install.
- * When it did not fit, the untracked WARN and gptps_stats_health give the exact figure
- * (1.13): handles_peak, the most handles live at once (tracked plus untracked), and
- * handles_needed, the gptps_stats_reserve argument that would have held them.
+ * When it did not fit, the untracked WARN and gptps_stats_health give the figure
+ * (1.13): handles_peak, the most handles live at once (tracked plus untracked, each
+ * refused handle counted once - see the field), and handles_needed, the
+ * gptps_stats_reserve argument that would have held them. With the flag on and the table
+ * stopped at cfg.handles_max, the WARN names a larger handles_max instead of the flag.
  *
  * Growth on the event path (1.13, opt-in): GPTPS_STATS_GROW_ON_EVENT in cfg.flags lets
  * the observer itself grow the full table, by doubling up to cfg.handles_max, so a burst
@@ -279,7 +281,13 @@ typedef struct {
     /* ---- 1.13 (read only if struct_size covers them) ---- */
     uint64_t handles_peak;         /* the most handles live at once since install: table entries
                                     * plus handles the full table refused that had not ended yet
-                                    * (a refused handle's terminal event takes it off) */
+                                    * (a refused handle's terminal event takes it off). Each
+                                    * refused handle counts once, however its events interleave
+                                    * (STARTED before QUEUED, retries). Exact while at most 256
+                                    * refused handles are live at once; past that, a span handle
+                                    * never refused can stand in for an older refused one for a
+                                    * while (the count comes back), and a refused STARTED whose
+                                    * late QUEUED comes after 256 newer refusals counts twice */
     uint64_t handles_needed;       /* the gptps_stats_reserve(s, n) that would have tracked them all:
                                     * the next power of two >= handles_peak (at most 1<<24) */
     uint64_t grows_on_event;       /* of `grows`, those made by the observer (GPTPS_STATS_GROW_ON_EVENT) */

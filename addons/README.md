@@ -613,8 +613,11 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   N live handles past a table of C: gptps_stats_reserve(s, P) ... or
   GPTPS_STATS_GROW_ON_EVENT"`, where `P` (`health.handles_needed`) is the next power of
   two at or above the peak of live handles (`health.handles_peak`: table entries plus
-  refused handles not yet ended). The event path's WARN speaks at the burst's start
-  (the figure so far); the first read after it repeats it with the final figure.
+  refused handles not yet ended, each counted once however its events interleave —
+  STARTED before QUEUED, retries). The event path's WARN speaks at the burst's start
+  (the figure so far); the first read after it repeats it with the final figure. With
+  the flag below on and the table stopped at `handles_max`, the WARN names "a
+  cfg.handles_max of at least that" instead of the flag.
 - **Growth on the event path (1.13, opt-in):** `GPTPS_STATS_GROW_ON_EVENT` in
   `gptps_stats_config.flags` lets the observer grow the full table itself, doubling up
   to `handles_max`, so a pre-read burst is tracked exactly. It trades the

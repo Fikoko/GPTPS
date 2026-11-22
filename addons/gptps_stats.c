@@ -91,6 +91,15 @@
 #define ST_ABSORB       256u
 #define ST_ABSORB_SLOTS 512u
 
+/* A bounded set of handles: a ring (eviction order, oldest first) over an open-addressed
+ * set (lookup), both fixed - nothing allocated. Two of them: the absorb set, and (1.13)
+ * the refused handles counted live. */
+typedef struct {
+    gptps_handle ring[ST_ABSORB];
+    unsigned     head, n;
+    gptps_handle set[ST_ABSORB_SLOTS];
+} st_hset;
+
 enum { ST_NONE = 0, ST_PENDING, ST_RUNNING, ST_LIMBO, ST_DONE };
 enum { W_UNTRACKED = 0, W_FOLD, W_ORPHAN, W_NOMEM, W_MEASURE, W_NEEDED, W_N };
 
@@ -167,15 +176,16 @@ struct gptps_stats {
     unsigned              orph_head, orph_n;
     /* handles whose late QUEUED / RETRIED must move no gauge: a ring (eviction order)
      * over a set (lookup), both fixed */
-    gptps_handle          ab_ring[ST_ABSORB];
-    unsigned              ab_head, ab_n;
-    gptps_handle          ab_set[ST_ABSORB_SLOTS];
+    st_hset               ab;
     /* the span of handles the full table refused: their later events stay untracked */
     gptps_handle          rf_lo, rf_hi;
-    /* (1.13) sizing figures: handles refused and not yet ended (a refused handle's
-     * terminal event takes one off), and the peak of live entries plus those - the
-     * table a burst needed. GPTPS_STATS_GROW_ON_EVENT: the observer grows the table. */
-    uint64_t              untracked_live, peak;
+    /* (1.13) sizing figures: handles refused and not yet ended, and the peak of live
+     * entries plus those - the table a burst needed. Each refused handle counts once:
+     * the newest are in rc (counted, not yet over); rc_lost counts the ones that aged
+     * out of it still live, so their later events take them off without being counted
+     * again. GPTPS_STATS_GROW_ON_EVENT: the observer grows the table. */
+    uint64_t              untracked_live, peak, rc_lost;
+    st_hset               rc;
     int                   grow_ev;
     /* health */
     uint64_t              untracked, untracked_seen, orphans_dropped, grows, nomem, grows_event;
@@ -186,7 +196,7 @@ struct gptps_stats {
 };
 
 /* WARNs are composed under the lock and logged after it is dropped. */
-#define ST_WARN_LEN 512
+#define ST_WARN_LEN 768
 typedef struct { int n; char m[3][ST_WARN_LEN]; } st_warns;
 
 static int st_warn_due(gptps_stats *s, int k)
@@ -283,46 +293,72 @@ static size_t st_live(const gptps_stats *s) { return s->tabn - s->ndone; }
  * nothing allocated) and their late QUEUED / RETRIED bumps the totals only, counted in
  * health.late_absorbed. A handle that ages out of the ring before its late event comes
  * is not caught: that is the residual case the header documents. */
-static int st_ab_has(const gptps_stats *s, gptps_handle h)
+static int hs_has(const st_hset *a, gptps_handle h)
 {
     size_t i;
-    for (i = slot_hash(h, ST_ABSORB_SLOTS); s->ab_set[i]; i = (i + 1) & (ST_ABSORB_SLOTS - 1))
-        if (s->ab_set[i] == h) return 1;
+    if (!a->n || !h) return 0;
+    for (i = slot_hash(h, ST_ABSORB_SLOTS); a->set[i]; i = (i + 1) & (ST_ABSORB_SLOTS - 1))
+        if (a->set[i] == h) return 1;
     return 0;
 }
-static void st_ab_del(gptps_stats *s, gptps_handle h)
+/* Out of the set only (the ring keeps its place: a stale ring entry is skipped when it
+ * ages out, as hs_del finds nothing to delete). */
+static int hs_del(st_hset *a, gptps_handle h)
 {
     size_t i, j;
-    for (i = slot_hash(h, ST_ABSORB_SLOTS); s->ab_set[i] != h; i = (i + 1) & (ST_ABSORB_SLOTS - 1))
-        if (!s->ab_set[i]) return;
+    if (!h) return 0;
+    for (i = slot_hash(h, ST_ABSORB_SLOTS); a->set[i] != h; i = (i + 1) & (ST_ABSORB_SLOTS - 1))
+        if (!a->set[i]) return 0;
     for (j = i;;) {                               /* backward shift, as tab_del */
         size_t k;
         j = (j + 1) & (ST_ABSORB_SLOTS - 1);
-        if (!s->ab_set[j]) break;
-        k = slot_hash(s->ab_set[j], ST_ABSORB_SLOTS);
-        if ((i <= j) ? (k <= i || k > j) : (k <= i && k > j)) { s->ab_set[i] = s->ab_set[j]; i = j; }
+        if (!a->set[j]) break;
+        k = slot_hash(a->set[j], ST_ABSORB_SLOTS);
+        if ((i <= j) ? (k <= i || k > j) : (k <= i && k > j)) { a->set[i] = a->set[j]; i = j; }
     }
-    s->ab_set[i] = 0;
+    a->set[i] = 0;
+    return 1;
 }
-static void st_ab_add(gptps_stats *s, gptps_handle h)
+/* Add h; returns 1 if a handle still in the set aged out to make room. */
+static int hs_add(st_hset *a, gptps_handle h)
 {
     size_t i;
-    if (!h || st_ab_has(s, h)) return;
-    if (s->ab_n == ST_ABSORB) {                   /* the oldest ages out */
-        st_ab_del(s, s->ab_ring[s->ab_head]);
-        s->ab_ring[s->ab_head] = h;
-        s->ab_head = (s->ab_head + 1) % ST_ABSORB;
+    int evicted = 0;
+    if (!h || hs_has(a, h)) return 0;
+    if (a->n == ST_ABSORB) {                      /* the oldest ages out */
+        evicted = hs_del(a, a->ring[a->head]);
+        a->ring[a->head] = h;
+        a->head = (a->head + 1) % ST_ABSORB;
     } else {
-        s->ab_ring[(s->ab_head + s->ab_n) % ST_ABSORB] = h;
-        s->ab_n++;
+        a->ring[(a->head + a->n) % ST_ABSORB] = h;
+        a->n++;
     }
-    for (i = slot_hash(h, ST_ABSORB_SLOTS); s->ab_set[i]; i = (i + 1) & (ST_ABSORB_SLOTS - 1)) { }
-    s->ab_set[i] = h;
+    for (i = slot_hash(h, ST_ABSORB_SLOTS); a->set[i]; i = (i + 1) & (ST_ABSORB_SLOTS - 1)) { }
+    a->set[i] = h;
+    return evicted;
 }
+static void hs_clear(st_hset *a) { memset(a, 0, sizeof *a); }
+static int st_ab_has(const gptps_stats *s, gptps_handle h) { return hs_has(&s->ab, h); }
+static void st_ab_add(gptps_stats *s, gptps_handle h) { (void)hs_add(&s->ab, h); }
 /* In the span of handles the full table refused (see st_untracked). */
 static int st_refused(const gptps_stats *s, gptps_handle h)
 {
     return s->rf_hi && h >= s->rf_lo && h <= s->rf_hi;
+}
+/* (1.13) A refused handle's event, for a handle not in the table: in the refused span,
+ * and not a late QUEUED / RETRIED - those may open a handle the span merely covers -
+ * unless the handle is a refused one counted live (its STARTED was refused before its
+ * QUEUED came), or the RETRIED is of a later attempt (the handle lived before, and
+ * untracked: a tracked one would be in the table, or absorbed). */
+static int st_refused_ev(const gptps_stats *s, const gptps_event *ev)
+{
+    if (!st_refused(s, ev->handle)) return 0;
+    if (ev->kind != GPTPS_EV_QUEUED && ev->kind != GPTPS_EV_RETRIED) return 1;
+    return hs_has(&s->rc, ev->handle) || (ev->kind == GPTPS_EV_RETRIED && ev->attempt >= 2);
+}
+static void st_rc_add(gptps_stats *s, gptps_handle h)
+{
+    if (hs_add(&s->rc, h)) s->rc_lost++;         /* aged out still live: its end comes later */
 }
 
 /* Remember a new marker; drop the oldest when the FIFO is full (it may delete a slot,
@@ -410,6 +446,15 @@ static uint64_t st_needed(const gptps_stats *s)
     size_t p = st_pow2(s->peak ? (size_t)s->peak : 1);
     return p > ST_MAX_HANDLES ? ST_MAX_HANDLES : p;
 }
+/* mu held: the other way to the figure, for the untracked WARNs - the flag, or, when it
+ * is on and the table stopped at cfg.handles_max, a larger handles_max (the event path
+ * grows no further; gptps_stats_reserve ignores handles_max). */
+static const char *st_hint(const gptps_stats *s)
+{
+    if (!s->grow_ev) return "GPTPS_STATS_GROW_ON_EVENT";
+    if (s->live_cap >= s->handles_max) return "a cfg.handles_max of at least that (GPTPS_STATS_GROW_ON_EVENT stops at it)";
+    return "memory for GPTPS_STATS_GROW_ON_EVENT (gptps_stats_health.nomem)";
+}
 /* mu held: note the live handles now (tracked entries plus refused ones not yet over). */
 static void st_peak(gptps_stats *s)
 {
@@ -429,10 +474,10 @@ static size_t st_grow_want(gptps_stats *s, st_warns *w)
     if (refused && st_warn_due(s, W_NEEDED) && (m = st_warn_slot(w)) != NULL)
         snprintf(m, ST_WARN_LEN, "gptps_stats: handles went untracked: a burst of %llu live handles past a table of %lu: "
                  "gptps_stats_reserve(s, %llu) (the next power of two >= the peak live handles) or "
-                 "GPTPS_STATS_GROW_ON_EVENT; %llu event(s) not tracked so far, the pending / in-flight gauges "
+                 "%s; %llu event(s) not tracked so far, the pending / in-flight gauges "
                  "undercount (gptps_stats_health.handles_needed)",
                  (unsigned long long)s->peak, (unsigned long)s->live_cap, (unsigned long long)st_needed(s),
-                 (unsigned long long)s->untracked);
+                 st_hint(s), (unsigned long long)s->untracked);
     if (s->live_cap >= s->handles_max) return 0;
     if (!refused && st_live(s) * 2 <= s->live_cap) return 0;
     want = s->live_cap * 2;
@@ -665,24 +710,27 @@ static int st_terminal(const gptps_event *ev)
 /* A handle the full table could not take: counted, and WARNed at most once a minute.
  * It joins the refused span, so its later events stay untracked too - counted once, here,
  * never again as a marker dropped. */
-static void st_untracked(gptps_stats *s, gptps_handle h, st_warns *w)
+static void st_untracked(gptps_stats *s, gptps_handle h, int live, st_warns *w)
 {
     char *m;
     s->untracked++;
     if (h) {
         if (!s->rf_hi || h < s->rf_lo) s->rf_lo = h;
         if (h > s->rf_hi) s->rf_hi = h;
-        s->untracked_live++;                     /* live, but not in the table: the peak counts it */
-        st_peak(s);
+        if (live) {                              /* live, but not in the table: the peak counts it, once */
+            s->untracked_live++;
+            st_rc_add(s, h);
+            st_peak(s);
+        }
     }
     if (st_warn_due(s, W_UNTRACKED) && (m = st_warn_slot(w)) != NULL)
         snprintf(m, ST_WARN_LEN, "gptps_stats: the handle table is full: a burst of %llu live handles (so far) past a table "
                  "of %lu: gptps_stats_reserve(s, %llu) (the next power of two >= the peak live handles) or "
-                 "GPTPS_STATS_GROW_ON_EVENT; %llu event(s) not tracked so far and the pending / in-flight gauges "
+                 "%s; %llu event(s) not tracked so far and the pending / in-flight gauges "
                  "undercount (reads grow it up to cfg.handles_max = %lu; the figure once the burst is over: "
                  "gptps_stats_health.handles_needed)",
                  (unsigned long long)s->peak, (unsigned long)s->live_cap, (unsigned long long)st_needed(s),
-                 (unsigned long long)s->untracked, (unsigned long)s->handles_max);
+                 st_hint(s), (unsigned long long)s->untracked, (unsigned long)s->handles_max);
 }
 
 /* Event ORDER is not guaranteed across threads (see EVENT ORDER in gptps.h). Two
@@ -707,6 +755,26 @@ static void st_untracked(gptps_stats *s, gptps_handle h, st_warns *w)
  * event never comes - work submitted before install never sends its QUEUED, and a
  * service's later runs have none - are bounded (1.12): the newest GPTPS_STATS_ORPHANS
  * are kept, the oldest dropped and counted. */
+/* (1.13) A refused handle's event: keep the live count exact. A handle counts once, while
+ * it lives: one counted (in rc) comes off at its end; one that aged out of rc still live
+ * is taken back (rc_lost) rather than counted again; one in the span never refused - its
+ * QUEUED still on the way - is live untracked, so it counts now. */
+static void st_refused_seen(gptps_stats *s, const gptps_event *ev)
+{
+    gptps_handle h = ev->handle;
+    int term = st_terminal(ev);
+    if (hs_has(&s->rc, h)) {
+        if (term) { (void)hs_del(&s->rc, h); if (s->untracked_live) s->untracked_live--; }
+    } else if (s->rc_lost) {
+        s->rc_lost--;
+        if (term) { if (s->untracked_live) s->untracked_live--; }
+        else st_rc_add(s, h);
+    } else if (!term) {
+        s->untracked_live++;
+        st_rc_add(s, h);
+    }
+    if (ev->kind == GPTPS_EV_STARTED || term) st_ab_add(s, h);
+}
 static void finish_slot(gptps_stats *s, stats_slot *slot, st_warns *w)
 {
     if (slot->seen_queued && !OWES_RETRIED(slot)) { tab_del(s, slot); return; }
@@ -739,24 +807,24 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
     if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) fold_measures(s, k, ev, w);
     if (!slot && ev->handle) {
         int late = ev->kind == GPTPS_EV_QUEUED || ev->kind == GPTPS_EV_RETRIED;
-        if (late && s->ab_n && st_ab_has(s, ev->handle)) {
+        if (late && st_ab_has(s, ev->handle)) {
             /* the late event of a dropped marker or of an untracked handle: totals only */
             s->late_absorbed++;
-        } else if (!late && st_refused(s, ev->handle)) {
+        } else if (st_refused_ev(s, ev)) {
             /* a refused handle's later events (or one in that span whose QUEUED is
-             * still on its way): untracked, already counted; its late QUEUED, if one
-             * comes, is absorbed */
-            if (ev->kind == GPTPS_EV_STARTED || st_terminal(ev)) st_ab_add(s, ev->handle);
-            if (st_terminal(ev) && s->untracked_live) s->untracked_live--;   /* it is over */
+             * still on its way): untracked, never tracked again; its late QUEUED, if
+             * one comes, is absorbed */
+            st_refused_seen(s, ev);
+            if (late) s->late_absorbed++;
         /* A terminal event may always take an entry: it becomes a marker at once, and
          * the orphan FIFO bounds those. Anything else needs a live entry's room. */
-        } else if (!st_terminal(ev) && st_live(s) >= s->live_cap) st_untracked(s, ev->handle, w);
+        } else if (!st_terminal(ev) && st_live(s) >= s->live_cap) st_untracked(s, ev->handle, 1, w);
         else if ((slot = tab_insert(s, ev->handle)) != NULL) { slot->task = (uint32_t)(k - s->rows); slot->state = ST_NONE; }
-        else st_untracked(s, ev->handle, w);
+        else st_untracked(s, ev->handle, !st_terminal(ev), w);
     } else if (slot && slot->state == ST_DONE && st_live(s) >= s->live_cap &&
                (ev->kind == GPTPS_EV_STARTED || (ev->kind == GPTPS_EV_FAILED && ev->status != GPTPS_E_CANCELLED))) {
         /* reviving a marker makes it live again: it needs the room a new entry would */
-        st_untracked(s, 0, w);
+        st_untracked(s, 0, 0, w);
         slot = NULL;
     }
 
@@ -882,8 +950,8 @@ static int st_needs_room(gptps_stats *s, const gptps_event *ev)
     slot = tab_find(s, ev->handle);
     if (!slot) {
         int late = ev->kind == GPTPS_EV_QUEUED || ev->kind == GPTPS_EV_RETRIED;
-        if (late && s->ab_n && st_ab_has(s, ev->handle)) return 0;
-        if (!late && st_refused(s, ev->handle)) return 0;
+        if (late && st_ab_has(s, ev->handle)) return 0;
+        if (st_refused_ev(s, ev)) return 0;
         return !st_terminal(ev);
     }
     return slot->state == ST_DONE &&
@@ -1050,10 +1118,10 @@ gptps_status gptps_stats_set_enabled(gptps_stats *s, int on)
         memset(s->tab, 0, s->tabcap * sizeof *s->tab);
         s->tabn = s->ndone = 0;
         s->orph_head = s->orph_n = 0;
-        memset(s->ab_set, 0, sizeof s->ab_set);
-        s->ab_head = s->ab_n = 0;
+        hs_clear(&s->ab);
+        hs_clear(&s->rc);
         s->rf_lo = s->rf_hi = 0;
-        s->untracked_live = 0;                   /* the peak stays: a sizing figure since install */
+        s->untracked_live = s->rc_lost = 0;      /* the peak stays: a sizing figure since install */
         s->total.pending = s->total.in_flight = 0;
         for (i = 0; i <= s->max_tasks; ++i) s->rows[i].c.pending = s->rows[i].c.in_flight = 0;
         s->resumes++;
