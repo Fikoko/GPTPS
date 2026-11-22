@@ -29,7 +29,10 @@
  *     set_arm(always) arms at once, set_arm(on_view) counts as a view.
  * 10) the header line follows the clock's unit (and says a fixed point with clock OFF).
  * 11) HINT: FULL with no terminal logs one WARN at install (not at a lower tier, not with
- *     on_view); gptps_tui_run with interactive 0 says so - once - and counts every call.
+ *     on_view); gptps_tui_run with interactive 0 says so - once - and counts every call; with
+ *     no terminal it says so at most once a minute, and counts every call.
+ * Throughout 3) and 4): an arm (render, snapshot, key) and a disarm (health) allocate nothing
+ * while the dashboard's lock is held (TUI_LOCK_HOOK follows it).
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700         /* posix_openpt & co. */
@@ -46,10 +49,22 @@ static size_t ta_live;              /* bytes the add-on holds now */
 static size_t ta_peak;              /* the most it held (set ta_peak = ta_live to start) */
 static long   ta_calls;             /* allocations made (the event path must make none) */
 static size_t ta_fail_n;            /* !0: the next allocation of exactly this many bytes fails (once) */
+/* the dashboard's lock `mu` (tl_watch: &t->mu; its other locks, smu and rmu, may be held
+ * while allocating), followed through TUI_LOCK_HOOK: how deep this thread holds it, and the
+ * allocations made while it did (arming builds unlocked and swaps under the lock: none) */
+#if defined(__GNUC__) || defined(__clang__)
+static __thread int tl_held;
+#else
+static int tl_held;
+#endif
+static long ta_locked;
+static const void *tl_watch;
+#define TUI_LOCK_HOOK(m, d) ((void)((const void *)(m) == tl_watch ? (tl_held += (d)) : 0))
 static void *ta_malloc(size_t n)
 {
     ta_hdr *h;
     ta_calls++;
+    if (tl_held > 0) ta_locked++;
     if (ta_fail_n && n == ta_fail_n) { ta_fail_n = 0; return NULL; }
     h = (ta_hdr *)malloc(sizeof *h + n);
     if (!h) return NULL;
@@ -78,6 +93,7 @@ static void *ta_realloc(void *p, size_t n)
     if (!p) return ta_malloc(n);
     h = (ta_hdr *)p - 1;
     ta_calls++;
+    if (tl_held > 0) ta_locked++;
     if (ta_fail_n && n == ta_fail_n) { ta_fail_n = 0; return NULL; }
     nh = (ta_hdr *)realloc(h, sizeof *nh + n);
     if (!nh) return NULL;
@@ -236,6 +252,7 @@ static void test_on_view(void)
     CHECK(t != NULL);
     if (!t) { gptps_shutdown(e); return; }
     t->cols = 120;                                        /* the ARM line whole (it is fitted to the width) */
+    tl_watch = &t->mu;
     /* 2) disarmed: totals and gauges only */
     h = health(t);
     CHECK(h.arm == GPTPS_TUI_ARM_ON_VIEW && h.armed == 0 && h.kpi == GPTPS_TUI_KPI_GAUGE &&
@@ -253,9 +270,11 @@ static void test_on_view(void)
     CHECK(h.problems_held == 0 && h.activity_held == 0 && h.task_rows == 0 && h.handles_tracked == 0);
     CHECK(t->fin == 25 && t->fail == 25 && t->q == 50);   /* the totals always run */
     CHECK(h.gauges == GPTPS_TUI_GAUGES_APPROX);
-    /* 3) the first view arms */
+    /* 3) the first view arms - building the request with the lock let go */
     tui_fake_ms += 5000;
+    ta_locked = 0;
     gptps_tui_render(t, frame, sizeof frame);
+    CHECK(ta_locked == 0);                                /* nothing allocated under the lock */
     h = health(t);
     CHECK(h.armed == 1 && h.kpi == GPTPS_TUI_KPI_FULL && h.arms == 1 && h.views == 1 && h.record_ms == 0);
     CHECK(h.footprint_bytes == formula(TUI_T_FULL, 0));
@@ -278,7 +297,9 @@ static void test_on_view(void)
     burst(t, 200, 4);                                     /* 2 failures no frame shows */
     tui_fake_ms += 30000;
     live = ta_live;
+    ta_locked = 0;
     h = health(t);                                        /* disarm_ms since the last view: disarmed */
+    CHECK(ta_locked == 0);
     CHECK(h.armed == 0 && h.disarms == 1 && h.kpi == GPTPS_TUI_KPI_GAUGE && h.record_ms == 0);
     CHECK(h.footprint_bytes == formula(TUI_T_GAUGE, 0));
     CHECK(live - ta_live == formula(TUI_T_FULL, 0) - formula(TUI_T_GAUGE, 0));   /* frees exactly what it armed */
@@ -290,15 +311,20 @@ static void test_on_view(void)
     CHECK(ta_calls == calls && health(t).problems_held == 0);
     /* re-armed by the next view: a snapshot this time */
     tui_fake_ms += 60000;
+    ta_locked = 0;
     gptps_tui_snapshot(t);
+    CHECK(ta_locked == 0);                                /* the snapshot's arm: nothing under the lock */
     h = health(t);
     CHECK(h.armed == 1 && h.arms == 2 && h.footprint_bytes == formula(TUI_T_FULL, 0) && ta_live == armed_live);
     gptps_tui_render(t, frame, sizeof frame);
     CHECK(strstr(frame, "tui.arm=on_view, off 30.0 s after the last view, 1 disarm so far\n") != NULL);
     tui_fake_ms += 30000;
     CHECK(health(t).armed == 0 && health(t).disarms == 2);
+    ta_locked = 0;
     CHECK(gptps_tui_press(t, 'j') == 2);                  /* and a key */
+    CHECK(ta_locked == 0);
     CHECK(health(t).armed == 1 && health(t).arms == 3);
+    tl_watch = NULL;
     gptps_shutdown(e);
     gptps_tui_close(t);
     if (snap) fclose(snap);
@@ -758,7 +784,7 @@ static void test_hint(void)
     CHECK(t != NULL);
     CHECK(log_count("gptps_tui_install: no terminal to run the live dashboard on") == 1);
     CHECK(log_count("kpi full collects everything from now on - about 38 ns and one lock an event, 110 KiB held") == 1 ||
-          sizeof(gptps_tui) != 7176);                     /* the figure: the formula at the defaults */
+          sizeof(gptps_tui) != 7184);                     /* the figure: the formula at the defaults */
     CHECK(log_count("tui.arm=on_view") == 1);
     loglen = 0; logbuf[0] = 0;
     gptps_tui_run(t);                                     /* interactive 0: said, once */
@@ -774,6 +800,13 @@ static void test_hint(void)
     CHECK(t != NULL);
     gptps_tui_run(t);                                     /* returns at once: said, and counted */
     CHECK(log_count("gptps_tui_run: stdin or the output is not a terminal") == 1 && health(t).run_noops == 1);
+    gptps_tui_run(t);                                     /* again within a minute: counted, not said */
+    tui_fake_ms += 59999;
+    gptps_tui_run(t);
+    CHECK(log_count("gptps_tui_run: stdin or the output is not a terminal") == 1 && health(t).run_noops == 3);
+    tui_fake_ms += 1;                                     /* a minute after the last: said again */
+    gptps_tui_run(t);
+    CHECK(log_count("gptps_tui_run: stdin or the output is not a terminal") == 2 && health(t).run_noops == 4);
     gptps_shutdown(e);
     gptps_tui_close(t);
     {   /* tui.arm = on_view from a settings file (applied as install defines the tui keys): it

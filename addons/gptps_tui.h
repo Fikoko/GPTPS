@@ -304,11 +304,11 @@ typedef struct {
  *     entries' array (8, then doubling, at most max_tasks; 0 before the first); payloads:
  *     the bytes of their payload copies. The struct sizes on x86-64 Linux (other targets
  *     differ a little - health has the exact figure on every one; tests/test_tui_budget.c
- *     holds these to the code): D = 7176 (the dashboard itself), U = 280 (an add_task
+ *     holds these to the code): D = 7184 (the dashboard itself), U = 280 (an add_task
  *     entry), R = 264 (a TASKS row), E = 304 (a PROBLEMS record), A = 24 (an ACTIVITY
  *     record), S = 32 (a handle-table slot; 28 on i386). At the defaults (FULL,
- *     max_tasks 64, 8 + 8 journal lines, window 1024): 7176 + 19720 + 2432 + 192 + 65536 +
- *     16640 = 111696 bytes, 110 KiB (rounded up).
+ *     max_tasks 64, 8 + 8 journal lines, window 1024): 7184 + 19720 + 2432 + 192 + 65536 +
+ *     16640 = 111704 bytes, 110 KiB (rounded up).
  *  2. The BUFFERS (health.runtime_bytes) a frame is made in, held while they are used and
  *     grown as a frame needs: the dashboard frame's copy-out (the view: 13600 B, plus 560 B
  *     a row of the terminal's height - 208 B more with a source - kept once made), the open
@@ -327,7 +327,7 @@ typedef struct {
  * changes nothing: install (NULL), gptps_tui_set_kpi, set_recent, set_latency_window,
  * add_task / add_task_ex (a new entry, a bigger payload), the 'm' key, a tui.kpi /
  * tui.recent / tui.activity / tui.latency_window write - each GPTPS_E_INVAL with one WARN
- * naming what it needs ("tui.kpi=full needs 110 KiB (111696 bytes: ...), over tui.budget_kb
+ * naming what it needs ("tui.kpi=full needs 110 KiB (111704 bytes: ...), over tui.budget_kb
  * 64 (65536 bytes): refused, nothing changed"), counted in health.budget_refusals and budget_need_bytes - and
  * so is a budget below the footprint already asked for. Never a silent clamp. A change that
  * does not grow the footprint is never refused. The BUFFERS are not refused - a frame is

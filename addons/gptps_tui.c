@@ -24,13 +24,19 @@
 #include <errno.h>
 
 /* ---- portable mutex + tty + terminal control ---- */
+/* TUI_LOCK_HOOK(m, d): a test that compiles this file in may define it to follow a lock
+ * (d = +1 when m is taken, -1 before it is let go) - tests/test_tui_arm.c checks with it
+ * that nothing is allocated while the dashboard's `mu` is held. Nothing by default. */
+#ifndef TUI_LOCK_HOOK
+#  define TUI_LOCK_HOOK(m, d) ((void)0)
+#endif
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <io.h>
 typedef CRITICAL_SECTION tui_mutex;
 static void mu_init(tui_mutex *m)    { InitializeCriticalSection(m); }
-static void mu_lock(tui_mutex *m)    { EnterCriticalSection(m); }
-static void mu_unlock(tui_mutex *m)  { LeaveCriticalSection(m); }
+static void mu_lock(tui_mutex *m)    { EnterCriticalSection(m); TUI_LOCK_HOOK(m, 1); }
+static void mu_unlock(tui_mutex *m)  { TUI_LOCK_HOOK(m, -1); LeaveCriticalSection(m); }
 static void mu_destroy(tui_mutex *m) { DeleteCriticalSection(m); }
 static int  fd_is_tty(FILE *f)       { return _isatty(_fileno(f)); }
 #else
@@ -42,8 +48,8 @@ static int  fd_is_tty(FILE *f)       { return _isatty(_fileno(f)); }
 #  include <pthread.h>
 typedef pthread_mutex_t tui_mutex;
 static void mu_init(tui_mutex *m)    { pthread_mutex_init(m, NULL); }
-static void mu_lock(tui_mutex *m)    { pthread_mutex_lock(m); }
-static void mu_unlock(tui_mutex *m)  { pthread_mutex_unlock(m); }
+static void mu_lock(tui_mutex *m)    { pthread_mutex_lock(m); TUI_LOCK_HOOK(m, 1); }
+static void mu_unlock(tui_mutex *m)  { TUI_LOCK_HOOK(m, -1); pthread_mutex_unlock(m); }
 static void mu_destroy(tui_mutex *m) { pthread_mutex_destroy(m); }
 static int  fd_is_tty(FILE *f)       { return isatty(fileno(f)); }
 #endif
@@ -887,6 +893,7 @@ struct gptps_tui {
     int              arm_mode, armed, run_on, run_said;
     uint64_t         disarm_ms, view_ms, arm_ms, h_views, h_arms, h_disarms, h_arm_fail, h_run_noop;
     uint64_t         arm_warn_ms;     /* ARM: the last "arming on a view: no memory" WARN (one a minute) */
+    uint64_t         tty_warn_ms;     /* the last "gptps_tui_run: not a terminal" WARN (one a minute) */
     char             ad_line[1280];   /* one line a condition, '\n' between */
     /* ---- SOURCE (1.12; gptps_tui_set_source) ----
      * src: the host's source (src.read NULL: none; src.name not kept - src_name is the copy).
@@ -1689,7 +1696,9 @@ static void fmt_num(char *b, size_t cap, double v)
     char *at;
     int p;
     if (v > -1e15 && v < 1e15 && (double)(long long)v == v) {
-        snprintf(b, cap, "%.0f", v);       /* a whole number as one: 10, not 1e+01 */
+        /* a whole number as one: 10, not 1e+01. Below 1e15 it is exact as a long long, and
+         * %lld is at most 16 characters - which %.0f, as far as a compiler can tell, is not */
+        snprintf(b, cap, "%lld", (long long)v);
     } else {
         for (p = 1; p <= 17; ++p) {        /* the shortest that reads back: 0.1, not 0.10000000000000001 */
             snprintf(b, cap, "%.*g", p, v);
@@ -4603,9 +4612,17 @@ void gptps_tui_run(gptps_tui *t)
      * (</dev/null, a closed pipe, a launcher that gives it none) the key poll returned
      * at once and the loop repainted tens of thousands of frames a second. */
     if (!fd_is_tty(t->cfg.out) || !fd_is_tty(stdin)) {
-        mu_lock(&t->mu); t->h_run_noop++; mu_unlock(&t->mu);
-        gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: stdin or the output is not a terminal; "
-                  "the live dashboard does not run (gptps_tui_snapshot renders a frame)");
+        int say;
+        uint64_t now = TUI_NOW_MS();
+        mu_lock(&t->mu);
+        t->h_run_noop++;               /* every call counted; the WARN at most once a minute */
+        say = !t->tty_warn_ms || now - t->tty_warn_ms >= TUI_WARN_GAP_MS;
+        if (say) t->tty_warn_ms = now ? now : 1;
+        mu_unlock(&t->mu);
+        if (say)
+            gptps_log(NULL, GPTPS_LOG_WARN, "gptps_tui_run: stdin or the output is not a terminal; "
+                      "the live dashboard does not run (gptps_tui_snapshot renders a frame; "
+                      "gptps_tui_health.run_noops counts these calls; this WARN at most once a minute)");
         return;
     }
     {   /* BUFFERS (gptps_tui.h, MEMORY): within tui.budget_kb */
@@ -5039,7 +5056,7 @@ static uint64_t foot_held(const gptps_tui *t)
          + (t->tab ? (uint64_t)(t->tab_mask + 1) * sizeof(tui_slot) : 0);
 }
 static uint64_t kib_up(uint64_t b) { return (b + 1023u) / 1024u; }
-/* "needs 110 KiB (111696 bytes: the dashboard 7176, TASKS 19720, ...), over tui.budget_kb 64 (65536
+/* "needs 110 KiB (111704 bytes: the dashboard 7184, TASKS 19720, ...), over tui.budget_kb 64 (65536
  * bytes): refused, nothing changed" */
 /* (each piece formatted into a buffer it provably fits - a 20-digit number, a name of at most
  * 16 bytes - and appended whole while it fits `cap`) */

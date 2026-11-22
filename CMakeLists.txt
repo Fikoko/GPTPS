@@ -1319,7 +1319,7 @@ if(NOT WIN32)
     target_link_libraries(test_tui_arm PRIVATE Threads::Threads)
 endif()
 add_test(NAME tui_arm COMMAND test_tui_arm)
-set_tests_properties(tui_budget PROPERTIES TIMEOUT 60)
+set_tests_properties(tui_budget tui_arm PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 # the handle table's exact gauges and latency vs every order one handle's events can
 # arrive in - tests/test_stats_order.c's scenarios, with gptps_stats fed beside it

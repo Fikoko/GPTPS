@@ -860,7 +860,7 @@ enabled automatically). Panes/metrics:
   `gptps_tui_health.footprint_bytes` (`tests/test_tui_budget.c` holds it to the allocator,
   byte for byte, at every tier). With a budget, every change that would take the footprint
   of the *request* past it is **refused** — `GPTPS_E_INVAL`, one WARN naming what it needs
-  (`tui.kpi=full needs 110 KiB (111696 bytes: the dashboard 7176, TASKS 19720, ...), over
+  (`tui.kpi=full needs 110 KiB (111704 bytes: the dashboard 7184, TASKS 19720, ...), over
   tui.budget_kb 64 (65536 bytes): refused, nothing changed`), counted
   (`budget_refusals`, `budget_need_bytes`) and nothing changed: install (NULL), `set_kpi`,
   `set_recent`, `set_latency_window`, `add_task`, `m`, the `tui.*` writes, and a budget below

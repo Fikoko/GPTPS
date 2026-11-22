@@ -212,11 +212,11 @@ static void test_formula(void)
     int r, st, sr;
 #if defined(__linux__) && defined(__x86_64__)
     /* the sizes gptps_tui.h states (a change there must change the header too) */
-    CHECK(sizeof(gptps_tui) == 7176 && sizeof(tui_ui) == 280 && sizeof(tui_task) == 264 && sizeof(tui_event) == 304);
+    CHECK(sizeof(gptps_tui) == 7184 && sizeof(tui_ui) == 280 && sizeof(tui_task) == 264 && sizeof(tui_event) == 304);
     CHECK(sizeof(tui_slot) == 32 && sizeof(tui_act) == 24 && TUI_HIST_B * sizeof(uint64_t) == 256);
     CHECK(sizeof(tui_view) == 13600 && sizeof(tui_vrow) + sizeof(tui_event) == 560 &&
           sizeof(gptps_tui_source_row) == 208);
-    CHECK(doc_formula(TUI_T_FULL, 64, 1, 1, 8, 8, 0, 1024, 0, 0) == 111696);   /* the defaults: 110 KiB */
+    CHECK(doc_formula(TUI_T_FULL, 64, 1, 1, 8, 8, 0, 1024, 0, 0) == 111704);   /* the defaults: 110 KiB */
 #endif
     /* installed at each tier, each pane shown or hidden */
     for (st = 0; st < 2; ++st)
