@@ -840,8 +840,9 @@ GPTPS_API size_t       gptps_task_count(gptps *e);
 GPTPS_API gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out);
 /* Since ABI 2.9 the queued / running / dead counters above cost O(1): the engine
  * keeps them per type as items move between its queues, where each call used to walk
- * every item it held under the engine lock (116 ms a call at 64 types and 100k
- * queued). The values are the same as the walk's, by construction. */
+ * every item it held under the engine lock (about 1 ms a call at 64 types and 100k
+ * queued, so over 100 ms for a dashboard reading all 64 rows). The values are the
+ * same as the walk's, by construction. */
 
 /* ABI 2.9: the engine-wide totals, in O(1), under the engine lock (struct_size
  * first). The struct is not called gptps_engine_counts because a C typedef and a

@@ -5,8 +5,9 @@
  * queue depth (ABI 2.9).
  *
  * Before 2.9 each gptps_task_get_info call counted its type's items by walking six
- * queues under the engine lock: 116 ms a call at 64 types and 100k queued, stalling
- * the dispatcher and every submitter while a dashboard refreshed. The counts are now
+ * queues under the engine lock: ~1 ms a call at 64 types and 100k queued (116 ms for
+ * a dashboard frame reading all 64 rows), stalling the dispatcher and every submitter
+ * while a dashboard refreshed. The counts are now
  * kept as items move (see "per-type counts" in src/engine.c).
  *
  * A complexity gate like tests/test_cancel_perf.c: it asserts on a RATIO, never on a

@@ -157,7 +157,8 @@ typedef struct gptps_reg {
      * fifo_push / fifo_pop / fifo_remove, intake_insert / intake_unlink - and by
      * item_own_name, which severs a dead letter from its type, so no caller keeps
      * them and none can forget to. gptps_task_get_info reads them in O(1) where it
-     * used to walk six queues under e->m (116 ms a call at 64 types and 100k queued).
+     * used to walk six queues under e->m (~1 ms a call at 64 types and 100k queued;
+     * 116 ms for a dashboard frame that read all 64 rows).
      * See "per-type counts". Under e->m. */
     size_t             nq[8];
 } gptps_reg;
@@ -4750,8 +4751,8 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
     out->default_cost = r->def.default_cost; out->default_policy = r->def.default_policy;
     out->enabled = r->enabled ? 1 : 0; out->removed = r->removed ? 1 : 0;
     /* O(1): the counts the queue primitives keep (see "per-type counts") - the same
-     * values the walk over the six queues gave, which held e->m for 116 ms a call at
-     * 64 types and 100k queued. */
+     * values the walk over the six queues gave, which held e->m for ~1 ms a call at
+     * 64 types and 100k queued (116 ms for a 64-row dashboard frame). */
     out->queued  = (uint32_t)(r->nq[GPTPS_Q_INTAKE] + r->nq[GPTPS_Q_DELAYED]);
     out->running = (uint32_t)(r->nq[GPTPS_Q_READY] + r->nq[GPTPS_Q_RUNNING] + r->nq[GPTPS_Q_DONE]);
     out->dead    = (uint32_t)r->nq[GPTPS_Q_DEAD];

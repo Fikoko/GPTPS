@@ -16,7 +16,8 @@
  *   inside a task body while others run), fail and retry, dead letters evicted past
  *   a small cap, re-drive of a drain and plain discard, pause / resume, clone,
  *   unregister in all three modes and re-register under the same name, shutdown and
- *   a fresh engine.
+ *   a fresh engine; and, with every allocation failing across one unregister, a
+ *   type parked on e->retired that still owns dead letters, then their drain.
  *
  * Each event the engine emits is checked too, from the observer - so the counts hold
  * between the halves of a transition, not only between API calls. Legs: MANUAL (1e5
@@ -324,6 +325,63 @@ static void leg(const char *name, gptps_run_mode mode, unsigned conc, uint64_t m
     fflush(stdout);
 }
 
+/* A dead letter whose name copy cannot be made when its type is unregistered keeps
+ * naming the type through its reg, which is parked on e->retired and still holds that
+ * letter's count (item_own_name returns before qcount_out). Fail every allocation
+ * across one unregister to get there, then drain: the counts on the retired reg must
+ * match the walk at each step, and the drain must take them back to 0. */
+static int g_oom;
+static void *oom_malloc(size_t n, void *u)           { (void)u; return g_oom ? NULL : malloc(n ? n : 1); }
+static void *oom_realloc(void *p, size_t n, void *u) { (void)u; return g_oom ? NULL : realloc(p, n ? n : 1); }
+static void  oom_free(void *p, void *u)              { (void)u; free(p); }
+static void retired_leg(void)
+{
+    gptps_allocator a;
+    gptps_engine_totals t;
+    gptps *e;
+    unsigned i, nd;
+    size_t ran;
+    int before = fails;
+    memset(&a, 0, sizeof a);
+    a.struct_size = sizeof a; a.malloc_fn = oom_malloc; a.realloc_fn = oom_realloc; a.free_fn = oom_free;
+    CHECK(gptps_set_allocator(&a) == GPTPS_OK);
+    g_leg = "retired"; g_op = 0;
+    e = t_open_engine(GPTPS_RUN_MANUAL, 2, 0);
+    if (!e) { (void)gptps_set_allocator(NULL); return; }
+    CHECK(gptps_settings_set(e, "limits.max_dead_letters", "16") == GPTPS_OK);
+    CHECK(t_reg_type(e, "oomr", GPTPS_EXEC_INPROC, NULL) == GPTPS_OK);
+    CHECK(t_reg_type(e, "keep", GPTPS_EXEC_INPROC, NULL) == GPTPS_OK);
+    g_e = e; g_manual = 1;
+    for (i = 0; i < 4; ++i) {
+        gptps_submit_options o; unsigned char pl = 1; gptps_handle h = 0;
+        memset(&o, 0, sizeof o); o.struct_size = sizeof o; o.flags = GPTPS_SUBMIT_POLICY;
+        o.policy.struct_size = sizeof o.policy; o.policy.on_failure = GPTPS_ON_FAILURE_DEAD_LETTER;
+        CHECK(gptps_submit_ex(e, i & 1 ? "keep" : "oomr", &pl, 1, &o, &h) == GPTPS_OK);
+    }
+    for (i = 0; i < 20; ++i) (void)gptps_step(e, &ran);
+    nd = (unsigned)gptps_dead_letter_count(e);
+    CHECK(nd == 4);
+    g_oom = 1;
+    (void)gptps_unregister_task(e, "oomr", GPTPS_REMOVE_CANCEL);
+    g_oom = 0;
+    gptps_mutex_lock(e->m);
+    CHECK(e->retired != NULL);
+    if (e->retired) CHECK(e->retired->nq[GPTPS_Q_DEAD] == 2);
+    gptps_mutex_unlock(e->m);
+    t_verify_locked(e, "retired: after unregister", 0);
+    verify_public(e);
+    memset(&t, 0, sizeof t); t.struct_size = sizeof t;
+    CHECK(gptps_engine_counts(e, &t) == GPTPS_OK && t.dead == 4);
+    CHECK(gptps_dead_letter_drain(e, NULL, NULL) == 4);
+    t_verify_locked(e, "retired: after drain", 0);
+    gptps_mutex_lock(e->m);
+    if (e->retired) CHECK(e->retired->nq[GPTPS_Q_DEAD] == 0);
+    gptps_mutex_unlock(e->m);
+    g_closing = 1; gptps_shutdown(e); g_closing = 0; g_e = NULL; g_manual = 0;
+    CHECK(gptps_set_allocator(NULL) == GPTPS_OK);
+    printf("  leg retired: %s\n", fails == before ? "a retired type's dead letters counted on it" : "FAILED");
+}
+
 #if !defined(_WIN32) && !defined(GPTPS_TEST_HAL_SIM)
 /* The process executors move items through the same queues; a short run of each. */
 static void proc_leg(void)
@@ -376,6 +434,7 @@ int main(int argc, char **argv)
     leg("threaded", GPTPS_RUN_THREADED, 3, 0,  20000ul,  5000ul);
     leg("bounded",  GPTPS_RUN_MANUAL,   2, 64, 20000ul,  5000ul);
     leg("bounded-threaded", GPTPS_RUN_THREADED, 2, 64, 10000ul, 5000ul);
+    retired_leg();
 #if !defined(_WIN32) && !defined(GPTPS_TEST_HAL_SIM)
     proc_leg();
 #endif
