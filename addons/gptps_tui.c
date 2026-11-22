@@ -175,6 +175,9 @@ static uint64_t tui_now_us(void)
 #define TUI_RENDER_DIV   10u
 #define TUI_COST_DEF     5
 #define TUI_P_N          9          /* GPTPS_TUI_P_* bits */
+/* ADAPT, GPTPS_TUI_SHED_PANE (1.13): each such step doubles the engine-reading panes' interval
+ * (what runs, pane_every_ms), up to this (ms) - past a minute a pane is no longer read live */
+#define TUI_PANE_SHED_MAX 60000u
 
 /* ---- the KPI ladder ----------------------------------------------------------------
  * The public gptps_tui_kpi values keep their 1.10 numbers, so they are not in ladder
@@ -213,10 +216,15 @@ static int kpi_tier(int k)
 }
 
 /* The tier that runs for a requested `tier` once the DEGRADE steps `shed` are taken out
- * (gptps_tui.h, ADAPT): each later step caps the ladder lower. */
-static int shed_cap(int tier, unsigned shed)
+ * (gptps_tui.h, ADAPT): each later step caps the ladder lower. `act`: the ACTIVITY journal
+ * is wanted (show_recent, a size above 0). Since 1.13 a step may be taken on its own (the
+ * first that relieves what is present), so -latency caps at NORMAL while the journal still
+ * runs - the handle table out, the journal kept - and at TASKS once it does not (1.12's
+ * tier after "-activity -percentiles -latency", unchanged). GPTPS_TUI_SHED_PANE caps no tier. */
+static int shed_cap(int tier, unsigned shed, int act)
 {
-    int cap = (shed & GPTPS_TUI_SHED_TASKS) ? TUI_T_PROBLEMS : (shed & GPTPS_TUI_SHED_LATENCY) ? TUI_T_TASKS
+    int cap = (shed & GPTPS_TUI_SHED_TASKS) ? TUI_T_PROBLEMS
+            : (shed & GPTPS_TUI_SHED_LATENCY) ? (act && !(shed & GPTPS_TUI_SHED_ACTIVITY) ? TUI_T_ACTIVITY : TUI_T_TASKS)
             : (shed & GPTPS_TUI_SHED_PERCENTILES) ? TUI_T_LATENCY : TUI_T_FULL;
     return tier < cap ? tier : cap;
 }
@@ -793,6 +801,7 @@ struct gptps_tui {
     int              lat_warned;    /* the window size the table-full WARN was given for (0: none) */
     /* gptps_tui_health: counted since install, never reset (h_*). */
     uint64_t         h_untracked, h_orphans, h_folded, h_trunc, h_nomem;
+    uint64_t         h_trunc_dash;  /* the part of h_trunc that were dashboard frames (ADAPT, 1.13) */
     uint64_t         h_painted, h_skipped, h_written, h_wakes, h_made;   /* h_made: frames the loop formatted */
     size_t           frame_bytes;   /* the frame buffer gptps_tui_run holds while it runs */
     int              scroll;        /* recent-log scroll offset (lines back) */
@@ -837,11 +846,16 @@ struct gptps_tui {
      * pr_seen, p_row (windows in a row with a sheddable one), ad_rate, ad_ppm; ad_line: the
      * PRESSURE line's text; ad_warn_ms: each condition's last WARN. shed: GPTPS_TUI_SHED_*,
      * shed_why: the conditions behind the last step; ad_floor_ms: the last "nothing left" WARN;
-     * ad_gen: a new window (adapt_base) since, so a late PRESSURE text is not stored. */
+     * ad_gen: a new window (adapt_base) since, so a late PRESSURE text is not stored.
+     * 1.13: shed_whys: the conditions behind every step since the operator last cleared it
+     * (the DEGRADED line's "(pressure: ...)"); pane_shed_ms: the engine-reading panes'
+     * interval floor GPTPS_TUI_SHED_PANE set (0: none); ad_trd: h_trunc_dash at the window's
+     * start (TRUNCATED acts only for dashboard frames). */
     int              kpi_req, adapt, cost_pct;
     unsigned         shed;
     uint64_t         ad_ms, ad_ev, ad_plost, ad_alost, ad_untr, ad_fold, ad_trunc, ad_nomem, ad_preads, ad_rmax_us;
     uint64_t         pressure, pr_seen, p_row, shed_why, ad_windows, ad_steps, ad_warns, ad_rate, ad_ppm, ad_rmax_last;
+    uint64_t         shed_whys, pane_shed_ms, ad_trd;
     uint64_t         ad_warn_ms[TUI_P_N], ad_floor_ms, ad_gen;
     char             ad_line[1280];   /* one line a condition, '\n' between */
     /* ---- SOURCE (1.12; gptps_tui_set_source) ----
@@ -1545,7 +1559,12 @@ static size_t frame_finish(int color, char *buf, size_t cap, size_t pos)
  * without mu held. */
 static size_t tui_finish(gptps_tui *t, char *buf, size_t cap, size_t pos)
 {
-    if (cap && pos >= cap) { mu_lock(&t->mu); t->h_trunc++; mu_unlock(&t->mu); }
+    if (cap && pos >= cap) {
+        mu_lock(&t->mu);
+        t->h_trunc++;
+        if (t->pane == TUI_PANE_DASH) t->h_trunc_dash++;    /* what DEGRADE's rows can make shorter */
+        mu_unlock(&t->mu);
+    }
     return frame_finish(t->cfg.color, buf, cap, pos);
 }
 
@@ -1871,11 +1890,15 @@ static void pc_read(gptps_tui *t, uint64_t now)
     t1 = tui_now_us();
     c->cost_us = t1 > t0 ? t1 - t0 : 0;
     every = (c->cost_us * TUI_DUTY + 999u) / 1000u;           /* ms: at most 1/TUI_DUTY of the time */
-    if (every < (uint64_t)t->cfg.pane_refresh_ms) every = t->cfg.pane_refresh_ms;
+    mu_lock(&t->mu);
+    {   /* never sooner than pane_refresh_ms - or what GPTPS_TUI_SHED_PANE raised it to */
+        uint64_t base = t->cfg.pane_refresh_ms;
+        if (t->pane_shed_ms > base) base = t->pane_shed_ms;
+        if (every < base) every = base;
+    }
     c->every_ms = every; c->read_ms = now; c->stale = 0; c->pane = p;
     copy_name(c->task, sizeof c->task, p == TUI_PANE_DETAIL ? t->detail_task : "");
     c->sel_for = -1; c->have_sel = 0;
-    mu_lock(&t->mu);
     t->h_pane_reads++; t->h_pane_us += c->cost_us; t->pane_cost_us = c->cost_us; t->pane_every_ms = every;
     t->pane_bytes = pc_bytes(c);
     if (nomem) t->h_nomem++;                                  /* never silent: shown on the pane too */
@@ -2457,7 +2480,7 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     v->nplines = 0;
     if (v->pline[0]) { const char *c = v->pline; v->nplines = 1; while ((c = strchr(c, '\n')) != NULL) { ++c; ++v->nplines; } }
     if (v->pline[0] && t->adapt != GPTPS_TUI_ADAPT_OFF) nx_adapt = t->ad_ms + (uint64_t)t->cfg.rate_window_s * 1000u;
-    v->shed = t->shed; v->shed_why = t->shed_why; v->kpi_req = t->kpi_req;
+    v->shed = t->shed; v->shed_why = t->shed_whys; v->kpi_req = t->kpi_req;
     if (!v->leg_ok || v->leg_gen != t->ui_gen || v->leg_W != W || v->leg_uni != v->uni) {
         v->legrows = legend_text(t, W, v->legend, sizeof v->legend);
         v->leg_ok = 1; v->leg_gen = t->ui_gen; v->leg_W = W; v->leg_uni = v->uni; v->leg_builds++;
@@ -2640,8 +2663,33 @@ static void tui_logf(gptps_log_level lvl, const char *fmt, ...);
 static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int alines, int unshed,
                                  char *what, size_t cap);
 
-/* what a step takes out, named as the DEGRADED line shows it, in shedding order */
-static const char *const TUI_SHED_NAME[4] = { "activity", "percentiles", "latency", "tasks" };
+/* The DEGRADE steps in shedding order (gptps_tui.h, ADAPT): each one's bit, its name as the
+ * DEGRADED line shows it, and the conditions it relieves - from what each step takes out:
+ *   pane         the engine-reading panes read half as often: their engine-lock duty, the
+ *                PANE condition (the interval is stretched past its floor no longer)
+ *   activity     the journal's write per lifecycle event (COST: 3 ns of the estimate), its
+ *                records (ACTIVITY_LOST), the RECENT rows a frame merges and prints (RENDER,
+ *                TRUNCATED: a frame is rows of at most W columns), its memory (NOMEM)
+ *   percentiles  the histograms' memory (NOMEM) and the per-row p50/p95/p99 a frame computes
+ *                (RENDER); NOT the event cost - FULL and LATENCY estimate the same 38 ns
+ *   latency      the handle table: the QUEUEDs it had no room for (UNTRACKED), its per-event
+ *                lookup (COST: 38 -> 24 ns), its memory (NOMEM). A frame reads two sums a row
+ *                from it, so not RENDER; and no row goes, so not TRUNCATED
+ *   tasks        the per-type rows: their bump an event (COST), their rows on a frame (RENDER,
+ *                TRUNCATED), their memory (NOMEM)
+ * Not relieved by any: PROBLEMS_LOST (the PROBLEMS journal is the floor and no step changes
+ * how many failures arrive) and FOLDED (folding into '(other)' is the cheap fallback already;
+ * only -tasks ends it, by dropping every row to save merging a few) - report-only. */
+#define TUI_SHED_N 5
+static const struct { unsigned bit; const char *name; uint64_t relieves; } TUI_SHED[TUI_SHED_N] = {
+    { GPTPS_TUI_SHED_PANE,        "pane",        GPTPS_TUI_P_PANE },
+    { GPTPS_TUI_SHED_ACTIVITY,    "activity",    GPTPS_TUI_P_ACTIVITY_LOST | GPTPS_TUI_P_COST | GPTPS_TUI_P_RENDER |
+                                                 GPTPS_TUI_P_TRUNCATED | GPTPS_TUI_P_NOMEM },
+    { GPTPS_TUI_SHED_PERCENTILES, "percentiles", GPTPS_TUI_P_RENDER | GPTPS_TUI_P_NOMEM },
+    { GPTPS_TUI_SHED_LATENCY,     "latency",     GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_COST | GPTPS_TUI_P_NOMEM },
+    { GPTPS_TUI_SHED_TASKS,       "tasks",       GPTPS_TUI_P_COST | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_TRUNCATED |
+                                                 GPTPS_TUI_P_NOMEM }
+};
 /* the conditions, named as the DEGRADED line's "(pressure: ...)" and the WARNs show them */
 static const char *const TUI_P_NAME[TUI_P_N] = { "problems lost", "activity lost", "untracked", "folded",
                                                  "truncated", "no memory", "render", "pane", "cost" };
@@ -2655,27 +2703,68 @@ static unsigned cost_ns(int tier, int act_on)
     return tier >= TUI_T_ACTIVITY && !act_on ? u - TUI_COST_ACT : u;
 }
 
-/* mu held: the next DEGRADE step that would change what runs (0: none - the floor) */
-static unsigned shed_next(const gptps_tui *t)
+/* mu held: whether the ACTIVITY journal is wanted (shed_cap's `act`) */
+static int act_wanted(const gptps_tui *t) { return t->show_recent && t->act_want > 0; }
+/* mu held: the tier that runs, the request minus what is shed */
+static int shed_tier(const gptps_tui *t) { return shed_cap(kpi_tier(t->kpi_req), t->shed, act_wanted(t)); }
+/* mu held: the pane interval GPTPS_TUI_SHED_PANE would set next - twice what runs, up to
+ * TUI_PANE_SHED_MAX - or 0 when it would change nothing (at the cap) */
+static uint64_t pane_shed_next(const gptps_tui *t)
 {
-    int eff = shed_cap(kpi_tier(t->kpi_req), t->shed);
-    if (!(t->shed & GPTPS_TUI_SHED_ACTIVITY) && eff >= TUI_T_ACTIVITY && t->show_recent && t->act_want > 0)
-        return GPTPS_TUI_SHED_ACTIVITY;
-    if (!(t->shed & GPTPS_TUI_SHED_PERCENTILES) && eff >= TUI_T_FULL)    return GPTPS_TUI_SHED_PERCENTILES;
-    if (!(t->shed & GPTPS_TUI_SHED_LATENCY)     && eff >= TUI_T_LATENCY) return GPTPS_TUI_SHED_LATENCY;
-    if (!(t->shed & GPTPS_TUI_SHED_TASKS)       && eff >= TUI_T_TASKS)   return GPTPS_TUI_SHED_TASKS;
+    uint64_t cur = t->pane_every_ms, base = t->cfg.pane_refresh_ms;
+    if (t->pane_shed_ms > base) base = t->pane_shed_ms;
+    if (cur < base) cur = base;
+    if (cur >= TUI_PANE_SHED_MAX) return 0;
+    return cur * 2u < TUI_PANE_SHED_MAX ? cur * 2u : TUI_PANE_SHED_MAX;
+}
+/* mu held: whether step `bit` would change what runs */
+static int shed_avail(const gptps_tui *t, unsigned bit)
+{
+    int eff = shed_tier(t);
+    switch (bit) {
+        case GPTPS_TUI_SHED_PANE:        return pane_shed_next(t) != 0;
+        case GPTPS_TUI_SHED_ACTIVITY:    return !(t->shed & bit) && eff >= TUI_T_ACTIVITY && act_wanted(t);
+        case GPTPS_TUI_SHED_PERCENTILES: return !(t->shed & bit) && eff >= TUI_T_FULL;
+        case GPTPS_TUI_SHED_LATENCY:     return !(t->shed & bit) && eff >= TUI_T_LATENCY;
+        case GPTPS_TUI_SHED_TASKS:       return !(t->shed & bit) && eff >= TUI_T_TASKS;
+        default:                         return 0;
+    }
+}
+
+/* mu held: the next DEGRADE step for the conditions `why` (GPTPS_TUI_P_*): in the fixed order,
+ * the first that would change what runs AND relieves one of them (1.12 took the next in the
+ * order whatever it relieved). Returned as the bits it sets: a tier step also sets the steps
+ * above it in the ladder that it takes out with it and that still ran (-latency takes the
+ * percentiles, -tasks the journal, the percentiles and the table), so the DEGRADED line
+ * names all that went. 0: none - the floor, or nothing left relieves `why`. *chosen: the
+ * step itself (its `relieves` is the window's shed_why). */
+static unsigned shed_next(const gptps_tui *t, uint64_t why, int *chosen)
+{
+    int k, j;
+    for (k = 0; k < TUI_SHED_N; ++k)
+        if ((TUI_SHED[k].relieves & why) && shed_avail(t, TUI_SHED[k].bit)) {
+            unsigned bits = TUI_SHED[k].bit;
+            if (bits != GPTPS_TUI_SHED_PANE)
+                for (j = 1; j < k; ++j)                      /* the tier steps before it */
+                    if (shed_avail(t, TUI_SHED[j].bit) &&
+                        (TUI_SHED[k].bit == GPTPS_TUI_SHED_TASKS || TUI_SHED[j].bit == GPTPS_TUI_SHED_PERCENTILES))
+                        bits |= TUI_SHED[j].bit;
+            *chosen = k;
+            return bits;
+        }
+    *chosen = -1;
     return 0;
 }
 
-/* "-activity -latency": the steps in `shed`, in order */
+/* "-pane -activity -latency": the steps in `shed`, in order */
 static void shed_text(unsigned shed, char *out, size_t cap)
 {
     size_t p = 0;
     int k;
     out[0] = 0;
-    for (k = 0; k < 4; ++k)
-        if ((shed & (1u << k)) && p < cap)
-            p += (size_t)snprintf(out + p, cap - p, "%s-%s", p ? " " : "", TUI_SHED_NAME[k]);
+    for (k = 0; k < TUI_SHED_N; ++k)
+        if ((shed & TUI_SHED[k].bit) && p < cap)
+            p += (size_t)snprintf(out + p, cap - p, "%s-%s", p ? " " : "", TUI_SHED[k].name);
 }
 /* "cost, render": the conditions in `bits` */
 static void pnames(uint64_t bits, char *out, size_t cap)
@@ -2702,13 +2791,13 @@ static void adapt_phrase(const tui_adsnap *a, int k, char *out, size_t cap)
 {
     char c[16];
     switch (k) {
-        case 0: snprintf(out, cap, "PROBLEMS lost %s unseen: raise tui.recent (%d)", fmt_count(c, sizeof c, a->d[0]),
-                         a->prob_want); break;
+        case 0: snprintf(out, cap, "PROBLEMS lost %s unseen: raise tui.recent (%d) - report-only: PROBLEMS is "
+                         "the floor, never shed", fmt_count(c, sizeof c, a->d[0]), a->prob_want); break;
         case 1: snprintf(out, cap, "ACTIVITY lost %s unseen: tui.activity=0", fmt_count(c, sizeof c, a->d[1])); break;
         case 2: snprintf(out, cap, "%s items untracked: raise tui.latency_window (%d)", fmt_count(c, sizeof c, a->d[2]),
                          a->lat_cap); break;
-        case 3: snprintf(out, cap, "%s types folded into (other): raise cfg.max_tasks (%d)",
-                         fmt_count(c, sizeof c, a->d[3]), a->max_tasks); break;
+        case 3: snprintf(out, cap, "%s types folded into (other): raise cfg.max_tasks (%d) - report-only: "
+                         "folding is the cheap fallback", fmt_count(c, sizeof c, a->d[3]), a->max_tasks); break;
         case 4: snprintf(out, cap, "%s frames truncated: lower tui.recent / tui.activity", fmt_count(c, sizeof c, a->d[4]));
                 break;
         case 5: snprintf(out, cap, "%s allocations failed: a lower tui.kpi", fmt_count(c, sizeof c, a->d[5])); break;
@@ -2736,7 +2825,7 @@ static void adapt_base(gptps_tui *t, uint64_t now)
 {
     t->ad_ms = now; t->ad_ev = adapt_events(t); t->ad_plost = adapt_plost(t); t->ad_alost = adapt_alost(t);
     t->ad_untr = t->h_untracked; t->ad_fold = t->h_folded; t->ad_trunc = t->h_trunc; t->ad_nomem = t->h_nomem;
-    t->ad_preads = t->h_pane_reads; t->ad_rmax_us = 0; t->ad_gen++;
+    t->ad_preads = t->h_pane_reads; t->ad_rmax_us = 0; t->ad_trd = t->h_trunc_dash; t->ad_gen++;
 }
 
 /* Evaluate the window, if one has passed (see above). `now`: TUI_NOW_MS. Never under a lock. */
@@ -2744,8 +2833,8 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
 {
     tui_adsnap a;
     unsigned step = 0;
-    uint64_t win, el, ev, pl, al, wmask = 0, why = 0, gen;
-    int k, floor_warn = 0, changed = 0, eff = 0;
+    uint64_t win, el, ev, pl, al, wmask = 0, why = 0, gen, acting, pane_to = 0;
+    int k, floor_warn = 0, changed = 0, eff = 0, chosen = -1;
     char line[sizeof t->ad_line], ph[256];
     size_t lp;
     mu_lock(&t->mu);
@@ -2761,7 +2850,12 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
     a.d[4] = t->h_trunc - t->ad_trunc;
     a.d[5] = t->h_nomem - t->ad_nomem;
     a.d[6] = t->ad_rmax_us;
-    a.d[7] = t->h_pane_reads != t->ad_preads && t->pane_every_ms > (uint64_t)t->cfg.pane_refresh_ms ? t->pane_cost_us : 0;
+    {   /* PANE: a pass in the window, and its interval stretched past its floor - pane_refresh_ms,
+         * or what GPTPS_TUI_SHED_PANE raised it to (so a step that covers the pass relieves it) */
+        uint64_t base = t->cfg.pane_refresh_ms;
+        if (t->pane_shed_ms > base) base = t->pane_shed_ms;
+        a.d[7] = t->h_pane_reads != t->ad_preads && t->pane_every_ms > base ? t->pane_cost_us : 0;
+    }
     a.rate = (ev - t->ad_ev) * 1000u / el;
     a.unit = t->tier == TUI_T_OFF ? 0u : cost_ns(t->tier, t->act != NULL);   /* OFF: the totals stand still */
     a.ppm = a.rate * a.unit / 1000u;                 /* ns a second / 1e9 x 1e6 */
@@ -2778,13 +2872,20 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
     if (a.ppm > (uint64_t)a.budget * 10000u) a.flags |= GPTPS_TUI_P_COST;
     t->pressure = a.flags; t->pr_seen |= a.flags; t->ad_windows++;
     t->ad_rate = a.rate; t->ad_ppm = a.ppm; t->ad_rmax_last = a.d[6];
-    if (a.flags & GPTPS_TUI_P_SHEDDABLE) t->p_row++; else t->p_row = 0;
+    /* What counts toward DEGRADE (1.13: every condition a step relieves - TUI_SHED). Frames cut
+     * on another pane (or a host's small render buffer there) are not ones the dashboard's
+     * rows can shorten: TRUNCATED acts for dashboard frames only. */
+    acting = a.flags & GPTPS_TUI_P_SHEDDABLE;
+    if (t->h_trunc_dash == t->ad_trd) acting &= ~(uint64_t)GPTPS_TUI_P_TRUNCATED;
+    if (acting) t->p_row++; else t->p_row = 0;
     if (t->adapt == GPTPS_TUI_ADAPT_DEGRADE && t->p_row >= TUI_SHED_AFTER) {
         t->p_row = 0;                                /* the next step needs as many windows again */
-        why = a.flags & GPTPS_TUI_P_SHEDDABLE;
-        if ((step = shed_next(t)) != 0) {
-            t->shed |= step; t->shed_why = why; t->ad_steps++; t->ad_warns++;
-            eff = shed_cap(kpi_tier(t->kpi_req), t->shed);
+        why = acting;
+        if ((step = shed_next(t, acting, &chosen)) != 0) {
+            why = acting & TUI_SHED[chosen].relieves;   /* what this step answers */
+            if (step & GPTPS_TUI_SHED_PANE) { pane_to = pane_shed_next(t); t->pane_shed_ms = pane_to; }
+            t->shed |= step; t->shed_why = why; t->shed_whys |= why; t->ad_steps++; t->ad_warns++;
+            eff = shed_tier(t);
         } else if (!t->ad_floor_ms || now - t->ad_floor_ms >= TUI_WARN_GAP_MS) {
             t->ad_floor_ms = now ? now : 1; floor_warn = 1; t->ad_warns++;
         }
@@ -2828,19 +2929,25 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
         char wn[160], sn[64];
         pnames(why, wn, sizeof wn);
         if (step) {
+            char pn[128];
             shed_text(step, sn, sizeof sn);
+            pn[0] = 0;
+            if (step & GPTPS_TUI_SHED_PANE)
+                snprintf(pn, sizeof pn, " (the tasks / settings / detail panes read the engine at most every %llu.%u s)",
+                         (unsigned long long)(pane_to / 1000u), (unsigned)(pane_to / 100u % 10u));
             tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: pressure (%s) for %u windows in a row; shedding "
-                     "%s - kpi %s requested, %s runs. Sticky: nothing comes back by itself; 'u', "
+                     "%s%s - kpi %s requested, %s runs. Sticky: nothing comes back by itself; 'u', "
                      "gptps_tui_set_kpi or a tui.kpi / tui.adapt write restores the request ('m' clears it too, "
-                     "stepping up from what runs)", wn, TUI_SHED_AFTER, sn,
+                     "stepping up from what runs)", wn, TUI_SHED_AFTER, sn, pn,
                      kpi_str(a.kpi_req), kpi_str(TUI_LADDER[eff]));
         } else {
             tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: pressure (%s) for %u windows in a row, but nothing "
-                     "is left to shed at kpi %s - the totals, the gauges and the PROBLEMS journal never are",
-                     wn, TUI_SHED_AFTER, kpi_str(TUI_LADDER[a.tier]));
+                     "is left to shed that relieves it at kpi %s - the totals, the gauges and the PROBLEMS journal "
+                     "never are, and the panes are read at least every %u s", wn, TUI_SHED_AFTER,
+                     kpi_str(TUI_LADDER[a.tier]), TUI_PANE_SHED_MAX / 1000u);
         }
     }
-    if (step) {                                      /* the request is kept */
+    if (step & ~(unsigned)GPTPS_TUI_SHED_PANE) {      /* a tier step; the request is kept */
         /* It frees what the step sheds; a part the tier still wants and that failed to
          * allocate before is tried again here (tui_reconfig builds what is missing) - and
          * may fail again, which is said, as every caller of tui_reconfig does. */
@@ -4628,13 +4735,13 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
     memset(&w, 0, sizeof w);
     mu_lock(&t->smu);
     mu_lock(&t->mu);
-    if (unshed) { t->shed = 0; t->shed_why = 0; t->p_row = 0; }
+    if (unshed) { t->shed = 0; t->shed_why = 0; t->shed_whys = 0; t->pane_shed_ms = 0; t->p_row = 0; }
     if (lvl < 0) lvl = t->kpi_req;
     t->kpi_req = lvl;
-    tier = shed_cap(kpi_tier(lvl), t->shed);
     if (win <= 0) win = t->lat_cap;
     if (plines >= 0) t->prob_want = plines;
     if (alines >= 0) t->act_want = alines;
+    tier = shed_tier(t);
     cur_win = t->lat_cap;
     want_tasks = tier >= TUI_T_TASKS && t->show_tasks;
     want_prob  = tier >= TUI_T_PROBLEMS && t->show_recent && t->prob_want > 0;
@@ -5046,6 +5153,8 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     h.source_reads      = t->src_reads;
     h.source_errors     = t->src_errors;
     h.source_rows       = t->src_rows;
+    h.pane_shed_ms      = t->pane_shed_ms;
+    h.shed_pressure_all = t->shed_whys;
     mu_unlock(&t->mu);
     n = out->struct_size < sizeof h ? out->struct_size : sizeof h;   /* what the caller's struct has */
     memcpy((char *)out + sizeof(size_t), (char *)&h + sizeof(size_t), n - sizeof(size_t));

@@ -442,7 +442,8 @@ typedef struct {
     uint64_t windows;             /* windows evaluated since install */
     uint64_t pressure_warns;      /* pressure / degrade WARNs logged */
     uint64_t shed;                /* GPTPS_TUI_SHED_* bits: what DEGRADE has shed (0: nothing) */
-    uint64_t shed_pressure;       /* GPTPS_TUI_P_* bits: the conditions behind the last step */
+    uint64_t shed_pressure;       /* GPTPS_TUI_P_* bits: the conditions behind the last step (1.13:
+                                   * those of the window that the step relieves) */
     uint64_t degrade_steps;       /* steps shed since install (cleared ones included) */
     uint64_t event_rate;          /* events a second in the last window (from the totals) */
     uint64_t cost_est_ppm;        /* the observer's ESTIMATED cost in the last window, in
@@ -457,6 +458,11 @@ typedef struct {
     uint64_t source_errors;       /* reads that failed, since install: those frames showed the
                                    * dashboard's own counts, and said so */
     uint64_t source_rows;         /* task rows the last good read said the source has */
+    /* 1.13, ADAPT (see below) */
+    uint64_t pane_shed_ms;        /* the engine-reading panes' interval floor GPTPS_TUI_SHED_PANE
+                                   * set (0: not shed; pane_refresh_ms is the floor then) */
+    uint64_t shed_pressure_all;   /* GPTPS_TUI_P_* bits: the conditions behind every step shed
+                                   * since an operator last cleared it (the DEGRADED line's) */
 } gptps_tui_health_info;
 
 /* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
@@ -469,13 +475,24 @@ typedef struct {
 #define GPTPS_TUI_P_RENDER        0x040u  /* a frame took more than a tenth of refresh_ms to make */
 #define GPTPS_TUI_P_PANE          0x080u  /* an engine read was slow enough to stretch its interval */
 #define GPTPS_TUI_P_COST          0x100u  /* the estimated observer cost is over cost_budget_pct */
-/* the conditions shedding relieves - the only ones DEGRADE acts on */
-#define GPTPS_TUI_P_SHEDDABLE (GPTPS_TUI_P_ACTIVITY_LOST | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_COST)
-/* GPTPS_TUI_SHED_*: a DEGRADE step (gptps_tui_health_info.shed), in the order they are shed */
-#define GPTPS_TUI_SHED_ACTIVITY    0x1u   /* 1: the ACTIVITY journal off ("-activity") */
-#define GPTPS_TUI_SHED_PERCENTILES 0x2u   /* 2: FULL -> LATENCY, the histograms ("-percentiles") */
-#define GPTPS_TUI_SHED_LATENCY     0x4u   /* 3: -> TASKS, the handle table: avg ms, exact gauges ("-latency") */
-#define GPTPS_TUI_SHED_TASKS       0x8u   /* 4: -> PROBLEMS, the TASKS rows and mem.peak ("-tasks") */
+/* The conditions a DEGRADE step relieves - the ones DEGRADE acts on (see ADAPT below for
+ * which step relieves which). 1.12: ACTIVITY_LOST | RENDER | COST (0x142). 1.13 adds
+ * UNTRACKED, TRUNCATED (dashboard frames only), NOMEM and PANE (0x1f6). It is a macro: a
+ * caller built against 1.12's header still sees 0x142; what the dashboard acts on is the
+ * library's. */
+#define GPTPS_TUI_P_SHEDDABLE (GPTPS_TUI_P_ACTIVITY_LOST | GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_TRUNCATED | \
+                               GPTPS_TUI_P_NOMEM | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_PANE | GPTPS_TUI_P_COST)
+/* 1.13: the conditions no step relieves - reported, never acted on (see ADAPT for why) */
+#define GPTPS_TUI_P_REPORT_ONLY (GPTPS_TUI_P_PROBLEMS_LOST | GPTPS_TUI_P_FOLDED)
+/* GPTPS_TUI_SHED_*: a DEGRADE step (gptps_tui_health_info.shed). The bits keep their 1.12
+ * values; the ORDER steps are considered in is PANE, ACTIVITY, PERCENTILES, LATENCY, TASKS. */
+#define GPTPS_TUI_SHED_ACTIVITY    0x1u   /* 2: the ACTIVITY journal off ("-activity") */
+#define GPTPS_TUI_SHED_PERCENTILES 0x2u   /* 3: FULL -> LATENCY, the histograms ("-percentiles") */
+#define GPTPS_TUI_SHED_LATENCY     0x4u   /* 4: the handle table: avg ms, exact gauges ("-latency"):
+                                           * -> NORMAL while the ACTIVITY journal runs, else TASKS */
+#define GPTPS_TUI_SHED_TASKS       0x8u   /* 5: -> PROBLEMS, the TASKS rows and mem.peak ("-tasks") */
+#define GPTPS_TUI_SHED_PANE        0x10u  /* 1 (1.13): the panes read the engine half as often ("-pane");
+                                           * no tier changes and nothing is lost but freshness */
 
 /* Fill *out (struct_size bytes of it; the rest of a newer struct is left alone, and
  * out->struct_size is kept). GPTPS_E_INVAL for a NULL argument or a struct_size that
@@ -491,12 +508,12 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  * window (cfg.rate_window_s, 10 s), when a frame is made (render, snapshot, the live loop)
  * or health is read. With no viewer and no health call nothing is computed at all. A
  * window's conditions (GPTPS_TUI_P_*), each from what changed in that window:
- *   PROBLEMS_LOST  PROBLEMS records lost unseen          -> raise tui.recent
+ *   PROBLEMS_LOST  PROBLEMS records lost unseen          -> raise tui.recent (report-only)
  *   ACTIVITY_LOST  ACTIVITY records lost unseen at 1000/s -> tui.activity=0 (a log
  *                  or more (a log scrolling too fast to     scrolling that fast is not read)
  *                  read; a few lost between frames are not pressure)
  *   UNTRACKED      items the latency table had no room for -> raise tui.latency_window
- *   FOLDED         types folded into '(other)'             -> raise cfg.max_tasks
+ *   FOLDED         types folded into '(other)'             -> raise cfg.max_tasks (report-only)
  *   TRUNCATED      frames cut at 256 KiB                   -> lower tui.recent / tui.activity
  *   NOMEM          failed allocations                      -> a lower tui.kpi
  *   RENDER         the slowest frame took more than 10% of  -> raise tui.refresh_ms
@@ -517,20 +534,45 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  * the setting to change ("PRESSURE: ACTIVITY lost 41k unseen: tui.activity=0"), logs a WARN
  * - at most once a minute per condition - and sets the health fields. Nothing is changed.
  * DEGRADE (opt-in; the one exception to "report, never act", and it acts only when a frame
- * is made or health is read): when a condition shedding relieves (GPTPS_TUI_P_SHEDDABLE:
- * ACTIVITY_LOST, RENDER, COST) lasts 3 windows in a row, one step is shed, in this order -
- * GPTPS_TUI_SHED_ACTIVITY, _PERCENTILES (FULL -> LATENCY), _LATENCY (-> TASKS), _TASKS (->
- * PROBLEMS) - a step that would change nothing is passed over, and after a step the count
- * starts again. PROBLEMS is the floor: the totals, the gauges and the PROBLEMS journal are
- * never shed; at the floor a WARN says there is nothing left. Each step logs a WARN. What
- * was asked for is kept: tui.kpi, tui.activity and set_kpi's level read back as requested
- * (so a file saved with 'w' holds the request, not the degraded state); what runs is the
- * request minus what is shed - health.kpi, health.shed, and the line under the header:
- * "DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores full". STICKY:
- * nothing is restored when the pressure goes. It is cleared only by an operator. The request
- * is built again by gptps_tui_set_kpi (any level, the same one too), a tui.kpi write, the
- * 'u' key, gptps_tui_set_adapt or a tui.adapt write; the 'm' key clears it too, but steps
- * up one tier from what RUNS (FULL degraded to PROBLEMS, then 'm': TASKS). */
+ * is made or health is read): when conditions a step relieves (GPTPS_TUI_P_SHEDDABLE) last
+ * 3 windows in a row - any of them, in each window - one step is shed: of the steps, in this
+ * fixed order, the FIRST that would change what runs and relieves one of the last window's
+ * conditions (1.12 took the next one in the order, whatever it relieved):
+ *   step (GPTPS_TUI_SHED_*)    relieves
+ *   PANE        "-pane"        PANE: the tasks / settings / detail panes' interval (what runs,
+ *                              pane_every_ms) doubled, up to 60 s - their hold on the engine's
+ *                              lock halved. Repeatable while under 60 s; no data is lost
+ *   ACTIVITY    "-activity"    ACTIVITY_LOST, COST (3 ns of the estimate), RENDER and TRUNCATED
+ *                              (the RECENT rows a frame merges and prints), NOMEM (its memory)
+ *   PERCENTILES "-percentiles" RENDER (the per-row p50/p95/p99), NOMEM - not COST: FULL and
+ *                              LATENCY estimate the same 38 ns
+ *   LATENCY     "-latency"     UNTRACKED (the table is gone), COST (38 -> 24 ns), NOMEM; it
+ *                              also takes the percentiles, and runs NORMAL while the ACTIVITY
+ *                              journal does (TASKS once it is shed, as in 1.12)
+ *   TASKS       "-tasks"       COST, RENDER, TRUNCATED (the TASKS rows), NOMEM; it also takes
+ *                              what runs above PROBLEMS (journal, percentiles, table)
+ * TRUNCATED acts only for dashboard frames (a frame is rows of at most the width, so only
+ * fewer rows shorten it; a frame cut on another pane is reported only). NOMEM: every step
+ * but PANE frees memory, so failed allocations shed down the ladder, one step per 3 windows,
+ * until they stop (a step's rebuild that fails again is counted and logged, so it keeps
+ * counting). Report-only, never shed for: PROBLEMS_LOST - PROBLEMS is the floor, and no step
+ * changes how many failures arrive (raise tui.recent, or look more often); FOLDED - folding
+ * into '(other)' is already the cheap fallback (the totals stay exact) and the only step that
+ * ends it, -tasks, drops every row to save merging a few (raise cfg.max_tasks). Their
+ * PRESSURE text says "report-only" and why. A step that would change nothing (at a lower
+ * request, or PANE at 60 s) is passed over; after a step the count starts again. PROBLEMS is
+ * the floor: the totals, the gauges and the PROBLEMS journal are never shed; when nothing
+ * left relieves the conditions, a WARN says so (at most once a minute). Each step logs a
+ * WARN naming all it takes out. What was asked for is kept: tui.kpi, tui.activity and
+ * set_kpi's level read back as requested (so a file saved with 'w' holds the request, not
+ * the degraded state); what runs is the request minus what is shed - health.kpi,
+ * health.shed, health.pane_shed_ms, and the line under the header: "DEGRADED: -activity
+ * -percentiles (pressure: render) - 'u' restores full" (the conditions behind every step;
+ * health.shed_pressure has the last step's). STICKY: nothing is restored when the pressure
+ * goes. It is cleared only by an operator. The request is built again (and the pane interval
+ * back to pane_refresh_ms) by gptps_tui_set_kpi (any level, the same one too), a tui.kpi
+ * write, the 'u' key, gptps_tui_set_adapt or a tui.adapt write; the 'm' key clears it too,
+ * but steps up one tier from what RUNS (FULL degraded to PROBLEMS, then 'm': TASKS). */
 gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode);   /* DEFAULT => REPORT; else
                                    * GPTPS_E_INVAL. Clears what DEGRADE shed (above) */
 /* The estimated-cost budget, in percent of one core: 1..100 (else GPTPS_E_INVAL). Also

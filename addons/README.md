@@ -773,10 +773,10 @@ enabled automatically). Panes/metrics:
 
     | condition | when | suggestion |
     |---|---|---|
-    | PROBLEMS lost | a failure record overwritten before any frame showed it | raise `tui.recent` |
+    | PROBLEMS lost | a failure record overwritten before any frame showed it | raise `tui.recent` (report-only) |
     | ACTIVITY lost | lifecycle records lost unseen at ≥ 1000/s | `tui.activity=0` |
     | untracked | the latency table was full for a QUEUED | raise `tui.latency_window` |
-    | folded | a new type folded into `(other)` | raise `cfg.max_tasks` |
+    | folded | a new type folded into `(other)` | raise `cfg.max_tasks` (report-only) |
     | truncated / no memory | a frame cut at 256 KiB / an allocation failed | lower `tui.recent`, `tui.activity` / `tui.kpi` |
     | render | a frame took more than 1/10 of `refresh_ms` to make | raise `tui.refresh_ms` |
     | pane | a pane pass slow enough to stretch past `cfg.pane_refresh_ms` | raise it, or leave the pane |
@@ -789,20 +789,40 @@ enabled automatically). Panes/metrics:
     has millisecond resolution, so it cannot be timed; contention is not in it. At 5%,
     `full` reaches the budget near 1.3 million events a second.
     `degrade` is the one opt-in exception to "report, never act", and it acts only when a
-    frame is made or health is read — with no viewer nothing acts. When a condition shedding
-    relieves (activity lost, render, cost) lasts **3 windows in a row**, one step is shed, a
-    WARN each, in this order: the ACTIVITY journal → the percentiles (`full` → `latency`) →
-    the handle table (→ `tasks`) → the TASKS rows (→ `problems`). A step that would change
-    nothing is passed over; `problems` is the floor (the totals, gauges and PROBLEMS journal
-    are never shed; a WARN says when nothing is left). **Sticky**: nothing comes back when
-    the pressure goes. What you asked for is kept — `tui.kpi` and `tui.activity` read back
-    the request, so `w` saves it, not the degraded state — and what runs is shown in
-    `gptps_tui_health` (`kpi`, `kpi_requested`, `shed`, `shed_pressure`, `degrade_steps`)
-    and under the header: `DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores
-    full`. Only an operator clears it: `u`, `gptps_tui_set_kpi` (any level), a `tui.kpi`
-    write, `gptps_tui_set_adapt` or a `tui.adapt` write build the request again; `m` clears
-    it too but steps up one tier from what runs (`full` degraded to `problems`, then `m`,
-    gives `tasks`).
+    frame is made or health is read — with no viewer nothing acts. When conditions a step
+    relieves (`GPTPS_TUI_P_SHEDDABLE`) last **3 windows in a row**, one step is shed, a WARN
+    each: of the steps, in this fixed order, the **first that would change what runs and
+    relieves one of the window's conditions** (1.13; 1.12 acted on activity lost, render and
+    cost only, and took the next step in the order whatever it relieved):
+
+    | step | what goes | relieves |
+    |---|---|---|
+    | `-pane` (1.13) | the tasks / settings / detail panes read the engine half as often (doubled from what runs, up to 60 s; repeatable) — no data is lost | pane |
+    | `-activity` | the ACTIVITY journal | activity lost, cost (3 ns of the estimate), render and truncated (its RECENT rows), no memory |
+    | `-percentiles` | the histograms (`full` → `latency`) | render (the per-row p50/p95/p99), no memory — not cost: `full` and `latency` estimate the same 38 ns |
+    | `-latency` | the handle table, and the percentiles with it (→ `normal` while the journal runs, else `tasks`) | untracked, cost (38 → 24 ns), no memory |
+    | `-tasks` | the TASKS rows and all above `problems` | cost, render, truncated (the TASKS rows), no memory |
+
+    Truncated acts for dashboard frames only (a frame is rows of at most the width, so only
+    fewer rows shorten it). No memory sheds down the ladder, one step per 3 windows, until
+    allocations stop failing. **Report-only** — never shed for, and their `PRESSURE:` text
+    says so: *PROBLEMS lost* (PROBLEMS is the floor, and no step changes how many failures
+    arrive: raise `tui.recent` or look more often) and *folded* (folding into `(other)` is
+    already the cheap fallback, the totals stay exact; the only step that would end it,
+    `-tasks`, drops every row to save merging a few). `GPTPS_TUI_P_SHEDDABLE` grew from
+    `0x142` to `0x1f6` (`GPTPS_TUI_P_REPORT_ONLY` is the rest); it is a macro, so a caller
+    built against 1.12's header sees the old mask. A step that would change nothing is
+    passed over; `problems` is the floor (the totals, gauges and PROBLEMS journal are never
+    shed; a WARN says when nothing left relieves the pressure). **Sticky**: nothing comes
+    back when the pressure goes. What you asked for is kept — `tui.kpi` and `tui.activity`
+    read back the request, so `w` saves it, not the degraded state — and what runs is shown
+    in `gptps_tui_health` (`kpi`, `kpi_requested`, `shed`, `shed_pressure`,
+    `shed_pressure_all`, `pane_shed_ms`, `degrade_steps`) and under the header: `DEGRADED:
+    -activity -percentiles (pressure: render) - 'u' restores full`. Only an operator clears
+    it (and the pane interval goes back to `pane_refresh_ms`): `u`, `gptps_tui_set_kpi` (any
+    level), a `tui.kpi` write, `gptps_tui_set_adapt` or a `tui.adapt` write build the request
+    again; `m` clears it too but steps up one tier from what runs (`full` degraded to
+    `problems`, then `m`, gives `tasks`).
 - **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
   runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
   instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back

@@ -133,6 +133,14 @@
  *     never below PROBLEMS; sticky with the pressure gone; cleared only by 'u', 'm',
  *     set_kpi, a tui.kpi or tui.adapt write; nothing acts without a frame or health call;
  *     tui.kpi / tui.activity read back the request; the event path allocates nothing.
+ * 1.13:
+ * 50) also: under COST, -percentiles (no estimated relief) is passed over for -latency; under
+ *     RENDER, -latency (it leaves every row) for -tasks.
+ * 51) Every pressure condition acts or is report-only: UNTRACKED sheds -latency (NORMAL keeps
+ *     the journal), TRUNCATED -activity then -tasks (dashboard frames only), NOMEM each tier
+ *     step in turn, PANE the new -pane (the panes' interval doubled up to 60 s, cleared by
+ *     'u'); a WARN each, sticky, operator-cleared; several at once follow the order;
+ *     PROBLEMS_LOST and FOLDED never shed and say why; the event path allocates nothing.
  */
 #if !defined(_WIN32)
 #  define _XOPEN_SOURCE 700      /* posix_openpt & co., for 7) */
@@ -3642,8 +3650,9 @@ static void test_adapt_degrade(void)
     static const struct { unsigned shed; int kpi, act, hist, tab, tasks; const char *mark; } STEP[] = {
         { 0,                                   GPTPS_TUI_KPI_FULL,     1, 1, 1, 1, NULL },
         { 0x1,                                 GPTPS_TUI_KPI_FULL,     0, 1, 1, 1, "DEGRADED: -activity (pressure:" },
-        { 0x3,                                 GPTPS_TUI_KPI_LATENCY,  0, 0, 1, 1, "DEGRADED: -activity -percentiles (" },
-        { 0x7,                                 GPTPS_TUI_KPI_TASKS,    0, 0, 0, 1, "-percentiles -latency (" },
+        /* 1.13: -percentiles alone does not relieve COST (FULL and LATENCY estimate the same
+         * 38 ns), so the next step for it is -latency - which takes the percentiles with it */
+        { 0x7,                                 GPTPS_TUI_KPI_TASKS,    0, 0, 0, 1, "DEGRADED: -activity -percentiles -latency (" },
         { 0xf,                                 GPTPS_TUI_KPI_PROBLEMS, 0, 0, 0, 0, "-latency -tasks (pressure: cost" },
     };
     size_t k;
@@ -3685,18 +3694,18 @@ static void test_adapt_degrade(void)
         CHECK(ad_setting(e, "tui.kpi", "full"));                    /* the request reads back */
     }
     CHECK(log_count("shedding -activity -percentiles") == 0 && log_count("shedding -activity") == 1 &&
-          log_count("shedding -percentiles") == 1 && log_count("shedding -latency") == 1 &&
-          log_count("shedding -tasks") == 1);
+          log_count("shedding -percentiles -latency - kpi full requested, tasks runs") == 1 &&
+          log_count("shedding -latency") == 0 && log_count("shedding -tasks") == 1);
     /* the floor: 3 more windows, nothing more shed, one WARN saying so */
     for (w = 0; w < 3; ++w) { ad_flood(t, 500000u); ad_window(t, frame, sizeof frame); }
     CHECK(t->shed == 0xf && t->kpi == GPTPS_TUI_KPI_PROBLEMS && t->prob != NULL && t->tier == TUI_T_PROBLEMS);
-    CHECK(log_count("nothing is left to shed") == 1 && log_count("shedding") == 4);
+    CHECK(log_count("nothing is left to shed") == 1 && log_count("shedding") == 3);
     /* ... and at most once a minute: 57 more windows (19 more times at the floor) say nothing,
      * the one 60 s after it says it again */
     for (w = 0; w < 57; ++w) { ad_flood(t, 500000u); ad_window(t, frame, sizeof frame); }
     CHECK(log_count("nothing is left to shed") == 1);
     for (w = 0; w < 3; ++w) { ad_flood(t, 500000u); ad_window(t, frame, sizeof frame); }
-    CHECK(log_count("nothing is left to shed") == 2 && log_count("shedding") == 4 && t->shed == 0xf);
+    CHECK(log_count("nothing is left to shed") == 2 && log_count("shedding") == 3 && t->shed == 0xf);
     /* the event path allocates nothing, degraded or not */
     a0 = __atomic_load_n(&tui_allocs, __ATOMIC_SEQ_CST);
     ad_burst(t, 1000, &hd);
@@ -3761,6 +3770,323 @@ static void test_adapt_degrade(void)
     tui_fake_ms = 0;
 }
 
+/* 51) 1.13: every pressure condition either acts under DEGRADE - shedding the first step, in
+ * the fixed order, that relieves it - or is report-only, saying why. On a MANUAL engine with
+ * the observer called directly and the clock the test sets, each acting condition (UNTRACKED,
+ * TRUNCATED, NOMEM, PANE) sheds after 3 windows the step that relieves it, a WARN each, stays
+ * shed with the pressure gone and comes back only on an operator's action; TRUNCATED on
+ * another pane and the report-only conditions (PROBLEMS_LOST, FOLDED) never shed; with
+ * several present the order decides; the event path still allocates nothing. */
+/* a pane pass, as pc_read records it: synthetic (no engine read), `every` ms, `cost` us */
+static void ad_pane(gptps_tui *t, uint64_t every, uint64_t cost)
+{
+    mu_lock(&t->mu); t->h_pane_reads++; t->pane_every_ms = every; t->pane_cost_us = cost; mu_unlock(&t->mu);
+}
+/* one failed allocation, as tui_reconfig counts it: a PROBLEMS journal resize with no memory */
+static void ad_nomem(gptps_tui *t)
+{
+    int want;
+    mu_lock(&t->mu); want = t->pcap + 1; mu_unlock(&t->mu);
+    tui_calloc_skip = 0; tui_calloc_fail = 1;
+    CHECK(gptps_tui_set_recent(t, want, -1) == GPTPS_E_NOMEM);
+    tui_calloc_fail = 0;
+}
+static int ad_allocs(void) { return __atomic_load_n(&tui_allocs, __ATOMIC_SEQ_CST); }
+
+static void test_adapt_acting(void)
+{
+    gptps *e; gptps_tui *t; static char frame[16384]; static char small[64];
+    gptps_tui_health_info h;
+    gptps_handle hd = 1;
+    int w, a0, i;
+    char nm[24];
+    /* the masks: released bits kept, every condition either acting or report-only */
+    CHECK(GPTPS_TUI_P_SHEDDABLE == 0x1f6u && GPTPS_TUI_P_REPORT_ONLY == 0x009u &&
+          (GPTPS_TUI_P_SHEDDABLE & GPTPS_TUI_P_REPORT_ONLY) == 0 &&
+          (GPTPS_TUI_P_SHEDDABLE | GPTPS_TUI_P_REPORT_ONLY) == 0x1ffu && GPTPS_TUI_SHED_PANE == 0x10u &&
+          GPTPS_TUI_SHED_ACTIVITY == 1u && GPTPS_TUI_SHED_PERCENTILES == 2u && GPTPS_TUI_SHED_LATENCY == 4u &&
+          GPTPS_TUI_SHED_TASKS == 8u);
+
+    /* UNTRACKED -> -latency (the handle table), which takes the percentiles; the ACTIVITY
+     * journal is kept: NORMAL runs */
+    if ((e = open_manual()) == NULL) return;
+    tui_fake_ms = 3000000u;
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    CHECK(gptps_tui_set_latency_window(t, 2) == GPTPS_OK);
+    log_begin();
+    emit(t, GPTPS_EV_QUEUED, "ut", hd++, GPTPS_OK, tui_fake_ms);
+    emit(t, GPTPS_EV_QUEUED, "ut", hd++, GPTPS_OK, tui_fake_ms);       /* the table is full */
+    ad_window(t, frame, sizeof frame);
+    for (w = 0; w < 3; ++w) {
+        CHECK(t->shed == 0);
+        emit(t, GPTPS_EV_QUEUED, "ut", hd++, GPTPS_OK, tui_fake_ms);   /* not tracked */
+        ad_window(t, frame, sizeof frame);
+        h = health(t);
+        CHECK(h.pressure == GPTPS_TUI_P_UNTRACKED);
+        if (w < 2) CHECK(t->shed == 0 && h.pressure_windows == (uint64_t)w + 1);
+    }
+    CHECK(t->shed == (GPTPS_TUI_SHED_PERCENTILES | GPTPS_TUI_SHED_LATENCY) && t->kpi == GPTPS_TUI_KPI_NORMAL &&
+          t->kpi_req == GPTPS_TUI_KPI_FULL);
+    CHECK(t->tab == NULL && t->hist == NULL && t->act != NULL && t->tasks != NULL && t->prob != NULL);
+    CHECK(log_count("tui.adapt=degrade: pressure (untracked) for 3 windows in a row; shedding -percentiles -latency - "
+                    "kpi full requested, normal runs") == 1 && log_count("shedding") == 1);
+    h = health(t);
+    CHECK(h.shed == 0x6u && h.shed_pressure == GPTPS_TUI_P_UNTRACKED && h.shed_pressure_all == GPTPS_TUI_P_UNTRACKED &&
+          h.degrade_steps == 1 && h.kpi == GPTPS_TUI_KPI_NORMAL && h.pane_shed_ms == 0);
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "DEGRADED: -percentiles -latency (pressure: untracked)") != NULL);
+    /* relieved (no table, nothing untracked) and sticky; the event path allocates nothing */
+    a0 = ad_allocs();
+    for (w = 0; w < 4; ++w) {
+        for (i = 0; i < 5; ++i) emit(t, GPTPS_EV_QUEUED, "ut", hd++, GPTPS_OK, tui_fake_ms);
+        CHECK(ad_allocs() == a0);
+        ad_window(t, frame, sizeof frame);
+        CHECK(health(t).pressure == 0 && t->shed == 0x6u && t->tab == NULL);
+        a0 = ad_allocs();
+    }
+    CHECK(gptps_tui_press(t, 'u') == 3);
+    CHECK(t->shed == 0 && t->kpi == GPTPS_TUI_KPI_FULL && t->tab && t->hist && health(t).shed_pressure_all == 0);
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+
+    /* TRUNCATED: a cut frame on another pane is reported, never shed for; on the dashboard
+     * -activity (its RECENT rows) and then -tasks (the TASKS rows, and all above PROBLEMS) */
+    if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    log_begin();
+    t->pane = TUI_PANE_HELP;
+    for (w = 0; w < 5; ++w) {
+        gptps_tui_render(t, small, sizeof small);
+        ad_window(t, frame, sizeof frame);
+        h = health(t);
+        CHECK(h.pressure == GPTPS_TUI_P_TRUNCATED && h.pressure_windows == 0 && t->shed == 0);
+    }
+    CHECK(log_count("shedding") == 0 && log_count("pressure (truncated") == 1);
+    t->pane = TUI_PANE_DASH;
+    ad_window(t, frame, sizeof frame);
+    {
+        static const struct { unsigned shed; int kpi; const char *log; } TR[] = {
+            { 0x1u, GPTPS_TUI_KPI_FULL,     "pressure (truncated) for 3 windows in a row; shedding -activity - kpi full requested, full runs" },
+            { 0xfu, GPTPS_TUI_KPI_PROBLEMS, "shedding -percentiles -latency -tasks - kpi full requested, problems runs" },
+        };
+        size_t k;
+        for (k = 0; k < 2; ++k) {
+            for (w = 0; w < 3; ++w) {
+                CHECK(t->shed == (k ? TR[k - 1].shed : 0u));
+                gptps_tui_render(t, small, sizeof small);
+                ad_window(t, frame, sizeof frame);
+            }
+            CHECK(t->shed == TR[k].shed && t->kpi == TR[k].kpi && log_count(TR[k].log) == 1 && t->prob != NULL);
+            CHECK(health(t).shed_pressure == GPTPS_TUI_P_TRUNCATED);
+        }
+    }
+    CHECK(t->act == NULL && t->tasks == NULL && t->tab == NULL && t->hist == NULL);
+    for (w = 0; w < 3; ++w) { gptps_tui_render(t, small, sizeof small); ad_window(t, frame, sizeof frame); }
+    CHECK(log_count("nothing is left to shed that relieves it at kpi problems") == 1 && log_count("shedding") == 2);
+    for (w = 0; w < 4; ++w) ad_window(t, frame, sizeof frame);             /* sticky */
+    CHECK(health(t).pressure == 0 && t->shed == 0xfu && t->kpi == GPTPS_TUI_KPI_PROBLEMS);
+    CHECK(gptps_settings_set(e, "tui.kpi", "full") == GPTPS_OK);
+    CHECK(t->shed == 0 && t->kpi == GPTPS_TUI_KPI_FULL && t->act && t->tasks);
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+
+    /* NOMEM: every tier step frees memory - down the ladder, one step per 3 windows */
+    if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    log_begin();
+    {
+        static const struct { unsigned shed; int kpi, act, hist, tab, tasks; const char *log; } NM[] = {
+            { 0x1u, GPTPS_TUI_KPI_FULL,     0, 1, 1, 1, "pressure (no memory) for 3 windows in a row; shedding -activity - kpi full requested, full runs" },
+            { 0x3u, GPTPS_TUI_KPI_LATENCY,  0, 0, 1, 1, "shedding -percentiles - kpi full requested, latency runs" },
+            { 0x7u, GPTPS_TUI_KPI_TASKS,    0, 0, 0, 1, "shedding -latency - kpi full requested, tasks runs" },
+            { 0xfu, GPTPS_TUI_KPI_PROBLEMS, 0, 0, 0, 0, "shedding -tasks - kpi full requested, problems runs" },
+        };
+        size_t k;
+        for (k = 0; k < 4; ++k) {
+            for (w = 0; w < 3; ++w) {
+                CHECK(t->shed == (k ? NM[k - 1].shed : 0u));
+                ad_nomem(t);
+                ad_window(t, frame, sizeof frame);
+                CHECK(health(t).pressure == GPTPS_TUI_P_NOMEM);
+            }
+            CHECK(t->shed == NM[k].shed && t->kpi == NM[k].kpi && log_count(NM[k].log) == 1);
+            CHECK((t->act != NULL) == NM[k].act && (t->hist != NULL) == NM[k].hist &&
+                  (t->tab != NULL) == NM[k].tab && (t->tasks != NULL) == NM[k].tasks && t->prob != NULL);
+            CHECK(health(t).shed_pressure == GPTPS_TUI_P_NOMEM && health(t).degrade_steps == k + 1);
+        }
+    }
+    for (w = 0; w < 3; ++w) { ad_nomem(t); ad_window(t, frame, sizeof frame); }
+    CHECK(log_count("nothing is left to shed that relieves it") == 1 && log_count("shedding") == 4);
+    for (w = 0; w < 4; ++w) ad_window(t, frame, sizeof frame);             /* sticky */
+    CHECK(health(t).pressure == 0 && t->shed == 0xfu);
+    CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK && t->shed == 0 && t->act && t->hist && t->tab && t->tasks);
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+
+    /* RENDER (acting since 1.12): -activity, -percentiles, then -tasks - not -latency, which
+     * leaves every row a frame makes (it takes the table too, as the ladder does) */
+    if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    log_begin();
+    {
+        static const unsigned RS[] = { 0x1u, 0x3u, 0xfu };
+        size_t k;
+        for (k = 0; k < 3; ++k) {
+            for (w = 0; w < 3; ++w) {
+                CHECK(t->shed == (k ? RS[k - 1] : 0u));
+                adapt_frame_us(t, 26000u);                          /* a 26 ms frame at refresh 250 */
+                ad_window(t, frame, sizeof frame);
+            }
+            CHECK(t->shed == RS[k] && health(t).shed_pressure == GPTPS_TUI_P_RENDER);
+        }
+        CHECK(t->kpi == GPTPS_TUI_KPI_PROBLEMS && log_count("shedding -latency -tasks - kpi full requested, problems runs") == 1 &&
+              log_count("shedding") == 3);
+    }
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+
+    /* PANE -> -pane: the panes' interval doubled (no tier changes, nothing freed); a real pass
+     * then no longer stretches it. Again while under 60 s, then nothing left relieves it */
+    if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    log_begin();
+    {
+        void *act = t->act, *hist = t->hist, *tab = t->tab, *tasks = t->tasks;
+        uint64_t every = 0, want;
+        t->pane = TUI_PANE_TASKS;
+        tui_read_delay_us = 30000;                                  /* a pass: 30 ms - read every 3 s */
+        t->pc.stale = 1; gptps_tui_render(t, frame, sizeof frame);  /* the first pass */
+        for (w = 0; w < 3; ++w) {
+            CHECK(t->shed == 0);
+            every = health(t).pane_every_ms;
+            CHECK(every >= 3000u);
+            t->pc.stale = 1;                                        /* a pass in every window */
+            ad_window(t, frame, sizeof frame);
+        }
+        want = every * 2u < TUI_PANE_SHED_MAX ? every * 2u : TUI_PANE_SHED_MAX;
+        h = health(t);
+        CHECK(t->shed == GPTPS_TUI_SHED_PANE && h.shed == 0x10u && h.pane_shed_ms == want &&
+              h.shed_pressure == GPTPS_TUI_P_PANE && h.degrade_steps == 1);
+        CHECK(t->kpi == GPTPS_TUI_KPI_FULL && t->act == act && t->hist == hist && t->tab == tab && t->tasks == tasks);
+        CHECK(log_count("pressure (pane) for 3 windows in a row; shedding -pane (the tasks / settings / detail panes "
+                        "read the engine at most every ") == 1 && log_count("shedding") == 1);
+        CHECK(h.pane_every_ms == want);                             /* the pass after the step: the new floor */
+        for (w = 0; w < 2; ++w) {                                   /* relieved: a pass no longer stretches */
+            t->pc.stale = 1;
+            ad_window(t, frame, sizeof frame);
+            CHECK((health(t).pressure & GPTPS_TUI_P_PANE) == 0 && health(t).pane_every_ms == want);
+        }
+        tui_read_delay_us = 0;
+        t->pane = TUI_PANE_DASH;
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "DEGRADED: -pane (pressure: pane) - 'u' restores full") != NULL);
+        /* stretched again past the new floor: doubled again, from what runs, up to 60 s */
+        while (t->pane_shed_ms < TUI_PANE_SHED_MAX) {
+            uint64_t from = t->pane_shed_ms + 1000u;
+            int steps = (int)health(t).degrade_steps;
+            for (w = 0; w < 3; ++w) { ad_pane(t, from, from * 10u); ad_window(t, frame, sizeof frame); }
+            CHECK(health(t).degrade_steps == (uint64_t)steps + 1);
+            CHECK(t->pane_shed_ms == (from * 2u < TUI_PANE_SHED_MAX ? from * 2u : TUI_PANE_SHED_MAX));
+            if (health(t).degrade_steps != (uint64_t)steps + 1) break;
+        }
+        CHECK(t->pane_shed_ms == TUI_PANE_SHED_MAX && t->shed == GPTPS_TUI_SHED_PANE && t->kpi == GPTPS_TUI_KPI_FULL);
+        for (w = 0; w < 3; ++w) { ad_pane(t, 61000u, 610000u); ad_window(t, frame, sizeof frame); }
+        CHECK(log_count("nothing is left to shed that relieves it at kpi full") == 1 && t->pane_shed_ms == TUI_PANE_SHED_MAX);
+        for (w = 0; w < 3; ++w) ad_window(t, frame, sizeof frame);  /* sticky */
+        CHECK(t->shed == GPTPS_TUI_SHED_PANE && t->pane_shed_ms == TUI_PANE_SHED_MAX);
+        /* the operator: 'u' - the interval floor back to pane_refresh_ms (2 s) */
+        CHECK(gptps_tui_press(t, 'u') == 3);
+        CHECK(t->shed == 0 && health(t).pane_shed_ms == 0);
+        t->pane = TUI_PANE_TASKS; t->pc.stale = 1;
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(health(t).pane_every_ms == 2000u);
+        t->pane = TUI_PANE_DASH;
+    }
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+
+    /* several at once: the order decides - PANE (the gentlest) first, then for what it did
+     * not relieve, the next step that does; the DEGRADED line names every step's conditions */
+    if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    log_begin();
+    CHECK(gptps_tui_set_latency_window(t, 2) == GPTPS_OK);
+    emit(t, GPTPS_EV_QUEUED, "mx", hd++, GPTPS_OK, tui_fake_ms);
+    emit(t, GPTPS_EV_QUEUED, "mx", hd++, GPTPS_OK, tui_fake_ms);
+    ad_window(t, frame, sizeof frame);
+    for (w = 0; w < 3; ++w) {
+        emit(t, GPTPS_EV_QUEUED, "mx", hd++, GPTPS_OK, tui_fake_ms);
+        ad_pane(t, 3000u, 30000u);
+        ad_window(t, frame, sizeof frame);
+        CHECK(health(t).pressure == (GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_PANE));
+    }
+    h = health(t);
+    CHECK(t->shed == GPTPS_TUI_SHED_PANE && h.shed_pressure == GPTPS_TUI_P_PANE && t->tab != NULL);
+    for (w = 0; w < 3; ++w) {                                       /* UNTRACKED alone now */
+        emit(t, GPTPS_EV_QUEUED, "mx", hd++, GPTPS_OK, tui_fake_ms);
+        ad_window(t, frame, sizeof frame);
+    }
+    h = health(t);
+    CHECK(t->shed == 0x16u && h.shed_pressure == GPTPS_TUI_P_UNTRACKED &&
+          h.shed_pressure_all == (GPTPS_TUI_P_UNTRACKED | GPTPS_TUI_P_PANE) && t->tab == NULL && t->act != NULL);
+    t->cols = 120;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "DEGRADED: -pane -percentiles -latency (pressure: untracked, pane) - 'u' restores full") != NULL);
+    t->cols = 80;
+    CHECK(gptps_tui_set_adapt(t, GPTPS_TUI_ADAPT_DEGRADE) == GPTPS_OK && t->shed == 0 && t->pane_shed_ms == 0 && t->tab);
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+
+    /* report-only: problems lost unseen and folded types, every window - never shed, and the
+     * PRESSURE text says why */
+    if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
+    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
+    log_begin();
+    for (i = 0; i < 64; ++i) {                                     /* the 64 rows taken */
+        snprintf(nm, sizeof nm, "row%02d", i);
+        emit(t, GPTPS_EV_FAILED, nm, hd++, GPTPS_E_TASK, tui_fake_ms);
+    }
+    ad_window(t, frame, sizeof frame);
+    a0 = ad_allocs();
+    for (w = 0; w < 8; ++w) {
+        int n = t->pcap + 3;
+        for (i = 0; i < n; ++i) {                                  /* new types: folded; more than the journal holds */
+            snprintf(nm, sizeof nm, "rf%d_%d", w, i);
+            emit(t, GPTPS_EV_FAILED, nm, hd++, GPTPS_E_TASK, tui_fake_ms);
+        }
+        CHECK(ad_allocs() == a0);
+        ad_window(t, frame, sizeof frame);
+        a0 = ad_allocs();
+        h = health(t);
+        CHECK(h.pressure == (GPTPS_TUI_P_PROBLEMS_LOST | GPTPS_TUI_P_FOLDED) && h.pressure_windows == 0 && t->shed == 0);
+    }
+    CHECK(log_count("shedding") == 0 && log_count("nothing is left to shed") == 0 && health(t).degrade_steps == 0);
+    CHECK(log_count("raise tui.recent (8) - report-only: PROBLEMS is the floor, never shed") == 1 &&
+          log_count("raise cfg.max_tasks (64) - report-only: folding is the cheap fallback") == 1);
+    t->cols = 200;
+    gptps_tui_render(t, frame, sizeof frame);   /* the same frame time: no new window */
+    t->cols = 80;
+    CHECK(strstr(frame, "report-only: PROBLEMS is the floor, never shed") != NULL &&
+          strstr(frame, "report-only: folding is the cheap fallback") != NULL);
+    log_end();
+    gptps_shutdown(e); gptps_tui_close(t);
+    tui_fake_ms = 0;
+}
+
 int main(int argc, char **argv)
 {
 #if defined(_WIN32)
@@ -3810,6 +4136,7 @@ int main(int argc, char **argv)
     test_pane_cache();
     test_adapt_report();
     test_adapt_degrade();
+    test_adapt_acting();
 #if !defined(_WIN32)
     test_format_unlocked();
 #if defined(GPTPS_TEST_HAL_SIM)

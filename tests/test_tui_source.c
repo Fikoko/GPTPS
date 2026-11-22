@@ -601,7 +601,8 @@ static void test_polled(void)
 SRC_ASSERT(h_source, offsetof(gptps_tui_health_info, source) == offsetof(gptps_tui_health_info, render_max_us) + 8);
 SRC_ASSERT(h_status, offsetof(gptps_tui_health_info, source_status) == offsetof(gptps_tui_health_info, source) + sizeof(int));
 SRC_ASSERT(h_reads, offsetof(gptps_tui_health_info, source_reads) == offsetof(gptps_tui_health_info, render_max_us) + 16);
-SRC_ASSERT(h_end, sizeof(gptps_tui_health_info) == offsetof(gptps_tui_health_info, source_rows) + 8);
+/* 1.12's struct ended at source_rows; 1.13 appends after it (a 1.12 caller's struct_size reads none of it) */
+SRC_ASSERT(h_end, offsetof(gptps_tui_health_info, pane_shed_ms) == offsetof(gptps_tui_health_info, source_rows) + 8);
 SRC_ASSERT(src_ss, offsetof(gptps_tui_source, struct_size) == 0 && offsetof(gptps_tui_source_totals, struct_size) == 0 &&
                    offsetof(gptps_tui_source_row, struct_size) == 0);
 static void test_health_size(void)
