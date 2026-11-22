@@ -1621,7 +1621,8 @@ GPTPS_API int gptps_settings_provisional(gptps *e, const char *key);
  * held or not. Inside an add-on's setup the setup's own waiting applies instead, and
  * its loader applies everything when the setup returns. A dashboard or other module
  * that defines several settings checked against each other holds around them
- * (addons/gptps_tui does). */
+ * (addons/gptps_tui does). Not in the host table (2.10): a plug-in loaded at runtime
+ * holds only through its setup's own waiting - define such settings in setup. */
 GPTPS_API gptps_status gptps_settings_hold(gptps *e, int hold);
 
 /* Watch for changes: `cb` fires (with the settings lock RELEASED) after each

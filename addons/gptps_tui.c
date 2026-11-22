@@ -3150,25 +3150,6 @@ static void tui_arm(gptps_tui *t, uint64_t now, int view)
     }
 }
 
-/* ARM: tui.arm = on_view applied while the dashboard is installed (a settings file, read as
- * the tui keys are defined) - nobody has looked yet, so it starts disarmed, as an install with
- * cfg.arm on_view does: no record from install, no hint. Only frees; not a disarm (none counted). */
-static void tui_arm_at_install(gptps_tui *t)
-{
-    int act = 0;
-    mu_lock(&t->mu);
-    if (t->arm_mode == GPTPS_TUI_ARM_ON_VIEW && t->armed) {
-        t->armed = 0; t->arm_ms = 0; act = 1;
-        if (t->adapt != GPTPS_TUI_ADAPT_OFF) adapt_base(t, TUI_NOW_MS());
-    }
-    mu_unlock(&t->mu);
-    if (act) {
-        char what[400];
-        (void)reconf_said("gptps_tui_install: tui.arm=on_view", "tui.arm=on_view",
-                          tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what), what);
-    }
-}
-
 /* A frame was made in `us` microseconds: the window's slowest (ADAPT's RENDER). */
 static void adapt_frame_us(gptps_tui *t, uint64_t us)
 {
@@ -5058,6 +5039,17 @@ static uint64_t foot_req(const gptps_tui *t)
     foot_calc(&f, t, kpi_tier(t->kpi_req), t->prob_want, t->act_want, 0, t->lat_cap, t->ui_cap, t->ui_pl);
     return f.total;
 }
+/* mu held (ARM): the formula for what an arm builds - the request less what ADAPT shed (the
+ * tier shed_tier runs once armed, the ACTIVITY journal out when shed). At or below foot_req,
+ * so within the budget; what the BUFFERS of an ON_VIEW dashboard are checked against, so a
+ * shed makes room for them as it does under ALWAYS (where the footprint held is this). */
+static uint64_t foot_arm(const gptps_tui *t)
+{
+    tui_foot f;
+    foot_calc(&f, t, shed_cap(kpi_tier(t->kpi_req), t->shed, act_wanted(t)), t->prob_want, t->act_want,
+              (t->shed & GPTPS_TUI_SHED_ACTIVITY) != 0, t->lat_cap, t->ui_cap, t->ui_pl);
+    return f.total;
+}
 /* mu held: the footprint held now, part by part (health's bytes_*) */
 static uint64_t foot_held(const gptps_tui *t)
 {
@@ -5137,11 +5129,13 @@ static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *
     *stop = 0;
     mu_lock(&t->mu);
     if (nw > old && t->budget) {
-        /* ON_VIEW (ARM): against the request, not what is held - a view arms up to it with the
-         * buffers still held (a snapshot's or run's are made before its first frame arms, and
-         * an arm may be between its flag and its build) */
+        /* ON_VIEW (ARM): against what an arm builds (the request less the shed), not what is
+         * held - a view arms up to it with the buffers still held (a snapshot's or run's are
+         * made before its first frame arms, and an arm may be between its flag and its build).
+         * Not the unshed request: DEGRADE sheds for a buffer stopped here (BUDGET), and only a
+         * figure the shed lowers lets that shed make room. */
         fp = foot_held(t); rt = t->rt_bytes; bud = t->budget;
-        if (t->arm_mode == GPTPS_TUI_ARM_ON_VIEW && foot_req(t) > fp) fp = foot_req(t);
+        if (t->arm_mode == GPTPS_TUI_ARM_ON_VIEW && foot_arm(t) > fp) fp = foot_arm(t);
         if (fp + rt + (nw - old) > bud && probe) *stop = 1;    /* not counted: the caller tries less */
         else if (fp + rt + (nw - old) > bud) {
             *stop = 1; t->h_bstop++; n = t->h_bstop;
@@ -5554,7 +5548,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     mu_lock(&t->mu); t->observing = 1; mu_unlock(&t->mu);
     trk_resync(t, 1);              /* only now: an item queued before this is missed by the table */
     tui_register_settings(e, t);   /* expose tui.refresh_ms / kpi / mode / latency_window / recent / activity */
-    tui_arm_at_install(t);         /* ARM: on_view from a settings file starts disarmed too */
+    /* (ARM: on_view from a settings file starts disarmed too - gptps_tui_set_arm, before a view) */
     tui_hint(t);                   /* HINT (1.13): FULL with no terminal to show it on - said once */
     return t;
 }
@@ -5858,13 +5852,23 @@ gptps_status gptps_tui_set_arm(gptps_tui *t, gptps_tui_arm mode)
     now = TUI_NOW_MS();
     mu_lock(&t->mu);
     t->arm_mode = mode; t->cfg.arm = mode;
-    if (mode == GPTPS_TUI_ARM_ON_VIEW) t->view_ms = now ? now : 1;     /* counts as a view */
-    else if (!t->armed) { t->armed = 1; t->arm_ms = now ? now : 1; t->h_arms++; arm = 1; }
+    if (mode == GPTPS_TUI_ARM_ON_VIEW) {
+        t->view_ms = now ? now : 1;                                     /* counts as a view */
+        /* ...unless nothing has viewed the dashboard since install: nobody has looked yet,
+         * so it starts disarmed, as cfg.arm = ON_VIEW does - not a disarm (none counted), no
+         * record from install. Decided by the views, not by when the value comes: a settings
+         * file's tui.arm applied at a host's outer gptps_settings_hold let-go, or by an
+         * add-on setup's loader, after gptps_tui_install returned, starts disarmed too. */
+        if (t->armed && !t->h_views) { t->armed = 0; t->arm_ms = 0; arm = -1; }
+    } else if (!t->armed) { t->armed = 1; t->arm_ms = now ? now : 1; t->h_arms++; arm = 1; }
     if (arm && t->adapt != GPTPS_TUI_ADAPT_OFF) adapt_base(t, now);
     tui_touch(t);
     mu_unlock(&t->mu);
     tui_kick(t);
     if (!arm) return GPTPS_OK;
+    if (arm < 0)                                     /* only frees */
+        return reconf_said("gptps_tui_set_arm(on_view)", "tui.arm=on_view",
+                           tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what), what);
     {
         gptps_status st = tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what);   /* the request: never refused */
         if (st == GPTPS_E_NOMEM) { mu_lock(&t->mu); t->h_arm_fail++; mu_unlock(&t->mu); }

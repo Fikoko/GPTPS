@@ -110,8 +110,9 @@ cmake --build build
 ctest --test-dir build --output-on-failure              # full suite (should be 100%)
 ```
 
-The single-file amalgamation builds the same way (`gnu99` for the `<windows.h>` GNU
-extensions): `sh tools/amalgamate.sh && cc -std=gnu99 -I amalgamation amalgamation/gptps.c
+The single-file amalgamation builds the same way (ISO C99: since 1.13 every amalgamated
+file is clean under mingw-w64 `-std=c99 -pedantic` too, checked in CI; `gnu99` also works):
+`sh tools/amalgamate.sh && cc -std=gnu99 -I amalgamation amalgamation/gptps.c
 myapp.c -o myapp.exe` — no `-lpthread`/`-ldl` needed (the Win32 HAL uses the OS threads
 and `LoadLibrary` directly). The native **MSVC** (`cl.exe`) toolchain is also supported —
 open the folder in Visual Studio or `cmake -S . -B build` with the default VS generator.

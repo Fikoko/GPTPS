@@ -901,17 +901,25 @@ enabled automatically). Panes/metrics:
   `record_ms`, `views`, `view_age_ms`, `arms`, `disarms`) and on the frame: "recording since
   first view (4m ago) - tui.arm=on_view, off 60.0 s after the last view". A shed survives a
   disarm and an arm (only the operator clears it), and the budget is checked against the
-  request (the frame buffers of an `on_view` dashboard too, since `snapshot` and `run` make
-  theirs before the frame that arms), so an arm is never refused and never passes
-  `tui.budget_kb`. `tui.arm = on_view` from a settings file starts disarmed, as
-  `cfg.arm` does; set at runtime on an `on_view` dashboard it only restarts the
-  `disarm_ms` timer.
+  request, so an arm is never refused and never passes `tui.budget_kb`. The frame buffers
+  of an `on_view` dashboard are checked against what an arm builds (the request less the
+  shed), since `snapshot` and `run` make theirs before the frame that arms — so with
+  `tui.adapt = degrade` a shed for a buffer stopped at the budget makes room for it, as with
+  `always`. `tui.arm = on_view` set before any view since install starts disarmed, as
+  `cfg.arm` does — so from a settings file it does whenever the file's value arrives (also
+  at a host's outer `gptps_settings_hold` let-go, or an add-on setup's loader); set after a
+  view it counts as one, and on an `on_view` dashboard it only restarts the `disarm_ms`
+  timer.
 - **A hint for a headless FULL install** (1.13). An install that runs `full` with
   `tui.arm = always` and no terminal for the live dashboard (the output or stdin is not one)
   logs one WARN naming what it collects for frames only `render` / `snapshot` show and the
   settings that lower it; `gptps_tui_run` with `cfg.interactive = 0`, which returned
-  silently, now says so (one WARN a dashboard), and every `run` that returns at once is
-  counted in `gptps_tui_health.run_noops`.
+  silently, now says so (one WARN a dashboard; the not-a-terminal WARN at most once a
+  minute), and every `run` that returns at once is counted in `gptps_tui_health.run_noops`.
+  The hint is decided at install: when the host holds settings (`gptps_settings_hold`)
+  around `gptps_tui_install`, or installs it inside an add-on's setup, the file's `tui`
+  values apply after install returns, so the hint goes by `cfg` alone (set `cfg.arm` there
+  to keep it quiet; the arming itself follows the file either way).
 - **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
   runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
   instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back
