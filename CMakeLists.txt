@@ -1277,6 +1277,12 @@ if(GPTPS_HAL_SOURCE MATCHES "hal_sim\\.c$")
 endif()
 add_test(NAME tui_unit COMMAND test_tui_unit)
 set_tests_properties(tui_unit PROPERTIES TIMEOUT 60)
+# gptps_tui_source (1.12): the dashboard showing a host's numbers, read only at a frame
+add_executable(test_tui_source tests/test_tui_source.c)
+target_include_directories(test_tui_source PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(test_tui_source PRIVATE gptps)
+add_test(NAME tui_source COMMAND test_tui_source)
+set_tests_properties(tui_source PROPERTIES TIMEOUT 60)
 set_tests_properties(tui PROPERTIES TIMEOUT 30)
 # the handle table's exact gauges and latency vs every order one handle's events can
 # arrive in - tests/test_stats_order.c's scenarios, with gptps_stats fed beside it
@@ -1433,6 +1439,17 @@ target_include_directories(example_dashboard
 target_link_libraries(example_dashboard PRIVATE gptps_tui)
 add_test(NAME example_dashboard COMMAND example_dashboard)
 set_tests_properties(example_dashboard PROPERTIES TIMEOUT 20)
+endif()
+
+# the dashboard showing a host's gptps_stats through gptps_tui_source (1.12): the adapter
+# lives in the example, so gptps_tui does not link gptps_stats. Headless it checks a frame.
+if(TARGET gptps_tui AND TARGET gptps_stats)
+add_executable(example_dashboard_stats examples/dashboard_stats.c)
+target_include_directories(example_dashboard_stats
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(example_dashboard_stats PRIVATE gptps_tui gptps_stats)
+add_test(NAME example_dashboard_stats COMMAND example_dashboard_stats)
+set_tests_properties(example_dashboard_stats PROPERTIES TIMEOUT 20)
 endif()
 
 if(UNIX)

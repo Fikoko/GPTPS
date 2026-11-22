@@ -2518,14 +2518,14 @@ static void test_header(void)
     /* done/s over the last 10 s: 50 finished in the second after the first snapshot... */
     mu_lock(&t->mu);
     t->rate_n = 0; t->rate_head = 0; t->fin = 0;
-    r = rate_take(t, 1000, &st, &nx);
+    r = rate_take(t, 1000, t->fin, &st, &nx);
     CHECK(st == 0 && nx == 1001);                          /* nothing to measure against: "-", until the next ms */
     t->fin = 50;
-    r = rate_take(t, 2000, &st, &nx);
+    r = rate_take(t, 2000, t->fin, &st, &nx);
     CHECK(st == 1 && r > 49.9 && r < 50.1 && nx == 3000);  /* and it settles with no event: a deadline */
-    r = rate_take(t, 6000, &st, &nx);
+    r = rate_take(t, 6000, t->fin, &st, &nx);
     CHECK(st == 1 && r > 9.9 && r < 10.1);                 /* the same 50, over 5 s */
-    r = rate_take(t, 12500, &st, &nx);                     /* ...and 10.5 s later they have left the window */
+    r = rate_take(t, 12500, t->fin, &st, &nx);                     /* ...and 10.5 s later they have left the window */
     CHECK(st == 1 && r == 0.0 && nx == 0);                 /* 0, and no more deadlines (since install: 4.8) */
     /* peak: the highest in-flight over the last one or two windows */
     t->peak = 7; t->peak_prev = 0; t->peak_ms = 0;
@@ -2536,7 +2536,7 @@ static void test_header(void)
      * of order, no early rotation - the unsigned differences must not wrap */
     {
         int n0 = t->rate_n;
-        r = rate_take(t, 11000, &st, &nx);
+        r = rate_take(t, 11000, t->fin, &st, &nx);
         CHECK(t->rate_n == n0 && t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms == 12500);
         CHECK(st == 1 && r == 0.0);
         t->peak = 5;

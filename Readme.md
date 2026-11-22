@@ -656,6 +656,12 @@ that scrolled away between two frames.
   at a time while it lasts (ACTIVITY journal, percentiles, latency table, TASKS rows; never
   below `problems`), sticky until you press `u` or set `tui.kpi`. See
   [addons/README.md](addons/README.md#tui--real-time-terminal-dashboard).
+- **A host's numbers (1.12):** a host that already runs `gptps_stats` can feed the
+  dashboard its totals, gauges and per-task rows through the read-only `gptps_tui_source`
+  (`gptps_tui_set_source`), and run the dashboard's own collection at `off` — read once a
+  frame, never on the event path, a failed read shown and counted; the dashboard never
+  resets or closes the host's stats. The adapter is
+  [`examples/dashboard_stats.c`](examples/dashboard_stats.c) (no link between the add-ons).
 - **Task control plane:** `t` opens a **task manager** — list every type with its
   queued/running/dead counts, inspect one to edit its settings inline, pause/resume (`a`),
   clone (`c`), create a `GPTPS_EXEC_PROGRAM` task from a typed name + argv (`n`), or delete

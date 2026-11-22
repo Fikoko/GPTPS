@@ -450,6 +450,13 @@ typedef struct {
                                    * tier in effect (see ADAPT) - an estimate, not a measurement */
     uint64_t render_max_us;       /* the slowest frame made in the last window (render, snapshot
                                    * or the live loop; any pane) */
+    /* 1.12, SOURCE (see gptps_tui_set_source) */
+    int      source;              /* 1 while a host source is set */
+    int      source_status;       /* what its last read returned (GPTPS_OK before any) */
+    uint64_t source_reads;        /* reads made (one a dashboard frame), since install */
+    uint64_t source_errors;       /* reads that failed, since install: those frames showed the
+                                   * dashboard's own counts, and said so */
+    uint64_t source_rows;         /* task rows the last good read said the source has */
 } gptps_tui_health_info;
 
 /* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
@@ -529,6 +536,79 @@ gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode);   /* DEFAU
 /* The estimated-cost budget, in percent of one core: 1..100 (else GPTPS_E_INVAL). Also
  * `tui.cost_budget_pct`. */
 gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct);
+
+/* SOURCE (1.12). A host that already aggregates - it runs gptps_stats, say - can let the
+ * dashboard SHOW its numbers instead of collecting its own: the header's totals and gauges
+ * (and so done/s and peak) and the TASKS rows then come from the source, and the dashboard's
+ * own collection can be turned down to what the source does not give (tui.kpi = off, or
+ * problems for the failure journal). The interface is read-only: one callback that fills
+ * a snapshot. There is no reset and no close in it, so the dashboard can never reset or
+ * close what the host owns - not on set_source, not on any key or setting, not in
+ * gptps_tui_close.
+ *
+ * WHEN it is read: once per dashboard frame (gptps_tui_render, gptps_tui_snapshot, the live
+ * loop) on the thread making it, just before the frame's copy-out, with the dashboard's own
+ * lock released (only its render lock is held, so the callback may take the host's locks and
+ * may call gptps_tui_health; it must not render, snapshot or set_source this dashboard).
+ * NEVER on the event path: events cost what tui.kpi says, and nothing for the source. The
+ * other panes (tasks, settings, detail, dead letters) do not read it. While a source is set
+ * the live loop polls it: a frame is due every refresh_ms (it writes only lines that changed).
+ *
+ * ERRORS: a read that returns anything but GPTPS_OK is counted (gptps_tui_health
+ * source_errors, source_status), that frame shows the dashboard's own counts with a line
+ * saying so ("source <name>: read failed (...), N errors - own counts shown"), and a WARN is
+ * logged - at most once a minute. The next frame reads again.
+ *
+ * OWNERSHIP: ctx and the callback stay the host's. The dashboard copies the gptps_tui_source
+ * (and its name) at set_source; once gptps_tui_set_source (another source, or NULL) or
+ * gptps_tui_close has returned, the old one is never called again, so the host may then
+ * free it. Close order: gptps_shutdown, gptps_tui_close (or set_source(t, NULL)), then the
+ * host's own (gptps_stats_close). No link dependency: the dashboard knows nothing of
+ * gptps_stats; examples/dashboard_stats.c is the adapter (gptps_stats_snapshot: totals and
+ * every row under one lock). */
+typedef struct {
+    size_t   struct_size;         /* set by the dashboard; the source fills what it covers */
+    uint64_t queued, started, finished, failed, retried, dead, dropped;
+    uint64_t cancelled;           /* FAILED with GPTPS_E_CANCELLED (part of failed) */
+    uint64_t pending, in_flight;  /* the gauges */
+    int      gauges;              /* gptps_tui_gauges: EXACT (no mark), LOWER_BOUND ('>='), APPROX
+                                   * ('~'), or SUM (no gauges: `pending` is what is queued or
+                                   * running, as one sum). Anything else is shown as APPROX */
+} gptps_tui_source_totals;
+
+#define GPTPS_TUI_SOURCE_NAME    128      /* a row's name, with its NUL (= GPTPS_TASK_NAME_MAX + 1) */
+#define GPTPS_TUI_SRC_ROW_LATENCY 0x1u    /* flags: lat_* hold this row's latency */
+typedef struct {
+    size_t   struct_size;         /* the dashboard sets row_size instead; ignored */
+    uint32_t flags;               /* GPTPS_TUI_SRC_ROW_* */
+    char     name[GPTPS_TUI_SOURCE_NAME]; /* the task type; a gptps_tui_add_task label and hotkey
+                                   * for that name are shown with it. Cut at its last byte */
+    uint64_t started, finished, failed, dead, dropped;
+    uint64_t lat_n, lat_sum_ms, lat_max_ms;  /* avg ms and max ms (the source says what latency
+                                   * it is: the stats adapter's is run time); lat_n 0: "--" */
+} gptps_tui_source_row;
+
+/* Fill *totals (struct_size bytes of it) and rows[0 .. min(cap, rows there are)) - an array
+ * of `cap` elements of `row_size` bytes each, row_size >= the 1.12 sizeof(gptps_tui_source_row);
+ * fill each row only as far as row_size covers - and set *nrows to the rows there are (more
+ * than cap: the frame says "+N more"). cap is what the frame has room for (at most its height).
+ * Totals and rows should be one consistent snapshot. Return GPTPS_OK, or any error (above). */
+typedef gptps_status (*gptps_tui_source_read_fn)(void *ctx, gptps_tui_source_totals *totals,
+                                                 gptps_tui_source_row *rows, size_t row_size,
+                                                 size_t cap, size_t *nrows);
+typedef struct {
+    size_t                   struct_size; /* = sizeof(gptps_tui_source) */
+    void                    *ctx;         /* the host's: passed to read, never freed */
+    gptps_tui_source_read_fn read;        /* required */
+    const char              *name;        /* shown on the kpi line ("source:<name>"; NULL =>
+                                           * "host"); copied, up to 31 bytes */
+} gptps_tui_source;
+
+/* Set (src) or clear (NULL: the dashboard's own collection again) the source. GPTPS_E_INVAL
+ * for a NULL t, or a src with a struct_size below this layout's or no read. Waits for a frame
+ * being made to finish (see OWNERSHIP). done/s and peak start again from the next frame
+ * (the counts they are made from changed hands); the error and read counts are kept. */
+gptps_status gptps_tui_set_source(gptps_tui *t, const gptps_tui_source *src);
 
 /* Render one frame to the configured output stream right now ("once" / on-demand),
  * independent of the live loop or mode. */

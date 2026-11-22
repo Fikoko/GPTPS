@@ -668,6 +668,17 @@ typedef struct {
     tui_vrow  *rows;
     tui_event *recs;
     int        rows_cap, recs_cap;
+    /* SOURCE (gptps_tui_set_source): this frame's read - src 0 none, 1 read, 2 failed (own
+     * counts shown); gline: the gauge line (else MINIMAL's one sum); src_lat: a row has
+     * latency (the max ms column); src_warn: WARN about the failure once mu is dropped */
+    int        src, gline, src_lat, src_warn;
+    gptps_status src_st;
+    uint64_t   src_errors;
+    size_t     src_n;
+    char       src_name[32];
+    gptps_tui_source_totals stot;
+    gptps_tui_source_row   *srows;   /* the read's rows: srows_cap (= rows_cap) of them */
+    int        srows_cap;
 } tui_view;
 
 /* ---- the engine-reading panes' cache (see "pane cache") ----
@@ -833,6 +844,19 @@ struct gptps_tui {
     uint64_t         pressure, pr_seen, p_row, shed_why, ad_windows, ad_steps, ad_warns, ad_rate, ad_ppm, ad_rmax_last;
     uint64_t         ad_warn_ms[TUI_P_N], ad_floor_ms, ad_gen;
     char             ad_line[1280];   /* one line a condition, '\n' between */
+    /* ---- SOURCE (1.12; gptps_tui_set_source) ----
+     * src: the host's source (src.read NULL: none; src.name not kept - src_name is the copy).
+     * Written under rmu AND mu, so a frame - which calls it under rmu, mu released - never
+     * sees it change, and set_source returns only once no frame is using the old one.
+     * Under mu: src_reads / src_errors / src_rows / src_status for health; src_warned and
+     * src_warn_ms, the failure WARN's rate limit; src_kind, what the last frame's totals came
+     * from (0 own, 1 the source, -1 changed: done/s starts again, as its counts changed
+     * hands); sp_*: peak's two buckets over the source's in-flight gauge. */
+    gptps_tui_source src;
+    char             src_name[32];
+    uint64_t         src_reads, src_errors, src_rows, src_warn_ms;
+    int              src_status, src_kind, src_warned;
+    uint64_t         sp_peak, sp_prev, sp_ms;
     /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
      * all - taking a mutex to discover you have nothing to do is the entire cost this
      * tier exists to remove. Not the HAL's gptps_flag: the amalgamation ships gptps.c
@@ -2255,15 +2279,17 @@ static uint64_t rate_step(int win_s)
  * next ms, when there is), else 1. *next:
  * when it next changes with no event - while it is not 0, at the next snapshot (so it falls
  * to 0, frame by frame, as the last completions leave the window); 0 once it is 0. */
-static double rate_take(gptps_tui *t, uint64_t now, int *state, uint64_t *next)
+static double rate_take(gptps_tui *t, uint64_t now, uint64_t fin, int *state, uint64_t *next)
 {
     uint64_t win = (uint64_t)t->cfg.rate_window_s * 1000u, step = rate_step(t->cfg.rate_window_s);
     const tui_rs *pick = NULL, *older = NULL, *newest;
     int i;
+    /* a count that went back (a source's host reset its totals): measure from here */
+    if (t->rate_n && fin < t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].fin) t->rate_n = 0;
     if (now < t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms && t->rate_n)
         now = t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms;   /* never back in time */
     if (!t->rate_n || now - t->rate[(t->rate_head + TUI_RATE_N - 1) % TUI_RATE_N].ms >= step) {
-        t->rate[t->rate_head].ms = now; t->rate[t->rate_head].fin = t->fin;
+        t->rate[t->rate_head].ms = now; t->rate[t->rate_head].fin = fin;
         t->rate_head = (t->rate_head + 1) % TUI_RATE_N;
         if (t->rate_n < TUI_RATE_N) t->rate_n++;
     }
@@ -2278,8 +2304,8 @@ static double rate_take(gptps_tui *t, uint64_t now, int *state, uint64_t *next)
     *next = 0;
     if (!pick) { *state = 0; *next = newest->ms + 1; return 0.0; }   /* measurable from the next ms */
     *state = 1;
-    if (t->fin != pick->fin) *next = newest->ms + step > now ? newest->ms + step : now + step;
-    return (double)(t->fin - pick->fin) * 1000.0 / (double)(now - pick->ms);
+    if (fin != pick->fin) *next = newest->ms + step > now ? newest->ms + step : now + step;
+    return (double)(fin - pick->fin) * 1000.0 / (double)(now - pick->ms);
 }
 
 /* mu held: the in-flight peak over the window - two buckets, this one (`peak`, raised by
@@ -2293,6 +2319,18 @@ static uint64_t peak_take(gptps_tui *t, uint64_t now, uint64_t cur, uint64_t *ne
     if (cur > t->peak) t->peak = cur;
     shown = t->peak > t->peak_prev ? t->peak : t->peak_prev;
     *next = shown > cur ? t->peak_ms + win : 0;
+    return shown;
+}
+
+/* mu held: peak_take over a source's in-flight gauge, in buckets of its own (the event path
+ * raises `peak` with the dashboard's own gauge, which is not the source's) */
+static uint64_t src_peak_take(gptps_tui *t, uint64_t now, uint64_t cur, uint64_t *next)
+{
+    uint64_t win = (uint64_t)t->cfg.rate_window_s * 1000u, shown;
+    if (now >= t->sp_ms && now - t->sp_ms >= win) { t->sp_prev = t->sp_peak; t->sp_peak = cur; t->sp_ms = now; }
+    if (cur > t->sp_peak) t->sp_peak = cur;
+    shown = t->sp_peak > t->sp_prev ? t->sp_peak : t->sp_prev;
+    *next = shown > cur ? t->sp_ms + win : 0;
     return shown;
 }
 
@@ -2360,6 +2398,10 @@ static int view_ready(gptps_tui *t, int R)
         tui_event *r = (tui_event *)realloc(v->recs, (size_t)R * sizeof *r);
         if (r) { v->recs = r; v->recs_cap = R; } else nomem = 1;
     }
+    if (v && t->src.read && v->srows_cap < v->rows_cap) {   /* a source's rows: as many as the frame's */
+        gptps_tui_source_row *r = (gptps_tui_source_row *)realloc(v->srows, (size_t)v->rows_cap * sizeof *r);
+        if (r) { v->srows = r; v->srows_cap = v->rows_cap; } else nomem = 1;
+    }
     if (nomem) { mu_lock(&t->mu); t->h_nomem++; mu_unlock(&t->mu); }
     return v != NULL;
 }
@@ -2371,7 +2413,7 @@ static int view_ready(gptps_tui *t, int R)
 static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_t *warn_plost)
 {
     int R = v->R, W = v->W, i, k, n;
-    uint64_t nx_rate = 0, nx_peak = 0, nx_clock, nx_adapt = 0;
+    uint64_t nx_rate = 0, nx_peak = 0, nx_clock, nx_adapt = 0, nx_src = 0;
     mu_lock(&t->mu);
     *warn_plost = 0;
     /* This frame shows the journals: what left them since the last one was not shown. */
@@ -2385,6 +2427,24 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     }
     v->gen = t->gen;
     if (loop) t->dirty = 0;
+    v->src_warn = 0;
+    if (v->src) {                        /* the source's read, made just before (see src_read) */
+        t->src_reads++;
+        t->src_status = (int)v->src_st;
+        if (v->src == 2) {               /* never silent: counted, shown, WARNed once a minute */
+            t->src_errors++;
+            if (!t->src_warned || now - t->src_warn_ms >= TUI_WARN_GAP_MS) {
+                t->src_warned = 1; t->src_warn_ms = now; v->src_warn = 1;
+            }
+        } else t->src_rows = v->src_n;
+        v->src_errors = t->src_errors;
+        memcpy(v->src_name, t->src_name, sizeof v->src_name);
+    }
+    if ((v->src == 1) != t->src_kind) {  /* the totals changed hands: done/s and peak start again */
+        t->src_kind = v->src == 1;
+        t->rate_n = 0; t->rate_head = 0;
+        t->sp_peak = t->sp_prev = 0; t->sp_ms = now;
+    }
     v->tier = t->tier; v->kpi = t->kpi; v->mode = t->mode; v->refresh = t->cfg.refresh_ms;
     v->color = t->cfg.color; v->uni = t->cfg.unicode; v->clock = t->clock;
     v->up_ms = now >= t->start_ms ? now - t->start_ms : 0;
@@ -2402,18 +2462,34 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
         v->legrows = legend_text(t, W, v->legend, sizeof v->legend);
         v->leg_ok = 1; v->leg_gen = t->ui_gen; v->leg_W = W; v->leg_uni = v->uni; v->leg_builds++;
     }
-    /* done/s needs only the totals; at OFF they stand still, so there is no rate to show */
-    if (t->tier == TUI_T_OFF) { v->rate_state = 2; v->rate = 0.0; }
-    else v->rate = rate_take(t, now, &v->rate_state, &nx_rate);
-    v->q = t->q; v->s = t->s; v->fin = t->fin; v->fail = t->fail; v->retr = t->retr; v->dead = t->dead;
-    v->drop = t->drop; v->cancel = t->cancel;
-    v->alive = t->q > t->term ? t->q - t->term : 0;
-    /* EXACT from the handle table (LATENCY+); '>=' while that is a lower bound (see
-     * trk_lb); '~' from the counters, which cannot be exact (see `inflight`) */
-    v->exact = t->tab != NULL; v->lb = t->trk_lb;
-    v->inflt = v->exact ? t->g_run : t->inflight;
-    v->pend = v->exact ? t->g_pend : (v->alive > v->inflt ? v->alive - v->inflt : 0);
-    v->peak = t->tier >= TUI_T_GAUGE ? peak_take(t, now, v->inflt, &nx_peak) : 0;
+    if (v->src == 1) {                   /* the totals and gauges are the source's */
+        const gptps_tui_source_totals *so = &v->stot;
+        int g = so->gauges;
+        v->rate = rate_take(t, now, so->finished, &v->rate_state, &nx_rate);
+        v->q = so->queued; v->s = so->started; v->fin = so->finished; v->fail = so->failed;
+        v->retr = so->retried; v->dead = so->dead; v->drop = so->dropped; v->cancel = so->cancelled;
+        v->gline = g != GPTPS_TUI_GAUGES_SUM;
+        v->exact = g == GPTPS_TUI_GAUGES_EXACT || g == GPTPS_TUI_GAUGES_LOWER_BOUND;
+        v->lb = g == GPTPS_TUI_GAUGES_LOWER_BOUND;
+        v->inflt = v->gline ? so->in_flight : 0;
+        v->pend = so->pending;
+        v->alive = v->gline ? so->pending + so->in_flight : so->pending;
+        v->peak = v->gline ? src_peak_take(t, now, v->inflt, &nx_peak) : 0;
+    } else {
+        /* done/s needs only the totals; at OFF they stand still, so there is no rate to show */
+        if (t->tier == TUI_T_OFF) { v->rate_state = 2; v->rate = 0.0; }
+        else v->rate = rate_take(t, now, t->fin, &v->rate_state, &nx_rate);
+        v->q = t->q; v->s = t->s; v->fin = t->fin; v->fail = t->fail; v->retr = t->retr; v->dead = t->dead;
+        v->drop = t->drop; v->cancel = t->cancel;
+        v->alive = t->q > t->term ? t->q - t->term : 0;
+        /* EXACT from the handle table (LATENCY+); '>=' while that is a lower bound (see
+         * trk_lb); '~' from the counters, which cannot be exact (see `inflight`) */
+        v->gline = t->tier >= TUI_T_GAUGE;
+        v->exact = t->tab != NULL; v->lb = t->trk_lb;
+        v->inflt = v->exact ? t->g_run : t->inflight;
+        v->pend = v->exact ? t->g_pend : (v->alive > v->inflt ? v->alive - v->inflt : 0);
+        v->peak = t->tier >= TUI_T_GAUGE ? peak_take(t, now, v->inflt, &nx_peak) : 0;
+    }
     v->miss = 0;
     if (t->tier >= TUI_T_PROBLEMS && t->show_recent && t->prob_want && !t->prob) v->miss |= 1;
     if (t->tier >= TUI_T_TASKS && t->show_tasks && !t->tasks)                    v->miss |= 2;
@@ -2428,6 +2504,10 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     v->mcols = t->tab != NULL && W >= 88;
     v->pcols = t->hist && W >= (v->mcols ? 109 : 100);
     v->nfold = t->nfold; v->max_tasks = t->max_tasks; v->lat_cap = t->lat_cap;
+    if (v->src == 1) {                   /* the TASKS rows are the source's: none of the own table's notes */
+        v->has_tasks = t->show_tasks != 0; v->has_tab = 0; v->nfold = 0;
+        v->mcols = v->src_lat && W >= 88; v->pcols = 0;
+    }
     v->lat_untracked = t->lat_untracked; v->lat_unmatched = t->lat_unmatched;
     v->has_rec = t->prob || t->act; v->act_on = t->act != NULL;
     v->frame_unseen = t->frame_unseen;
@@ -2435,10 +2515,15 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     {   /* the layout: every line of the frame is one terminal row (each is fitted to W), and
          * the frame's last newline must not scroll the screen */
         int budget = R - 1 - (v->color ? 2 : 1) - 3 - (v->miss ? 1 : 0) - v->nplines - (v->shed ? 1 : 0)
+                   - (v->src == 2 ? 1 : 0)
                    - ((v->l_folded || v->l_untracked || v->l_plost || v->l_trunc || v->l_nomem) ? 1 : 0)
                    - (v->toast_on ? 2 : 0) - 1 - v->legrows;
         int want_rows = 0, other = 0, want_rec = 0, np = 0, na = 0, lines = 0;
-        if (t->tasks) {
+        int srcrows = v->src == 1 && v->has_tasks;
+        if (srcrows) {
+            want_rows = v->src_n > ((size_t)1 << 30) ? 1 << 30 : (int)v->src_n;
+            budget -= 3;
+        } else if (t->tasks) {
             tui_task *o = &t->tasks[0];
             uint64_t oterm = o->finished + o->dead + o->dropped;
             other = t->nfold || o->started || o->failed || o->retried || oterm;   /* '(other)' once it counted something */
@@ -2452,14 +2537,29 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
             want_rec = np + na < lines ? np + na : lines;
             budget -= 2;
         }
-        if (t->tasks) {   /* TASKS first, leaving RECENT a few lines; "+N more" for the rest */
+        if (srcrows || t->tasks) {   /* TASKS first, leaving RECENT a few lines; "+N more" for the rest */
             int room = budget - (want_rec < 3 ? want_rec : 3), show;
             if (want_rows <= room) show = want_rows;
             else show = room - 1 > 0 ? room - 1 : 0;          /* one line says how many more */
             if (show > v->rows_cap) show = v->rows_cap;      /* no memory for more: still counted */
+            if (srcrows && show > v->srows_cap) show = v->srows_cap;
             v->more = want_rows - show;
             budget -= show + (v->more ? 1 : 0);
-            for (i = 1, n = 0; i <= t->ntasks && n < show; ++i) {
+            for (i = 0, n = 0; srcrows && n < show; ++i) {   /* the source's rows, in its order */
+                const gptps_tui_source_row *sr = &v->srows[i];
+                const tui_ui *u = NULL;
+                tui_vrow *o = &v->rows[n];
+                for (k = 0; k < t->nui; ++k) if (strcmp(t->ui[k].name, sr->name) == 0) { u = &t->ui[k]; break; }
+                copy_u8(o->label, sizeof o->label, u ? u->label : sr->name);
+                o->hotkey = u ? u->hotkey : 0;
+                o->started = sr->started; o->finished = sr->finished; o->failed = sr->failed;
+                o->dead = sr->dead; o->dropped = sr->dropped;
+                if (sr->flags & GPTPS_TUI_SRC_ROW_LATENCY) { o->lat_sum = sr->lat_sum_ms; o->lat_max = sr->lat_max_ms; o->lat_n = sr->lat_n; }
+                else o->lat_sum = o->lat_max = o->lat_n = 0;
+                o->mem_peak = 0; o->has_mem = 0;
+                ++n;
+            }
+            for (i = 1, n = srcrows ? n : 0; !srcrows && i <= t->ntasks && n < show; ++i) {
                 tui_task *src = &t->tasks[i < t->ntasks ? i : 0];
                 const tui_ui *u = (src->ui >= 0 && src->ui < t->nui) ? &t->ui[src->ui] : NULL;
                 tui_vrow *o = &v->rows[n];
@@ -2515,8 +2615,11 @@ static void view_take(gptps_tui *t, tui_view *v, uint64_t now, int loop, uint64_
     }
     v->rec_t0 = t->start_ms;
     nx_clock = v->clock != GPTPS_TUI_CLOCK_OFF ? t->start_ms + clock_next(v->up_ms, v->clock) : 0;
+    /* a source changes with no event the dashboard sees: the live loop reads it every refresh_ms */
+    if (v->src) nx_src = now + (t->cfg.refresh_ms ? t->cfg.refresh_ms : 250u);
     mu_unlock(&t->mu);
     v->next_change = 0;
+    if (nx_src && (!v->next_change || nx_src < v->next_change)) v->next_change = nx_src;
     if (nx_rate && (!v->next_change || nx_rate < v->next_change)) v->next_change = nx_rate;
     if (nx_peak && (!v->next_change || nx_peak < v->next_change)) v->next_change = nx_peak;
     if (nx_clock && (!v->next_change || nx_clock < v->next_change)) v->next_change = nx_clock;
@@ -2814,7 +2917,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
         pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(dl, W - 1), dl, X);
     }
 
-    if (v->tier < TUI_T_GAUGE) {     /* MINIMAL keeps no gauge: what is alive, as one sum */
+    if (!v->gline) {                 /* MINIMAL keeps no gauge (nor a SUM source): what is alive, as one sum */
         char pc[16], gl[128];
         snprintf(gl, sizeof gl, "queued %llu  started %llu  pending+in-flight ~%s",
                  (unsigned long long)v->q, (unsigned long long)v->s, fmt_count(pc, sizeof pc, v->alive));
@@ -2860,8 +2963,15 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
         char kl[320];
         size_t kp = 0;
         int k, nm = 0;
-        snprintf(kl, sizeof kl, "kpi:%s mode:%s refresh:%ums", kpi_str(v->kpi), mode_str(v->mode), v->refresh);
+        char sn[sizeof v->src_name * 2];
+        snprintf(kl, sizeof kl, "kpi:%s mode:%s refresh:%ums%s%s", kpi_str(v->kpi), mode_str(v->mode), v->refresh,
+                 v->src ? " source:" : "", v->src ? tui_cl(v->src_name, sn, sizeof sn) : "");
         pos = appendf(buf, cap, pos, "%s%.*s%s\n", D, (int)u8_fit(kl, W - 1), kl, X);
+        if (v->src == 2) {               /* never silent: what this frame shows instead */
+            snprintf(kl, sizeof kl, "source %s: read failed (%s), %llu errors - own counts shown",
+                     tui_cl(v->src_name, sn, sizeof sn), gptps_strerror(v->src_st), (unsigned long long)v->src_errors);
+            pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(kl, W - 1), kl, X);
+        }
         for (k = 0; k < 5 && kp < sizeof kl; ++k)    /* and, when any, the parts it lacks: a line of its own */
             if (v->miss & (1 << k))
                 kp += (size_t)snprintf(kl + kp, sizeof kl - kp, "%s%s", nm++ ? ", " : "no memory for: ", MISS[k]);
@@ -3025,6 +3135,30 @@ typedef struct { char *b; size_t cap; } tui_fbuf;
 /* What the live loop learns from a frame it has made. */
 typedef struct { uint64_t gen, next_change; int pane; } tui_fmeta;
 
+/* rmu held, mu NOT held: the host's source, read into the view for view_take (gptps_tui.h,
+ * SOURCE) - here, once a dashboard frame, and nowhere else. v->src: 0 no source, 1 read, 2
+ * failed. What it returns is taken defensively: a row's name is cut at its last byte, the
+ * totals' struct_size is the dashboard's again. */
+static void src_read(gptps_tui *t, tui_view *v)
+{
+    size_t n = 0, cap = v->srows ? (size_t)v->srows_cap : 0, i;
+    gptps_status st;
+    v->src = 0; v->src_n = 0; v->src_lat = 0;
+    if (!t->src.read) return;            /* set under rmu, which is held */
+    memset(&v->stot, 0, sizeof v->stot);
+    v->stot.struct_size = sizeof v->stot;
+    if (cap) memset(v->srows, 0, cap * sizeof *v->srows);
+    st = t->src.read(t->src.ctx, &v->stot, v->srows, sizeof *v->srows, cap, &n);
+    v->stot.struct_size = sizeof v->stot;
+    v->src_st = st;
+    if (st != GPTPS_OK) { v->src = 2; return; }
+    v->src = 1; v->src_n = n;
+    for (i = 0; i < cap && i < n; ++i) {
+        v->srows[i].name[sizeof v->srows[i].name - 1] = 0;
+        if ((v->srows[i].flags & GPTPS_TUI_SRC_ROW_LATENCY) && v->srows[i].lat_n) v->src_lat = 1;
+    }
+}
+
 /* rmu held, the pane is the dashboard: take its view (allocating it first, unlocked). 0
  * with no memory for it (counted; WARNed once). */
 static int view_frame(gptps_tui *t, uint64_t now, int loop, uint64_t *warn_plost)
@@ -3041,7 +3175,15 @@ static int view_frame(gptps_tui *t, uint64_t now, int loop, uint64_t *warn_plost
     }
     t->view->W = draw_width(t);
     t->view->R = R;
+    src_read(t, t->view);
     view_take(t, t->view, now, loop, warn_plost);
+    if (t->view->src_warn) {             /* never silent; at most once a minute, outside mu */
+        char msg[320];
+        snprintf(msg, sizeof msg, "gptps_tui: the dashboard's source '%s' failed to read (%s); the frame shows "
+                 "the dashboard's own counts and says so (gptps_tui_health.source_errors: %llu)",
+                 t->view->src_name, gptps_strerror(t->view->src_st), (unsigned long long)t->view->src_errors);
+        gptps_log(NULL, GPTPS_LOG_WARN, msg);
+    }
     return 1;
 }
 
@@ -4606,7 +4748,7 @@ static void tui_destroy(gptps_tui *t)
     p.act_nm = t->act_nm; p.hist = t->hist; p.tab = t->tab;
     parts_free(&p);
     free(t->held);
-    if (t->view) { free(t->view->rows); free(t->view->recs); free(t->view); }
+    if (t->view) { free(t->view->rows); free(t->view->recs); free(t->view->srows); free(t->view); }
     free(t->pc.tasks); free(t->pc.sets); free(t->pc.pool);
     mu_destroy(&t->rmu);
     mu_destroy(&t->smu);
@@ -4898,6 +5040,11 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
     h.event_rate        = t->ad_rate;
     h.cost_est_ppm      = t->ad_ppm;
     h.render_max_us     = t->ad_rmax_last;
+    h.source            = t->src.read != NULL;
+    h.source_status     = t->src_status;
+    h.source_reads      = t->src_reads;
+    h.source_errors     = t->src_errors;
+    h.source_rows       = t->src_rows;
     mu_unlock(&t->mu);
     n = out->struct_size < sizeof h ? out->struct_size : sizeof h;   /* what the caller's struct has */
     memcpy((char *)out + sizeof(size_t), (char *)&h + sizeof(size_t), n - sizeof(size_t));
@@ -4921,6 +5068,31 @@ gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode)
     st = tui_reconfig(t, -1, 0, -1, -1, 1, what, sizeof what);
     if (what[0]) tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_adapt: no memory for %s; the dashboard runs without it", what);
     return st;
+}
+
+gptps_status gptps_tui_set_source(gptps_tui *t, const gptps_tui_source *src)
+{
+    gptps_tui_source c;
+    char name[sizeof t->src_name];
+    if (!t) return GPTPS_E_INVAL;
+    memset(&c, 0, sizeof c);
+    name[0] = 0;
+    if (src) {
+        if (src->struct_size < sizeof c || !src->read) return GPTPS_E_INVAL;
+        c.struct_size = sizeof c; c.ctx = src->ctx; c.read = src->read;   /* the name is copied, not kept */
+        copy_u8(name, sizeof name, src->name && src->name[0] ? src->name : "host");
+    }
+    /* rmu first (the order everywhere): no frame is reading the old source once this has it */
+    mu_lock(&t->rmu);
+    mu_lock(&t->mu);
+    t->src = c;
+    memcpy(t->src_name, name, sizeof name);
+    t->src_kind = -1;                    /* done/s and peak start again at the next frame */
+    tui_touch(t);
+    mu_unlock(&t->mu);
+    mu_unlock(&t->rmu);
+    tui_kick(t);
+    return GPTPS_OK;
 }
 
 gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct)

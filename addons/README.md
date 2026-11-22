@@ -803,6 +803,25 @@ enabled automatically). Panes/metrics:
     write, `gptps_tui_set_adapt` or a `tui.adapt` write build the request again; `m` clears
     it too but steps up one tier from what runs (`full` degraded to `problems`, then `m`,
     gives `tasks`).
+- **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
+  runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
+  instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back
+  to its own collection), then run the dashboard at `tui.kpi = off` (one flag read an
+  event, no lock) or `problems` (for the failure journal). The interface is one read-only
+  callback that fills a snapshot (`gptps_tui_source_totals` and an array of
+  `gptps_tui_source_row`, each read as far as its size); there is no reset and no close
+  in it, so the dashboard can never reset or close what the host owns. It is read once a
+  dashboard frame, before the copy-out, with the dashboard's lock released — never on the
+  event path, never by health or the other panes; while one is set the live loop polls it
+  every `refresh_ms`. A failed read is counted (`gptps_tui_health.source_errors`,
+  `source_status`), that frame shows the dashboard's own counts with a line saying so, and
+  a WARN is logged at most once a minute. Once `set_source` (or close) has returned, the
+  old source is never called again. done/s and peak start again when the totals change
+  hands. There is no link dependency: the `gptps_stats` adapter is
+  [`examples/dashboard_stats.c`](../examples/dashboard_stats.c) (`gptps_stats_snapshot`:
+  every row and the totals under one lock; avg / max ms there are run time), built and
+  run headless as the `example_dashboard_stats` test. Close order: `gptps_shutdown`,
+  `gptps_tui_close`, then `gptps_stats_close`.
 - **Host profiles.**
 
   | host | suggested | why |
