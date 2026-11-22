@@ -645,10 +645,17 @@ that scrolled away between two frames.
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
   dashboard's own CPU/RAM cost live, one tier up the ladder a press (minimal, gauge,
   problems, tasks, normal, latency, full, then minimal again; `off` is set, never
-  stepped into); `p` pauses; `s` opens the live
+  stepped into); `u` undoes a degrade (below); `p` pauses; `s` opens the live
   **settings editor**, which explains the selected setting, says why it refuses a value,
   and saves your changes into the config file in place (`w`); `?` shows a help overlay of
   every key.
+- **Pressure (1.12):** the dashboard watches its own losses and estimated cost once a
+  rate window, from counters it already keeps (nothing on the event path), and shows a
+  `PRESSURE:` line naming the setting to change (`tui.adapt = report`, the default; a WARN
+  at most once a minute per condition). `tui.adapt = degrade` opts in to shedding one step
+  at a time while it lasts (ACTIVITY journal, percentiles, latency table, TASKS rows; never
+  below `problems`), sticky until you press `u` or set `tui.kpi`. See
+  [addons/README.md](addons/README.md#tui--real-time-terminal-dashboard).
 - **Task control plane:** `t` opens a **task manager** — list every type with its
   queued/running/dead counts, inspect one to edit its settings inline, pause/resume (`a`),
   clone (`c`), create a `GPTPS_EXEC_PROGRAM` task from a typed name + argv (`n`), or delete

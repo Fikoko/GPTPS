@@ -189,6 +189,8 @@ key nothing claimed.
 | `recent` | whole number, 0 to 4096 | `8` | at once | failed/retried/dead/dropped events the RECENT log keeps (the PROBLEMS journal, kpi problems and up); 0 = off, its memory freed |
 | `activity` | whole number, 0 to 4096 | `8` | at once | queued/started/finished events the RECENT log keeps (the ACTIVITY journal, kpi normal and up); by default as tui.recent; 0 = off, its memory freed |
 | `clock` | one of `"off"`, `"minutes"`, `"seconds"` | `"minutes"` | at once | the header's uptime: off, whole minutes (an idle dashboard repaints once a minute) or seconds (once a second) |
+| `adapt` | one of `"off"`, `"report"`, `"degrade"` | `"report"` | at once | what the dashboard does about its own pressure (its cost and losses, checked once a rate window when a frame is made): off; report - a PRESSURE line and a WARN naming the setting to change; degrade - also shed collection a step at a time (sticky: tui.kpi or 'u' restores) |
+| `cost_budget_pct` | whole number, 1 to 100 | `5` | at once | the dashboard observer's estimated cost (event rate x a measured cost per kpi tier), in percent of one core, past which tui.adapt reports pressure |
 
 ### [gpu_quota]
 

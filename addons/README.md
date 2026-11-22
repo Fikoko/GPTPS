@@ -741,9 +741,11 @@ enabled automatically). Panes/metrics:
     `refresh_ms` in every mode. On Windows a console resize repaints by itself (the loop
     turns on `ENABLE_WINDOW_INPUT` while it runs).
   - **Engine-reading panes** (1.11). The tasks, settings and detail panes read the
-    engine — and `gptps_task_get_info` holds its lock while it walks every queue (1.10
-    read every row on every frame: 116 ms a frame at 64 types and 100k queued, 46% of the
-    time at 250 ms). Now an open pane reads the engine in **one pass into a cache**: when
+    engine, one call per task type or setting, each in the engine's lock. Before ABI 2.9
+    `gptps_task_get_info` walked every queue to count (~1 ms a call at 64 types and 100k
+    queued; 1.10 read every row on every frame — 116 ms a frame, 46% of the time at
+    250 ms); since 2.9 (1.12) it reads counters, O(1), so a pass costs microseconds a type
+    and the 1% rule below now rarely binds. An open pane reads the engine in **one pass into a cache**: when
     it opens, after a change made from it, on `R`, and every `cfg.pane_refresh_ms` (2 s) —
     or, when a pass is slow, 100× what the last one took, so the panes hold the engine's
     lock **at most 1% of the time**. Frames and `j`/`k` read only the cache, and the pane
@@ -755,6 +757,45 @@ enabled automatically). Panes/metrics:
     The dashboard's frames keep the same 1% for their own look at the engine (to clear the
     gauges' `>=`): each look is timed and the next waits 99× as long, and a frame is due
     when that wait ends. `gptps_tui_health` always looks, at the rate the host calls it.
+    Since 1.12 that look is one `gptps_engine_counts` call (O(1)) instead of a
+    `gptps_task_get_info` walk per type.
+  - **Pressure: report, and opt-in degrade** (1.12; `cfg.adapt`, `tui.adapt` =
+    `off` | `report` (default) | `degrade`). Nothing is added to the event path: once a
+    rate window (`cfg.rate_window_s`, 10 s), when a frame is made or health is read, the
+    dashboard compares the counters it already keeps with the window's start. A condition
+    shows a `PRESSURE:` line naming the setting to change, logs a WARN (at most one a
+    minute per condition) and sets `gptps_tui_health.pressure` (`GPTPS_TUI_P_*`):
+
+    | condition | when | suggestion |
+    |---|---|---|
+    | PROBLEMS lost | a failure record overwritten before any frame showed it | raise `tui.recent` |
+    | ACTIVITY lost | lifecycle records lost unseen at ≥ 1000/s | `tui.activity=0` |
+    | untracked | the latency table was full for a QUEUED | raise `tui.latency_window` |
+    | folded | a new type folded into `(other)` | raise `cfg.max_tasks` |
+    | truncated / no memory | a frame cut at 256 KiB / an allocation failed | lower `tui.recent`, `tui.activity` / `tui.kpi` |
+    | render | a frame took more than 1/10 of `refresh_ms` to make | raise `tui.refresh_ms` |
+    | pane | a pane pass slow enough to stretch past `cfg.pane_refresh_ms` | raise it, or leave the pane |
+    | cost | the **estimated** observer cost over `tui.cost_budget_pct` (default 5% of one core) | the highest `tui.kpi` that fits |
+
+    The cost is an estimate, labelled `est.`: the window's event rate × a unit cost per tier
+    (off 3, minimal 9, gauge 10, problems 10, tasks 21, normal 24, latency 38, full 38 ns;
+    35 at latency/full with the ACTIVITY journal off) — the upper end measured on one thread
+    with `tests/test_tui_perf.c`'s harness. An event takes nanoseconds and `gptps_now_ms`
+    has millisecond resolution, so it cannot be timed; contention is not in it. At 5%,
+    `full` reaches the budget near 1.3 million events a second.
+    `degrade` is the one opt-in exception to "report, never act", and it acts only when a
+    frame is made or health is read — with no viewer nothing acts. When a condition shedding
+    relieves (activity lost, render, cost) lasts **3 windows in a row**, one step is shed, a
+    WARN each, in this order: the ACTIVITY journal → the percentiles (`full` → `latency`) →
+    the handle table (→ `tasks`) → the TASKS rows (→ `problems`). A step that would change
+    nothing is passed over; `problems` is the floor (the totals, gauges and PROBLEMS journal
+    are never shed; a WARN says when nothing is left). **Sticky**: nothing comes back when
+    the pressure goes. What you asked for is kept — `tui.kpi` and `tui.activity` read back
+    the request, so `w` saves it, not the degraded state — and what runs is shown in
+    `gptps_tui_health` (`kpi`, `kpi_requested`, `shed`, `shed_pressure`, `degrade_steps`)
+    and under the header: `DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores
+    full`. Only an operator clears it: `u`, `m`, `gptps_tui_set_kpi` (any level), a
+    `tui.kpi` write, `gptps_tui_set_adapt` or a `tui.adapt` write.
 - **Host profiles.**
 
   | host | suggested | why |
@@ -772,7 +813,8 @@ enabled automatically). Panes/metrics:
 Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scroll ·
 `m` steps the KPI tier up, `minimal` → `gauge` → `problems` → `tasks` → `normal` →
 `latency` → `full` → `minimal` (the rule: up one tier, wrapping to `minimal`, never into
-`off`; from `off` it goes to `minimal`) · `p` pauses/resumes · `s` settings · `t` tasks ·
+`off`; from `off` it goes to `minimal`) · `u` undoes a degrade (the requested tier
+again) · `p` pauses/resumes · `s` settings · `t` tasks ·
 `l` dead letters · `?` help · `q` quits. In the tasks, settings and detail panes `R` (or
 `r`) reads the engine again now; in the dead-letter view `r` re-submits all.
 
