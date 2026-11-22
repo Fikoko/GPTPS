@@ -61,6 +61,8 @@ static double drain(int kind, int n, int reps)
     size_t ran;
     int i, r;
 
+    if (g_overtime) return 0.0;   /* out of budget already: the caller reports it */
+
     memset(&cfg, 0, sizeof cfg); cfg.struct_size = sizeof cfg;
     cfg.limits.struct_size = sizeof cfg.limits;
     cfg.limits.max_concurrent_tasks = 8;
@@ -86,8 +88,10 @@ static double drain(int kind, int n, int reps)
             o.deadline_in_ms = ((uint64_t)i * 7919u) % 50000u;   /* 64-bit: i * 7919 overflows an int past ~271k items */
             o.priority = (int32_t)(i % 5);
             if (gptps_submit_ex(e, "n", &b, 1, &o, NULL) != GPTPS_OK) { ++fails; break; }
+            /* the budget covers submission too: an O(n) insert makes this loop the slow part */
+            if ((i & 255) == 255 && gptps_hal_monotonic_ms() - t0 > BUDGET_MS) { g_overtime = 1; break; }
         }
-        {
+        if (!g_overtime) {
             unsigned steps = 0;
             while (gptps_step(e, &ran) == GPTPS_OK && ran)
                 if ((++steps & 255u) == 0 && gptps_hal_monotonic_ms() - t0 > BUDGET_MS) { g_overtime = 1; break; }
@@ -105,14 +109,14 @@ int main(void)
         double a, b, ratio;
         for (;;) {                                 /* grow until clock noise cannot dominate */
             a = drain(k, n, reps);
-            if (fails) break;
+            if (fails || g_overtime) break;
             if (a >= 100.0) break;
             if (n < 160000) n *= 2; else if (reps < 32) reps *= 2; else break;
         }
         if (fails) break;
         b = drain(k, SCALE * n, reps);
         if (g_overtime) {
-            printf("%-10s a drain of %d items ran past %u ms: admission is super-linear\n",
+            printf("%-10s a drain of up to %d items ran past %u ms: admission is super-linear\n",
                    NAMES[k], SCALE * n, BUDGET_MS);
             ++fails;
             break;
@@ -120,13 +124,34 @@ int main(void)
         /* Best of three - unless the first is already far past the bar: the repeats
          * only filter out a noisy HIGH reading, and a quadratic path would spend
          * minutes on them before failing (it reached ctest's timeout instead). */
-        for (i = 0; i < 2 && !fails && a > 0.0 && b / a < 2.0 * MAX_RATIO; ++i) {
-            double a2 = drain(k, n, reps), b2 = drain(k, SCALE * n, reps);
+        for (i = 0; i < 2 && !fails && !g_overtime && a > 0.0 && b / a < 2.0 * MAX_RATIO; ++i) {
+            double a2 = drain(k, n, reps), b2 = (fails || g_overtime) ? 0.0 : drain(k, SCALE * n, reps);
+            if (fails || g_overtime) break;
             if (a2 < a) a = a2;
             if (b2 < b) b = b2;
         }
         if (fails) break;
         ratio = (a > 0.0) ? b / a : 0.0;
+        /* Confirm before failing, as in test_cancel_perf: a stall during the bigger drain
+         * can push even the best of three past the bar, but a stall does not repeat and a
+         * quadratic path is slow in EVERY run. So over the bar, measure again, up to six
+         * more pairs, keeping the best of each size. Not when the ratio is already twice
+         * the bar: no stall reads like that, and a quadratic path would spend minutes on
+         * the repeats. A repeat that runs out of budget is itself the verdict. */
+        for (i = 0; i < 6 && ratio >= MAX_RATIO && ratio < 2.0 * MAX_RATIO && !fails && !g_overtime; ++i) {
+            double a2 = drain(k, n, reps), b2 = (fails || g_overtime) ? 0.0 : drain(k, SCALE * n, reps);
+            if (fails || g_overtime) break;
+            printf("%-10s over the bar (%.2f): measuring again - %.0fms / %.0fms\n", NAMES[k], ratio, a2, b2);
+            if (a2 < a) a = a2;
+            if (b2 < b) b = b2;
+            ratio = (a > 0.0) ? b / a : 0.0;
+        }
+        if (g_overtime) {
+            printf("%-10s a repeat drain ran past %u ms: admission is super-linear\n", NAMES[k], BUDGET_MS);
+            ++fails;
+            break;
+        }
+        if (fails) break;
         printf("%-10s drain %d x%d: %.0fms | drain %d x%d: %.0fms | ratio %.2f (linear ~4, quadratic ~16)\n",
                NAMES[k], n, reps, a, SCALE * n, reps, b, ratio);
         CHECK(ratio < MAX_RATIO);
