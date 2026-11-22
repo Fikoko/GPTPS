@@ -442,6 +442,8 @@ without recompiling or restarting:
 size_t n = gptps_task_count(e);                       /* enumerate for a UI ... */
 gptps_task_info ti = { .struct_size = sizeof ti };
 gptps_task_get_info(e, 0, &ti);                       /* name, exec, prio, queued/running/dead */
+gptps_engine_totals tot = { .struct_size = sizeof tot };
+gptps_engine_counts(e, &tot);                         /* engine-wide queued/delayed/running/dead */
 uint64_t fl; gptps_task_flags(e, "resize", &fl);      /* GPTPS_TASK_* by name, race-free */
 
 gptps_set_task_enabled(e, "resize", 0);               /* pause: reject new submits, reversibly */
@@ -449,6 +451,12 @@ gptps_clone_task(e, "resize", "resize_hi");           /* duplicate, then retune 
 gptps_unregister_task(e, "resize", GPTPS_REMOVE_DRAIN);   /* finish in-flight work, then remove */
 ```
 
+- **Counters cost O(1)** (ABI 2.9): the engine keeps each type's queued / running / dead
+  counts as items move between its queues, so `gptps_task_get_info` no longer walks every
+  item under the engine lock (it did: about 1 ms a call at 64 types and 100k queued,
+  116 ms for a 64-row dashboard frame), and
+  `gptps_engine_counts` gives the engine-wide totals the same way. A dashboard or a host
+  can poll them as often as it likes.
 - **Removal policy** (the `flags`): `GPTPS_REMOVE_REJECT_IF_BUSY` (default — refuse with
   `GPTPS_E_BUSY` while work is outstanding), `GPTPS_REMOVE_DRAIN` (stop new submits, let
   queued + in-flight finish, then free), or `GPTPS_REMOVE_CANCEL` (drop queued, cancel
@@ -988,9 +996,9 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **59** public functions · **ABI 2.8** (append-only; 2.0 was the first
+At a glance: **60** public functions · **ABI 2.9** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **108** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **117** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass - and a release tag publishes nothing until all of
 them have passed at that tag (`release.yml` runs `ci.yml` as its gate).
 

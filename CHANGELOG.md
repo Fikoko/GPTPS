@@ -5,6 +5,128 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+O(1) task counts in the core (ABI 2.9), a hardened `gptps_stats`, pressure reporting with
+an opt-in sticky degrade mode for the dashboard, a way to feed the dashboard from a host's
+own `gptps_stats`, and perf gates that confirm before they fail. Lock stripes for the
+dashboard were measured against a gate stated in advance and are not shipped. Every
+released name, value, field offset, setting, choice and range keeps its place.
+
+### Changed
+
+- **Core: `gptps_task_get_info`'s queued / running / dead counts are now O(1).** The
+  engine keeps per-type counts as items move between its queues. Before this, each call
+  walked every item the engine held, under the engine lock: at 64 types and 100k queued
+  that was about 1 ms a call (116 ms for a dashboard frame reading 64 rows), holding up the
+  dispatcher and every submitter. Now 0.09 us. The values are unchanged.
+- **gptps_stats is bounded and allocates nothing on the event path.** Task rows, the name
+  index, the handle table and the measurement tables are made at install;
+  `gptps_stats_install_ex(e, &gptps_stats_config)` sizes them (`max_tasks` 256, `handles`
+  1024, `handles_max` 1<<20, `measure_tables` 8, about 0.25 MiB). Out-of-range values are
+  refused, never clamped. A full handle table refuses a new handle and counts it once; it
+  never evicts a live entry. The table grows only outside the event path
+  (`gptps_stats_reserve`, or a read that finds it over half full): allocated unlocked,
+  swapped under the lock, the old one freed after. **Behaviour change:** a host that
+  submits more than `cfg.handles` items before its first read must size the table
+  (`install_ex` or `gptps_stats_reserve`); until it does, the pending gauge and wait
+  samples undercount, counted in `health.handles_untracked` and WARNed. 1.11 grew the table
+  on the event path, without bound.
+- **gptps_stats task lookup is hashed** (FNV-1a, one probe and one compare, whatever the
+  number of types; before, a compare against every row on every handle's first event and
+  every SAMPLE). Past `max_tasks`, types count in one `(other)` row, always enumerated
+  last; a folded type is `GPTPS_E_NOTFOUND` by its own name.
+- **gptps_stats markers are bounded.** Handles whose QUEUED never came (work submitted
+  before install, a service's later runs) keep at most 64 markers; the oldest are dropped
+  and counted (1.11 measured 14.7 MB at 100k handles). The last 256 dropped or untracked
+  handles are remembered so their late QUEUED / RETRIED moves no gauge
+  (`health.late_absorbed`).
+- **gptps_stats getters honour `struct_size`**: they copy min(caller size, current size).
+  A size below the 1.7 layout that the caller never set still gets the 1.7 fields, for
+  compatibility. `gptps_stats_merge` does the same for its destination.
+- **Dashboard:** the idle check behind the gauges' `>=` mark is one `gptps_engine_counts`
+  call instead of a `gptps_task_get_info` per task type.
+- **Tests:** `test_admission_perf`, `test_durable_perf` and `test_sched_perf` confirm
+  before failing, like `test_cancel_perf` and `test_tui_perf`: when the best of three is
+  over the bar, up to six more pairs are measured, because a stall does not repeat. A
+  reading already twice the bar fails at once. The bars are unchanged, and an injected O(n)
+  regression still fails each one. `test_sched_perf`'s 30 s budget now also covers
+  submission and repeat drains.
+
+### Added
+
+- **Core: `gptps_engine_counts(e, &gptps_engine_totals)`** - engine-wide queued /
+  delayed / running / dead totals in O(1). `struct_size`-fronted; its floor is frozen at
+  the 2.9 layout. ABI minor 8 -> 9.
+- **gptps_stats:** `gptps_stats_set_enabled` / `gptps_stats_enabled` and
+  `GPTPS_STATS_START_DISABLED`. Off, the observer returns before its lock. Switching on
+  again drops the handle table and zeroes the gauges, which then cover only work queued
+  after the resume (`health.gauges_since_ms`). Both transitions WARN.
+- **gptps_stats:** `gptps_stats_snapshot` - the totals, the health and every task row under
+  one lock acquisition, into a caller-sized array; returns the count needed and
+  `GPTPS_E_FULL` when the array is short.
+- **gptps_stats:** `gptps_stats_health` / `gptps_stats_health_info` - untracked handles,
+  markers dropped, late events absorbed, growths, types folded, measurement tables refused,
+  failed allocations (`nomem`) and memory held. Every loss WARNs at most once a minute per
+  condition, on the `gptps_now_ms` clock.
+- **Dashboard pressure reporting** (`tui.adapt`, `cfg.adapt`; default `report`). Once per
+  rate window, when a frame is made or `gptps_tui_health` is read, the dashboard checks its
+  own losses and estimated cost from counters it already keeps - nothing is added to the
+  event path. Each condition shows a `PRESSURE:` line naming the setting to change (for
+  example `ACTIVITY lost 41k unseen: tui.activity=0`), logs at most one WARN a minute and
+  sets `gptps_tui_health.pressure` (`GPTPS_TUI_P_*`). The conditions: problems lost
+  unseen, activity lost unseen at 1000/s or more, items untracked, types folded, frames
+  truncated, allocations failed, frames over 1/10 of `refresh_ms`, pane reads past
+  `pane_refresh_ms`, and estimated observer cost over `tui.cost_budget_pct` (new; default
+  5% of one core). The cost is an **estimate** - event rate x a measured per-tier unit cost
+  (3-38 ns), contention not included; at the default budget, `full` reaches it near 1.3M
+  events/s.
+- **Opt-in sticky degrade** (`tui.adapt = degrade`). When activity loss, slow frames or
+  cost lasts 3 windows in a row, one step is shed, with a WARN, in this order: ACTIVITY
+  journal, percentiles, the latency (handle) table, the TASKS rows. It never goes below
+  `problems`: totals, gauges and the PROBLEMS journal are never shed. The other conditions
+  are reported, not acted on. Nothing comes back by itself: only an operator clears it -
+  the new `u` key, `gptps_tui_set_kpi`, a `tui.kpi` write, `gptps_tui_set_adapt` or a
+  `tui.adapt` write restore the request; `m` also clears it but steps one tier up from what
+  runs. `tui.kpi` and `tui.activity` keep reading back the request, so `w` saves the
+  request, not the degraded state. A `DEGRADED: -activity ... - 'u' restores full` line and
+  `gptps_tui_health` (`kpi`, `kpi_requested`, `shed`, `degrade_steps`, ...) show what runs.
+  It acts only when a frame is made or health is read; with no viewer, nothing acts. This
+  is the one opt-in exception to "report, never act".
+- **Dashboard: `gptps_tui_source` / `gptps_tui_set_source`** let a host that already
+  aggregates (for example with `gptps_stats`) feed the dashboard its totals, gauges and
+  per-task rows through one read-only snapshot callback; the dashboard's own collection
+  can then run at `tui.kpi = off`. The source is read once per frame, before the copy-out,
+  with the dashboard's lock released - never on the event path. A failed read is counted
+  (`gptps_tui_health.source_errors`, `source_status`), that frame shows the dashboard's own
+  counts with a line saying so, and a WARN is logged at most once a minute. The interface
+  has no reset or close: the dashboard never resets or closes what the host owns.
+- New tui API: `gptps_tui_set_adapt`, `gptps_tui_set_cost_budget`, `gptps_tui_adapt`,
+  `GPTPS_TUI_P_*`, `GPTPS_TUI_SHED_*`; `gptps_tui_config` gains `adapt` and
+  `cost_budget_pct` (appended; a 1.11 `struct_size` does not read them);
+  `gptps_tui_health_info` gains the adapt and source fields at the end.
+- **`examples/dashboard_stats.c`** - the `gptps_stats` adapter, built on
+  `gptps_stats_snapshot`, run headless as the `example_dashboard_stats` test. There is no
+  link dependency between the tui and stats add-ons.
+- **`tools/bench_tui_stripes.c`** (`--target gptps_bench_tui_stripes`, POSIX, not built by
+  default) reproduces the stripes measurement below.
+- Tests: `test_counts` compares the kept counts with a full queue walk (compiled in with
+  `GPTPS_COUNTS_CHECK`) after every one of 1e5+ random operations and every event, across
+  MANUAL, THREADED, bounded, service and OOP/PROGRAM runs, a type retired while it still
+  owns dead letters, and the simulation HAL seeds. `test_counts_perf` ratio-gates
+  `get_info` at 64 types x 100k queued against 1 type. `test_stats_unit` and
+  `test_tui_source` are new; `test_tui_unit` covers report and degrade.
+
+### Not shipped
+
+- **Dashboard lock stripes.** The gate, stated before measuring, was >= 1.5x items/s at 8
+  threads through a real engine at `normal` or `full`. Measured: a median of 1.03-1.06x.
+  With the dashboard installed directly, its whole end-to-end cost at every tier is within
+  run-to-run noise (+-15-20% at 8 threads), because the engine's own lock serializes first,
+  so stripes have nothing to win back. The dashboard keeps its single lock, and
+  `gptps_tui_config` gains no stripes field. The numbers are in docs/MEASUREMENTS.md
+  ("Dashboard lock stripes").
+
 ## [1.11.0] - 2026-11-21
 
 The dashboard (`addons/gptps_tui`) as a ladder of cost tiers, with idle that costs
