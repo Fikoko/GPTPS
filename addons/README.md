@@ -794,8 +794,10 @@ enabled automatically). Panes/metrics:
     the request, so `w` saves it, not the degraded state — and what runs is shown in
     `gptps_tui_health` (`kpi`, `kpi_requested`, `shed`, `shed_pressure`, `degrade_steps`)
     and under the header: `DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores
-    full`. Only an operator clears it: `u`, `m`, `gptps_tui_set_kpi` (any level), a
-    `tui.kpi` write, `gptps_tui_set_adapt` or a `tui.adapt` write.
+    full`. Only an operator clears it: `u`, `gptps_tui_set_kpi` (any level), a `tui.kpi`
+    write, `gptps_tui_set_adapt` or a `tui.adapt` write build the request again; `m` clears
+    it too but steps up one tier from what runs (`full` degraded to `problems`, then `m`,
+    gives `tasks`).
 - **Host profiles.**
 
   | host | suggested | why |

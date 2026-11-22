@@ -518,9 +518,10 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  * (so a file saved with 'w' holds the request, not the degraded state); what runs is the
  * request minus what is shed - health.kpi, health.shed, and the line under the header:
  * "DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores full". STICKY:
- * nothing is restored when the pressure goes. It is cleared, and the request built again,
- * only by an operator: gptps_tui_set_kpi (any level, the same one too), a tui.kpi write, the
- * 'm' and 'u' keys, gptps_tui_set_adapt or a tui.adapt write. */
+ * nothing is restored when the pressure goes. It is cleared only by an operator. The request
+ * is built again by gptps_tui_set_kpi (any level, the same one too), a tui.kpi write, the
+ * 'u' key, gptps_tui_set_adapt or a tui.adapt write; the 'm' key clears it too, but steps
+ * up one tier from what RUNS (FULL degraded to PROBLEMS, then 'm': TASKS). */
 gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode);   /* DEFAULT => REPORT; else
                                    * GPTPS_E_INVAL. Clears what DEGRADE shed (above) */
 /* The estimated-cost budget, in percent of one core: 1..100 (else GPTPS_E_INVAL). Also

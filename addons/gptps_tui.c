@@ -103,6 +103,14 @@ static uint64_t tui_now_us(void)
 #ifndef TUI_NOW_MS
 #  define TUI_NOW_MS() gptps_now_ms(NULL)
 #endif
+/* ADAPT's frame timing (us) and the gap between tui_adapt's two locked sections: hooks
+ * for that test too (it fakes the clock, so a real frame's time is not the window's). */
+#ifndef TUI_FRAME_US
+#  define TUI_FRAME_US(us) (us)
+#endif
+#ifndef TUI_ADAPT_MID
+#  define TUI_ADAPT_MID(t) ((void)0)
+#endif
 
 /* cfg.max_tasks: the TASKS rows (and gptps_tui_add_task entries) by default, and the most
  * an install may ask for. */
@@ -817,12 +825,13 @@ struct gptps_tui {
      * ad_rmax_us: the slowest frame made in it. The last window's results: pressure (bits),
      * pr_seen, p_row (windows in a row with a sheddable one), ad_rate, ad_ppm; ad_line: the
      * PRESSURE line's text; ad_warn_ms: each condition's last WARN. shed: GPTPS_TUI_SHED_*,
-     * shed_why: the conditions behind the last step; ad_floor_ms: the last "nothing left" WARN. */
+     * shed_why: the conditions behind the last step; ad_floor_ms: the last "nothing left" WARN;
+     * ad_gen: a new window (adapt_base) since, so a late PRESSURE text is not stored. */
     int              kpi_req, adapt, cost_pct;
     unsigned         shed;
     uint64_t         ad_ms, ad_ev, ad_plost, ad_alost, ad_untr, ad_fold, ad_trunc, ad_nomem, ad_preads, ad_rmax_us;
     uint64_t         pressure, pr_seen, p_row, shed_why, ad_windows, ad_steps, ad_warns, ad_rate, ad_ppm, ad_rmax_last;
-    uint64_t         ad_warn_ms[TUI_P_N], ad_floor_ms;
+    uint64_t         ad_warn_ms[TUI_P_N], ad_floor_ms, ad_gen;
     char             ad_line[1280];   /* one line a condition, '\n' between */
     /* Read by tui_on_event WITHOUT the lock, so that KPI OFF can skip acquiring it at
      * all - taking a mutex to discover you have nothing to do is the entire cost this
@@ -2600,12 +2609,16 @@ static void adapt_phrase(const tui_adsnap *a, int k, char *out, size_t cap)
         case 4: snprintf(out, cap, "%s frames truncated: lower tui.recent / tui.activity", fmt_count(c, sizeof c, a->d[4]));
                 break;
         case 5: snprintf(out, cap, "%s allocations failed: a lower tui.kpi", fmt_count(c, sizeof c, a->d[5])); break;
-        case 6: snprintf(out, cap, "%.1f ms frames: raise tui.refresh_ms (%u; over 1/%u of it)",
-                         (double)a->d[6] / 1000.0, (unsigned)a->refresh, TUI_RENDER_DIV); break;
-        case 7: snprintf(out, cap, "%.1f ms pane reads: raise cfg.pane_refresh_ms (%d) or leave the pane (reads "
-                         "every %.1f s)", (double)a->d[7] / 1000.0, a->pane_cfg, (double)a->pane_every / 1000.0); break;
-        default: snprintf(out, cap, "est. cost %.1f%% of a core > tui.cost_budget_pct %d: tui.kpi=%s (%s ev/s x %u ns "
-                          "at %s)", (double)a->ppm / 10000.0, a->budget,
+        /* tenths as integers, not %.1f: a double's %f has no bound the compiler can see */
+        case 6: snprintf(out, cap, "%llu.%u ms frames: raise tui.refresh_ms (%u; over 1/%u of it)",
+                         (unsigned long long)(a->d[6] / 1000u), (unsigned)(a->d[6] / 100u % 10u),
+                         (unsigned)a->refresh, TUI_RENDER_DIV); break;
+        case 7: snprintf(out, cap, "%llu.%u ms pane reads: raise cfg.pane_refresh_ms (%d) or leave the pane (reads "
+                         "every %llu.%u s)", (unsigned long long)(a->d[7] / 1000u), (unsigned)(a->d[7] / 100u % 10u),
+                         a->pane_cfg, (unsigned long long)(a->pane_every / 1000u), (unsigned)(a->pane_every / 100u % 10u));
+                break;
+        default: snprintf(out, cap, "est. cost %llu.%u%% of a core > tui.cost_budget_pct %d: tui.kpi=%s (%s ev/s x %u ns "
+                          "at %s)", (unsigned long long)(a->ppm / 10000u), (unsigned)(a->ppm / 1000u % 10u), a->budget,
                           a->fit >= 0 ? kpi_str(TUI_LADDER[a->fit]) : "off", fmt_count(c, sizeof c, a->rate), a->unit,
                           kpi_str(TUI_LADDER[a->tier]));
                  break;
@@ -2620,7 +2633,7 @@ static void adapt_base(gptps_tui *t, uint64_t now)
 {
     t->ad_ms = now; t->ad_ev = adapt_events(t); t->ad_plost = adapt_plost(t); t->ad_alost = adapt_alost(t);
     t->ad_untr = t->h_untracked; t->ad_fold = t->h_folded; t->ad_trunc = t->h_trunc; t->ad_nomem = t->h_nomem;
-    t->ad_preads = t->h_pane_reads; t->ad_rmax_us = 0;
+    t->ad_preads = t->h_pane_reads; t->ad_rmax_us = 0; t->ad_gen++;
 }
 
 /* Evaluate the window, if one has passed (see above). `now`: TUI_NOW_MS. Never under a lock. */
@@ -2628,7 +2641,7 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
 {
     tui_adsnap a;
     unsigned step = 0;
-    uint64_t win, el, ev, pl, al, wmask = 0, why = 0;
+    uint64_t win, el, ev, pl, al, wmask = 0, why = 0, gen;
     int k, floor_warn = 0, changed = 0, eff = 0;
     char line[sizeof t->ad_line], ph[256];
     size_t lp;
@@ -2678,7 +2691,9 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
             t->ad_warn_ms[k] = now ? now : 1; wmask |= 1u << k; t->ad_warns++;
         }
     adapt_base(t, now);
+    gen = t->ad_gen;
     mu_unlock(&t->mu);
+    TUI_ADAPT_MID(t);
 
     line[0] = 0; lp = 0;                             /* the PRESSURE lines: one a condition */
     for (k = 0; k < TUI_P_N; ++k)
@@ -2693,7 +2708,10 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
             memcpy(line + lp, ph, n + 1u); lp += n;
         }
     mu_lock(&t->mu);
-    if (strcmp(t->ad_line, line) != 0) { memcpy(t->ad_line, line, sizeof line); tui_touch(t); changed = 1; }
+    /* not if, meanwhile, gptps_tui_set_adapt (OFF: it cleared the line) or a newer window ran */
+    if (t->ad_gen == gen && t->adapt != GPTPS_TUI_ADAPT_OFF && strcmp(t->ad_line, line) != 0) {
+        memcpy(t->ad_line, line, sizeof line); tui_touch(t); changed = 1;
+    }
     mu_unlock(&t->mu);
     if (changed) tui_kick(t);
     for (k = 0; k < TUI_P_N; ++k)                    /* never silent; logged with no lock held */
@@ -2709,8 +2727,9 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
         if (step) {
             shed_text(step, sn, sizeof sn);
             tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: pressure (%s) for %u windows in a row; shedding "
-                     "%s - kpi %s requested, %s runs. Sticky: nothing comes back by itself; 'u', 'm', "
-                     "gptps_tui_set_kpi or a tui.kpi / tui.adapt write restores the request", wn, TUI_SHED_AFTER, sn,
+                     "%s - kpi %s requested, %s runs. Sticky: nothing comes back by itself; 'u', "
+                     "gptps_tui_set_kpi or a tui.kpi / tui.adapt write restores the request ('m' clears it too, "
+                     "stepping up from what runs)", wn, TUI_SHED_AFTER, sn,
                      kpi_str(a.kpi_req), kpi_str(TUI_LADDER[eff]));
         } else {
             tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: pressure (%s) for %u windows in a row, but nothing "
@@ -2718,9 +2737,14 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
                      wn, TUI_SHED_AFTER, kpi_str(TUI_LADDER[a.tier]));
         }
     }
-    if (step) {                                      /* frees only; the request is kept */
+    if (step) {                                      /* the request is kept */
+        /* It frees what the step sheds; a part the tier still wants and that failed to
+         * allocate before is tried again here (tui_reconfig builds what is missing) - and
+         * may fail again, which is said, as every caller of tui_reconfig does. */
         char what[400];
         (void)tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what);
+        if (what[0]) tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: no memory for %s; the dashboard runs "
+                              "without it", what);
     }
 }
 
@@ -3074,7 +3098,7 @@ static size_t tui_frame(gptps_tui *t, tui_fbuf *f, int loop, tui_fmeta *meta)
         }
     }
     mu_unlock(&t->rmu);
-    adapt_frame_us(t, tui_now_us() - t0);
+    adapt_frame_us(t, TUI_FRAME_US(tui_now_us() - t0));
     warn_problems_lost(warn);
     return n;
 }
@@ -3092,7 +3116,7 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap)
     if (t->pane == TUI_PANE_DASH) view_frame(t, TUI_NOW_MS(), 0, &warn);
     n = tui_finish(t, buf, cap, pane_format(t, buf, cap));
     mu_unlock(&t->rmu);
-    adapt_frame_us(t, tui_now_us() - t0);
+    adapt_frame_us(t, TUI_FRAME_US(tui_now_us() - t0));
     warn_problems_lost(warn);
     return n;
 }
