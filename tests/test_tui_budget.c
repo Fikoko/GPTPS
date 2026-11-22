@@ -22,6 +22,10 @@
  *  5) The BUFFERS stop at the budget, counted, a WARN once a minute: the view (the frame
  *     says so), snapshot's first 16 KiB (no frame), a frame's growth (cut, truncated), the
  *     tasks pane's cache (it says so); never counted as an allocation failure.
+ *  5b) A pane pass counts one stop however many entries it leaves out (tasks and settings
+ *     panes), and a real allocation failure in the same pass is still counted.
+ *  5c) Settings files: at install budget_kb applies last; at a reload the file's order
+ *     decides (budget_kb first to raise both, last to lower both), as gptps_tui.h says.
  *  6) With ADAPT: REPORT shows BUDGET pressure; DEGRADE sheds for it (-activity first),
  *     a WARN each, until the buffers fit; the request is unchanged, so a budget below it is
  *     still refused and 'u' restores it; the event path allocates nothing.
@@ -41,10 +45,13 @@
 typedef union { size_t n; long double ld; void *p; uint64_t u; } tb_hdr;
 static size_t tb_live;              /* bytes the add-on holds now */
 static long   tb_calls;             /* allocations made (the event path must make none) */
+static size_t tb_fail_n;            /* !0: the next allocation of exactly this many bytes fails (once) */
 static void *tb_malloc(size_t n)
 {
-    tb_hdr *h = (tb_hdr *)malloc(sizeof *h + n);
+    tb_hdr *h;
     tb_calls++;
+    if (tb_fail_n && n == tb_fail_n) { tb_fail_n = 0; return NULL; }
+    h = (tb_hdr *)malloc(sizeof *h + n);
     if (!h) return NULL;
     h->n = n; tb_live += n;
     return h + 1;
@@ -71,6 +78,7 @@ static void *tb_realloc(void *p, size_t n)
     if (!p) return tb_malloc(n);
     h = (tb_hdr *)p - 1;
     tb_calls++;
+    if (tb_fail_n && n == tb_fail_n) { tb_fail_n = 0; return NULL; }
     nh = (tb_hdr *)realloc(h, sizeof *nh + n);
     if (!nh) return NULL;
     tb_live -= nh->n; nh->n = n; tb_live += n;
@@ -779,11 +787,13 @@ static void test_run_output_stopped(void)
     log_begin();
     if (pthread_create(&th, NULL, ob_run, NULL) == 0) {
         char b[4096];
-        for (k = 0; k < 600 && health(ob_t).frames_painted == 0; ++k) {   /* 3 s at most */
+        alarm(60);                                      /* the only bound: no wall-clock limit to miss */
+        for (k = 0; health(ob_t).frames_painted == 0; ++k) {
             struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 5000;
             select(0, NULL, NULL, NULL, &tv);
             while (read(m, b, sizeof b) > 0) { }
         }
+        alarm(0);
         h = health(ob_t);
         CHECK(h.frames_painted >= 1 && h.budget_stops >= 1 && h.budget_stops <= h.frames_painted &&   /* one a frame */
               h.alloc_failures == 0 && h.bytes_written > 0);
@@ -803,6 +813,132 @@ static void test_run_output_stopped(void)
 }
 #endif
 #endif
+
+/* 5b) A pane pass counts ONE budget stop, however many entries it leaves out (no growth is
+ * tried after it), and a real allocation failure in the same pass is still counted. */
+static void test_pane_one_stop(void)
+{
+    static char frame[300000];
+    gptps *e = open_manual();
+    gptps_tui *t;
+    gptps_tui_config c;
+    gptps_tui_health_info h;
+    uint64_t st0, nm0, b;
+    int k;
+    if (!e) return;
+    for (k = 0; k < 200; ++k) { char nm[32]; snprintf(nm, sizeof nm, "t%03d", k); deftask(e, nm); }
+    base_cfg(&c, GPTPS_TUI_KPI_MINIMAL, 0);
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (!t) { gptps_shutdown(e); return; }
+    log_begin();
+    tui_fake_ms = 1000000;
+    gptps_tui_render(t, frame, sizeof frame);           /* the view */
+    /* 200 task types, no room for even 16 cache entries: one stop, 200 not read */
+    h = health(t);
+    CHECK(gptps_tui_set_budget_kb(t, (int)((h.footprint_bytes + h.runtime_bytes + 1023) / 1024)) == GPTPS_OK);
+    st0 = h.budget_stops; nm0 = h.alloc_failures;
+    t->pane = TUI_PANE_TASKS;
+    gptps_tui_render(t, frame, sizeof frame);
+    h = health(t);
+    CHECK(h.budget_stops == st0 + 1 && h.alloc_failures == nm0 && h.pane_reads == 1 && t->pc.short_by == 200);
+    CHECK(strstr(frame, "no room in tui.budget_kb to list 200 task types") != NULL);
+    /* room for 16 entries, not 32; the first 16-entry allocation fails for real: the pane
+     * reads 15 (the next entry's try makes the 16), one budget stop, one allocation failure */
+    t->pane = TUI_PANE_DASH;
+    gptps_tui_render(t, frame, sizeof frame);           /* the cache freed */
+    h = health(t);
+    CHECK(16 * sizeof(tui_ctask) >= 1024);
+    b = (h.footprint_bytes + h.runtime_bytes + 16 * sizeof(tui_ctask) + 1023) / 1024;
+    CHECK(b * 1024 < h.footprint_bytes + h.runtime_bytes + 32 * sizeof(tui_ctask));
+    CHECK(gptps_tui_set_budget_kb(t, (int)b) == GPTPS_OK);
+    st0 = h.budget_stops; nm0 = h.alloc_failures;
+    tb_fail_n = 16 * sizeof(tui_ctask);
+    t->pane = TUI_PANE_TASKS;
+    tui_fake_ms += TUI_WARN_GAP_MS;
+    gptps_tui_render(t, frame, sizeof frame);
+    tb_fail_n = 0;
+    h = health(t);
+    CHECK(h.budget_stops == st0 + 1 && h.alloc_failures == nm0 + 1);
+    CHECK(t->pc.n == 16 && t->pc.short_by == 184 && t->pc.cap == 16);
+    CHECK(strstr(frame, "184 not read: no memory, and no room in tui.budget_kb") != NULL);
+    CHECK(log_count("the tasks pane's cache (fewer task types listed) not grown") == 2);
+    /* the settings pane: the pool's stop ends the pass's growth too - one stop */
+    t->pane = TUI_PANE_DASH;
+    gptps_tui_render(t, frame, sizeof frame);
+    h = health(t);
+    CHECK(gptps_tui_set_budget_kb(t, (int)((h.footprint_bytes + h.runtime_bytes + 1023) / 1024)) == GPTPS_OK);
+    st0 = h.budget_stops; nm0 = h.alloc_failures;
+    t->pane = TUI_PANE_SETTINGS;
+    gptps_tui_render(t, frame, sizeof frame);
+    h = health(t);
+    CHECK(h.budget_stops == st0 + 1 && h.alloc_failures == nm0 && t->pc.short_by > 16 && t->pc.n < 16);
+    CHECK(strstr(frame, "not read: no room in tui.budget_kb") != NULL);
+    t->pane = TUI_PANE_DASH;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(holds(t, health(t).footprint_bytes, health(t).runtime_bytes, __LINE__));
+    tui_fake_ms = 0;
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+}
+
+/* 5c) A settings file. At install the file's tui.budget_kb comes last (it is registered
+ * last); at a reload the FILE's order decides, as gptps_tui.h says: budget_kb first to
+ * raise both, last to lower both - and the other order refuses the first key. */
+static const char *RL_PATH = "test_tui_budget_reload.toml";
+static void rl_write(const char *text)
+{
+    FILE *f = fopen(RL_PATH, "w");
+    CHECK(f != NULL);
+    if (f) { fputs(text, f); fclose(f); }
+}
+static int rl_is(gptps *e, const char *kpi, const char *budget)
+{
+    char v[64], w[64];
+    if (gptps_settings_get(e, "tui.kpi", v, sizeof v) != GPTPS_OK) return 0;
+    if (gptps_settings_get(e, "tui.budget_kb", w, sizeof w) != GPTPS_OK) return 0;
+    return !strcmp(v, kpi) && !strcmp(w, budget);
+}
+static void test_reload(void)
+{
+    gptps_config cfg;
+    gptps *e = NULL;
+    gptps_tui *t;
+    gptps_tui_config c;
+    /* at open: the budget below FULL's footprint, kpi before it in the file - both apply */
+    rl_write("[tui]\nkpi = \"minimal\"\nbudget_kb = 16\n");
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
+    cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 1u << 20;
+    cfg.mode = GPTPS_RUN_MANUAL; cfg.config_path = RL_PATH;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    if (!e) return;
+    base_cfg(&c, GPTPS_TUI_KPI_FULL, 0);
+    log_begin();
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    if (!t) { log_end(); gptps_shutdown(e); remove(RL_PATH); return; }
+    CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 0);
+    /* a raise, budget_kb first: both */
+    rl_write("[tui]\nbudget_kb = 200\nkpi = \"full\"\n");
+    CHECK(gptps_settings_reload(e, RL_PATH) == GPTPS_OK);
+    CHECK(rl_is(e, "full", "200") && health(t).budget_refusals == 0);
+    /* a lower, budget_kb last: both */
+    rl_write("[tui]\nkpi = \"minimal\"\nbudget_kb = 16\n");
+    CHECK(gptps_settings_reload(e, RL_PATH) == GPTPS_OK);
+    CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 0);
+    /* a raise, budget_kb last: kpi refused (an ERROR names it), the budget applied */
+    loglen = 0; logbuf[0] = 0;
+    rl_write("[tui]\nkpi = \"full\"\nbudget_kb = 200\n");
+    CHECK(gptps_settings_reload(e, RL_PATH) == GPTPS_E_CONFIG);
+    CHECK(rl_is(e, "minimal", "200") && health(t).budget_refusals == 1);
+    CHECK(log_count("tui.kpi=full needs") == 1 && log_count("tui.kpi: full was refused") == 1);
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    remove(RL_PATH);
+}
 
 /* 7) */
 static void test_health_layout(void)
@@ -836,6 +972,8 @@ int main(void)
     test_install_refused();
     test_refusals();
     test_buffer_stops();
+    test_pane_one_stop();
+    test_reload();
 #if !defined(_WIN32)
     test_run_stopped();
 #  if !defined(GPTPS_TEST_HAL_SIM)

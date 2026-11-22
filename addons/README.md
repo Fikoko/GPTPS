@@ -853,6 +853,11 @@ enabled automatically). Panes/metrics:
   condition: `report` shows it, `degrade` sheds for it like *no memory* — every tier step
   lowers the footprint, making room for the buffers. A refusal never sheds, and a budget is
   checked against the request, not what a degrade left running, so `u` always fits.
+  In a settings file, `tui.budget_kb` is applied after the other `tui` keys when the
+  settings are defined (it is registered last); a `gptps_settings_reload` applies keys in
+  the file's order, so a reload that raises both the footprint and the budget lists
+  `budget_kb` first, and one that lowers both lists it last (in the other order the first
+  key is refused with an ERROR and the reload returns `GPTPS_E_CONFIG`).
 - **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
   runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
   instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back

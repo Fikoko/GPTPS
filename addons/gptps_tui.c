@@ -714,7 +714,8 @@ typedef struct {
     size_t     n, cap, pool_len, pool_cap;
     size_t     total;             /* settings: the registry's size at the pass */
     size_t     short_by;          /* entries the pass had no memory for (counted, shown) */
-    int        short_budget;      /* ... or no room for in tui.budget_kb (1.13: a budget stop) */
+    int        short_why;         /* why (1.13): PC_NOROOM - a budget stop (one a pass: no growth is
+                                   * tried after it), PC_NOMEM - an allocation failed; both may be set */
     int        kw;                /* the key column's width */
     int        stale;             /* a change made from the pane, or 'R': read at the next frame */
     uint64_t   read_ms, cost_us, every_ms;
@@ -1828,7 +1829,10 @@ static size_t pc_bytes(const tui_pcache *c)
 { return c->cap * (c->tasks ? sizeof(tui_ctask) : c->sets ? sizeof(tui_cset) : 0) + c->pool_cap; }
 
 /* what the pane says it lacked for the entries it could not read */
-#define PC_SHORT(c) ((c)->short_budget ? "no room in tui.budget_kb" : "no memory")
+#define PC_NOROOM 1
+#define PC_NOMEM  2
+#define PC_SHORT(c) ((c)->short_why == (PC_NOROOM | PC_NOMEM) ? "no memory, and no room in tui.budget_kb" \
+                     : (c)->short_why == PC_NOROOM ? "no room in tui.budget_kb" : "no memory")
 
 static void pc_free(gptps_tui *t)
 {
@@ -1841,25 +1845,27 @@ static void pc_free(gptps_tui *t)
     mu_lock(&t->mu); t->pane_bytes = 0; mu_unlock(&t->mu);
 }
 
-/* rmu held: room for `want` entries (a BUFFER: within tui.budget_kb - a stop sets short_budget) */
-static int pc_grow(gptps_tui *t, int tasks, size_t want)
+/* rmu held: room for `want` entries (a BUFFER: within tui.budget_kb). 0 when it is not made:
+ * an allocation failed (PC_NOMEM) or the budget stopped it (PC_NOROOM - after which the pass
+ * tries no more growth, so a pass counts one stop). `probe`: the pass's first try for room
+ * for every entry at once - a stop then is neither counted nor noted (the entries are then
+ * read one by one, and a stop of those is). */
+static void *rt_probe(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop);
+static int pc_grow(gptps_tui *t, int tasks, size_t want, int probe)
 {
     tui_pcache *c = &t->pc;
     size_t nc = c->cap ? c->cap : 16;
     int stop = 0;
+    void *np;
     if (want <= c->cap) return 1;
+    if (c->short_why & PC_NOROOM) return 0;
     while (nc < want) nc *= 2;
-    if (tasks) {
-        tui_ctask *n = (tui_ctask *)rt_realloc(t, c->tasks, c->cap * sizeof *n, nc * sizeof *n,
-                                               "the tasks pane's cache (fewer task types listed)", &stop);
-        if (!n) { c->short_budget |= stop; return 0; }
-        c->tasks = n;
-    } else {
-        tui_cset *n = (tui_cset *)rt_realloc(t, c->sets, c->cap * sizeof *n, nc * sizeof *n,
-                                             "the settings pane's cache (fewer settings listed)", &stop);
-        if (!n) { c->short_budget |= stop; return 0; }
-        c->sets = n;
-    }
+    if (tasks) np = (probe ? rt_probe : rt_realloc)(t, c->tasks, c->cap * sizeof(tui_ctask), nc * sizeof(tui_ctask),
+                                                    "the tasks pane's cache (fewer task types listed)", &stop);
+    else np = (probe ? rt_probe : rt_realloc)(t, c->sets, c->cap * sizeof(tui_cset), nc * sizeof(tui_cset),
+                                              "the settings pane's cache (fewer settings listed)", &stop);
+    if (!np) { if (!stop) c->short_why |= PC_NOMEM; else if (!probe) c->short_why |= PC_NOROOM; return 0; }
+    if (tasks) c->tasks = (tui_ctask *)np; else c->sets = (tui_cset *)np;
     c->cap = nc;
     return 1;
 }
@@ -1873,9 +1879,10 @@ static size_t pc_str(gptps_tui *t, const char *s)
         size_t nc = c->pool_cap ? c->pool_cap : 4096;
         char *np;
         int stop = 0;
+        if (c->short_why & PC_NOROOM) return (size_t)-1;      /* one stop a pass */
         while (nc < c->pool_len + l) nc *= 2;
         np = (char *)rt_realloc(t, c->pool, c->pool_cap, nc, "the settings pane's cache (fewer settings listed)", &stop);
-        if (np == NULL) { c->short_budget |= stop; return (size_t)-1; }
+        if (np == NULL) { c->short_why |= stop ? PC_NOROOM : PC_NOMEM; return (size_t)-1; }
         c->pool = np; c->pool_cap = nc;
     }
     off = c->pool_len;
@@ -1897,23 +1904,23 @@ static size_t detail_prefix(const char *task, char *out, size_t cap)
 static void pc_read(gptps_tui *t, uint64_t now)
 {
     tui_pcache *c = &t->pc;
-    int p = t->pane, nomem = 0, tasks = p == TUI_PANE_TASKS;
+    int p = t->pane, tasks = p == TUI_PANE_TASKS;
     size_t i, n, plen = 0;
     char prefix[160];
     uint64_t t0 = tui_now_us(), t1, every;
     if (tasks && c->sets)       { rt_free(t, c->sets, c->cap * sizeof(tui_cset));   c->sets = NULL;  c->cap = 0; }
     else if (!tasks && c->tasks) { rt_free(t, c->tasks, c->cap * sizeof(tui_ctask)); c->tasks = NULL; c->cap = 0; }
-    c->n = 0; c->pool_len = 0; c->short_by = 0; c->short_budget = 0; c->kw = p == TUI_PANE_DETAIL ? 16 : 20;
+    c->n = 0; c->pool_len = 0; c->short_by = 0; c->short_why = 0; c->kw = p == TUI_PANE_DETAIL ? 16 : 20;
     if (p == TUI_PANE_DETAIL) plen = detail_prefix(t->detail_task, prefix, sizeof prefix);
     n = tasks ? gptps_task_count(t->e) : gptps_settings_count(t->e);
     c->total = n;
-    if (p != TUI_PANE_DETAIL && n > c->cap && !pc_grow(t, tasks, n)) nomem = 1;   /* then entry by entry */
+    if (p != TUI_PANE_DETAIL && n > c->cap) (void)pc_grow(t, tasks, n, 1);   /* else entry by entry */
     for (i = 0; i < n; ++i) {
         if (tasks) {
             gptps_task_info info;
             tui_ctask *k;
             if (!tui_task_at(t->e, i, &info)) continue;          /* gone meanwhile */
-            if (c->n == c->cap && !pc_grow(t, 1, c->n + 1)) { c->short_by++; nomem = 1; continue; }
+            if (c->n == c->cap && !pc_grow(t, 1, c->n + 1, 0)) { c->short_by++; continue; }
             k = &c->tasks[c->n++];
             copy_name(k->name, sizeof k->name, info.name_copy);
             k->exec = (int)info.exec; k->pri = info.priority; k->enabled = info.enabled; k->removed = info.removed;
@@ -1925,9 +1932,9 @@ static void pc_read(gptps_tui *t, uint64_t now)
             int kc;
             if (!tui_setting_at(t->e, i, &info)) continue;
             if (plen && strncmp(info.key_copy, prefix, plen) != 0) continue;
-            if (c->n == c->cap && !pc_grow(t, 0, c->n + 1)) { c->short_by++; nomem = 1; continue; }
+            if (c->n == c->cap && !pc_grow(t, 0, c->n + 1, 0)) { c->short_by++; continue; }
             if ((ko = pc_str(t, skey(&info))) != (size_t)-1) vo = pc_str(t, info.value);
-            if (vo == (size_t)-1) { c->short_by++; nomem = 1; continue; }
+            if (vo == (size_t)-1) { c->short_by++; continue; }
             st = &c->sets[c->n++];
             st->key = ko; st->val = vo; st->idx = i; st->hot = info.hot;
             kc = u8_cols(skey(&info) + plen);
@@ -1949,8 +1956,8 @@ static void pc_read(gptps_tui *t, uint64_t now)
     c->sel_for = -1; c->have_sel = 0;
     t->h_pane_reads++; t->h_pane_us += c->cost_us; t->pane_cost_us = c->cost_us; t->pane_every_ms = every;
     t->pane_bytes = pc_bytes(c);
-    if (nomem && !c->short_budget) t->h_nomem++;              /* never silent: shown on the pane too (a
-                                                               * budget stop is counted as one: rt_realloc) */
+    if (c->short_why & PC_NOMEM) t->h_nomem++;               /* never silent: shown on the pane too (a
+                                                               * budget stop is counted apart: rt_realloc) */
     mu_unlock(&t->mu);
 }
 
@@ -4906,6 +4913,7 @@ static int budget_refuses(gptps_tui *t, int ui_cap, uint64_t ui_pl, char *why, s
  * both take the last room. */
 static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop, int how)
 {
+    int probe = how & 8;
     uint64_t fp = 0, rt = 0, bud = 0, now = TUI_NOW_MS(), n = 0;
     void *np;
     int warn = 0;
@@ -4913,7 +4921,8 @@ static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *
     mu_lock(&t->mu);
     if (nw > old && t->budget) {
         fp = foot_held(t); rt = t->rt_bytes; bud = t->budget;
-        if (fp + rt + (nw - old) > bud) {
+        if (fp + rt + (nw - old) > bud && probe) *stop = 1;    /* not counted: the caller tries less */
+        else if (fp + rt + (nw - old) > bud) {
             *stop = 1; t->h_bstop++; n = t->h_bstop;
             if (!t->b_warn_ms || now - t->b_warn_ms >= TUI_WARN_GAP_MS) { t->b_warn_ms = now ? now : 1; warn = 1; }
         }
@@ -4929,6 +4938,7 @@ static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *
                      (unsigned long long)rt, (unsigned long long)kib_up(fp + rt + (nw - old)), (unsigned long long)n);
         return NULL;
     }
+    how &= 7;
     np = how == 1 ? malloc(nw) : how == 2 ? calloc(1, nw) : realloc(p, nw);   /* each as before 1.13 */
     if (!np) {
         if (nw > old) { mu_lock(&t->mu); t->rt_bytes -= nw - old; mu_unlock(&t->mu); }
@@ -4939,6 +4949,10 @@ static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *
 }
 static void *rt_realloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop)
 { return rt_alloc(t, p, old, nw, what, stop, 0); }
+/* rt_realloc for a try the caller falls back from (a pane's room for every entry at once): a
+ * stop is not counted or WARNed - the fallback's is */
+static void *rt_probe(gptps_tui *t, void *p, size_t old, size_t nw, const char *what, int *stop)
+{ return rt_alloc(t, p, old, nw, what, stop, 8); }
 /* a new BUFFER, by malloc (1) or zeroed by calloc (2) */
 static void *rt_new(gptps_tui *t, size_t n, int zero, const char *what, int *stop)
 { return rt_alloc(t, NULL, 0, n, what, stop, zero ? 2 : 1); }

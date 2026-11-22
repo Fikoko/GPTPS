@@ -320,8 +320,9 @@ typedef struct {
  * always attempted - but they grow only while footprint + buffers stays within the budget:
  * past it a growth STOPS (health.budget_stops; a WARN once a minute naming the budget that
  * would fit): the frame is cut where its buffer ends ("[frame truncated]"), a pane's cache
- * reads fewer entries (it says so), a dashboard frame with no room for its view says so,
- * and gptps_tui_run / gptps_tui_snapshot without room for their first 16 KiB make no frame
+ * reads fewer entries (it says so; one stop a pass - no growth is tried after it - and an
+ * allocation that fails in the same pass is counted in alloc_failures too), a dashboard
+ * frame with no room for its view says so, and gptps_tui_run / gptps_tui_snapshot without room for their first 16 KiB make no frame
  * (gptps_tui_run's output buffer, when it has no room, writes the frame whole, in pieces).
  * So leave room for them over the footprint: about 27 KiB for gptps_tui_render at 24 rows
  * (the view), 16 KiB more for gptps_tui_snapshot, 32 KiB more for gptps_tui_run (and its
@@ -330,8 +331,14 @@ typedef struct {
  * REPORT shows it and WARNs; DEGRADE sheds for it like NOMEM, as every tier step lowers the
  * footprint and so makes room for the buffers. A REFUSAL never sheds (it changed nothing),
  * and a shed never lowers the request, so a budget set under DEGRADE is checked against
- * the request ('u' must fit). Settings files: tui.budget_kb is the last tui key, so a file
- * is applied with the footprint it sets and then its budget. */
+ * the request ('u' must fit). Settings files: when the tui.* settings are DEFINED (at
+ * install), a file's tui.budget_kb is applied last - it is the last tui key registered - so
+ * the footprint the file sets is in place before its budget is checked against it. A
+ * gptps_settings_reload applies the file's keys in the order the FILE lists them: a reload
+ * that RAISES the footprint and the budget must list tui.budget_kb before the tui keys that
+ * raise it, and one that LOWERS both must list it after them. In the other order the first
+ * key is refused (an ERROR naming it, the reload returns GPTPS_E_CONFIG) and the rest are
+ * applied - the old tier with the new budget, say; reload again, or set them in that order. */
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 
 /* LOCAL per-task settings. `label` (NULL => task name) is shown in the table;
