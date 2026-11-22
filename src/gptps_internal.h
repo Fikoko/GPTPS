@@ -244,6 +244,11 @@ void        gptps_toml_claim_at(gptps_toml *t, size_t i);
  * engine's own value there instead (gptps_settings_save_to). */
 int         gptps_toml_refused_at(const gptps_toml *t, size_t i);
 void        gptps_toml_refuse_at(gptps_toml *t, size_t i);
+/* An entry put off by the apply `by` (a mark unique while that apply runs, never 0): a
+ * value refused by its write accessor, retried once other keys of the file are applied
+ * (engine.c, cfg_apply). 0 = not deferred. */
+uint64_t    gptps_toml_deferred_at(const gptps_toml *t, size_t i);
+void        gptps_toml_defer_at(gptps_toml *t, size_t i, uint64_t by);
 void        gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap);
 /* section + "." + key (just key when section is ""), for a message: whole if it fits
  * `cap`, else its start and its end with "..." between, so what follows the key in
@@ -301,6 +306,14 @@ gptps_status    gptps_settings_set_live(gptps_settings *r, const char *key, cons
                                         char *why, size_t whylen);
 gptps_status    gptps_settings_set_text(gptps_settings *r, const char *key, const char *value,
                                         char *why, size_t whylen);
+/* As set_text, and *by_write says whether the setting's write accessor answered: a
+ * value the registry's own checks (type, range, choices) let through. 0 when they
+ * refused it, or no setting has the key. *writing (may be NULL) is 1 exactly while
+ * the write accessor runs, 0 before and after it (while watchers run): what
+ * gptps_settings_provisional answers from, so a live set a watcher makes meanwhile
+ * is never taken for the file's provisional try. */
+gptps_status    gptps_settings_set_file(gptps_settings *r, const char *key, const char *value,
+                                        char *why, size_t whylen, int *by_write, int *writing);
 void            gptps_settings_nosave(gptps_settings *r, const char *key);  /* a statistic: never saved */
 int             gptps_settings_has(gptps_settings *r, const char *key);
 int             gptps_settings_type_of(gptps_settings *r, const char *key, gptps_setting_type *out);

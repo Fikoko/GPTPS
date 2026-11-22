@@ -312,6 +312,10 @@ static void generate(out_t *o)
     put(o, "- **Applies** says when a change takes effect while the engine runs - through\n"
            "  `gptps_settings_set`, the dashboard, or `gptps_settings_reload`: at once, or at the\n"
            "  next start.\n");
+    put(o, "- **Order** does not matter within a file: a key whose check reads another setting\n"
+           "  (`tui.kpi` against `tui.budget_kb`, say) is tried again after the file's other keys,\n"
+           "  at open and at a reload, so a file that raises or lowers both applies whole in either\n"
+           "  order, and a value still refused is refused once (`gptps.h`, THE FILE'S ORDER).\n");
     put(o, "- Units are in the names: `_bytes`, `_ms`, `_seconds`.\n");
     put(o, "- `<task>` stands for a task's name and `<name>` for a resource's. A part of a\n"
            "  name that holds anything but letters, digits, `_` and `-` goes in quotes, as\n"

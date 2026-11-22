@@ -956,6 +956,10 @@ static void *rt_new(gptps_tui *t, size_t n, int zero, const char *what, int *sto
 static void rt_free(gptps_tui *t, void *p, size_t n);
 static void tui_logf(gptps_log_level lvl, const char *fmt, ...);
 static gptps_status reconf_said(const char *who, const char *setting, gptps_status st, const char *what);
+static gptps_status tui_set_kpi_q(gptps_tui *t, gptps_tui_kpi level, int quiet);
+static gptps_status tui_set_recent_q(gptps_tui *t, int problems, int activity, int quiet);
+static gptps_status tui_set_latency_window_q(gptps_tui *t, int handles, int quiet);
+static gptps_status tui_set_budget_kb_q(gptps_tui *t, int kb, int quiet);
 
 /* ---- state (under mu) ---- */
 
@@ -2749,6 +2753,11 @@ static void tui_logf(gptps_log_level lvl, const char *fmt, ...);
  * (tui_reconfig's `unshed`). */
 static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int alines, int unshed,
                                  char *what, size_t cap);
+/* tui_reconfig's `unshed`, as bits: the operator's word (clear what DEGRADE shed), and a
+ * settings file's value tried provisionally (a budget refusal is neither counted nor logged:
+ * the engine tries it again after the file's other keys, and that try reports it) */
+#define TUI_RC_UNSHED 1
+#define TUI_RC_QUIET  2
 
 /* The DEGRADE steps in shedding order (gptps_tui.h, ADAPT): each one's bit, its name as the
  * DEGRADED line shows it, and the conditions it relieves - from what each step takes out:
@@ -4749,6 +4758,10 @@ static const char *const TUI_CLOCK_CHOICES[] = { "off", "minutes", "seconds", 0 
 static const char *const TUI_ADAPT_CHOICES[] = { "off", "report", "degrade", 0 };     /* GPTPS_TUI_ADAPT_* - 1 */
 static const char *const TUI_ARM_CHOICES[] = { "always", "on_view", 0 };              /* GPTPS_TUI_ARM_* - 1 */
 
+/* A settings file's value tried provisionally (the engine tries a refused one again after the
+ * file's other keys, gptps.h THE FILE'S ORDER): the budget's setters then refuse without
+ * counting or logging it - the last try does. */
+static int ts_provisional(void *p, const char *key) { return gptps_settings_provisional(((gptps_tui *)p)->e, key); }
 static size_t ts_rd_refresh(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; unsigned ms; mu_lock(&t->mu); ms = t->cfg.refresh_ms; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%u", ms); }
 static gptps_status ts_wr_refresh(void *p, const char *v) { return gptps_tui_set_refresh((gptps_tui *)p, (uint32_t)strtoul(v, NULL, 10)); }
 /* tui.kpi reads back what was REQUESTED (ADAPT: a degrade is not saved by 'w') */
@@ -4757,15 +4770,16 @@ static gptps_status ts_wr_kpi(void *p, const char *v)
 {
     size_t i;
     for (i = 0; TUI_KPI_CHOICES[i]; ++i)
-        if (strcmp(v, TUI_KPI_CHOICES[i]) == 0) return gptps_tui_set_kpi((gptps_tui *)p, (gptps_tui_kpi)TUI_KPI_CHOICE_VAL[i]);
+        if (strcmp(v, TUI_KPI_CHOICES[i]) == 0)
+            return tui_set_kpi_q((gptps_tui *)p, (gptps_tui_kpi)TUI_KPI_CHOICE_VAL[i], ts_provisional(p, "tui.kpi"));
     return GPTPS_E_INVAL;              /* the registry checks the choices first: not reached */
 }
 static size_t ts_rd_recent(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->prob_want; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
-static gptps_status ts_wr_recent(void *p, const char *v) { return gptps_tui_set_recent((gptps_tui *)p, (int)strtol(v, NULL, 10), -1); }
+static gptps_status ts_wr_recent(void *p, const char *v) { return tui_set_recent_q((gptps_tui *)p, (int)strtol(v, NULL, 10), -1, ts_provisional(p, "tui.recent")); }
 static size_t ts_rd_activity(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->act_want; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
-static gptps_status ts_wr_activity(void *p, const char *v) { return gptps_tui_set_recent((gptps_tui *)p, -1, (int)strtol(v, NULL, 10)); }
+static gptps_status ts_wr_activity(void *p, const char *v) { return tui_set_recent_q((gptps_tui *)p, -1, (int)strtol(v, NULL, 10), ts_provisional(p, "tui.activity")); }
 static size_t ts_rd_latwin(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->lat_cap; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
-static gptps_status ts_wr_latwin(void *p, const char *v) { return gptps_tui_set_latency_window((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
+static gptps_status ts_wr_latwin(void *p, const char *v) { return tui_set_latency_window_q((gptps_tui *)p, (int)strtol(v, NULL, 10), ts_provisional(p, "tui.latency_window")); }
 static size_t ts_rd_clock(void *p, char *b, size_t c)
 {
     gptps_tui *t = (gptps_tui *)p; int k;
@@ -4795,7 +4809,7 @@ static gptps_status ts_wr_adapt(void *p, const char *v)
 static size_t ts_rd_budget(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->cost_pct; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
 static gptps_status ts_wr_budget(void *p, const char *v) { return gptps_tui_set_cost_budget((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
 static size_t ts_rd_budget_kb(void *p, char *b, size_t c) { gptps_tui *t = (gptps_tui *)p; int n; mu_lock(&t->mu); n = t->cfg.budget_kb; mu_unlock(&t->mu); return (size_t)snprintf(b, c, "%d", n); }
-static gptps_status ts_wr_budget_kb(void *p, const char *v) { return gptps_tui_set_budget_kb((gptps_tui *)p, (int)strtol(v, NULL, 10)); }
+static gptps_status ts_wr_budget_kb(void *p, const char *v) { return tui_set_budget_kb_q((gptps_tui *)p, (int)strtol(v, NULL, 10), ts_provisional(p, "tui.budget_kb")); }
 static size_t ts_rd_arm(void *p, char *b, size_t c)
 {
     gptps_tui *t = (gptps_tui *)p; int k;
@@ -4870,7 +4884,8 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
         { "tui.disarm_ms",      GPTPS_SETTING_UINT, "with tui.arm=on_view: ms after the last view at which a "
                                                     "health call stops the layers above gauge",
                                                     NULL, ts_rd_disarm, ts_wr_disarm, 1, TUI_DISARM_MIN, TUI_DISARM_MAX },
-        /* 1.13 - LAST, so a settings file is applied with the footprint it sets, then its budget */
+        /* 1.13. Defined under gptps_settings_hold (below), so a settings file's tui keys are
+         * applied together, in any order: a footprint checked against the file's budget */
         { "tui.budget_kb",      GPTPS_SETTING_UINT, "a memory budget for the dashboard, in KiB: a change whose "
                                                     "footprint (gptps_tui.h, MEMORY) would exceed it is refused "
                                                     "with a WARN naming what it needs, and frame buffers stop "
@@ -4879,7 +4894,12 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
     };
     size_t i;
     gptps_setting_def d;
+    gptps_status hs;
     memset(&d, 0, sizeof d); d.struct_size = sizeof d; d.target = t; d.hot = 1;
+    /* The file's values for these wait until all are defined, then apply together: tui.kpi
+     * against the file's tui.budget_kb, not the budget the install had. BUSY (another thread
+     * holds): one at a time, as before 1.13 - budget_kb is still defined last. */
+    hs = gptps_settings_hold(e, 1);
     for (i = 0; i < sizeof S / sizeof S[0]; ++i) {
         gptps_status st;
         d.key = S[i].key; d.type = S[i].type; d.desc = S[i].desc; d.choices = S[i].choices;
@@ -4891,6 +4911,7 @@ static void tui_register_settings(gptps *e, gptps_tui *t)
                      "but this knob cannot be read or changed through the settings registry", S[i].key,
                      gptps_strerror(st));
     }
+    if (hs == GPTPS_OK) (void)gptps_settings_hold(e, 0);   /* applies the file's tui values */
 }
 
 /* The oldest gptps_tui_config a caller can have: everything through `title`. */
@@ -5053,10 +5074,12 @@ static void foot_text(const tui_foot *f, uint64_t budget, char *out, size_t cap)
 /* mu held: whether a change to the request - the formula `nw` - is over the budget; if so it
  * is counted and *why says what it needs. The request's footprint is never over the budget
  * (install, set_budget_kb and every change are checked), so a change that does not grow it
- * is never refused. */
-static int foot_refuses(gptps_tui *t, const tui_foot *nw, char *why, size_t cap)
+ * is never refused. `quiet`: a settings file's value tried provisionally (the engine tries
+ * it again after the file's other keys - gptps_settings_provisional): refused, not counted. */
+static int foot_refuses(gptps_tui *t, const tui_foot *nw, char *why, size_t cap, int quiet)
 {
     if (!t->budget || nw->total <= t->budget) return 0;
+    if (quiet) { if (cap) why[0] = 0; return 1; }
     t->h_bref++; t->b_need = nw->total;
     foot_text(nw, t->budget, why, cap);
     return 1;
@@ -5066,7 +5089,7 @@ static int budget_refuses(gptps_tui *t, int ui_cap, uint64_t ui_pl, char *why, s
 {
     tui_foot f;
     foot_calc(&f, t, kpi_tier(t->kpi_req), t->prob_want, t->act_want, 0, t->lat_cap, ui_cap, ui_pl);
-    return foot_refuses(t, &f, why, cap);
+    return foot_refuses(t, &f, why, cap, 0);
 }
 
 /* mu NOT held: grow a BUFFER from `old` to `nw` bytes (make one: p NULL, old 0; shrink it: nw <
@@ -5169,6 +5192,7 @@ static void act_out(gptps_tui *t, tui_parts *old)
 static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int alines, int unshed,
                                  char *what, size_t cap)
 {
+    int quiet = unshed & TUI_RC_QUIET;   /* a provisional try: a budget refusal is not counted */
     tui_foot fn;
     tui_parts nw, old;
     tui_plan w;
@@ -5184,7 +5208,8 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
      * (GPTPS_E_INVAL; `what` says what it needs) */
     foot_calc(&fn, t, kpi_tier(lvl < 0 ? t->kpi_req : lvl), plines >= 0 ? plines : t->prob_want,
               alines >= 0 ? alines : t->act_want, 0, win <= 0 ? t->lat_cap : win, t->ui_cap, t->ui_pl);
-    if (foot_refuses(t, &fn, what, cap)) { mu_unlock(&t->mu); mu_unlock(&t->smu); return GPTPS_E_INVAL; }
+    if (foot_refuses(t, &fn, what, cap, quiet)) { mu_unlock(&t->mu); mu_unlock(&t->smu); return GPTPS_E_INVAL; }
+    unshed &= TUI_RC_UNSHED;
     if (unshed) { t->shed = 0; t->shed_why = 0; t->shed_whys = 0; t->pane_shed_ms = 0; t->p_row = 0; }
     if (lvl < 0) lvl = t->kpi_req;
     t->kpi_req = lvl;
@@ -5525,7 +5550,7 @@ void gptps_tui_close(gptps_tui *t)
  * refusal (GPTPS_E_INVAL, nothing changed) or the parts it had no memory for. */
 static gptps_status reconf_said(const char *who, const char *setting, gptps_status st, const char *what)
 {
-    if (!what[0]) return st;
+    if (!what[0]) return st;             /* a quiet refusal says nothing (foot_refuses) */
     if (st == GPTPS_E_INVAL)
         tui_logf(GPTPS_LOG_WARN, "%s: %s %s (gptps_tui_health.budget_refusals)", who, setting, what);
     else
@@ -5537,37 +5562,51 @@ static gptps_status reconf_said(const char *who, const char *setting, gptps_stat
  * copied: every entry is an in-flight handle awaiting its terminal event, and a resize is
  * an admission that the window was wrong. The gauges are a lower bound ('>=') until the
  * work in flight at the resize has ended; samples resume with the next QUEUED. */
-gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
+/* The setters below, with `quiet`: a settings file's value tried provisionally (the write
+ * accessors ask gptps_settings_provisional) - a budget refusal changes nothing, as ever, and
+ * is neither counted nor logged; the engine's last try of it is not quiet. */
+static gptps_status tui_set_latency_window_q(gptps_tui *t, int handles, int quiet)
 {
     gptps_status st;
     char what[400], set[48];
-    int changed;
+    int changed, capped = 0;
     if (!t || handles < 0) return GPTPS_E_INVAL;
     if (handles == 0) handles = 1024;
     if (handles > TUI_LAT_CAP) {
-        tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_latency_window: %d is above the cap of %d handles; tracking %d",
-                 handles, TUI_LAT_CAP, TUI_LAT_CAP);
+        capped = handles;
         handles = TUI_LAT_CAP;
+        if (!quiet)
+            tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_latency_window: %d is above the cap of %d handles; tracking %d",
+                     capped, TUI_LAT_CAP, TUI_LAT_CAP);
     }
     mu_lock(&t->mu);
     /* also when LATENCY or FULL is running without its table (an earlier allocation failed): retry */
     changed = handles != t->lat_cap || (t->tier >= TUI_T_LATENCY && !t->tab);
     mu_unlock(&t->mu);
+    st = changed ? tui_reconfig(t, -1, handles, -1, -1, quiet ? TUI_RC_QUIET : 0, what, sizeof what) : GPTPS_OK;
+    if (quiet && capped && st != GPTPS_E_INVAL)   /* taken: the cap is news; refused, the last try says it */
+        tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_latency_window: %d is above the cap of %d handles; tracking %d",
+                 capped, TUI_LAT_CAP, TUI_LAT_CAP);
     if (!changed) return GPTPS_OK;
-    st = tui_reconfig(t, -1, handles, -1, -1, 0, what, sizeof what);
     snprintf(set, sizeof set, "tui.latency_window=%d", handles);
     return reconf_said("gptps_tui_set_latency_window", set, st, what);
 }
 
-gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
+gptps_status gptps_tui_set_latency_window(gptps_tui *t, int handles)
+{
+    return tui_set_latency_window_q(t, handles, 0);
+}
+
+static gptps_status tui_set_kpi_q(gptps_tui *t, gptps_tui_kpi level, int quiet)
 {
     gptps_status st;
     char what[400];
     if (!t) return GPTPS_E_INVAL;
     if (kpi_tier((int)level) < 0) return GPTPS_E_INVAL;
     level = (gptps_tui_kpi)TUI_LADDER[kpi_tier((int)level)];   /* DEFAULT is FULL, ACTIVITY is NORMAL */
-    st = tui_reconfig(t, (int)level, 0, -1, -1, 1, what, sizeof what);   /* build what the tier needs, free the rest;
-                                                                          * the operator's word: nothing shed */
+    st = tui_reconfig(t, (int)level, 0, -1, -1, TUI_RC_UNSHED | (quiet ? TUI_RC_QUIET : 0), what, sizeof what);
+                                         /* build what the tier needs, free the rest;
+                                          * the operator's word: nothing shed */
     {
         char who[48], set[48];
         snprintf(who, sizeof who, "gptps_tui_set_kpi(%s)", kpi_str(level));
@@ -5576,13 +5615,18 @@ gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
     }
 }
 
-gptps_status gptps_tui_set_recent(gptps_tui *t, int problems, int activity)
+gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level)
+{
+    return tui_set_kpi_q(t, level, 0);
+}
+
+static gptps_status tui_set_recent_q(gptps_tui *t, int problems, int activity, int quiet)
 {
     gptps_status st;
     char what[400];
     if (!t || problems < -1 || problems > TUI_JOURNAL_CAP || activity < -1 || activity > TUI_JOURNAL_CAP)
         return GPTPS_E_INVAL;
-    st = tui_reconfig(t, -1, 0, problems, activity, 0, what, sizeof what);
+    st = tui_reconfig(t, -1, 0, problems, activity, quiet ? TUI_RC_QUIET : 0, what, sizeof what);
     {
         char set[64];
         if (problems >= 0 && activity >= 0) snprintf(set, sizeof set, "tui.recent=%d, tui.activity=%d", problems, activity);
@@ -5590,6 +5634,11 @@ gptps_status gptps_tui_set_recent(gptps_tui *t, int problems, int activity)
         else snprintf(set, sizeof set, "tui.activity=%d", activity);
         return reconf_said("gptps_tui_set_recent", set, st, what);
     }
+}
+
+gptps_status gptps_tui_set_recent(gptps_tui *t, int problems, int activity)
+{
+    return tui_set_recent_q(t, problems, activity, 0);
 }
 
 gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out)
@@ -5741,7 +5790,7 @@ gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct)
     return GPTPS_OK;
 }
 
-gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb)
+static gptps_status tui_set_budget_kb_q(gptps_tui *t, int kb, int quiet)
 {
     tui_foot f;
     char why[400];
@@ -5751,14 +5800,18 @@ gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb)
     mu_lock(&t->mu);
     foot_calc(&f, t, kpi_tier(t->kpi_req), t->prob_want, t->act_want, 0, t->lat_cap, t->ui_cap, t->ui_pl);
     if (kb && f.total > (uint64_t)kb * 1024u) {
-        refused = 1; t->h_bref++; t->b_need = f.total;
-        foot_text(&f, (uint64_t)kb * 1024u, why, sizeof why);
+        refused = 1;
+        if (!quiet) {                    /* quiet: the engine tries it again (gptps_settings_provisional) */
+            t->h_bref++; t->b_need = f.total;
+            foot_text(&f, (uint64_t)kb * 1024u, why, sizeof why);
+        }
     } else {
         t->budget = (uint64_t)kb * 1024u; t->cfg.budget_kb = kb;
     }
     mu_unlock(&t->mu);
     mu_unlock(&t->smu);
     if (!refused) return GPTPS_OK;
+    if (quiet) return GPTPS_E_INVAL;
     tui_logf(GPTPS_LOG_WARN, "gptps_tui_set_budget_kb: tui.budget_kb=%d is below the footprint the configuration "
              "holds - it %s (gptps_tui_health.budget_refusals)", kb, why);
     return GPTPS_E_INVAL;
@@ -5797,6 +5850,11 @@ gptps_status gptps_tui_set_disarm_ms(gptps_tui *t, uint32_t ms)
     mu_lock(&t->mu); t->disarm_ms = ms; t->cfg.disarm_ms = (int)ms; tui_touch(t); mu_unlock(&t->mu);
     tui_kick(t);
     return GPTPS_OK;
+}
+
+gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb)
+{
+    return tui_set_budget_kb_q(t, kb, 0);
 }
 
 gptps_status gptps_tui_set_mode(gptps_tui *t, gptps_tui_mode mode)

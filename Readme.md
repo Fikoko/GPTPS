@@ -382,7 +382,12 @@ observer for it.
 checks. A file that does not parse changes nothing; otherwise every valid value is
 applied, each problem is logged, and the result is `GPTPS_E_CONFIG` if there was one. The
 keys that size the engine (`max_concurrent_tasks`, `[bounded]`, `addons`) take effect at
-the next start. `gptps_settings_save(e, NULL)` writes the values changed live back into
+the next start. The order of the file's keys does not matter: a setting whose check
+reads another one (a size against a budget, a low mark against a high one) is tried again
+after the file's other keys, so a file that raises both, either listed first, applies
+whole, and a value still refused at the end is refused once (ABI 2.10; `gptps.h`,
+*THE FILE'S ORDER*, also for settings defined together with `gptps_settings_hold`).
+`gptps_settings_save(e, NULL)` writes the values changed live back into
 the file, **in place**: each on its own line, keeping that line's comment; a changed
 setting the file lacks goes next to its siblings; every other line stays exactly as
 written, so a `0 = auto` stays auto. A file with an error in it is not overwritten: save
@@ -996,9 +1001,9 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **60** public functions · **ABI 2.9** (append-only; 2.0 was the first
+At a glance: **62** public functions · **ABI 2.10** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **117** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **120** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass - and a release tag publishes nothing until all of
 them have passed at that tag (`release.yml` runs `ci.yml` as its gate).
 

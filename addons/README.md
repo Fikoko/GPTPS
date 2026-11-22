@@ -873,11 +873,14 @@ enabled automatically). Panes/metrics:
   condition: `report` shows it, `degrade` sheds for it like *no memory* — every tier step
   lowers the footprint, making room for the buffers. A refusal never sheds, and a budget is
   checked against the request, not what a degrade left running, so `u` always fits.
-  In a settings file, `tui.budget_kb` is applied after the other `tui` keys when the
-  settings are defined (it is registered last); a `gptps_settings_reload` applies keys in
-  the file's order, so a reload that raises both the footprint and the budget lists
-  `budget_kb` first, and one that lowers both lists it last (in the other order the first
-  key is refused with an ERROR and the reload returns `GPTPS_E_CONFIG`).
+  In a settings file the order of the keys does not matter (core ABI 2.10, `gptps.h`
+  *THE FILE'S ORDER*): at install the `tui` settings are defined together
+  (`gptps_settings_hold`), so `tui.kpi` is checked against the file's `tui.budget_kb`,
+  and at a reload a key the budget refuses is tried again after the file's other keys —
+  provisionally, so that try counts no refusal and logs no WARN. A file that raises or
+  lowers both the footprint and the budget applies whole in either order; one whose
+  footprint cannot fit its own budget is refused once (one WARN, one count, one ERROR,
+  `GPTPS_E_CONFIG`) and the rest of it applies.
 - **Collect only while someone looks: `tui.arm = on_view`** (1.13; `cfg.arm`,
   `gptps_tui_set_arm`; `always`, the default, is 1.12's behaviour). For a headless host
   that rarely looks: the totals and the gauges always run, and the layers above `gauge` —

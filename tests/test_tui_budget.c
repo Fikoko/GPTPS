@@ -24,8 +24,11 @@
  *     tasks pane's cache (it says so); never counted as an allocation failure.
  *  5b) A pane pass counts one stop however many entries it leaves out (tasks and settings
  *     panes), and a real allocation failure in the same pass is still counted.
- *  5c) Settings files: at install budget_kb applies last; at a reload the file's order
- *     decides (budget_kb first to raise both, last to lower both), as gptps_tui.h says.
+ *  5c) Settings files (gptps.h, THE FILE'S ORDER): the file's order does not matter. At
+ *     install (the tui keys defined under gptps_settings_hold) and at a reload, a file that
+ *     raises or lowers both the footprint and tui.budget_kb applies whole in either order -
+ *     no refusal counted, no budget WARN, no ERROR; a file that cannot fit is refused once:
+ *     one WARN, one count, one ERROR, GPTPS_E_CONFIG, the same state in either order.
  *  6) With ADAPT: REPORT shows BUDGET pressure; DEGRADE sheds for it (-activity first),
  *     a WARN each, until the buffers fit; the request is unchanged, so a budget below it is
  *     still refused and 'u' restores it; the event path allocates nothing.
@@ -883,9 +886,13 @@ static void test_pane_one_stop(void)
     gptps_tui_close(t);
 }
 
-/* 5c) A settings file. At install the file's tui.budget_kb comes last (it is registered
- * last); at a reload the FILE's order decides, as gptps_tui.h says: budget_kb first to
- * raise both, last to lower both - and the other order refuses the first key. */
+/* 5c) A settings file, in either order (gptps.h, THE FILE'S ORDER). Before 1.13 the keys
+ * applied in the file's order: a reload raising tui.kpi and tui.budget_kb, kpi listed first,
+ * had kpi refused (counted, a WARN and an ERROR, GPTPS_E_CONFIG, the old tier with the new
+ * budget); one lowering both failed in the other order; at install, a file's kpi was checked
+ * against the budget the install had, not the file's. Now each key the budget refuses is
+ * tried again after the others, provisionally - not counted, not logged - and only what is
+ * still refused at the end is reported, once. */
 static const char *RL_PATH = "test_tui_budget_reload.toml";
 static void rl_write(const char *text)
 {
@@ -900,40 +907,199 @@ static int rl_is(gptps *e, const char *kpi, const char *budget)
     if (gptps_settings_get(e, "tui.budget_kb", w, sizeof w) != GPTPS_OK) return 0;
     return !strcmp(v, kpi) && !strcmp(w, budget);
 }
-static void test_reload(void)
+/* nothing about the budget in the log: no refusal WARN, no ERROR */
+static int rl_quiet(void)
+{
+    return log_count("needs") == 0 && log_count("refused") == 0 && log_count("is below the footprint") == 0;
+}
+/* A reload of `text`: the result, and the log it made from here */
+static gptps_status rl_reload(gptps *e, const char *text)
+{
+    loglen = 0; logbuf[0] = 0;
+    rl_write(text);
+    return gptps_settings_reload(e, RL_PATH);
+}
+static gptps *rl_open(const char *text)
 {
     gptps_config cfg;
     gptps *e = NULL;
-    gptps_tui *t;
-    gptps_tui_config c;
-    /* at open: the budget below FULL's footprint, kpi before it in the file - both apply */
-    rl_write("[tui]\nkpi = \"minimal\"\nbudget_kb = 16\n");
+    rl_write(text);
     memset(&cfg, 0, sizeof cfg);
     cfg.struct_size = sizeof cfg; cfg.limits.struct_size = sizeof cfg.limits;
     cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 1u << 20;
     cfg.mode = GPTPS_RUN_MANUAL; cfg.config_path = RL_PATH;
     CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK);
+    return e;
+}
+static void test_reload(void)
+{
+    static const char *const RAISE[2]  = { "[tui]\nbudget_kb = 200\nkpi = \"full\"\n",
+                                           "[tui]\nkpi = \"full\"\nbudget_kb = 200\n" };
+    static const char *const LOWER[2]  = { "[tui]\nkpi = \"minimal\"\nbudget_kb = 16\n",
+                                           "[tui]\nbudget_kb = 16\nkpi = \"minimal\"\n" };
+    /* full cannot fit 16 KiB: the one that comes second is refused, whichever it is */
+    static const char *const NOFIT[2]  = { "[tui]\nkpi = \"full\"\nbudget_kb = 16\n",
+                                           "[tui]\nbudget_kb = 16\nkpi = \"full\"\n" };
+    gptps *e;
+    gptps_tui *t;
+    gptps_tui_config c;
+    int o;
+    for (o = 0; o < 2; ++o) {
+        /* at install: the install's budget (16 KiB) is below FULL, the file's (200) is not -
+         * kpi is checked against the file's budget, in either order */
+        e = rl_open(RAISE[o]);
+        if (!e) return;
+        base_cfg(&c, GPTPS_TUI_KPI_MINIMAL, 16);
+        log_begin();
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        if (!t) { log_end(); gptps_shutdown(e); remove(RL_PATH); return; }
+        CHECK(rl_is(e, "full", "200") && health(t).budget_refusals == 0 && rl_quiet());
+        CHECK(gptps_config_check(e) == GPTPS_OK);
+        /* lower both, either order */
+        CHECK(rl_reload(e, LOWER[o]) == GPTPS_OK);
+        CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 0 && rl_quiet());
+        CHECK(rl_reload(e, LOWER[1 - o]) == GPTPS_OK);
+        CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 0 && rl_quiet());
+        /* raise both, either order */
+        CHECK(rl_reload(e, RAISE[o]) == GPTPS_OK);
+        CHECK(rl_is(e, "full", "200") && health(t).budget_refusals == 0 && rl_quiet());
+        CHECK(rl_reload(e, LOWER[o]) == GPTPS_OK);
+        CHECK(rl_reload(e, RAISE[1 - o]) == GPTPS_OK);
+        CHECK(rl_is(e, "full", "200") && health(t).budget_refusals == 0 && rl_quiet());
+        CHECK(gptps_config_check(e) == GPTPS_OK);
+        /* a file that cannot fit: from full/200, budget_kb = 16 is refused (full holds more) -
+         * once: one WARN, one count, one ERROR, GPTPS_E_CONFIG; kpi = full is applied (no
+         * change) in either order */
+        CHECK(rl_reload(e, NOFIT[o]) == GPTPS_E_CONFIG);
+        CHECK(rl_is(e, "full", "200") && health(t).budget_refusals == 1);
+        CHECK(log_count("tui.budget_kb=16 is below the footprint") == 1 &&
+              log_count("tui.budget_kb: 16 was refused") == 1 && log_count("needs") == 1);
+        CHECK(gptps_config_check(e) == GPTPS_E_CONFIG);
+        /* from minimal/16, the same file: kpi = full is refused once, the budget stays 16 */
+        CHECK(rl_reload(e, LOWER[o]) == GPTPS_OK && rl_is(e, "minimal", "16"));
+        CHECK(rl_reload(e, NOFIT[1 - o]) == GPTPS_E_CONFIG);
+        CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 2);
+        CHECK(log_count("tui.kpi=full needs") == 1 && log_count("tui.kpi: full was refused") == 1 &&
+              log_count("needs") == 1 && log_count("refused (") == 1);
+        log_end();
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+
+        /* at install, a file that cannot fit: kpi = full against 16 KiB - refused once, in
+         * either order. (From an install budget the file lowers, which key the file loses
+         * would depend on the order: either can be applied, not both - gptps.h.) */
+        e = rl_open(NOFIT[o]);
+        if (!e) { remove(RL_PATH); return; }
+        base_cfg(&c, GPTPS_TUI_KPI_MINIMAL, 16);
+        log_begin();
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        if (!t) { log_end(); gptps_shutdown(e); remove(RL_PATH); return; }
+        CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 1);
+        CHECK(log_count("tui.kpi=full needs") == 1 && log_count("tui.kpi: full was refused") == 1 &&
+              log_count("needs") == 1);
+        CHECK(gptps_config_check(e) == GPTPS_E_CONFIG);
+        log_end();
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+    }
+    remove(RL_PATH);
+}
+
+/* 5d) The same for the other footprint keys: tui.recent, tui.activity and
+ * tui.latency_window raised or lowered together with tui.budget_kb, in either order - the
+ * one listed first, refused provisionally, counts and logs nothing. And a latency window
+ * above the cap (clamped, with a WARN) that is refused provisionally and then taken logs
+ * that WARN exactly once. */
+static void test_reload_sizes(void)
+{
+    static const struct { const char *key; int small, big; } K[] = {
+        { "recent", 8, 4096 }, { "activity", 8, 4096 }, { "latency_window", 1024, 65536 },
+    };
+    gptps *e;
+    gptps_tui *t;
+    gptps_tui_config c;
+    char text[256];
+    size_t k;
+    int o;
+    e = rl_open("");
     if (!e) return;
     base_cfg(&c, GPTPS_TUI_KPI_FULL, 0);
     log_begin();
     t = gptps_tui_install(e, &c);
     CHECK(t != NULL);
     if (!t) { log_end(); gptps_shutdown(e); remove(RL_PATH); return; }
-    CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 0);
-    /* a raise, budget_kb first: both */
-    rl_write("[tui]\nbudget_kb = 200\nkpi = \"full\"\n");
-    CHECK(gptps_settings_reload(e, RL_PATH) == GPTPS_OK);
-    CHECK(rl_is(e, "full", "200") && health(t).budget_refusals == 0);
-    /* a lower, budget_kb last: both */
-    rl_write("[tui]\nkpi = \"minimal\"\nbudget_kb = 16\n");
-    CHECK(gptps_settings_reload(e, RL_PATH) == GPTPS_OK);
-    CHECK(rl_is(e, "minimal", "16") && health(t).budget_refusals == 0);
-    /* a raise, budget_kb last: kpi refused (an ERROR names it), the budget applied */
-    loglen = 0; logbuf[0] = 0;
-    rl_write("[tui]\nkpi = \"full\"\nbudget_kb = 200\n");
-    CHECK(gptps_settings_reload(e, RL_PATH) == GPTPS_E_CONFIG);
-    CHECK(rl_is(e, "minimal", "200") && health(t).budget_refusals == 1);
-    CHECK(log_count("tui.kpi=full needs") == 1 && log_count("tui.kpi: full was refused") == 1);
+    for (k = 0; k < sizeof K / sizeof K[0]; ++k) {
+        char v[64];
+        int lo_kb, hi_kb, cap_kb = 0;
+        uint64_t f_small, f_big, r0;
+        gptps_tui_health_info h;
+        /* calibrate: the footprint at each size, with no budget */
+        CHECK(gptps_settings_set(e, "tui.budget_kb", "0") == GPTPS_OK);
+        snprintf(v, sizeof v, "%d", K[k].big);
+        CHECK(gptps_settings_set(e, k == 0 ? "tui.recent" : k == 1 ? "tui.activity" : "tui.latency_window", v) == GPTPS_OK);
+        h = health(t); f_big = h.footprint_bytes + h.runtime_bytes;
+        if (k == 2) {                    /* and at the cap */
+            CHECK(gptps_tui_set_latency_window(t, TUI_LAT_CAP) == GPTPS_OK);
+            h = health(t); cap_kb = (int)((h.footprint_bytes + h.runtime_bytes) / 1024) + 2;
+        }
+        snprintf(v, sizeof v, "%d", K[k].small);
+        CHECK(gptps_settings_set(e, k == 0 ? "tui.recent" : k == 1 ? "tui.activity" : "tui.latency_window", v) == GPTPS_OK);
+        h = health(t); f_small = h.footprint_bytes + h.runtime_bytes;
+        lo_kb = (int)(f_small / 1024) + 2; hi_kb = (int)(f_big / 1024) + 2;
+        CHECK((uint64_t)lo_kb * 1024u < f_big);   /* the big size does not fit the small budget */
+        snprintf(v, sizeof v, "%d", lo_kb);
+        CHECK(gptps_settings_set(e, "tui.budget_kb", v) == GPTPS_OK);
+        r0 = health(t).budget_refusals;
+        for (o = 0; o < 2; ++o) {
+            char want[64], got[64], bk[64], key[64];
+            snprintf(key, sizeof key, "tui.%s", K[k].key);
+            /* raise both: the size listed first is refused provisionally, then taken */
+            if (o == 0) snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\n%s = %d\nbudget_kb = %d\n", K[k].key, K[k].big, hi_kb);
+            else        snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nbudget_kb = %d\n%s = %d\n", hi_kb, K[k].key, K[k].big);
+            CHECK(rl_reload(e, text) == GPTPS_OK);
+            snprintf(want, sizeof want, "%d", K[k].big);
+            CHECK(gptps_settings_get(e, key, got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+            snprintf(want, sizeof want, "%d", hi_kb);
+            CHECK(gptps_settings_get(e, "tui.budget_kb", bk, sizeof bk) == GPTPS_OK && !strcmp(bk, want));
+            CHECK(health(t).budget_refusals == r0 && rl_quiet());
+            /* lower both: the budget listed first is refused provisionally, then taken */
+            if (o == 0) snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nbudget_kb = %d\n%s = %d\n", lo_kb, K[k].key, K[k].small);
+            else        snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\n%s = %d\nbudget_kb = %d\n", K[k].key, K[k].small, lo_kb);
+            CHECK(rl_reload(e, text) == GPTPS_OK);
+            snprintf(want, sizeof want, "%d", K[k].small);
+            CHECK(gptps_settings_get(e, key, got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+            snprintf(want, sizeof want, "%d", lo_kb);
+            CHECK(gptps_settings_get(e, "tui.budget_kb", bk, sizeof bk) == GPTPS_OK && !strcmp(bk, want));
+            CHECK(health(t).budget_refusals == r0 && rl_quiet());
+        }
+        if (k == 2) {
+            /* above the cap, listed first: refused provisionally (no WARN, no count), taken
+             * after the budget - clamped, one cap WARN; listed last: one WARN too */
+            for (o = 0; o < 2; ++o) {
+                char got[64], want[64];
+                if (o == 0) snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nlatency_window = %d\nbudget_kb = %d\n", TUI_LAT_CAP + 1, cap_kb);
+                else        snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nbudget_kb = %d\nlatency_window = %d\n", cap_kb, TUI_LAT_CAP + 1);
+                CHECK(rl_reload(e, text) == GPTPS_OK);
+                snprintf(want, sizeof want, "%d", TUI_LAT_CAP);
+                CHECK(gptps_settings_get(e, "tui.latency_window", got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+                CHECK(log_count("is above the cap of") == 1 && log_count("needs") == 0 && log_count("refused") == 0);
+                CHECK(health(t).budget_refusals == r0);
+                /* a provisional try that is TAKEN (it fits the budget the file already has,
+                 * and another key follows it): the clamp's WARN, once */
+                snprintf(text, sizeof text, "[tui]\nlatency_window = %d\n", K[k].small);
+                CHECK(rl_reload(e, text) == GPTPS_OK);
+                snprintf(text, sizeof text, "[tui]\nlatency_window = %d\nkpi = \"full\"\n", TUI_LAT_CAP + 1);
+                CHECK(rl_reload(e, text) == GPTPS_OK);
+                CHECK(gptps_settings_get(e, "tui.latency_window", got, sizeof got) == GPTPS_OK && !strcmp(got, want));
+                CHECK(log_count("is above the cap of") == 1 && log_count("needs") == 0 && log_count("refused") == 0);
+                CHECK(health(t).budget_refusals == r0);
+                snprintf(text, sizeof text, "[tui]\nkpi = \"full\"\nlatency_window = %d\nbudget_kb = %d\n", K[k].small, lo_kb);
+                CHECK(rl_reload(e, text) == GPTPS_OK && health(t).budget_refusals == r0 && rl_quiet());
+            }
+        }
+    }
     log_end();
     gptps_shutdown(e);
     gptps_tui_close(t);
@@ -974,6 +1140,7 @@ int main(void)
     test_buffer_stops();
     test_pane_one_stop();
     test_reload();
+    test_reload_sizes();
 #if !defined(_WIN32)
     test_run_stopped();
 #  if !defined(GPTPS_TEST_HAL_SIM)
