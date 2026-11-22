@@ -598,13 +598,17 @@ void  gptps_dl_release(gptps_dl *h) { free(h); }
 size_t gptps_dl_error(char *buf, size_t cap)
 {
     const char *m = dlerror();
-    int n;
+    size_t n;
     if (!buf || !cap) return 0;
     buf[0] = 0;
     if (!m) return 0;
-    n = snprintf(buf, cap, "%s", m);
-    if (n < 0) { buf[0] = 0; return 0; }
-    return (size_t)n < cap ? (size_t)n : cap - 1;
+    /* A plain bounded copy, cut to cap - 1 like snprintf("%s") was, without the format
+     * call gcc -Wformat-truncation=2 flags for an unbounded %s into a run-time cap. */
+    n = strlen(m);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(buf, m, n);
+    buf[n] = 0;
+    return n;
 }
 
 /* ---- atomic, durable file replace (the settings save) -----------------------
@@ -770,4 +774,9 @@ gptps_status gptps_hal_atomic_replace(const char *tmp_path, const char *final_pa
     return GPTPS_OK;
 }
 
+#else
+/* The POSIX backend compiles to nothing on Windows (hal_win.c is used). ISO C forbids an empty
+ * translation unit (-pedantic), so one file-scope typedef keeps this one non-empty: a
+ * typedef has no linkage and emits no code or symbol. */
+typedef int gptps_hal_posix_not_this_platform;
 #endif /* !_WIN32 */

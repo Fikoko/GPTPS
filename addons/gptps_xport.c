@@ -49,7 +49,10 @@
  */
 #if defined(_WIN32)
 /* fork()/socketpair() have no Win32 equivalent; this reference add-on is POSIX-only
- * (like GPTPS_EXEC_OOP). It compiles to nothing on Windows. */
+ * (like GPTPS_EXEC_OOP). It compiles to nothing on Windows - no symbol, no code. ISO C
+ * forbids an empty translation unit (gcc -pedantic), so one file-scope typedef keeps it
+ * non-empty: a typedef has no linkage and emits nothing. */
+typedef int gptps_xport_unavailable_on_win32;
 #else
 
 #if defined(__linux__) && !defined(_GNU_SOURCE)

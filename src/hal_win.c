@@ -25,6 +25,7 @@
 #include <io.h>        /* _open_osfhandle, _close: gptps_hal_open_private */
 #include <fcntl.h>     /* _O_WRONLY, _O_BINARY */
 #include <stdlib.h>
+#include <string.h>    /* memcpy: gptps_dl_sym */
 
 /* --- hardware detection -------------------------------------------------- */
 /* Logical processors in every processor group. GetSystemInfo counts only the caller's
@@ -192,7 +193,20 @@ gptps_dl *gptps_dl_open(const char *path)
     free(w);
     return (gptps_dl *)h;
 }
-void     *gptps_dl_sym(gptps_dl *h, const char *symbol) { return (void *)GetProcAddress((HMODULE)h, symbol); }
+/* GetProcAddress hands back a FARPROC - a FUNCTION pointer - and this seam returns
+ * void *, as dlsym does. ISO C defines no conversion between the two (gcc -pedantic:
+ * "ISO C forbids conversion of function pointer to object pointer type"), so copy the
+ * representation instead of casting: on every Windows ABI the two are the same size
+ * (asserted below), so the bytes are the address - exactly what the cast produced. The
+ * engine copies them back into its init function pointer the same way. */
+typedef char hal_win_farproc_fits_voidp[sizeof(FARPROC) == sizeof(void *) ? 1 : -1];
+void *gptps_dl_sym(gptps_dl *h, const char *symbol)
+{
+    FARPROC f = GetProcAddress((HMODULE)h, symbol);
+    void *p = NULL;
+    if (f) memcpy(&p, &f, sizeof p);
+    return p;
+}
 void      gptps_dl_close(gptps_dl *h) { if (h) FreeLibrary((HMODULE)h); }
 /* The handle IS the HMODULE here - nothing was allocated to wrap it - so keeping
  * the mapping and dropping the bookkeeping is simply doing nothing. */
@@ -275,4 +289,9 @@ FILE *gptps_hal_open_private(const char *path)
     return f;
 }
 
+#else
+/* The Win32 backend compiles to nothing on POSIX (hal_posix.c is used). ISO C forbids an empty
+ * translation unit (-pedantic), so one file-scope typedef keeps this one non-empty: a
+ * typedef has no linkage and emits no code or symbol. */
+typedef int gptps_hal_win_not_this_platform;
 #endif /* _WIN32 */

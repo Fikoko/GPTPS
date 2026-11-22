@@ -259,6 +259,45 @@ static void check_dl(int freestanding, const char *module)
     h = gptps_dl_open("gptps-hal-conformance-no-such-module.so");
     expect(h == NULL, "dl: open of a missing file returns NULL");
     if (h) gptps_dl_close(h);
+    {
+        /* gptps_dl_error: "writes a NUL-terminated line into buf and returns its
+         * length", cut to what fits. 0 is a complete port implementation, so the
+         * full-size read decides what the small buffers must hold. Each read follows
+         * a fresh failure: dlerror() clears itself once read. */
+        char full[512], small[8];
+        size_t L, n, z, caps[3] = { 1, 2, sizeof small };
+        int k, ok = 1;
+        memset(full, 'x', sizeof full);
+        h = gptps_dl_open("gptps-hal-conformance-no-such-module.so");
+        L = gptps_dl_error(full, sizeof full);
+        if (h) gptps_dl_close(h);
+        /* Bounded: a broken port may leave buf without a NUL (still all 'x'). The
+         * check must report that as a FAIL, not read past the buffer itself. */
+        for (z = 0; z < sizeof full && full[z]; ++z) {}
+        if (z < sizeof full)
+            snprintf(why, sizeof why, "returned %lu for a %lu-byte line", (unsigned long)L,
+                     (unsigned long)z);
+        else
+            snprintf(why, sizeof why, "returned %lu and wrote no NUL in %lu bytes",
+                     (unsigned long)L, (unsigned long)sizeof full);
+        expect(L < sizeof full && z == L,
+               "dl: error returns the length of the NUL-terminated line it wrote");
+        if (z != L) L = 0; /* the cut checks below compare against full[0..L) */
+        for (k = 0; k < 3 && L; ++k) {
+            size_t cap = caps[k], want = L < cap - 1 ? L : cap - 1;
+            memset(small, 'x', sizeof small);
+            h = gptps_dl_open("gptps-hal-conformance-no-such-module.so");
+            n = gptps_dl_error(small, cap);
+            if (h) gptps_dl_close(h);
+            if (n != want || small[n] != 0 || memcmp(small, full, n) != 0 ||
+                (cap < sizeof small && small[cap] != 'x')) {
+                snprintf(why, sizeof why, "cap %lu: returned %lu, want %lu (or wrote past cap)",
+                         (unsigned long)cap, (unsigned long)n, (unsigned long)want);
+                ok = 0;
+            }
+        }
+        expect(ok, "dl: error cuts the line to cap - 1, NUL-terminated, never past cap");
+    }
     if (!module) { skip("dl: open, sym, close", "no module path given"); return; }
     h = gptps_dl_open(module);
     snprintf(why, sizeof why, "could not open %s", module);

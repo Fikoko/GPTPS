@@ -265,6 +265,35 @@ jobs:
           cc -std=c99 -D_GNU_SOURCE -Wall -Wextra -I amalgamation \
              amalgamation/gptps.c tests/test_version.c -lpthread -ldl -o test_amalg_version
           ./test_amalg_version
+      - name: Every amalgamated file is ISO C99 (gcc + clang, -pedantic -Werror)
+        # The project rule, held in CI: each of the files `--addons all` produces
+        # (gptps.c and one .c per add-on) compiles on its own as strict C99. Each file
+        # is its own translation unit, exactly as a vendoring consumer builds it.
+        run: |
+          set -eu
+          sh tools/amalgamate.sh amalg-all --addons all
+          n=0
+          for cc in gcc clang; do
+            for f in amalg-all/*.c; do
+              "$cc" -std=c99 -pedantic -Wall -Wextra -Werror -D_GNU_SOURCE -I amalg-all \
+                    -c "$f" -o /dev/null
+              n=$((n+1))
+            done
+          done
+          echo "OK: $n compiles clean under -pedantic -Werror"
+          # Each source file on its own too. In the amalgamation the platform-gated
+          # backends (hal_win.c, exec_win.c next to hal_posix.c, exec_oop_posix.c) share
+          # one translation unit, so a backend that is empty on this platform (an empty
+          # TU, which -pedantic rejects) only shows when it is compiled alone.
+          m=0
+          for cc in gcc clang; do
+            for f in src/*.c addons/*.c; do
+              "$cc" -std=c99 -pedantic -Wall -Wextra -Werror -D_GNU_SOURCE \
+                    -I include -I src -I addons -c "$f" -o /dev/null
+              m=$((m+1))
+            done
+          done
+          echo "OK: $m per-file compiles clean under -pedantic -Werror"
 
   # Windows build + test on a real runner (Win32 HAL: src/hal_win.c) via mingw-w64
   # gcc (native PE binaries, __atomic support, full <windows.h>). POSIX-only tests
@@ -315,6 +344,31 @@ jobs:
           sh tools/amalgamate.sh
           cc -std=gnu99 -I amalgamation amalgamation/gptps.c examples/demo.c -o demo_amalg.exe
           ./demo_amalg.exe
+      - name: Every amalgamated file is ISO C99 on Windows (-pedantic -Werror)
+        # The Ubuntu job cannot see what is behind _WIN32: a FARPROC returned as void *
+        # (function -> object pointer) and an add-on that is empty on Windows (an empty
+        # translation unit) both passed every other leg here. Each file on its own, as a
+        # vendoring consumer compiles it.
+        run: |
+          set -eu
+          sh tools/amalgamate.sh amalg-all --addons all
+          n=0
+          for f in amalg-all/*.c; do
+            cc -std=c99 -pedantic -Wall -Wextra -Werror -I amalg-all -c "$f" -o amalg-all/check.o
+            n=$((n+1))
+          done
+          [ "$n" -ge 14 ] || { echo "ERROR: only $n amalgamated files"; exit 1; }
+          echo "OK: all $n amalgamated files compile under mingw -pedantic -Werror"
+          # Each source file on its own too: the POSIX backends (hal_posix.c,
+          # exec_oop_posix.c) are empty here unless they keep their #else typedef, and in
+          # the amalgamation they share a translation unit with the Win32 ones.
+          m=0
+          for f in src/*.c addons/*.c; do
+            cc -std=c99 -pedantic -Wall -Wextra -Werror -I include -I src -I addons \
+               -c "$f" -o amalg-all/check.o
+            m=$((m+1))
+          done
+          echo "OK: $m per-file compiles clean under mingw -pedantic -Werror"
 
   # Windows build + test with the native MSVC toolchain (cl.exe) via the default
   # Visual Studio (multi-config) generator. Complements the mingw-w64 gcc job: same
