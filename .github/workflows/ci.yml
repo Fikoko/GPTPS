@@ -272,10 +272,16 @@ jobs:
         run: |
           set -eu
           sh tools/amalgamate.sh amalg-all --addons all
+          # glibc 2.43+ with _GNU_SOURCE defines strchr, strrchr, strstr, memchr, ... as
+          # _Generic macros (C23's const-preserving forms). gcc keeps the system header's
+          # macro quiet; clang reports its expansion at our call as a C11 extension. Our
+          # code is C99, so clang's leg drops that one diagnostic; gcc's leg still fails
+          # on any C11 construct of our own.
           n=0
           for cc in gcc clang; do
+            x=; [ "$cc" = clang ] && x=-Wno-c11-extensions
             for f in amalg-all/*.c; do
-              "$cc" -std=c99 -pedantic -Wall -Wextra -Werror -D_GNU_SOURCE -I amalg-all \
+              "$cc" -std=c99 -pedantic -Wall -Wextra -Werror $x -D_GNU_SOURCE -I amalg-all \
                     -c "$f" -o /dev/null
               n=$((n+1))
             done
@@ -287,8 +293,9 @@ jobs:
           # TU, which -pedantic rejects) only shows when it is compiled alone.
           m=0
           for cc in gcc clang; do
+            x=; [ "$cc" = clang ] && x=-Wno-c11-extensions
             for f in src/*.c addons/*.c; do
-              "$cc" -std=c99 -pedantic -Wall -Wextra -Werror -D_GNU_SOURCE \
+              "$cc" -std=c99 -pedantic -Wall -Wextra -Werror $x -D_GNU_SOURCE \
                     -I include -I src -I addons -c "$f" -o /dev/null
               m=$((m+1))
             done
