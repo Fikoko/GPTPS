@@ -85,6 +85,7 @@ typedef struct {
     int                     delay_ms;    /* 5): each read takes this long (real time) */
     int                     hold;        /* 5): a read waits, inside, until `release` */
     int                     in_read, release;
+    int                     bogus_size;  /* 2): each read writes nonsense into totals->struct_size */
     unsigned char           guard[32];   /* 5): never written by the dashboard */
 } script;
 
@@ -111,6 +112,7 @@ static gptps_status script_read(void *ctx, gptps_tui_source_totals *totals, gptp
     n = sc->nrows < cap ? sc->nrows : cap;
     if (n > 64) n = 64;
     for (i = 0; i < n; ++i) memcpy((char *)rows + i * row_size, &sc->rows[i], sizeof sc->rows[i]);
+    if (sc->bogus_size) totals->struct_size = 3;   /* a source that writes the field it should not */
     *nrows = sc->nrows;
     return GPTPS_OK;
 }
@@ -277,6 +279,32 @@ static void test_frame(void)
         CHECK(lines <= 24);
     }
     CHECK(health(t).source_rows == 500);
+    /* the unterminated name is cut at exactly its last byte: 127 'z's, which is a task added
+     * with a label, so the TASKS row shows the label - the bytes after the name (padding,
+     * started) are not 0 either, so an uncut name runs on past them, matches nothing and is
+     * shown raw */
+    {
+        char zn[GPTPS_TASK_NAME_MAX + 1];
+        size_t off = offsetof(gptps_tui_source_row, name);
+        memset(zn, 'z', GPTPS_TASK_NAME_MAX); zn[GPTPS_TASK_NAME_MAX] = 0;
+        CHECK(gptps_tui_add_task(t, zn, "Zed label", 'z', NULL, 0) == GPTPS_OK);
+        memset((char *)&sc.rows[1] + off, 'z', offsetof(gptps_tui_source_row, finished) - off);
+        sc.nrows = 2;
+        gptps_tui_render(t, frame, sizeof frame);
+        CHECK(strstr(frame, "Zed label") != NULL && strstr(frame, "[z]") != NULL);
+        CHECK(strstr(frame, "zzzzzzzzzzzzzzz") == NULL);   /* the row is the label, not the raw name */
+    }
+    /* a source that writes totals->struct_size: the next read is handed the right size again,
+     * and its totals are still shown */
+    script_row(&sc, 1, "upload", 100, 2, 0);
+    totals(&sc, 4321, 4000, 0, 0, GPTPS_TUI_GAUGES_EXACT);
+    sc.bogus_size = 1;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(strstr(frame, "queued 4321 ") != NULL);
+    sc.last_tot_size = 0;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(sc.last_tot_size == sizeof(gptps_tui_source_totals) && strstr(frame, "queued 4321 ") != NULL);
+    sc.bogus_size = 0;
     gptps_shutdown(e); gptps_tui_close(t);
     tui_fake_ms = 0;
 }
@@ -362,6 +390,16 @@ static void test_errors(void)
     h = health(t);
     CHECK(strstr(frame, "read failed") == NULL && strstr(frame, "finished 800") != NULL);
     CHECK(h.source_errors == 3 && h.source_reads == 4 && h.source_status == GPTPS_OK);
+    /* the WARN shows a host's name cleaned, as the frame does: no escape reaches the log sink */
+    s = src_of(&sc, "a\x1b[2J");
+    CHECK(gptps_tui_set_source(t, &s) == GPTPS_OK);
+    sc.ret = GPTPS_E_IO;
+    tui_fake_ms += 61000u;
+    log_begin();
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(log_count("failed to read") == 1 && log_count("source 'a [2J' failed to read") == 1);
+    CHECK(strchr(logbuf, '\x1b') == NULL);
+    log_end();
     gptps_shutdown(e); gptps_tui_close(t);
     tui_fake_ms = 0;
 }

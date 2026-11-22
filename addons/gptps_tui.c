@@ -3137,8 +3137,9 @@ typedef struct { uint64_t gen, next_change; int pane; } tui_fmeta;
 
 /* rmu held, mu NOT held: the host's source, read into the view for view_take (gptps_tui.h,
  * SOURCE) - here, once a dashboard frame, and nowhere else. v->src: 0 no source, 1 read, 2
- * failed. What it returns is taken defensively: a row's name is cut at its last byte, the
- * totals' struct_size is the dashboard's again. */
+ * failed. What it returns is taken defensively: a row's name is cut at its last byte, and
+ * every read is handed totals set afresh (struct_size the dashboard's, whatever the last
+ * read wrote there; nothing reads struct_size after a read). */
 static void src_read(gptps_tui *t, tui_view *v)
 {
     size_t n = 0, cap = v->srows ? (size_t)v->srows_cap : 0, i;
@@ -3149,7 +3150,6 @@ static void src_read(gptps_tui *t, tui_view *v)
     v->stot.struct_size = sizeof v->stot;
     if (cap) memset(v->srows, 0, cap * sizeof *v->srows);
     st = t->src.read(t->src.ctx, &v->stot, v->srows, sizeof *v->srows, cap, &n);
-    v->stot.struct_size = sizeof v->stot;
     v->src_st = st;
     if (st != GPTPS_OK) { v->src = 2; return; }
     v->src = 1; v->src_n = n;
@@ -3178,10 +3178,11 @@ static int view_frame(gptps_tui *t, uint64_t now, int loop, uint64_t *warn_plost
     src_read(t, t->view);
     view_take(t, t->view, now, loop, warn_plost);
     if (t->view->src_warn) {             /* never silent; at most once a minute, outside mu */
-        char msg[320];
+        char msg[384], sn[sizeof t->view->src_name * 2];   /* the host's name, cleaned as on the frame */
         snprintf(msg, sizeof msg, "gptps_tui: the dashboard's source '%s' failed to read (%s); the frame shows "
                  "the dashboard's own counts and says so (gptps_tui_health.source_errors: %llu)",
-                 t->view->src_name, gptps_strerror(t->view->src_st), (unsigned long long)t->view->src_errors);
+                 tui_cl(t->view->src_name, sn, sizeof sn), gptps_strerror(t->view->src_st),
+                 (unsigned long long)t->view->src_errors);
         gptps_log(NULL, GPTPS_LOG_WARN, msg);
     }
     return 1;
