@@ -5,7 +5,7 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.13.0] - 2026-11-22
 
 Closes the gaps 1.12.0 left. The dashboard's degrade mode now acts on every pressure
 condition a step can relieve, and says why for the two it cannot. It also gains an exact
