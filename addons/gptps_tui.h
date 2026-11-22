@@ -304,11 +304,11 @@ typedef struct {
  *     entries' array (8, then doubling, at most max_tasks; 0 before the first); payloads:
  *     the bytes of their payload copies. The struct sizes on x86-64 Linux (other targets
  *     differ a little - health has the exact figure on every one; tests/test_tui_budget.c
- *     holds these to the code): D = 7168 (the dashboard itself), U = 280 (an add_task
+ *     holds these to the code): D = 7176 (the dashboard itself), U = 280 (an add_task
  *     entry), R = 264 (a TASKS row), E = 304 (a PROBLEMS record), A = 24 (an ACTIVITY
  *     record), S = 32 (a handle-table slot; 28 on i386). At the defaults (FULL,
- *     max_tasks 64, 8 + 8 journal lines, window 1024): 7168 + 19720 + 2432 + 192 + 65536 +
- *     16640 = 111688 bytes, 110 KiB (rounded up).
+ *     max_tasks 64, 8 + 8 journal lines, window 1024): 7176 + 19720 + 2432 + 192 + 65536 +
+ *     16640 = 111696 bytes, 110 KiB (rounded up).
  *  2. The BUFFERS (health.runtime_bytes) a frame is made in, held while they are used and
  *     grown as a frame needs: the dashboard frame's copy-out (the view: 13600 B, plus 560 B
  *     a row of the terminal's height - 208 B more with a source - kept once made), the open
@@ -327,7 +327,7 @@ typedef struct {
  * changes nothing: install (NULL), gptps_tui_set_kpi, set_recent, set_latency_window,
  * add_task / add_task_ex (a new entry, a bigger payload), the 'm' key, a tui.kpi /
  * tui.recent / tui.activity / tui.latency_window write - each GPTPS_E_INVAL with one WARN
- * naming what it needs ("tui.kpi=full needs 110 KiB (111688 bytes: ...), over tui.budget_kb
+ * naming what it needs ("tui.kpi=full needs 110 KiB (111696 bytes: ...), over tui.budget_kb
  * 64 (65536 bytes): refused, nothing changed"), counted in health.budget_refusals and budget_need_bytes - and
  * so is a budget below the footprint already asked for. Never a silent clamp. A change that
  * does not grow the footprint is never refused. The BUFFERS are not refused - a frame is
@@ -376,7 +376,9 @@ typedef struct {
  *   start at the arm, and the gauges are a lower bound ('>=') until the work then in flight
  *   has ended. An arm with no memory for a part runs without it, as gptps_tui_set_kpi does
  *   (counted: health.arm_failures and alloc_failures; the frame's "no memory for:" line; a
- *   WARN), and a later arm or set_kpi tries again.
+ *   WARN at most once a minute, since arms come by themselves), and a later arm or set_kpi
+ *   tries again. A key arms before it is looked at, so 'q' on a disarmed dashboard builds the
+ *   request before it quits.
  *   DISARMING is decided only when the dashboard is asked - with no timer and no thread: by
  *   gptps_tui_health, once no view has come for disarm_ms (60 s) and no gptps_tui_run loop
  *   runs (a live loop is a view while it runs, even idle). It only FREES (the swap under the
@@ -399,9 +401,14 @@ typedef struct {
  *   measured with the layers off says nothing about them. With BUDGET: the budget is checked
  *   against the REQUEST, which is what an arm builds, so an arm is never refused and never goes
  *   past it; disarmed, the footprint held (health.footprint_bytes) is the formula at GAUGE,
- *   footprint_request_bytes is unchanged, and every change is checked as when armed. Switching
- *   to ON_VIEW at runtime counts as a view (it disarms disarm_ms later with none); to ALWAYS
- *   arms at once.
+ *   footprint_request_bytes is unchanged, and every change is checked as when armed. The
+ *   BUFFERS (MEMORY) of an ON_VIEW dashboard are checked against the request too, not against
+ *   what is held: gptps_tui_snapshot and gptps_tui_run make theirs before the frame that arms,
+ *   so footprint plus buffers stays within the budget across the arm. Switching an ALWAYS
+ *   dashboard to ON_VIEW at runtime counts as a view (it stays armed and disarms disarm_ms
+ *   later with none); on an ON_VIEW dashboard it only restarts the disarm_ms timer (it does
+ *   not arm one that is disarmed). ON_VIEW from a settings file (read while gptps_tui_install
+ *   defines the tui keys) starts disarmed, as cfg.arm = ON_VIEW does. To ALWAYS arms at once.
  *
  * HINT (1.13): an install that runs FULL (tui.arm = always) with no terminal to show the live
  * dashboard on - the output or stdin is not one, so gptps_tui_run will not run - logs one WARN
@@ -630,7 +637,8 @@ typedef struct {
     uint64_t arms, disarms;       /* transitions since install */
     uint64_t arm_failures;        /* arms that had no memory for a part (also in alloc_failures) */
     uint64_t run_noops;           /* gptps_tui_run calls that returned at once: cfg.interactive 0, or
-                                   * no terminal (each WARNed once a dashboard) */
+                                   * no terminal (interactive 0: WARNed once a dashboard; no
+                                   * terminal: WARNed each call) */
 } gptps_tui_health_info;
 
 /* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
@@ -763,7 +771,8 @@ gptps_status gptps_tui_set_budget_kb(gptps_tui *t, int kb);
 
 /* ARM (1.13; see gptps_tui_install): ALWAYS or ON_VIEW (DEFAULT => ALWAYS); else
  * GPTPS_E_INVAL. Also `tui.arm` ("always", "on_view"). To ON_VIEW: counts as a view, so it
- * disarms disarm_ms later with none; to ALWAYS: a disarmed dashboard arms at once (it may
+ * disarms disarm_ms later with none (already ON_VIEW: only restarts that timer - a disarmed
+ * dashboard stays disarmed until a frame or key); to ALWAYS: a disarmed dashboard arms at once (it may
  * allocate; GPTPS_E_NOMEM, with a WARN, as gptps_tui_set_kpi). Never refused by the budget. */
 gptps_status gptps_tui_set_arm(gptps_tui *t, gptps_tui_arm mode);
 /* How long after the last view ON_VIEW disarms, in ms: 0 => 60000, 100..86400000; else

@@ -840,7 +840,7 @@ enabled automatically). Panes/metrics:
   `gptps_tui_health.footprint_bytes` (`tests/test_tui_budget.c` holds it to the allocator,
   byte for byte, at every tier). With a budget, every change that would take the footprint
   of the *request* past it is **refused** — `GPTPS_E_INVAL`, one WARN naming what it needs
-  (`tui.kpi=full needs 110 KiB (111688 bytes: the dashboard 7168, TASKS 19720, ...), over
+  (`tui.kpi=full needs 110 KiB (111696 bytes: the dashboard 7176, TASKS 19720, ...), over
   tui.budget_kb 64 (65536 bytes): refused, nothing changed`), counted
   (`budget_refusals`, `budget_need_bytes`) and nothing changed: install (NULL), `set_kpi`,
   `set_recent`, `set_latency_window`, `add_task`, `m`, the `tui.*` writes, and a budget below
@@ -878,7 +878,11 @@ enabled automatically). Panes/metrics:
   `record_ms`, `views`, `view_age_ms`, `arms`, `disarms`) and on the frame: "recording since
   first view (4m ago) - tui.arm=on_view, off 60.0 s after the last view". A shed survives a
   disarm and an arm (only the operator clears it), and the budget is checked against the
-  request, so an arm is never refused and never passes `tui.budget_kb`.
+  request (the frame buffers of an `on_view` dashboard too, since `snapshot` and `run` make
+  theirs before the frame that arms), so an arm is never refused and never passes
+  `tui.budget_kb`. `tui.arm = on_view` from a settings file starts disarmed, as
+  `cfg.arm` does; set at runtime on an `on_view` dashboard it only restarts the
+  `disarm_ms` timer.
 - **A hint for a headless FULL install** (1.13). An install that runs `full` with
   `tui.arm = always` and no terminal for the live dashboard (the output or stdin is not one)
   logs one WARN naming what it collects for frames only `render` / `snapshot` show and the

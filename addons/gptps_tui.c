@@ -886,6 +886,7 @@ struct gptps_tui {
      * arm; 0: never armed). h_*: counted since install. */
     int              arm_mode, armed, run_on, run_said;
     uint64_t         disarm_ms, view_ms, arm_ms, h_views, h_arms, h_disarms, h_arm_fail, h_run_noop;
+    uint64_t         arm_warn_ms;     /* ARM: the last "arming on a view: no memory" WARN (one a minute) */
     char             ad_line[1280];   /* one line a condition, '\n' between */
     /* ---- SOURCE (1.12; gptps_tui_set_source) ----
      * src: the host's source (src.read NULL: none; src.name not kept - src_name is the copy).
@@ -3097,9 +3098,45 @@ static void tui_arm(gptps_tui *t, uint64_t now, int view)
     if (act) {
         char what[400];
         gptps_status st = tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what);   /* the request: never refused */
-        if (act > 0 && st == GPTPS_E_NOMEM) { mu_lock(&t->mu); t->h_arm_fail++; mu_unlock(&t->mu); }
-        (void)reconf_said(act > 0 ? "gptps_tui: tui.arm=on_view: arming on a view" : "gptps_tui: tui.arm=on_view: "
-                          "disarming", "tui.arm=on_view", st, what);
+        int say = 1;
+        uint64_t nf = 0;
+        if (act > 0 && st == GPTPS_E_NOMEM) {
+            /* arms come by themselves, every view after a disarm: the WARN at most once a
+             * minute, every failure counted (arm_failures, alloc_failures) */
+            mu_lock(&t->mu);
+            nf = ++t->h_arm_fail;
+            say = !t->arm_warn_ms || now - t->arm_warn_ms >= TUI_WARN_GAP_MS;
+            if (say) t->arm_warn_ms = now ? now : 1;
+            mu_unlock(&t->mu);
+        }
+        if (act > 0 && st == GPTPS_E_NOMEM && what[0]) {
+            if (say)
+                tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.arm=on_view: arming on a view: no memory for %s; the "
+                         "dashboard runs without it (gptps_tui_health.arm_failures: %llu; this WARN at most once "
+                         "a minute)", what, (unsigned long long)nf);
+        } else {
+            (void)reconf_said(act > 0 ? "gptps_tui: tui.arm=on_view: arming on a view" : "gptps_tui: tui.arm=on_view: "
+                              "disarming", "tui.arm=on_view", st, what);
+        }
+    }
+}
+
+/* ARM: tui.arm = on_view applied while the dashboard is installed (a settings file, read as
+ * the tui keys are defined) - nobody has looked yet, so it starts disarmed, as an install with
+ * cfg.arm on_view does: no record from install, no hint. Only frees; not a disarm (none counted). */
+static void tui_arm_at_install(gptps_tui *t)
+{
+    int act = 0;
+    mu_lock(&t->mu);
+    if (t->arm_mode == GPTPS_TUI_ARM_ON_VIEW && t->armed) {
+        t->armed = 0; t->arm_ms = 0; act = 1;
+        if (t->adapt != GPTPS_TUI_ADAPT_OFF) adapt_base(t, TUI_NOW_MS());
+    }
+    mu_unlock(&t->mu);
+    if (act) {
+        char what[400];
+        (void)reconf_said("gptps_tui_install: tui.arm=on_view", "tui.arm=on_view",
+                          tui_reconfig(t, -1, 0, -1, -1, 0, what, sizeof what), what);
     }
 }
 
@@ -4981,7 +5018,7 @@ static uint64_t foot_held(const gptps_tui *t)
          + (t->tab ? (uint64_t)(t->tab_mask + 1) * sizeof(tui_slot) : 0);
 }
 static uint64_t kib_up(uint64_t b) { return (b + 1023u) / 1024u; }
-/* "needs 110 KiB (111688 bytes: the dashboard 7168, TASKS 19720, ...), over tui.budget_kb 64 (65536
+/* "needs 110 KiB (111696 bytes: the dashboard 7176, TASKS 19720, ...), over tui.budget_kb 64 (65536
  * bytes): refused, nothing changed" */
 /* (each piece formatted into a buffer it provably fits - a 20-digit number, a name of at most
  * 16 bytes - and appended whole while it fits `cap`) */
@@ -5047,7 +5084,11 @@ static void *rt_alloc(gptps_tui *t, void *p, size_t old, size_t nw, const char *
     *stop = 0;
     mu_lock(&t->mu);
     if (nw > old && t->budget) {
+        /* ON_VIEW (ARM): against the request, not what is held - a view arms up to it with the
+         * buffers still held (a snapshot's or run's are made before its first frame arms, and
+         * an arm may be between its flag and its build) */
         fp = foot_held(t); rt = t->rt_bytes; bud = t->budget;
+        if (t->arm_mode == GPTPS_TUI_ARM_ON_VIEW && foot_req(t) > fp) fp = foot_req(t);
         if (fp + rt + (nw - old) > bud && probe) *stop = 1;    /* not counted: the caller tries less */
         else if (fp + rt + (nw - old) > bud) {
             *stop = 1; t->h_bstop++; n = t->h_bstop;
@@ -5458,6 +5499,7 @@ gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg)
     mu_lock(&t->mu); t->observing = 1; mu_unlock(&t->mu);
     trk_resync(t, 1);              /* only now: an item queued before this is missed by the table */
     tui_register_settings(e, t);   /* expose tui.refresh_ms / kpi / mode / latency_window / recent / activity */
+    tui_arm_at_install(t);         /* ARM: on_view from a settings file starts disarmed too */
     tui_hint(t);                   /* HINT (1.13): FULL with no terminal to show it on - said once */
     return t;
 }

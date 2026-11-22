@@ -43,6 +43,7 @@
 /* ---- the interposed allocator: a header before each block holds its size ---- */
 typedef union { size_t n; long double ld; void *p; uint64_t u; } ta_hdr;
 static size_t ta_live;              /* bytes the add-on holds now */
+static size_t ta_peak;              /* the most it held (set ta_peak = ta_live to start) */
 static long   ta_calls;             /* allocations made (the event path must make none) */
 static size_t ta_fail_n;            /* !0: the next allocation of exactly this many bytes fails (once) */
 static void *ta_malloc(size_t n)
@@ -52,7 +53,7 @@ static void *ta_malloc(size_t n)
     if (ta_fail_n && n == ta_fail_n) { ta_fail_n = 0; return NULL; }
     h = (ta_hdr *)malloc(sizeof *h + n);
     if (!h) return NULL;
-    h->n = n; ta_live += n;
+    h->n = n; ta_live += n; if (ta_live > ta_peak) ta_peak = ta_live;
     return h + 1;
 }
 static void *ta_calloc(size_t k, size_t s)
@@ -80,7 +81,7 @@ static void *ta_realloc(void *p, size_t n)
     if (ta_fail_n && n == ta_fail_n) { ta_fail_n = 0; return NULL; }
     nh = (ta_hdr *)realloc(h, sizeof *nh + n);
     if (!nh) return NULL;
-    ta_live -= nh->n; nh->n = n; ta_live += n;
+    ta_live -= nh->n; nh->n = n; ta_live += n; if (ta_live > ta_peak) ta_peak = ta_live;
     return nh + 1;
 }
 /* the dashboard's clock: the test sets it (never 0 here, so never the real one) */
@@ -313,7 +314,8 @@ static void test_on_view(void)
 #include <sys/ioctl.h>
 #include <sys/select.h>
 static gptps_tui *run_t;
-static void *run_main(void *p) { (void)p; gptps_tui_run(run_t); return NULL; }
+static int run_done;
+static void *run_main(void *p) { (void)p; gptps_tui_run(run_t); __atomic_store_n(&run_done, 1, __ATOMIC_SEQ_CST); return NULL; }
 static void test_run_is_a_view(void)
 {
     gptps *e;
@@ -336,6 +338,44 @@ static void test_run_is_a_view(void)
     if (!out || in0 < 0 || dup2(s, 0) < 0) { printf("note: cannot set up; skipped\n"); close(m); return; }
     if ((e = open_manual()) == NULL) return;
     tui_fake_ms = 3000000;
+    log_begin();                                          /* HINT: a terminal both ways - quiet */
+    base_cfg(&c, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ARM_ALWAYS);
+    c.out = out;
+    run_t = gptps_tui_install(e, &c);
+    CHECK(run_t != NULL && log_count("no terminal to run") == 0);
+    log_end();
+    gptps_shutdown(e);
+    gptps_tui_close(run_t);
+    if ((e = open_manual()) == NULL) return;
+    /* BUDGET: run makes its two 16 KiB buffers before the frame that arms - checked against the
+     * request, so with room for the request + 8 KiB they are stopped (as armed) and the peak
+     * never passes the budget */
+    base_cfg(&c, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ARM_ON_VIEW);
+    c.interactive = 1; c.out = out; c.budget_kb = (int)((formula(TUI_T_FULL, 0) + 1023u) / 1024u) + 8;
+    run_t = gptps_tui_install(e, &c);
+    CHECK(run_t != NULL);
+    if (run_t) {
+        int k;
+        log_begin();
+        ta_peak = ta_live;
+        run_done = 0;
+        if (pthread_create(&th, NULL, run_main, NULL) == 0) {
+            for (k = 0; k < 2000 && !__atomic_load_n(&run_done, __ATOMIC_SEQ_CST); ++k) {   /* <= 10 s */
+                struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 5000;
+                select(0, NULL, NULL, NULL, &tv);
+                while (read(m, b, sizeof b) > 0) { }
+            }
+            CHECK(__atomic_load_n(&run_done, __ATOMIC_SEQ_CST));   /* it returned: no buffer */
+            tui_quit(run_t);                              /* (else: it ran - stop it) */
+            pthread_join(th, NULL);
+            while (read(m, b, sizeof b) > 0) { }
+        }
+        log_end();
+        CHECK(ta_peak <= health(run_t).budget_bytes && health(run_t).budget_stops >= 1 && health(run_t).armed == 0);
+        gptps_shutdown(e);
+        gptps_tui_close(run_t);
+    }
+    if ((e = open_manual()) == NULL) return;
     base_cfg(&c, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ARM_ON_VIEW);
     c.interactive = 1; c.out = out; c.mode = GPTPS_TUI_PAUSED;   /* idle: no frame after the first */
     run_t = gptps_tui_install(e, &c);
@@ -448,6 +488,52 @@ static void test_budget(void)
     CHECK(h.footprint_bytes + h.runtime_bytes <= h.budget_bytes && ta_live == h.footprint_bytes + h.runtime_bytes);
     gptps_shutdown(e);
     gptps_tui_close(t);
+    {   /* a snapshot makes its 16 KiB buffer BEFORE the frame that arms: disarmed, the buffer is
+         * checked against the request (what the arm builds), so the peak never passes the budget */
+        FILE *o = tmpfile();
+        if (!o) { printf("note: no tmpfile here; the snapshot budget check skipped\n"); return; }
+        if ((e = open_manual()) == NULL) { fclose(o); return; }
+        base_cfg(&c, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ARM_ON_VIEW); c.out = o;
+        c.budget_kb = (int)((formula(TUI_T_FULL, 0) + 1023u) / 1024u) + 8;   /* the request + 8 KiB < + 16 */
+        t = gptps_tui_install(e, &c);
+        CHECK(t != NULL);
+        if (!t) { gptps_shutdown(e); fclose(o); return; }
+        h = health(t);
+        CHECK(h.armed == 0 && ta_live == h.footprint_bytes);
+        log_begin();
+        ta_peak = ta_live;
+        tui_fake_ms += 1000;
+        gptps_tui_snapshot(t);                            /* stopped, as it is armed: no frame */
+        h = health(t);
+        CHECK(ta_peak <= h.budget_bytes && h.budget_stops == 1 && h.armed == 0);
+        CHECK(log_count("gptps_tui_snapshot's frame buffer") == 1);
+        log_end();
+        gptps_tui_render(t, frame, sizeof frame);        /* armed: the same snapshot is stopped the same */
+        {
+            uint64_t st0 = health(t).budget_stops;
+            ta_peak = ta_live;
+            gptps_tui_snapshot(t);
+            h = health(t);
+            CHECK(h.armed == 1 && h.budget_stops == st0 + 1 && ta_peak <= h.budget_bytes);
+        }
+        /* room for the request, the buffer and the view: it arms and makes its frame */
+        CHECK(gptps_tui_set_budget_kb(t, (int)((formula(TUI_T_FULL, 0) + TUI_FRAME_MIN + view_bytes(24) + 1023u) /
+                                               1024u) + 2) == GPTPS_OK);
+        tui_fake_ms += 61000;
+        CHECK(health(t).armed == 0);
+        {
+            uint64_t st0 = health(t).budget_stops;
+            long at = ftell(o);
+            ta_peak = ta_live;
+            gptps_tui_snapshot(t);
+            h = health(t);
+            CHECK(h.armed == 1 && h.budget_stops == st0 && ta_peak <= h.budget_bytes &&
+                  ta_peak > formula(TUI_T_FULL, 0) + TUI_FRAME_MIN && ftell(o) > at);
+        }
+        gptps_shutdown(e);
+        gptps_tui_close(t);
+        fclose(o);
+    }
 }
 
 /* 8) */
@@ -481,6 +567,30 @@ static void test_arm_oom(void)
     h = health(t);
     CHECK(h.armed == 1 && h.arm_failures == 1 && h.bytes_handles == tab && h.footprint_bytes == formula(TUI_T_FULL, 0));
     CHECK(strstr(frame, "no memory for:") == NULL);
+    /* arms come by themselves: an arm that keeps failing WARNs at most once a minute, and
+     * every failure is counted */
+    CHECK(gptps_tui_set_disarm_ms(t, 100) == GPTPS_OK);
+    tui_fake_ms += 1000;
+    CHECK(health(t).armed == 0);
+    log_begin();
+    {
+        int k;
+        for (k = 0; k < 20; ++k) {                        /* 2 s of arm / disarm, the table failing each time */
+            ta_fail_n = tab;
+            gptps_tui_render(t, frame, sizeof frame);
+            tui_fake_ms += 100;
+            CHECK(health(t).armed == 0);
+        }
+    }
+    h = health(t);
+    CHECK(h.arm_failures == 21 && h.alloc_failures == 21 && h.arms == 22);
+    CHECK(log_count("arming on a view: no memory for") == 1);
+    tui_fake_ms += 60000;                                 /* a minute on: said again */
+    ta_fail_n = tab;
+    gptps_tui_render(t, frame, sizeof frame);
+    CHECK(log_count("arming on a view: no memory for") == 2 && health(t).arm_failures == 22);
+    log_end();
+    ta_fail_n = 0;
     gptps_shutdown(e);
     gptps_tui_close(t);
 }
@@ -648,7 +758,7 @@ static void test_hint(void)
     CHECK(t != NULL);
     CHECK(log_count("gptps_tui_install: no terminal to run the live dashboard on") == 1);
     CHECK(log_count("kpi full collects everything from now on - about 38 ns and one lock an event, 110 KiB held") == 1 ||
-          sizeof(gptps_tui) != 7168);                     /* the figure: the formula at the defaults */
+          sizeof(gptps_tui) != 7176);                     /* the figure: the formula at the defaults */
     CHECK(log_count("tui.arm=on_view") == 1);
     loglen = 0; logbuf[0] = 0;
     gptps_tui_run(t);                                     /* interactive 0: said, once */
@@ -656,6 +766,50 @@ static void test_hint(void)
     CHECK(log_count("gptps_tui_run: cfg.interactive is 0") == 1 && health(t).run_noops == 2);
     gptps_shutdown(e);
     gptps_tui_close(t);
+    e = open_manual();
+    if (!e) { log_end(); fclose(o); return; }
+    loglen = 0; logbuf[0] = 0;
+    base_cfg(&c, GPTPS_TUI_KPI_GAUGE, 0); c.out = o; c.interactive = 1;   /* interactive, no terminal */
+    t = gptps_tui_install(e, &c);
+    CHECK(t != NULL);
+    gptps_tui_run(t);                                     /* returns at once: said, and counted */
+    CHECK(log_count("gptps_tui_run: stdin or the output is not a terminal") == 1 && health(t).run_noops == 1);
+    gptps_shutdown(e);
+    gptps_tui_close(t);
+    {   /* tui.arm = on_view from a settings file (applied as install defines the tui keys): it
+         * starts disarmed, as cfg.arm does - no hint, no record from install */
+        const char *path = "test_tui_arm_settings.toml";
+        FILE *f = fopen(path, "w");
+        gptps_config ec;
+        gptps_tui_health_info h;
+        if (!f) { printf("note: cannot write a settings file; that check skipped\n"); }
+        else {
+            fputs("[tui]\narm = \"on_view\"\n", f); fclose(f);
+            memset(&ec, 0, sizeof ec);
+            ec.struct_size = sizeof ec; ec.limits.struct_size = sizeof ec.limits;
+            ec.limits.max_concurrent_tasks = 1; ec.limits.max_memory_bytes = 1u << 20;
+            ec.mode = GPTPS_RUN_MANUAL; ec.config_path = path;
+            e = NULL;
+            CHECK(gptps_open_ex(&ec, &e) == GPTPS_OK);
+            if (e) {
+                loglen = 0; logbuf[0] = 0;
+                base_cfg(&c, GPTPS_TUI_KPI_FULL, 0); c.out = o;
+                t = gptps_tui_install(e, &c);
+                CHECK(t != NULL);
+                h = health(t);
+                CHECK(h.arm == GPTPS_TUI_ARM_ON_VIEW && h.armed == 0 && h.kpi == GPTPS_TUI_KPI_GAUGE &&
+                      h.footprint_bytes == formula(TUI_T_GAUGE, 0) && h.arms == 0 && h.disarms == 0);
+                CHECK(log_count("no terminal to run") == 0);
+                tui_fake_ms += 1000;
+                gptps_tui_render(t, frame, sizeof frame);  /* the first view arms, and says so */
+                h = health(t);
+                CHECK(h.armed == 1 && h.arms == 1 && strstr(frame, "recording since first view") != NULL);
+                gptps_shutdown(e);
+                gptps_tui_close(t);
+            }
+            remove(path);
+        }
+    }
     e = open_manual();
     if (!e) { log_end(); fclose(o); return; }
     loglen = 0; logbuf[0] = 0;
