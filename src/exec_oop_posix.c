@@ -1981,4 +1981,9 @@ gptps_status gptps_program_execute(const gptps_task_def *def, const void *payloa
     }
 }
 
+#else
+/* The POSIX executor compiles to nothing on Windows (exec_win.c is used). ISO C forbids an empty
+ * translation unit (-pedantic), so one file-scope typedef keeps this one non-empty: a
+ * typedef has no linkage and emits no code or symbol. */
+typedef int gptps_exec_posix_not_this_platform;
 #endif /* !_WIN32 */
