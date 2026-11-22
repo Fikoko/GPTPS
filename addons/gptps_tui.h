@@ -552,10 +552,15 @@ gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
  *   TASKS       "-tasks"       COST, RENDER, TRUNCATED (the TASKS rows), NOMEM; it also takes
  *                              what runs above PROBLEMS (journal, percentiles, table)
  * TRUNCATED acts only for dashboard frames (a frame is rows of at most the width, so only
- * fewer rows shorten it; a frame cut on another pane is reported only). NOMEM: every step
- * but PANE frees memory, so failed allocations shed down the ladder, one step per 3 windows,
- * until they stop (a step's rebuild that fails again is counted and logged, so it keeps
- * counting). Report-only, never shed for: PROBLEMS_LOST - PROBLEMS is the floor, and no step
+ * fewer rows shorten it; a frame cut on another pane is reported only), and only for those
+ * cut after the header, where the rows begin, in any buffer (run's / snapshot's, or a
+ * host's gptps_tui_render one): a frame whose header alone did not fit - a host's small
+ * render buffer (a status widget), a title longer than the frame - is reported, never shed
+ * for, as no step shortens the header. NOMEM counts a failed allocation
+ * anywhere in the dashboard (journals, tables, the frame buffer, the tasks / settings pane
+ * caches): every step but PANE frees heap, which a failing allocation anywhere can use, so
+ * failed allocations shed down the ladder, one step per 3 windows, until they stop (a
+ * step's rebuild that fails again is counted and logged, so it keeps counting). Report-only, never shed for: PROBLEMS_LOST - PROBLEMS is the floor, and no step
  * changes how many failures arrive (raise tui.recent, or look more often); FOLDED - folding
  * into '(other)' is already the cheap fallback (the totals stay exact) and the only step that
  * ends it, -tasks, drops every row to save merging a few (raise cfg.max_tasks). Their

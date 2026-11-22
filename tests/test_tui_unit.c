@@ -3852,9 +3852,16 @@ static void test_adapt_acting(void)
     gptps_shutdown(e); gptps_tui_close(t);
 
     /* TRUNCATED: a cut frame on another pane is reported, never shed for; on the dashboard
-     * -activity (its RECENT rows) and then -tasks (the TASKS rows, and all above PROBLEMS) */
+     * -activity (its RECENT rows) and then -tasks (the TASKS rows, and all above PROBLEMS) -
+     * but only for a frame cut after its header, where fewer rows can make it fit */
     if ((e = open_manual()) == NULL) { tui_fake_ms = 0; return; }
-    t = ad_install(e, GPTPS_TUI_KPI_FULL, GPTPS_TUI_ADAPT_DEGRADE, 100);
+    {
+        gptps_tui_config c;
+        memset(&c, 0, sizeof c);
+        c.struct_size = sizeof c; c.kpi = GPTPS_TUI_KPI_FULL; c.max_tasks = 256; c.rate_window_s = 1;
+        c.adapt = GPTPS_TUI_ADAPT_DEGRADE; c.cost_budget_pct = 100; c.clock = GPTPS_TUI_CLOCK_OFF;
+        t = gptps_tui_install(e, &c);                 /* ad_install's, with room for 160 TASKS rows */
+    }
     CHECK(t != NULL);
     if (!t) { gptps_shutdown(e); tui_fake_ms = 0; return; }
     log_begin();
@@ -3866,29 +3873,69 @@ static void test_adapt_acting(void)
         CHECK(h.pressure == GPTPS_TUI_P_TRUNCATED && h.pressure_windows == 0 && t->shed == 0);
     }
     CHECK(log_count("shedding") == 0 && log_count("pressure (truncated") == 1);
+    /* the dashboard in a host's buffer its header does not fit (a status widget): reported,
+     * never shed for - no step shortens the header */
     t->pane = TUI_PANE_DASH;
-    ad_window(t, frame, sizeof frame);
-    {
-        static const struct { unsigned shed; int kpi; const char *log; } TR[] = {
-            { 0x1u, GPTPS_TUI_KPI_FULL,     "pressure (truncated) for 3 windows in a row; shedding -activity - kpi full requested, full runs" },
-            { 0xfu, GPTPS_TUI_KPI_PROBLEMS, "shedding -percentiles -latency -tasks - kpi full requested, problems runs" },
-        };
-        size_t k;
-        for (k = 0; k < 2; ++k) {
-            for (w = 0; w < 3; ++w) {
-                CHECK(t->shed == (k ? TR[k - 1].shed : 0u));
-                gptps_tui_render(t, small, sizeof small);
-                ad_window(t, frame, sizeof frame);
-            }
-            CHECK(t->shed == TR[k].shed && t->kpi == TR[k].kpi && log_count(TR[k].log) == 1 && t->prob != NULL);
-            CHECK(health(t).shed_pressure == GPTPS_TUI_P_TRUNCATED);
-        }
+    for (w = 0; w < 5; ++w) {
+        gptps_tui_render(t, small, sizeof small);
+        ad_window(t, frame, sizeof frame);
+        h = health(t);
+        CHECK(h.pressure == GPTPS_TUI_P_TRUNCATED && h.pressure_windows == 0 && t->shed == 0);
     }
-    CHECK(t->act == NULL && t->tasks == NULL && t->tab == NULL && t->hist == NULL);
-    for (w = 0; w < 3; ++w) { gptps_tui_render(t, small, sizeof small); ad_window(t, frame, sizeof frame); }
-    CHECK(log_count("nothing is left to shed that relieves it at kpi problems") == 1 && log_count("shedding") == 2);
-    for (w = 0; w < 4; ++w) ad_window(t, frame, sizeof frame);             /* sticky */
-    CHECK(health(t).pressure == 0 && t->shed == 0xfu && t->kpi == GPTPS_TUI_KPI_PROBLEMS);
+    CHECK(log_count("shedding") == 0 && log_count("nothing is left to shed") == 0);
+    /* a buffer the header fits and the rows overflow: -activity (its RECENT rows) makes the
+     * frame fit, and the cut stops - with frames still made into that buffer */
+    mu_lock(&t->rmu); t->cols = 200; t->rows = 200; mu_unlock(&t->rmu);
+    CHECK(gptps_tui_set_recent(t, -1, 400) == GPTPS_OK);
+    for (i = 0; i < 120; ++i) {
+        snprintf(nm, sizeof nm, "tr%03d", i % 60);
+        emit(t, GPTPS_EV_QUEUED, nm, hd, GPTPS_OK, tui_fake_ms);
+        emit(t, GPTPS_EV_STARTED, nm, hd, GPTPS_OK, tui_fake_ms);
+        emit(t, GPTPS_EV_FINISHED, nm, hd++, GPTPS_OK, tui_fake_ms);
+    }
+    {
+        static char mid[8192], whole[65536];
+        size_t n;
+        ad_window(t, whole, sizeof whole);
+        n = strlen(whole);
+        CHECK(n > sizeof mid && n < sizeof whole && t->view && t->view->rows_at < 2048);   /* it overflows mid */
+        gptps_tui_render(t, mid, sizeof mid);         /* a window counts the frames made in it */
+        for (w = 0; w < 3; ++w) {
+            CHECK(t->shed == 0);
+            ad_window(t, mid, sizeof mid);
+        }
+        CHECK(t->shed == GPTPS_TUI_SHED_ACTIVITY && t->kpi == GPTPS_TUI_KPI_FULL && t->act == NULL &&
+              log_count("pressure (truncated) for 3 windows in a row; shedding -activity - kpi full requested, "
+                        "full runs") == 1 && health(t).shed_pressure == GPTPS_TUI_P_TRUNCATED);
+        for (w = 0; w < 4; ++w) {                     /* relieved: it fits now */
+            ad_window(t, mid, sizeof mid);
+            CHECK(health(t).pressure == 0 && strstr(mid, "[frame truncated]") == NULL && t->shed == 0x1u);
+        }
+        /* 100 more types: the TASKS rows overflow it - -tasks (the percentiles and the table
+         * with it; neither relieves TRUNCATED, so they are not steps of their own) */
+        for (i = 60; i < 160; ++i) {
+            snprintf(nm, sizeof nm, "tr%03d", i);
+            emit(t, GPTPS_EV_QUEUED, nm, hd, GPTPS_OK, tui_fake_ms);
+            emit(t, GPTPS_EV_FINISHED, nm, hd++, GPTPS_OK, tui_fake_ms);
+        }
+        gptps_tui_render(t, mid, sizeof mid);
+        for (w = 0; w < 3; ++w) {
+            CHECK(t->shed == 0x1u);
+            ad_window(t, mid, sizeof mid);
+            CHECK(health(t).pressure == GPTPS_TUI_P_TRUNCATED);
+        }
+        CHECK(t->shed == 0xfu && t->kpi == GPTPS_TUI_KPI_PROBLEMS && t->prob != NULL &&
+              log_count("pressure (truncated) for 3 windows in a row; shedding -percentiles -latency -tasks - kpi "
+                        "full requested, problems runs") == 1 && health(t).shed_pressure == GPTPS_TUI_P_TRUNCATED);
+        CHECK(t->act == NULL && t->tasks == NULL && t->tab == NULL && t->hist == NULL);
+        for (w = 0; w < 4; ++w) {                     /* relieved, and sticky */
+            ad_window(t, mid, sizeof mid);
+            CHECK(health(t).pressure == 0 && strstr(mid, "[frame truncated]") == NULL && t->shed == 0xfu);
+        }
+        /* at the floor a small host buffer is still only reported: no floor WARN */
+        for (w = 0; w < 4; ++w) { gptps_tui_render(t, small, sizeof small); ad_window(t, frame, sizeof frame); }
+        CHECK(log_count("nothing is left to shed") == 0 && log_count("shedding") == 2);
+    }
     CHECK(gptps_settings_set(e, "tui.kpi", "full") == GPTPS_OK);
     CHECK(t->shed == 0 && t->kpi == GPTPS_TUI_KPI_FULL && t->act && t->tasks);
     log_end();
@@ -3923,6 +3970,7 @@ static void test_adapt_acting(void)
     }
     for (w = 0; w < 3; ++w) { ad_nomem(t); ad_window(t, frame, sizeof frame); }
     CHECK(log_count("nothing is left to shed that relieves it") == 1 && log_count("shedding") == 4);
+    CHECK(log_count("PROBLEMS journal never are\n") == 1 && log_count("panes read the engine every") == 0);   /* NOMEM: no pane clause */
     for (w = 0; w < 4; ++w) ad_window(t, frame, sizeof frame);             /* sticky */
     CHECK(health(t).pressure == 0 && t->shed == 0xfu);
     CHECK(gptps_tui_set_kpi(t, GPTPS_TUI_KPI_FULL) == GPTPS_OK && t->shed == 0 && t->act && t->hist && t->tab && t->tasks);
@@ -4002,6 +4050,8 @@ static void test_adapt_acting(void)
         CHECK(t->pane_shed_ms == TUI_PANE_SHED_MAX && t->shed == GPTPS_TUI_SHED_PANE && t->kpi == GPTPS_TUI_KPI_FULL);
         for (w = 0; w < 3; ++w) { ad_pane(t, 61000u, 610000u); ad_window(t, frame, sizeof frame); }
         CHECK(log_count("nothing is left to shed that relieves it at kpi full") == 1 && t->pane_shed_ms == TUI_PANE_SHED_MAX);
+        CHECK(log_count("never are; the tasks / settings / detail panes read the engine every 61.0 s, and shedding "
+                        "never stretches them past 60 s") == 1);   /* the interval in effect, said as it is */
         for (w = 0; w < 3; ++w) ad_window(t, frame, sizeof frame);  /* sticky */
         CHECK(t->shed == GPTPS_TUI_SHED_PANE && t->pane_shed_ms == TUI_PANE_SHED_MAX);
         /* the operator: 'u' - the interval floor back to pane_refresh_ms (2 s) */
@@ -4011,6 +4061,14 @@ static void test_adapt_acting(void)
         gptps_tui_render(t, frame, sizeof frame);
         CHECK(health(t).pane_every_ms == 2000u);
         t->pane = TUI_PANE_DASH;
+        /* a pane_refresh_ms past the cap (the config takes up to 600 s): no step is left, and
+         * the floor WARN says the interval that runs, not 60 s */
+        mu_lock(&t->mu); t->cfg.pane_refresh_ms = 120000u; mu_unlock(&t->mu);
+        tui_fake_ms += TUI_WARN_GAP_MS;               /* past the last floor WARN's minute */
+        for (w = 0; w < 3; ++w) { ad_pane(t, 240000u, 2400000u); ad_window(t, frame, sizeof frame); }
+        CHECK(t->shed == 0 && health(t).pressure == GPTPS_TUI_P_PANE);
+        CHECK(log_count("nothing is left to shed that relieves it at kpi full") == 2 &&
+              log_count("panes read the engine every 240.0 s, and shedding never stretches them past 60 s") == 1);
     }
     log_end();
     gptps_shutdown(e); gptps_tui_close(t);

@@ -804,8 +804,16 @@ enabled automatically). Panes/metrics:
     | `-tasks` | the TASKS rows and all above `problems` | cost, render, truncated (the TASKS rows), no memory |
 
     Truncated acts for dashboard frames only (a frame is rows of at most the width, so only
-    fewer rows shorten it). No memory sheds down the ladder, one step per 3 windows, until
-    allocations stop failing. **Report-only** — never shed for, and their `PRESSURE:` text
+    fewer rows shorten it), and only for frames cut after the header, where the rows begin —
+    in any buffer: `gptps_tui_run`'s and `gptps_tui_snapshot`'s (grown to 256 KiB, or as far
+    as memory allowed) or a host's `gptps_tui_render` one. A frame whose header alone did not
+    fit — a host's small render buffer (a status widget, say), or a title longer than the
+    frame — is counted and reported but never shed for: no step shortens the header. No memory counts a failed
+    allocation anywhere in the dashboard — the journals and tables, the frame buffer, the
+    tasks / settings pane caches — and sheds down the ladder, one step per 3 windows, until
+    allocations stop failing: every tier step frees heap, which a failing allocation
+    anywhere can use, so where it failed does not choose the step (`-pane` frees nothing,
+    so it never answers it). **Report-only** — never shed for, and their `PRESSURE:` text
     says so: *PROBLEMS lost* (PROBLEMS is the floor, and no step changes how many failures
     arrive: raise `tui.recent` or look more often) and *folded* (folding into `(other)` is
     already the cheap fallback, the totals stay exact; the only step that would end it,

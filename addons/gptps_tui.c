@@ -651,6 +651,7 @@ typedef struct {
     /* TASKS */
     int      has_tasks, pcols, mcols, nrows, more, nfold, fold_more, max_tasks, lat_cap, has_tab;
     uint64_t lat_untracked, lat_unmatched;
+    size_t   rows_at;                  /* where this frame's rows begin, after the header (tui_finish) */
     /* RECENT */
     int      has_rec, act_on, scroll, nrec;
     uint64_t frame_unseen, rec_t0;     /* rec_t0: install time, RECENT's 0 */
@@ -1556,13 +1557,20 @@ static size_t frame_finish(int color, char *buf, size_t cap, size_t pos)
 }
 
 /* frame_finish for a pane, counting a frame that did not fit (gptps_tui_health). Called
- * without mu held. */
+ * with rmu held, mu NOT held. A dashboard frame cut after its header (tui_view.rows_at,
+ * set by this frame's dash_format) is one that fewer rows can make fit: h_trunc_dash, what
+ * DEGRADE acts on - whatever the buffer (run's / snapshot's, grown as far as memory let it,
+ * or a host's). One whose header alone did not fit - a host's small gptps_tui_render buffer
+ * (a status widget), or a title longer than the frame - is counted in h_trunc and reported,
+ * never shed for: no step shortens the header. (The rows alone stay far under TUI_FRAME_MAX:
+ * at most TUI_ROWS_MAX of at most the width.) */
 static size_t tui_finish(gptps_tui *t, char *buf, size_t cap, size_t pos)
 {
     if (cap && pos >= cap) {
+        int rows = t->pane == TUI_PANE_DASH && t->view && t->view->rows_at < cap;
         mu_lock(&t->mu);
         t->h_trunc++;
-        if (t->pane == TUI_PANE_DASH) t->h_trunc_dash++;    /* what DEGRADE's rows can make shorter */
+        if (rows) t->h_trunc_dash++;
         mu_unlock(&t->mu);
     }
     return frame_finish(t->cfg.color, buf, cap, pos);
@@ -2873,8 +2881,9 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
     t->pressure = a.flags; t->pr_seen |= a.flags; t->ad_windows++;
     t->ad_rate = a.rate; t->ad_ppm = a.ppm; t->ad_rmax_last = a.d[6];
     /* What counts toward DEGRADE (1.13: every condition a step relieves - TUI_SHED). Frames cut
-     * on another pane (or a host's small render buffer there) are not ones the dashboard's
-     * rows can shorten: TRUNCATED acts for dashboard frames only. */
+     * on another pane, or before the dashboard's rows begin (a host's small render buffer, a
+     * title too long), are not ones fewer rows can make fit: TRUNCATED acts for h_trunc_dash
+     * only (tui_finish). */
     acting = a.flags & GPTPS_TUI_P_SHEDDABLE;
     if (t->h_trunc_dash == t->ad_trd) acting &= ~(uint64_t)GPTPS_TUI_P_TRUNCATED;
     if (acting) t->p_row++; else t->p_row = 0;
@@ -2888,6 +2897,11 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
             eff = shed_tier(t);
         } else if (!t->ad_floor_ms || now - t->ad_floor_ms >= TUI_WARN_GAP_MS) {
             t->ad_floor_ms = now ? now : 1; floor_warn = 1; t->ad_warns++;
+            if (why & GPTPS_TUI_P_PANE) {            /* the interval in effect, said as it is */
+                pane_to = t->cfg.pane_refresh_ms;
+                if (t->pane_shed_ms > pane_to) pane_to = t->pane_shed_ms;
+                if (t->pane_every_ms > pane_to) pane_to = t->pane_every_ms;
+            }
         }
     }
     for (k = 0; k < TUI_P_N; ++k)                   /* a WARN per condition, at most one a minute */
@@ -2941,10 +2955,15 @@ static void tui_adapt(gptps_tui *t, uint64_t now)
                      "stepping up from what runs)", wn, TUI_SHED_AFTER, sn, pn,
                      kpi_str(a.kpi_req), kpi_str(TUI_LADDER[eff]));
         } else {
+            char pn[160];
+            pn[0] = 0;
+            if (why & GPTPS_TUI_P_PANE)                  /* only when the panes are in it */
+                snprintf(pn, sizeof pn, "; the tasks / settings / detail panes read the engine every %llu.%u s, "
+                         "and shedding never stretches them past %u s", (unsigned long long)(pane_to / 1000u),
+                         (unsigned)(pane_to / 100u % 10u), TUI_PANE_SHED_MAX / 1000u);
             tui_logf(GPTPS_LOG_WARN, "gptps_tui: tui.adapt=degrade: pressure (%s) for %u windows in a row, but nothing "
                      "is left to shed that relieves it at kpi %s - the totals, the gauges and the PROBLEMS journal "
-                     "never are, and the panes are read at least every %u s", wn, TUI_SHED_AFTER,
-                     kpi_str(TUI_LADDER[a.tier]), TUI_PANE_SHED_MAX / 1000u);
+                     "never are%s", wn, TUI_SHED_AFTER, kpi_str(TUI_LADDER[a.tier]), pn);
         }
     }
     if (step & ~(unsigned)GPTPS_TUI_SHED_PANE) {      /* a tier step; the request is kept */
@@ -3118,6 +3137,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
         pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(ls, W - 1), ls, X);
     }
 
+    v->rows_at = pos;                    /* what a DEGRADE step can shorten starts here */
     if (v->has_tasks) {                  /* the TASKS tier and up, and shown (else not built) */
         pos = appendf(buf, cap, pos, "\n%sTASKS%s\n", B, X);
         /* max ms beside avg ms once the handle table is on (LATENCY and up) and the width has

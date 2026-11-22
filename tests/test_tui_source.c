@@ -603,6 +603,9 @@ SRC_ASSERT(h_status, offsetof(gptps_tui_health_info, source_status) == offsetof(
 SRC_ASSERT(h_reads, offsetof(gptps_tui_health_info, source_reads) == offsetof(gptps_tui_health_info, render_max_us) + 16);
 /* 1.12's struct ended at source_rows; 1.13 appends after it (a 1.12 caller's struct_size reads none of it) */
 SRC_ASSERT(h_end, offsetof(gptps_tui_health_info, pane_shed_ms) == offsetof(gptps_tui_health_info, source_rows) + 8);
+SRC_ASSERT(h_spa, offsetof(gptps_tui_health_info, shed_pressure_all) == offsetof(gptps_tui_health_info, pane_shed_ms) + 8);
+/* 1.13's end: a later release appends after shed_pressure_all and moves this */
+SRC_ASSERT(h_size, sizeof(gptps_tui_health_info) == offsetof(gptps_tui_health_info, shed_pressure_all) + 8);
 SRC_ASSERT(src_ss, offsetof(gptps_tui_source, struct_size) == 0 && offsetof(gptps_tui_source_totals, struct_size) == 0 &&
                    offsetof(gptps_tui_source_row, struct_size) == 0);
 static void test_health_size(void)
@@ -624,6 +627,13 @@ static void test_health_size(void)
     CHECK(gptps_tui_health(t, &u.h) == GPTPS_OK && u.h.struct_size == end);
     for (k = end; k < sizeof u.b; ++k) if (u.b[k] != 0xee) break;
     CHECK(k == sizeof u.b);                              /* nothing past what it covers */
+    end = offsetof(gptps_tui_health_info, source_rows) + sizeof(uint64_t);
+    memset(u.b, 0xee, sizeof u.b);
+    u.h.struct_size = end;                               /* 1.12's layout: 1.13's fields untouched */
+    CHECK(gptps_tui_health(t, &u.h) == GPTPS_OK && u.h.struct_size == end && u.h.source == 1 &&
+          u.h.source_errors == 1 && u.h.source_rows == 0);
+    for (k = end; k < sizeof u.b; ++k) if (u.b[k] != 0xee) break;
+    CHECK(k == sizeof u.b && end < sizeof u.b);          /* pane_shed_ms, shed_pressure_all not written */
     u.h.struct_size = sizeof u.h;
     CHECK(gptps_tui_health(t, &u.h) == GPTPS_OK && u.h.source == 1 && u.h.source_errors == 1 &&
           u.h.source_reads == 1 && u.h.source_status == GPTPS_E_IO);
