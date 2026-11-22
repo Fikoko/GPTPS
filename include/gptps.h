@@ -94,10 +94,12 @@ extern "C" {
  * gptps_setting_info and `name_copy` to gptps_task_info, adds GPTPS_TASK_DIE_WITH_HOST
  * and the start.error measurement, and appends `task_flags` and `event_measure` to the
  * host table (gptps_api_routines); 2.9 makes gptps_task_get_info's counters O(1) and
- * adds gptps_engine_counts (gptps_engine_totals). Additive, and the loader compares
- * MAJOR only, so no existing add-on is refused. */
+ * adds gptps_engine_counts (gptps_engine_totals); 2.10 adds gptps_settings_provisional
+ * and gptps_settings_hold (a settings file's keys apply whatever order it lists them in)
+ * and appends `settings_provisional` to the host table. Additive, and the loader
+ * compares MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 9u
+#define GPTPS_ABI_VERSION_MINOR 10u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -1549,6 +1551,31 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * the file, every other value if it ran out applying one - and the reload, made
  * again, applies that value and reports anything else. For both, path==NULL uses the
  * path the engine was opened with (GPTPS_E_INVAL if none).
+ * THE FILE'S ORDER (ABI 2.10). A write accessor may check one setting against another
+ * - a size against a budget, a low mark against a high one - so in the file's order a
+ * file that raises both, the size listed first, would have the size refused: a value
+ * the file as a whole makes valid. So at open, at a reload and when settings are
+ * defined together (an add-on's setup, gptps_settings_hold), a value its WRITE
+ * ACCESSOR refuses is put off and tried again after the other keys, in passes, while
+ * one more applies; only what is still refused when a pass applies nothing more is
+ * refused - with the same message, counted once in the errors and the result, and
+ * marked refused for save. The guarantee: when each key applied only ever lets more of
+ * the file's other keys apply - a value within a bound another key sets is that kind -
+ * the outcome does not depend on the order of the keys, and a file that some order
+ * applies whole is applied whole. (Checks that conflict - applying one key makes
+ * another refused that a different order would take - get the greedy result: what
+ * applies, in passes, in the file's order.) Not put off, and refused at once as
+ * before: a value of the wrong type, out of range or not a choice (no other key
+ * changes that), and GPTPS_E_NOMEM from an accessor (memory, not the file: it is not
+ * retried, and the result is GPTPS_E_NOMEM). The cost: one pass when every key
+ * applies; a key refused for good is tried at least twice (provisionally, then a last
+ * time), once more for each pass in which another key applied after it; at worst a
+ * pass per key, O(n^2) accessor calls for n keys. Every try but the last is PROVISIONAL: the
+ * accessor can ask gptps_settings_provisional, and should then refuse without
+ * counting or logging the refusal - the last try, which is not provisional, reports
+ * it. A provisional try that applies is an ordinary set (a watcher hears it once); one
+ * that refuses must change nothing, so nothing fires. An accessor that does not ask
+ * reports each try as it comes: the same refusal, more than once.
  * On Windows a file cannot be replaced while another handle has it open, nor opened
  * while it is being replaced. A save that lands while something else reads the file
  * fails with GPTPS_E_IO. A reload, or an open, that lands while an editor or another
@@ -1556,6 +1583,28 @@ GPTPS_API gptps_status gptps_config_check(gptps *e);
  * and GPTPS_E_CONFIG. Neither ever applies or writes part of a file: try again. */
 GPTPS_API gptps_status gptps_settings_save(gptps *e, const char *path);
 GPTPS_API gptps_status gptps_settings_reload(gptps *e, const char *path);
+
+/* ABI 2.10. For a WRITE ACCESSOR (gptps_setting_def.write): 1 when the write of `key`
+ * now running on the calling thread is a config file's value tried PROVISIONALLY - if
+ * it is refused, it is tried again once other keys of the file have applied (THE
+ * FILE'S ORDER, above), and a later try reports it. An accessor that counts or logs a
+ * refusal skips that while this says 1, and refuses as usual (changing nothing); a
+ * loss that is not a refusal of the value - memory that ran out - it reports as ever.
+ * 0 for a live set, for the last try of a file's value, on any other thread, and for
+ * NULL arguments. Cheap: the engine lock, a short list. Also in the host table. */
+GPTPS_API int gptps_settings_provisional(gptps *e, const char *key);
+
+/* ABI 2.10. Define settings together: while the calling thread holds (hold != 0), the
+ * config file's values for the settings it defines (gptps_register_setting,
+ * gptps_define_global, ...) wait, as an add-on's do during its setup; letting go (hold
+ * == 0) applies what waited together, in THE FILE'S ORDER's passes - so a file's value
+ * checked against a setting defined after it is checked against that setting's value
+ * from the file, not its default. Holds nest on one thread (each hold needs its let-go;
+ * the last applies); GPTPS_E_BUSY while another thread holds, GPTPS_E_INVAL to let go
+ * of a hold this thread does not have. Only the file's values wait: a definition, a
+ * live set and a reload go ahead. A dashboard or other module that defines several
+ * settings checked against each other holds around them (addons/gptps_tui does). */
+GPTPS_API gptps_status gptps_settings_hold(gptps *e, int hold);
 
 /* Watch for changes: `cb` fires (with the settings lock RELEASED) after each
  * successful gptps_settings_set, with the key and its newly-applied value - for
@@ -1786,6 +1835,11 @@ typedef struct {
      * older core's table ends before them. */
     gptps_status         (*task_flags)(gptps *e, const char *task_name, uint64_t *out_flags);
     const gptps_measure *(*event_measure)(const gptps_event *ev, const char *name);
+
+    /* --- ABI 2.10: for a plug-in's write accessor - whether this write is a config
+     * file's value tried provisionally (gptps_settings_provisional). Check struct_size
+     * first. */
+    int                  (*settings_provisional)(gptps *e, const char *key);
 
     /* DELIBERATELY ABSENT, so the omissions read as decisions rather than oversights:
      *   open / open_ex / shutdown / step - engine LIFECYCLE is the host's. A module

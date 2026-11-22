@@ -18,6 +18,10 @@ checked, reloaded and saved is in the [Readme](../Readme.md#configuration-file-o
 - **Applies** says when a change takes effect while the engine runs - through
   `gptps_settings_set`, the dashboard, or `gptps_settings_reload`: at once, or at the
   next start.
+- **Order** does not matter within a file: a key whose check reads another setting
+  (`tui.kpi` against `tui.budget_kb`, say) is tried again after the file's other keys,
+  at open and at a reload, so a file that raises or lowers both applies whole in either
+  order, and a value still refused is refused once (`gptps.h`, THE FILE'S ORDER).
 - Units are in the names: `_bytes`, `_ms`, `_seconds`.
 - `<task>` stands for a task's name and `<name>` for a resource's. A part of a
   name that holds anything but letters, digits, `_` and `-` goes in quotes, as

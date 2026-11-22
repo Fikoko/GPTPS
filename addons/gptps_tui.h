@@ -331,14 +331,19 @@ typedef struct {
  * REPORT shows it and WARNs; DEGRADE sheds for it like NOMEM, as every tier step lowers the
  * footprint and so makes room for the buffers. A REFUSAL never sheds (it changed nothing),
  * and a shed never lowers the request, so a budget set under DEGRADE is checked against
- * the request ('u' must fit). Settings files: when the tui.* settings are DEFINED (at
- * install), a file's tui.budget_kb is applied last - it is the last tui key registered - so
- * the footprint the file sets is in place before its budget is checked against it. A
- * gptps_settings_reload applies the file's keys in the order the FILE lists them: a reload
- * that RAISES the footprint and the budget must list tui.budget_kb before the tui keys that
- * raise it, and one that LOWERS both must list it after them. In the other order the first
- * key is refused (an ERROR naming it, the reload returns GPTPS_E_CONFIG) and the rest are
- * applied - the old tier with the new budget, say; reload again, or set them in that order. */
+ * the request ('u' must fit). Settings files: the ORDER of a file's keys does not matter
+ * (gptps.h, THE FILE'S ORDER; core ABI 2.10). At install the tui.* settings are defined
+ * under gptps_settings_hold, so the file's tui keys apply together - tui.kpi is checked
+ * against the file's tui.budget_kb, not the budget the install had - and at open, a reload
+ * and a definition the engine tries a key the budget refuses again after the file's other
+ * keys. Those tries are provisional (gptps_settings_provisional): a refusal then is not
+ * counted in budget_refusals and logs no WARN. A file that raises, or lowers, both the
+ * footprint and the budget applies whole, whichever it lists first; one whose footprint
+ * cannot fit its own budget is refused once - one WARN naming the figure, one count, one
+ * ERROR naming the key, GPTPS_E_CONFIG - and its other keys apply. (Which key of such a
+ * file is the one refused can depend on its order when either alone would fit: kpi = full
+ * with budget_kb = 16, from MINIMAL at 200 KiB, keeps one of the two.) Set live, one key at a
+ * time, the order is the caller's: gptps_tui_set_budget_kb first to raise, last to lower. */
 gptps_tui *gptps_tui_install(gptps *e, const gptps_tui_config *cfg);
 
 /* LOCAL per-task settings. `label` (NULL => task name) is shown in the table;

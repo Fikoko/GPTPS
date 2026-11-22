@@ -379,9 +379,23 @@ int main(void)
             (void)sizeof(et_size_first); (void)sizeof(et_order); (void)sizeof(et_wide);
             CHECK(fn != NULL);
         }
+        /* 2.10: gptps_settings_provisional and gptps_settings_hold, new; the host table
+         * appends settings_provisional, the last member, right after event_measure. */
+        {
+            typedef char hp_after[(offsetof(gptps_api_routines, settings_provisional) ==
+                                   offsetof(gptps_api_routines, event_measure) + sizeof(void (*)(void))) ? 1 : -1];
+            typedef char hp_last[(offsetof(gptps_api_routines, settings_provisional) + sizeof(void (*)(void)) ==
+                                  sizeof(gptps_api_routines)) ? 1 : -1];
+            int (*fp)(gptps *, const char *) = gptps_settings_provisional;
+            gptps_status (*fh)(gptps *, int) = gptps_settings_hold;
+            gptps_api_routines api;
+            (void)sizeof(hp_after); (void)sizeof(hp_last);
+            api.settings_provisional = gptps_settings_provisional;
+            CHECK(fp != NULL && fh != NULL && api.settings_provisional == fp);
+        }
         /* The ABI this file guards. A new minor appends something: add its guards
          * above, then move this. */
-        CHECK(GPTPS_ABI_VERSION_MAJOR == 2u && GPTPS_ABI_VERSION_MINOR == 9u);
+        CHECK(GPTPS_ABI_VERSION_MAJOR == 2u && GPTPS_ABI_VERSION_MINOR == 10u);
     }
 
     /* 7) Every flag family: single, distinct bits, and the whole family listed. */

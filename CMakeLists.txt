@@ -640,6 +640,20 @@ target_compile_definitions(test_config_strict PRIVATE
 add_test(NAME config_strict COMMAND test_config_strict)
 set_tests_properties(config_strict PROPERTIES TIMEOUT 60)
 
+# A settings file's outcome does not hang on the order of its keys (ABI 2.10): host
+# settings checked against each other, at definition (gptps_settings_hold) and at
+# reloads, and a binary plug-in whose accessors ask settings_provisional.
+add_library(addon_order MODULE tests/addon_order.c)
+target_include_directories(addon_order PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(addon_order PROPERTIES PREFIX "")
+add_executable(test_settings_order tests/test_settings_order.c)
+target_include_directories(test_settings_order PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(test_settings_order PRIVATE gptps)
+add_dependencies(test_settings_order addon_order)
+target_compile_definitions(test_settings_order PRIVATE ADDON_ORDER_PATH="$<TARGET_FILE:addon_order>")
+add_test(NAME settings_order COMMAND test_settings_order)
+set_tests_properties(settings_order PROPERTIES TIMEOUT 60)
+
 # The SAME policy as addons/gpu_quota.c, shipped as a binary plug-in. Built as a
 # MODULE precisely because that is its tier: the host never calls into it.
 add_library(gpu_quota_plugin MODULE addons/gptps_gpu_quota_plugin.c)

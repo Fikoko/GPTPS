@@ -51,6 +51,8 @@ typedef struct {
     int       line;
     int       claimed;   /* a consumer used it (gptps_toml_claim_at) */
     int       refused;   /* the engine refused its value (gptps_toml_refuse_at) */
+    uint64_t  deferred;  /* the apply that put it off, to retry after other keys (engine.c,
+                          * cfg_apply: its mark); 0 = not deferred */
     int       big;       /* an integer past LLONG_MAX: only its text holds it */
 } toml_entry;
 
@@ -861,6 +863,8 @@ const char *gptps_toml_table_at(const gptps_toml *t, size_t i) { return t->tb[i]
 void        gptps_toml_claim_at(gptps_toml *t, size_t i)       { t->e[i].claimed = 1; }
 int         gptps_toml_refused_at(const gptps_toml *t, size_t i) { return t->e[i].refused; }
 void        gptps_toml_refuse_at(gptps_toml *t, size_t i)      { t->e[i].refused = 1; }
+uint64_t    gptps_toml_deferred_at(const gptps_toml *t, size_t i) { return t->e[i].deferred; }
+void        gptps_toml_defer_at(gptps_toml *t, size_t i, uint64_t by) { t->e[i].deferred = by; }
 
 void gptps_toml_dotted_at(const gptps_toml *t, size_t i, char *buf, size_t cap)
 {

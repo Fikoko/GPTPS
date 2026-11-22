@@ -611,7 +611,10 @@ management + generic settings (new symbols, an appended `GPTPS_E_BUSY` status, a
 7 → 8) — each a new symbol or an appended field, never a reshape. ABI 2.9 is the
 same kind of step: `gptps_engine_counts` and its `gptps_engine_totals` are new, and
 `gptps_task_get_info` keeps its signature and values while its counters became O(1)
-(per-type counts the queue primitives keep - "per-type counts" in `src/engine.c`).
+(per-type counts the queue primitives keep - "per-type counts" in `src/engine.c`). ABI
+2.10 adds `gptps_settings_provisional` and `gptps_settings_hold` and appends
+`settings_provisional` to the host table: a settings file's keys apply whatever order it
+lists them in (cfg_apply's passes in `src/engine.c`).
 
 ---
 
