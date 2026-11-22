@@ -172,17 +172,24 @@ typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_stats_config) */
     uint32_t max_tasks;            /* task rows (0 => 256; 1..65536). Rows are found by an FNV-1a
                                     * hash of the name - one probe and one compare per lookup,
-                                    * whatever the number of types - and a row keeps its index for
-                                    * the life of the object. A type that arrives once every row is
-                                    * taken (or with a name longer than GPTPS_TASK_NAME_MAX) counts in
-                                    * one '(other)' row, enumerated after the real ones; the distinct
-                                    * types folded there are counted (health.types_folded). About
-                                    * 312 bytes a row (64-bit). */
+                                    * whatever the number of types - and a real row keeps its index
+                                    * for the life of the object. A type that arrives once every row
+                                    * is taken (or with a name longer than GPTPS_TASK_NAME_MAX) counts
+                                    * in one '(other)' row, always enumerated LAST, so its index is
+                                    * task_count - 1 and moves up while real rows are still being
+                                    * added (find it by GPTPS_STATS_ROW_OTHER or by name, not by a
+                                    * cached index); the distinct types folded there are counted
+                                    * (health.types_folded). About 312 bytes a row (64-bit). */
     uint32_t handles;              /* live handle-table entries at install (0 => 1024; 1..1<<24).
                                     * A slot is 56 bytes, the table a power of two at most 3/4 full. A
-                                    * handle that finds every live entry taken is NOT tracked - its
-                                    * gauges and samples are skipped, never another's evicted - and
-                                    * counted (health.handles_untracked); the gauges then undercount. */
+                                    * handle that finds every live entry taken is NOT tracked for the
+                                    * rest of its life - its gauges and samples are skipped, never
+                                    * another's evicted - and counted once (health.handles_untracked);
+                                    * the gauges then undercount. Only a read grows the table, so a
+                                    * host that submits more than this many items before it first
+                                    * reads the stats (a burst at start-up, a MANUAL engine filled
+                                    * then stepped) must size it here or with gptps_stats_reserve.
+                                    * Before 1.12 the table grew on the event path without bound. */
     uint32_t handles_max;          /* how far reads may grow the table (0 => max(handles, 1<<20);
                                     * handles..1<<24; = handles: never grow by itself) */
     uint32_t measure_tables;       /* task types that may keep measurement rows (0 => 8; 1..65536),
@@ -225,8 +232,13 @@ typedef struct {
     uint64_t markers;              /* entries kept for a late event (<= GPTPS_STATS_ORPHANS) */
     uint64_t handles_untracked;    /* events of a handle the full table could not take */
     uint64_t orphans_dropped;      /* markers dropped, oldest first, to bound them (work submitted
-                                    * before install, a service's later runs). If the late event
-                                    * still comes, it counts as a new handle's. */
+                                    * before install, a service's later runs, an out-of-order end
+                                    * whose QUEUED / RETRIED is still on its way). The last 256
+                                    * dropped (and untracked) handles are remembered: if one's late
+                                    * QUEUED / RETRIED still comes it bumps the totals only
+                                    * (late_absorbed). Past those 256 it is taken for a new handle's
+                                    * and leaves pending at +1 and one live entry held until the next
+                                    * resume - the residual cost of bounding the markers. */
     uint64_t grows;                /* handle-table growths */
     uint64_t tasks_cap;            /* cfg.max_tasks */
     uint64_t tasks;                /* rows in use, '(other)' not counted */
@@ -236,6 +248,8 @@ typedef struct {
     uint64_t measure_tables_refused; /* first measurements of a type that found no table left */
     uint64_t nomem;                /* allocations that failed: a growth, a host fold's table */
     uint64_t memory_bytes;         /* what this object holds */
+    uint64_t late_absorbed;        /* late QUEUED / RETRIED events of a dropped marker or of an
+                                    * untracked handle: counted in the totals, no gauge moved */
 } gptps_stats_health_info;
 gptps_status gptps_stats_health(gptps_stats *s, gptps_stats_health_info *out);
 
@@ -273,12 +287,18 @@ void gptps_stats_close(gptps_stats *s);
 gptps_status gptps_stats_total(gptps_stats *s, gptps_stats_counters *out);
 
 /* Counters for one task type by name; GPTPS_E_NOTFOUND if no event for that name
- * has been seen. */
+ * has been seen - and also for a type that was seen but has no row of its own (past
+ * cfg.max_tasks, or a name longer than GPTPS_TASK_NAME_MAX): its counts are in the
+ * '(other)' row (GPTPS_STATS_OTHER_NAME), and health.types_folded says how many types
+ * are there. */
 gptps_status gptps_stats_task(gptps_stats *s, const char *task, gptps_stats_counters *out);
 
-/* Enumerate task types seen so far (order is first-seen; stable while attached). Past
- * cfg.max_tasks types, an '(other)' row (GPTPS_STATS_OTHER_NAME) comes last; by name it
- * is found only when no real type has that name. */
+/* Enumerate task types seen so far. The real rows are in first-seen order and keep
+ * their index while attached. Once anything folds into it, the '(other)' row
+ * (GPTPS_STATS_OTHER_NAME) is always LAST: its index is task_count - 1, which moves up
+ * each time a real row is added (a long name can fold before max_tasks is reached), so
+ * a reader should not cache it. By name it is found only when no real type has that
+ * name. */
 size_t       gptps_stats_task_count(gptps_stats *s);
 gptps_status gptps_stats_task_at(gptps_stats *s, size_t index,
                                  char *name_buf, size_t name_cap,

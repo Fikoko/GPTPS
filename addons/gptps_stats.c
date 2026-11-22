@@ -77,8 +77,18 @@
 /* Task types folded into '(other)' are counted distinct, by name hash, up to this many. */
 #define ST_FOLD_SLOTS   256u
 #define ST_FOLD_MAX     192u
-/* A WARN condition speaks at most once in this long. */
+/* A WARN condition speaks at most once in this long, on ONE clock: gptps_now_ms, read
+ * only when a condition fires. Never an event's or a host's ts_ms - a host may fold with
+ * a wall-clock stamp, and two threads' stamps invert - so mixed clocks cannot make a
+ * condition speak more often. (A test may supply its own clock.) */
 #define ST_WARN_MS      60000u
+#ifndef ST_NOW_MS
+#  define ST_NOW_MS() gptps_now_ms(NULL)
+#endif
+/* Late QUEUED / RETRIED events to absorb (see "the absorb set"): the last ST_ABSORB handles
+ * whose marker was dropped or whose events the full table did not track. */
+#define ST_ABSORB       256u
+#define ST_ABSORB_SLOTS 512u
 
 enum { ST_NONE = 0, ST_PENDING, ST_RUNNING, ST_LIMBO, ST_DONE };
 enum { W_UNTRACKED = 0, W_FOLD, W_ORPHAN, W_NOMEM, W_MEASURE, W_N };
@@ -154,9 +164,16 @@ struct gptps_stats {
     size_t                handles_max;
     gptps_handle          orph[ST_ORPHANS];   /* the newest markers, oldest first */
     unsigned              orph_head, orph_n;
+    /* handles whose late QUEUED / RETRIED must move no gauge: a ring (eviction order)
+     * over a set (lookup), both fixed */
+    gptps_handle          ab_ring[ST_ABSORB];
+    unsigned              ab_head, ab_n;
+    gptps_handle          ab_set[ST_ABSORB_SLOTS];
+    /* the span of handles the full table refused: their later events stay untracked */
+    gptps_handle          rf_lo, rf_hi;
     /* health */
     uint64_t              untracked, untracked_seen, orphans_dropped, grows, nomem;
-    uint64_t              mtab_refused, resumes, resumed_ms;
+    uint64_t              mtab_refused, resumes, resumed_ms, late_absorbed;
     /* WARN rate limit: when each condition last spoke */
     uint64_t              w_last[W_N];
     uint8_t               w_any[W_N];
@@ -166,8 +183,9 @@ struct gptps_stats {
 #define ST_WARN_LEN 512
 typedef struct { int n; char m[3][ST_WARN_LEN]; } st_warns;
 
-static int st_warn_due(gptps_stats *s, int k, uint64_t now)
+static int st_warn_due(gptps_stats *s, int k)
 {
+    uint64_t now = ST_NOW_MS();
     if (s->w_any[k] && now >= s->w_last[k] && now - s->w_last[k] < ST_WARN_MS) return 0;
     s->w_any[k] = 1; s->w_last[k] = now;
     return 1;
@@ -251,9 +269,59 @@ static stats_slot *tab_insert(gptps_stats *s, gptps_handle h)
 }
 static size_t st_live(const gptps_stats *s) { return s->tabn - s->ndone; }
 
+/* ---- the absorb set: handles whose late QUEUED / RETRIED moves no gauge ----
+ * A marker dropped from the FIFO below, or a handle whose events the full table did not
+ * track, may still get the late QUEUED (or RETRIED) it was owed. With no slot, that
+ * event would open a PENDING entry nothing ever closes: pending stuck at +1 and a live
+ * entry lost for good. So the last ST_ABSORB such handles are remembered (fixed arrays,
+ * nothing allocated) and their late QUEUED / RETRIED bumps the totals only, counted in
+ * health.late_absorbed. A handle that ages out of the ring before its late event comes
+ * is not caught: that is the residual case the header documents. */
+static int st_ab_has(const gptps_stats *s, gptps_handle h)
+{
+    size_t i;
+    for (i = slot_hash(h, ST_ABSORB_SLOTS); s->ab_set[i]; i = (i + 1) & (ST_ABSORB_SLOTS - 1))
+        if (s->ab_set[i] == h) return 1;
+    return 0;
+}
+static void st_ab_del(gptps_stats *s, gptps_handle h)
+{
+    size_t i, j;
+    for (i = slot_hash(h, ST_ABSORB_SLOTS); s->ab_set[i] != h; i = (i + 1) & (ST_ABSORB_SLOTS - 1))
+        if (!s->ab_set[i]) return;
+    for (j = i;;) {                               /* backward shift, as tab_del */
+        size_t k;
+        j = (j + 1) & (ST_ABSORB_SLOTS - 1);
+        if (!s->ab_set[j]) break;
+        k = slot_hash(s->ab_set[j], ST_ABSORB_SLOTS);
+        if ((i <= j) ? (k <= i || k > j) : (k <= i && k > j)) { s->ab_set[i] = s->ab_set[j]; i = j; }
+    }
+    s->ab_set[i] = 0;
+}
+static void st_ab_add(gptps_stats *s, gptps_handle h)
+{
+    size_t i;
+    if (!h || st_ab_has(s, h)) return;
+    if (s->ab_n == ST_ABSORB) {                   /* the oldest ages out */
+        st_ab_del(s, s->ab_ring[s->ab_head]);
+        s->ab_ring[s->ab_head] = h;
+        s->ab_head = (s->ab_head + 1) % ST_ABSORB;
+    } else {
+        s->ab_ring[(s->ab_head + s->ab_n) % ST_ABSORB] = h;
+        s->ab_n++;
+    }
+    for (i = slot_hash(h, ST_ABSORB_SLOTS); s->ab_set[i]; i = (i + 1) & (ST_ABSORB_SLOTS - 1)) { }
+    s->ab_set[i] = h;
+}
+/* In the span of handles the full table refused (see st_untracked). */
+static int st_refused(const gptps_stats *s, gptps_handle h)
+{
+    return s->rf_hi && h >= s->rf_lo && h <= s->rf_hi;
+}
+
 /* Remember a new marker; drop the oldest when the FIFO is full (it may delete a slot,
  * which moves entries: no slot pointer survives this call). */
-static void st_orphan(gptps_stats *s, gptps_handle h, uint64_t now, st_warns *w)
+static void st_orphan(gptps_stats *s, gptps_handle h, st_warns *w)
 {
     if (s->orph_n == ST_ORPHANS) {
         gptps_handle old = s->orph[s->orph_head];
@@ -262,7 +330,8 @@ static void st_orphan(gptps_stats *s, gptps_handle h, uint64_t now, st_warns *w)
             char *m;
             tab_del(s, o);
             s->orphans_dropped++;
-            if (st_warn_due(s, W_ORPHAN, now) && (m = st_warn_slot(w)) != NULL)
+            st_ab_add(s, old);                   /* its late QUEUED / RETRIED moves no gauge */
+            if (st_warn_due(s, W_ORPHAN) && (m = st_warn_slot(w)) != NULL)
                 snprintf(m, ST_WARN_LEN, "gptps_stats: %llu handle marker(s) dropped so far, oldest first: they waited for a "
                          "late event that never came (work submitted before install, a service's later runs); "
                          "at most %d are kept (gptps_stats_health.orphans_dropped)",
@@ -291,7 +360,7 @@ static gptps_status st_grow(gptps_stats *s, size_t live_cap)
     if (!nt) {
         char *m;
         s->nomem++;
-        if (st_warn_due(s, W_NOMEM, gptps_now_ms(NULL)) && (m = st_warn_slot(&w)) != NULL)
+        if (st_warn_due(s, W_NOMEM) && (m = st_warn_slot(&w)) != NULL)
             snprintf(m, ST_WARN_LEN, "gptps_stats: no memory to grow the handle table to %lu entries; it stays at %lu, and "
                      "handles past it are not tracked (gptps_stats_health.nomem = %llu)",
                      (unsigned long)live_cap, (unsigned long)s->live_cap, (unsigned long long)s->nomem);
@@ -354,7 +423,7 @@ static int64_t st_row_lookup(const gptps_stats *s, const char *name, uint64_t h)
 
 /* The row an event of task type `name` counts in: its own, made on first sight, or
  * '(other)' once every row is taken. Never fails, never allocates. */
-static uint32_t task_index(gptps_stats *s, const char *name, uint64_t now, st_warns *w)
+static uint32_t task_index(gptps_stats *s, const char *name, st_warns *w)
 {
     uint64_t h;
     int64_t r;
@@ -377,7 +446,7 @@ static uint32_t task_index(gptps_stats *s, const char *name, uint64_t now, st_wa
     s->other_used = 1;
     if (st_fold_note(s, h)) {
         char *m;
-        if (st_warn_due(s, W_FOLD, now) && (m = st_warn_slot(w)) != NULL)
+        if (st_warn_due(s, W_FOLD) && (m = st_warn_slot(w)) != NULL)
             snprintf(m, ST_WARN_LEN, "gptps_stats: task type '%.64s' has no row of its own (%s); it counts in the '%s' row "
                      "(%u type(s) folded there so far%s; cfg.max_tasks = %u)",
                      name, n >= GPTPS_STATS_TASK_NAME ? "its name is too long" : "every row is taken",
@@ -432,7 +501,7 @@ static void st_meas_out(gptps_stats_measure *out, const gptps_stats_measure *src
     out->struct_size = n;
 }
 /* The 1.12 layouts: new structs, so their callers must say their size. */
-#define ST_HEALTH_MIN (offsetof(gptps_stats_health_info, memory_bytes) + sizeof(uint64_t))
+#define ST_HEALTH_MIN (offsetof(gptps_stats_health_info, late_absorbed) + sizeof(uint64_t))
 #define ST_ROW_MIN    (sizeof(gptps_stats_row))
 #define ST_CFG_MIN    (offsetof(gptps_stats_config, flags) + sizeof(uint32_t))
 
@@ -448,7 +517,7 @@ static void mrow_fold(gptps_stats_measure *m, uint64_t v, uint64_t ts)
 
 /* A table for a task type's first measurement: a slice of the pool, or 0 if the pool
  * is spent (counted; the caller counts the value as dropped). */
-static int st_mtab_take(gptps_stats *s, stats_mtab *mt, uint64_t now, st_warns *w)
+static int st_mtab_take(gptps_stats *s, stats_mtab *mt, st_warns *w)
 {
     char *m;
     if (mt->rows) return 1;
@@ -460,7 +529,7 @@ static int st_mtab_take(gptps_stats *s, stats_mtab *mt, uint64_t now, st_warns *
     if (mt->refused) return 0;                  /* counted once per task type */
     mt->refused = 1;
     s->mtab_refused++;
-    if (st_warn_due(s, W_MEASURE, now) && (m = st_warn_slot(w)) != NULL)
+    if (st_warn_due(s, W_MEASURE) && (m = st_warn_slot(w)) != NULL)
         snprintf(m, ST_WARN_LEN, "gptps_stats: every measurement table is taken (cfg.measure_tables = %u): a task type's "
                  "measurements are dropped and counted in measures_dropped (%llu type(s) refused so far)",
                  (unsigned)s->mpool_cap, (unsigned long long)s->mtab_refused);
@@ -498,7 +567,7 @@ static void fold_array(gptps_stats *s, stats_task *k, const gptps_measure *arr, 
                        uint64_t ts, st_warns *w)
 {
     size_t i;
-    int have = n ? st_mtab_take(s, &k->mt, ts, w) : 0;
+    int have = n ? st_mtab_take(s, &k->mt, w) : 0;
     for (i = 0; i < n; ++i) {
         const gptps_measure *x = &arr[i];
         int ok = x->name && x->method &&
@@ -543,15 +612,21 @@ static int st_terminal(const gptps_event *ev)
            (ev->kind == GPTPS_EV_FAILED && ev->status == GPTPS_E_CANCELLED);
 }
 
-/* A handle the full table could not take: counted, and WARNed at most once a minute. */
-static void st_untracked(gptps_stats *s, uint64_t now, st_warns *w)
+/* A handle the full table could not take: counted, and WARNed at most once a minute.
+ * It joins the refused span, so its later events stay untracked too - counted once, here,
+ * never again as a marker dropped. */
+static void st_untracked(gptps_stats *s, gptps_handle h, st_warns *w)
 {
     char *m;
     s->untracked++;
-    if (st_warn_due(s, W_UNTRACKED, now) && (m = st_warn_slot(w)) != NULL)
+    if (h) {
+        if (!s->rf_hi || h < s->rf_lo) s->rf_lo = h;
+        if (h > s->rf_hi) s->rf_hi = h;
+    }
+    if (st_warn_due(s, W_UNTRACKED) && (m = st_warn_slot(w)) != NULL)
         snprintf(m, ST_WARN_LEN, "gptps_stats: the handle table is full (%lu live entries; cfg.handles, gptps_stats_reserve, "
                  "or read the stats so it can grow up to cfg.handles_max = %lu): %llu event(s) not tracked so far, "
-                 "and the pending / in-flight gauges undercount",
+                 "and the pending / in-flight gauges undercount; size it for the most items submitted between reads",
                  (unsigned long)s->live_cap, (unsigned long)s->handles_max, (unsigned long long)s->untracked);
 }
 
@@ -577,13 +652,13 @@ static void st_untracked(gptps_stats *s, uint64_t now, st_warns *w)
  * event never comes - work submitted before install never sends its QUEUED, and a
  * service's later runs have none - are bounded (1.12): the newest GPTPS_STATS_ORPHANS
  * are kept, the oldest dropped and counted. */
-static void finish_slot(gptps_stats *s, stats_slot *slot, uint64_t now, st_warns *w)
+static void finish_slot(gptps_stats *s, stats_slot *slot, st_warns *w)
 {
     if (slot->seen_queued && !OWES_RETRIED(slot)) { tab_del(s, slot); return; }
     if (slot->state != ST_DONE) {                /* wait for the late QUEUED / RETRIED */
         gptps_handle h = slot->handle;
         st_state(s, slot, ST_DONE);
-        st_orphan(s, h, now, w);                 /* last use of `slot` */
+        st_orphan(s, h, w);                 /* last use of `slot` */
     }
 }
 static void note_attempt(stats_slot *slot, uint32_t attempt)
@@ -596,28 +671,36 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
     stats_slot *slot;
     stats_task *k;
     gptps_stats_counters *t;
-    uint64_t now = ev->ts_ms;
 
     if (ev->kind == GPTPS_EV_SAMPLE) {          /* a running job's values: no state moves */
-        fold_measures(s, st_row(s, task_index(s, ev->task_name, now, w)), ev, w);
+        fold_measures(s, st_row(s, task_index(s, ev->task_name, w)), ev, w);
         return;
     }
     slot = tab_find(s, ev->handle);
     /* The task row: from the slot if we have one (the name pointer is only valid for
      * this call, so the row index is what we keep), else by name. */
-    k = st_row(s, slot ? slot->task : task_index(s, ev->task_name, now, w));
+    k = st_row(s, slot ? slot->task : task_index(s, ev->task_name, w));
     t = &k->c;
     if (ev->kind == GPTPS_EV_FINISHED || ev->kind == GPTPS_EV_FAILED) fold_measures(s, k, ev, w);
     if (!slot && ev->handle) {
+        int late = ev->kind == GPTPS_EV_QUEUED || ev->kind == GPTPS_EV_RETRIED;
+        if (late && s->ab_n && st_ab_has(s, ev->handle)) {
+            /* the late event of a dropped marker or of an untracked handle: totals only */
+            s->late_absorbed++;
+        } else if (!late && st_refused(s, ev->handle)) {
+            /* a refused handle's later events (or one in that span whose QUEUED is
+             * still on its way): untracked, already counted; its late QUEUED, if one
+             * comes, is absorbed */
+            if (ev->kind == GPTPS_EV_STARTED || st_terminal(ev)) st_ab_add(s, ev->handle);
         /* A terminal event may always take an entry: it becomes a marker at once, and
          * the orphan FIFO bounds those. Anything else needs a live entry's room. */
-        if (!st_terminal(ev) && st_live(s) >= s->live_cap) st_untracked(s, now, w);
+        } else if (!st_terminal(ev) && st_live(s) >= s->live_cap) st_untracked(s, ev->handle, w);
         else if ((slot = tab_insert(s, ev->handle)) != NULL) { slot->task = (uint32_t)(k - s->rows); slot->state = ST_NONE; }
-        else st_untracked(s, now, w);
+        else st_untracked(s, ev->handle, w);
     } else if (slot && slot->state == ST_DONE && st_live(s) >= s->live_cap &&
                (ev->kind == GPTPS_EV_STARTED || (ev->kind == GPTPS_EV_FAILED && ev->status != GPTPS_E_CANCELLED))) {
         /* reviving a marker makes it live again: it needs the room a new entry would */
-        st_untracked(s, now, w);
+        st_untracked(s, 0, w);
         slot = NULL;
     }
 
@@ -677,7 +760,7 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
                 if (slot->have_started_ms && ev->ts_ms >= slot->started_ms)
                     sample_run(s, t, ev->ts_ms - slot->started_ms);
             }
-            finish_slot(s, slot, now, w);
+            finish_slot(s, slot, w);
         }
         break;
     case GPTPS_EV_FAILED:
@@ -693,7 +776,7 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
                 GAUGE(pending, -1);           /* cancelled before it ever started */
             }
             st_state(s, slot, ST_LIMBO);
-            if (ev->status == GPTPS_E_CANCELLED) finish_slot(s, slot, now, w);
+            if (ev->status == GPTPS_E_CANCELLED) finish_slot(s, slot, w);
         }
         break;
     case GPTPS_EV_RETRIED:
@@ -724,7 +807,7 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
             note_attempt(slot, ev->attempt);
             if (slot->state == ST_PENDING) GAUGE(pending, -1);
             else if (slot->state == ST_RUNNING) GAUGE(in_flight, -1);   /* defensive */
-            finish_slot(s, slot, now, w);
+            finish_slot(s, slot, w);
         }
         break;
     default:
@@ -858,6 +941,9 @@ gptps_status gptps_stats_set_enabled(gptps_stats *s, int on)
         memset(s->tab, 0, s->tabcap * sizeof *s->tab);
         s->tabn = s->ndone = 0;
         s->orph_head = s->orph_n = 0;
+        memset(s->ab_set, 0, sizeof s->ab_set);
+        s->ab_head = s->ab_n = 0;
+        s->rf_lo = s->rf_hi = 0;
         s->total.pending = s->total.in_flight = 0;
         for (i = 0; i <= s->max_tasks; ++i) s->rows[i].c.pending = s->rows[i].c.in_flight = 0;
         s->resumes++;
@@ -926,6 +1012,7 @@ static void st_health_out(gptps_stats *s, gptps_stats_health_info *out)
     h.measure_tables_refused = s->mtab_refused;
     h.nomem = s->nomem;
     h.memory_bytes = st_memory(s);
+    h.late_absorbed = s->late_absorbed;
     if (n > sizeof h) n = sizeof h;
     h.struct_size = n;
     memcpy(out, &h, n);
@@ -1138,11 +1225,12 @@ gptps_status gptps_stats_measure_fold(gptps_stats *s, const char *task,
                                       const gptps_measure *m, size_t n, uint64_t ts_ms)
 {
     stats_task *k;
+    stats_mrow *lost = NULL;
     st_warns w;
     if (!s || !task || (n && !m)) return GPTPS_E_INVAL;
     w.n = 0;
     apx_mutex_lock(&s->mu);
-    k = st_row(s, task_index(s, task, ts_ms, &w));
+    k = st_row(s, task_index(s, task, &w));
     if (n && !k->mt.rows && s->mpool_used >= s->mpool_cap) {
         /* A host call, not the event path: the table it needs is allocated here, with
          * the lock released, and installed under it (unless another fold did first). */
@@ -1155,17 +1243,20 @@ gptps_status gptps_stats_measure_fold(gptps_stats *s, const char *task,
         if (!nr) {
             char *msg;
             s->nomem++;
-            if (st_warn_due(s, W_NOMEM, ts_ms) && (msg = st_warn_slot(&w)) != NULL)
+            /* counted here, as nomem: not again as a spent pool by fold_array */
+            k->mt.refused = 1;
+            if (st_warn_due(s, W_NOMEM) && (msg = st_warn_slot(&w)) != NULL)
                 snprintf(msg, ST_WARN_LEN, "gptps_stats: no memory for task type '%.64s''s measurement table: its values are "
                          "dropped and counted in measures_dropped (gptps_stats_health.nomem = %llu)",
                          task, (unsigned long long)s->nomem);
         } else if (!k->mt.rows) {
             k->mt.rows = nr; k->mt.n = 0; k->mt.owned = 1; nr = NULL;
         }
-        free(nr);
+        lost = nr;                               /* another fold installed one first */
     }
     fold_array(s, k, m, n, ts_ms, &w);
     apx_mutex_unlock(&s->mu);
+    free(lost);                                  /* freed with the lock released */
     st_warn_flush(&w);
     return GPTPS_OK;
 }

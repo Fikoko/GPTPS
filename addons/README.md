@@ -595,14 +595,20 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   `measure_tables` 8 by default — about 0.25 MiB; out-of-range values are refused, never
   clamped). What does not fit is counted and WARNed, at most once a minute per condition,
   never grown into and never evicted: a task type past `max_tasks` counts in one
-  `(other)` row (enumerated last, `GPTPS_STATS_ROW_OTHER` in a snapshot); a handle that
-  finds every live entry taken is not tracked (the gauges undercount); markers for
-  handles whose `QUEUED` never came — work submitted before install, a service's later
-  runs — are bounded to the newest 64, the oldest dropped and counted. The handle table
-  grows only outside the event path: `gptps_stats_reserve(st, n)`, or any read (total,
-  task, snapshot, health) that finds it over half full or refusing, up to `handles_max` —
-  allocated with the lock released, swapped in under it, the old one freed after. A
-  host that never reads sizes it at install.
+  `(other)` row (always enumerated last, so its index moves up while real rows are
+  added; `GPTPS_STATS_ROW_OTHER` in a snapshot); a handle that finds every live entry
+  taken is not tracked for the rest of its life, counted once (the gauges undercount);
+  markers for handles whose `QUEUED` never came — work submitted before install, a
+  service's later runs — are bounded to the newest 64, the oldest dropped and counted.
+  The last 256 dropped or untracked handles are remembered, so a late `QUEUED` /
+  `RETRIED` for one moves no gauge (`late_absorbed`); one older than that still leaves
+  `pending` at +1 until the next resume. The handle table grows only outside the event
+  path: `gptps_stats_reserve(st, n)`, or any read (total, task, snapshot, health) that
+  finds it over half full or refusing, up to `handles_max` — allocated with the lock
+  released, swapped in under it, the old one freed after. So a host that submits more
+  than `handles` items before its first read (a start-up burst, a MANUAL engine filled
+  then stepped) must size the table with `install_ex` or `gptps_stats_reserve`: before
+  1.12 the table grew on the event path and such a burst was counted exactly.
 - **Switch:** `gptps_stats_set_enabled(st, 0)` makes the observer return before its lock
   (a flag read); nothing is counted while off, so the totals miss those events.
   Switching on again drops the handle table and zeroes the gauges: the gauges (and
@@ -611,7 +617,8 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   `GPTPS_STATS_START_DISABLED` installs it off — observers are registered before the
   first submit, so this is how a host makes stats optional at run time.
 - **Health:** `gptps_stats_health(st, &h)` — enabled, table capacity, live entries,
-  markers, handles untracked, markers dropped, growths, rows in use, types folded,
+  markers, handles untracked, markers dropped, late events absorbed, growths, rows in
+  use, types folded,
   measurement tables used and refused, failed allocations (`nomem`: a growth, a host
   fold's table) and the memory held.
 - **Snapshot:** `gptps_stats_snapshot(st, &total, &health, rows, sizeof rows[0], cap,

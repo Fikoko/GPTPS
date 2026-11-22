@@ -13,9 +13,12 @@
  *    5) getters honour struct_size; install honours the config's
  *    6) the bulk snapshot: one lock, rows add up to totals, needed / E_FULL
  *    7) OOM counted: growth, a host fold's table, the measurement pool, install
- *    8) WARNs at most once a minute per condition
- *    9) on a real engine: install_ex, START_DISABLED, the switch
+ *    8) WARNs at most once a minute per condition, on one clock whatever ts the events
+ *       and host folds carry
+ *    9) on a real engine: install_ex, START_DISABLED, the switch; a burst past the table
  *   10) a storm: emitters, a reader and the switch on several threads (TSan)
+ *   11) late events: a dropped marker's late QUEUED / RETRIED and an untracked handle's
+ *       later events move no gauge; reviving a marker needs room
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
@@ -23,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 /* every allocation the add-on makes, counted, and failed on demand */
 static int t_allocs;                /* ints: tests/test_atomic_compat.h maps them on MSVC */
@@ -30,6 +34,9 @@ static int t_held;                  /* the add-on's lock is held (single-threade
 static int t_locks;                 /* its lock acquisitions */
 static int t_alloc_locked;          /* allocations made while it was held */
 static int t_calloc_skip, t_calloc_fail, t_malloc_fail;   /* set by the main thread only */
+static int t_free_locked;           /* frees (even of NULL) while it was held */
+static void (*t_calloc_hook)(void); /* run once, inside the next calloc (main thread only) */
+static uint64_t t_now = 1;          /* the add-on's WARN clock (ST_NOW_MS), set by the main thread */
 static void t_note_alloc(void)
 {
     __atomic_add_fetch(&t_allocs, 1, __ATOMIC_SEQ_CST);
@@ -38,6 +45,7 @@ static void t_note_alloc(void)
 /* after `t_calloc_skip` more calls succeed, the next `t_calloc_fail` return NULL */
 static void *t_calloc(size_t n, size_t s)
 {
+    if (t_calloc_hook) { void (*f)(void) = t_calloc_hook; t_calloc_hook = NULL; f(); }
     t_note_alloc();
     if (t_calloc_fail > 0) {
         if (t_calloc_skip > 0) --t_calloc_skip;
@@ -51,12 +59,19 @@ static void *t_malloc(size_t n)
     if (t_malloc_fail > 0) { --t_malloc_fail; return NULL; }
     return malloc(n);
 }
+static void t_free(void *p)
+{
+    if (__atomic_load_n(&t_held, __ATOMIC_SEQ_CST) > 0) __atomic_add_fetch(&t_free_locked, 1, __ATOMIC_SEQ_CST);
+    free(p);
+}
 static int t_strcmps;               /* the add-on's string compares */
 static int t_strcmp(const char *a, const char *b) { __atomic_add_fetch(&t_strcmps, 1, __ATOMIC_SEQ_CST); return strcmp(a, b); }
 
 #include "addon_compat.h"
 #define calloc(n, s) t_calloc((n), (s))
 #define malloc(n) t_malloc((n))
+#define free(p) t_free((p))
+#define ST_NOW_MS() (t_now)
 #undef strcmp
 #define strcmp(a, b) t_strcmp((a), (b))
 #define apx_mutex_lock(m) (apx_mutex_lock(m), (void)__atomic_add_fetch(&t_held, 1, __ATOMIC_SEQ_CST), \
@@ -65,6 +80,7 @@ static int t_strcmp(const char *a, const char *b) { __atomic_add_fetch(&t_strcmp
 #include "../addons/gptps_stats.c"
 #undef calloc
 #undef malloc
+#undef free
 #undef strcmp
 #undef apx_mutex_lock
 #undef apx_mutex_unlock
@@ -305,7 +321,9 @@ static void test_bounded_table(void)
     for (i = 1; i <= 6; ++i) { emit(s, GPTPS_EV_STARTED, "q", (gptps_handle)i, 1); emit(s, GPTPS_EV_FINISHED, "q", (gptps_handle)i, 2); }
     c = total(s);
     CHECK(c.pending == 0 && c.in_flight == 0 && c.finished == 6);   /* ... and the first 4 kept */
-    CHECK(c.run_samples == 6 && c.wait_samples == 4);   /* 5 and 6 found room from STARTED on: no queue time */
+    CHECK(c.run_samples == 4 && c.wait_samples == 4);   /* 5 and 6 stay untracked to their end ... */
+    h = health(s);
+    CHECK(h.handles_untracked == 2 && h.markers == 0 && h.orphans_dropped == 0);   /* ... counted once, not as markers */
     CHECK(allocs() == a0);                            /* nothing allocated by an event */
     gptps_stats_close(s);
 
@@ -399,7 +417,15 @@ static void test_struct_size(void)
         CHECK(i == sizeof buf);
         memset(buf, 0, sizeof buf);                   /* zeroed (struct_size 0): as before, all of it */
         gptps_stats_merge(c, &a);
-        CHECK(c->struct_size == sizeof(gptps_stats_counters) && c->measures_dropped == 5); }
+        CHECK(c->struct_size == sizeof(gptps_stats_counters) && c->measures_dropped == 5);
+        /* a src from a 1.2-1.6 caller: its measures_dropped is not there to read */
+        {   unsigned char sb[sizeof(gptps_stats_counters)];
+            gptps_stats_counters *src = (gptps_stats_counters *)(void *)sb;
+            memset(sb, 0xAB, sizeof sb);
+            memset(sb, 0, ST_CNT_V1);
+            src->struct_size = ST_CNT_V1; src->queued = 2;
+            gptps_stats_merge(c, src);
+            CHECK(c->queued == 3 && c->measures_dropped == 5); } }
     /* measurement rows: their 1.7 size is their floor */
     CHECK(gptps_stats_measure_fold(s, "a", &x, 1, 1) == GPTPS_OK);
     memset(&m, 0, sizeof m);
@@ -496,6 +522,9 @@ static void test_snapshot(void)
 }
 
 /* 7) OOM, counted */
+static gptps_stats *oom_s;
+static const gptps_measure *oom_x;
+static void oom_race(void) { (void)gptps_stats_measure_fold(oom_s, "m6", oom_x, 1, 5); }
 static void test_oom(void)
 {
     gptps_stats *s = mk(0, 4, 64, 2);
@@ -537,17 +566,32 @@ static void test_oom(void)
     CHECK(gptps_stats_measure_count(s, "m3") == 0 && gptps_stats_measure_count(s, "m1") == 1);
     CHECK(total(s).measures_dropped == 0);           /* the engine's rows folded every one */
     /* a host fold allocates the table it needs (outside the lock); without memory, counted */
-    t_alloc_locked = 0;
+    t_alloc_locked = 0; t_free_locked = 0;
     CHECK(gptps_stats_measure_fold(s, "m4", &x, 1, 5) == GPTPS_OK);
     CHECK(t_alloc_locked == 0 && gptps_stats_measure_count(s, "m4") == 1);
+    CHECK(t_free_locked == 0);                        /* nor anything freed under it */
+    /* another fold installs the table while this one allocates: the loser is freed,
+     * with the lock released, and both values land */
+    oom_s = s; oom_x = &x;
+    t_free_locked = 0;
+    t_calloc_hook = oom_race;
+    CHECK(gptps_stats_measure_fold(s, "m6", &x, 1, 5) == GPTPS_OK);
+    CHECK(t_calloc_hook == NULL && t_free_locked == 0);
+    CHECK(gptps_stats_measure_count(s, "m6") == 1);
+    memset(&c, 0, sizeof c); c.struct_size = sizeof c;
+    {   gptps_stats_measure mm; memset(&mm, 0, sizeof mm); mm.struct_size = sizeof mm;
+        CHECK(gptps_stats_measure_get(s, "m6", "acme.n", "acme.m", &mm) == GPTPS_OK && mm.count == 2); }
+    t_now += 60000;                                   /* the earlier nomem WARN is a minute old */
     log_begin();
     t_calloc_fail = 1;
     CHECK(gptps_stats_measure_fold(s, "m5", &x, 1, 5) == GPTPS_OK);
     CHECK(log_count("no memory for task type 'm5'") == 1);
+    CHECK(log_count("every measurement table is taken") == 0);   /* one loss, one WARN */
     log_end();
-    CHECK(health(s).nomem == 3);
+    h = health(s);
+    CHECK(h.nomem == 3 && h.measure_tables_refused == 1);        /* counted once, as nomem */
     CHECK(gptps_stats_task(s, "m5", &c) == GPTPS_OK && c.measures_dropped == 1);
-    CHECK(health(s).measure_tables_used == 3);
+    CHECK(health(s).measure_tables_used == 4);
     gptps_stats_close(s);
     /* every allocation of construction failing in turn: NULL, nothing leaked (ASan) */
     for (i = 0; i < 5; ++i) {                         /* the object, rows, table, engine rows, pool */
@@ -572,19 +616,43 @@ static void test_warn_rate(void)
 {
     gptps_stats *s = mk(1, 1, 1, 0);
     int i;
+    uint64_t t0;
     CHECK(s != NULL); if (!s) return;
     emit(s, GPTPS_EV_QUEUED, "a", 1, 0);              /* the one live entry */
+    t0 = t_now = 1000;
     log_begin();
-    for (i = 0; i < 1000; ++i) emit(s, GPTPS_EV_QUEUED, "a", (gptps_handle)(i + 2), (uint64_t)i * 59);   /* 0 .. 58941 ms */
+    for (i = 0; i < 1000; ++i) { t_now = t0 + (uint64_t)i * 59; emit(s, GPTPS_EV_QUEUED, "a", (gptps_handle)(i + 2), 0); }   /* 0 .. 58941 ms */
     CHECK(log_count("handle table is full") == 1);
-    emit(s, GPTPS_EV_QUEUED, "a", 5000, 60000);
+    t_now = t0 + 60000;
+    emit(s, GPTPS_EV_QUEUED, "a", 5000, 0);
     CHECK(log_count("handle table is full") == 2);
-    emit(s, GPTPS_EV_QUEUED, "b", 5001, 60001);       /* another condition speaks on its own */
+    emit(s, GPTPS_EV_QUEUED, "b", 5001, 0);           /* another condition speaks on its own */
     CHECK(log_count("has no row of its own") == 1);
-    emit(s, GPTPS_EV_QUEUED, "c", 5002, 60002);
+    emit(s, GPTPS_EV_QUEUED, "c", 5002, 0);
     CHECK(log_count("has no row of its own") == 1);
     log_end();
     CHECK(health(s).handles_untracked == 1003);
+    gptps_stats_close(s);
+    /* two clocks mixed - a host folding with wall-clock stamps, events with the engine's
+     * monotonic ones, both jumping about - still speak once a minute */
+    s = mk(1, 0, 0, 0);
+    CHECK(s != NULL); if (!s) return;
+    life(s, "only", 1, 0);                            /* the one row */
+    t_now += 1;
+    log_begin();
+    for (i = 0; i < 20; ++i) {
+        gptps_measure x; char nm[16];
+        memset(&x, 0, sizeof x);
+        x.name = "acme.n"; x.method = "acme.m"; x.unit = GPTPS_UNIT_COUNT; x.kind = GPTPS_MEASURE_TOTAL; x.value = 1;
+        snprintf(nm, sizeof nm, "h%d", i);
+        (void)gptps_stats_measure_fold(s, nm, &x, 1, 1700000000000ULL + (uint64_t)i);
+        snprintf(nm, sizeof nm, "e%d", i);
+        emit(s, GPTPS_EV_QUEUED, nm, (gptps_handle)(100 + i), 200 + (uint64_t)i);
+        t_now += 10;                                  /* 400 ms of the one clock in all */
+    }
+    CHECK(log_count("has no row of its own") == 1);
+    log_end();
+    CHECK(health(s).types_folded == 40);
     gptps_stats_close(s);
 }
 
@@ -629,6 +697,113 @@ static void test_engine(void)
     CHECK(gptps_shutdown(e) == GPTPS_OK);
     gptps_stats_close(s);
     CHECK(runs == 5);
+}
+
+/* 9b) a burst past the table on a real engine, before any read: the handles it could
+ * not take are counted once, as untracked - not again as markers dropped - and every
+ * gauge comes back to zero */
+static void test_burst(void)
+{
+    gptps *e = NULL; gptps_config cfg; gptps_task_def d; gptps_stats_config sc;
+    gptps_stats *s; gptps_handle h; size_t ran; int i;
+    gptps_stats_counters c;
+    gptps_stats_health_info hi;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_MANUAL;
+    cfg.limits.struct_size = sizeof cfg.limits; cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 1 << 20;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK && e);
+    if (!e) return;
+    memset(&sc, 0, sizeof sc);
+    sc.struct_size = sizeof sc; sc.handles = 16; sc.handles_max = 16;
+    s = gptps_stats_install_ex(e, &sc);
+    CHECK(s != NULL);
+    if (!s) { gptps_shutdown(e); return; }
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "ok"; d.run = t_ok; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    for (i = 0; i < 200; ++i) CHECK(gptps_submit(e, "ok", NULL, 0, &h) == GPTPS_OK);
+    c = total(s);
+    CHECK(c.queued == 200 && c.pending == 16);       /* the table holds 16: documented undercount */
+    for (i = 0; i < 400; ++i) { ran = 0; if (gptps_step(e, &ran) != GPTPS_OK) break; }
+    c = total(s);
+    CHECK(c.finished == 200 && c.pending == 0 && c.in_flight == 0);
+    CHECK(c.wait_samples == 16 && c.run_samples == 16);
+    hi = health(s);
+    CHECK(hi.handles_untracked == 184 && hi.orphans_dropped == 0 && hi.markers == 0 && hi.handles_live == 0);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    gptps_stats_close(s);
+}
+
+/* 11) late events */
+static void test_late(void)
+{
+    gptps_stats *s = mk(0, 4, 4, 0);
+    gptps_stats_health_info h;
+    gptps_stats_counters c;
+    int i;
+    CHECK(s != NULL); if (!s) return;
+    /* handle 1's FINISHED outran its QUEUED: a marker waits for it ... */
+    emit(s, GPTPS_EV_STARTED, "t", 1, 1); emit(s, GPTPS_EV_FINISHED, "t", 1, 2);
+    /* ... and 64 more markers push it out of the FIFO */
+    for (i = 0; i < GPTPS_STATS_ORPHANS; ++i) {
+        emit(s, GPTPS_EV_STARTED, "t", (gptps_handle)(100 + i), 3);
+        emit(s, GPTPS_EV_FINISHED, "t", (gptps_handle)(100 + i), 4);
+    }
+    CHECK(health(s).orphans_dropped == 1);
+    emit(s, GPTPS_EV_QUEUED, "t", 1, 0);              /* the late QUEUED still comes */
+    c = total(s); h = health(s);
+    CHECK(c.queued == 1 && c.pending == 0);          /* counted, and no gauge stuck */
+    CHECK(h.handles_live == 0 && h.late_absorbed == 1);
+    /* the same for a late RETRIED owed after a cancel (attempt 2 cancelled before its
+     * RETRIED arrived), whose marker is dropped too */
+    emit(s, GPTPS_EV_QUEUED, "t", 2, 0);
+    emit_a(s, GPTPS_EV_STARTED, "t", 2, GPTPS_OK, 1, 1);
+    emit_a(s, GPTPS_EV_FAILED, "t", 2, GPTPS_E_IO, 2, 1);
+    emit_a(s, GPTPS_EV_FAILED, "t", 2, GPTPS_E_CANCELLED, 3, 2);
+    CHECK(health(s).markers == GPTPS_STATS_ORPHANS);
+    for (i = 0; i < GPTPS_STATS_ORPHANS; ++i) {
+        emit(s, GPTPS_EV_STARTED, "t", (gptps_handle)(200 + i), 3);
+        emit(s, GPTPS_EV_FINISHED, "t", (gptps_handle)(200 + i), 4);
+    }
+    emit_a(s, GPTPS_EV_RETRIED, "t", 2, GPTPS_OK, 5, 2);
+    c = total(s); h = health(s);
+    CHECK(c.pending == 0 && c.in_flight == 0 && h.handles_live == 0 && h.late_absorbed == 2);
+    gptps_stats_close(s);
+
+    /* the table refused a handle's QUEUED; it found room later, from STARTED on, and
+     * its late events stay out of the table */
+    s = mk(0, 2, 2, 0);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 5; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);    /* 3..5 refused */
+    for (i = 1; i <= 5; ++i) { emit(s, GPTPS_EV_STARTED, "q", (gptps_handle)i, 1); emit(s, GPTPS_EV_FINISHED, "q", (gptps_handle)i, 2); }
+    h = health(s);
+    CHECK(h.handles_untracked == 3 && h.markers == 0 && h.handles_live == 0);
+    /* a handle inside the refused span whose QUEUED was merely late: its STARTED and
+     * FINISHED are not tracked, and its QUEUED, when it comes, is absorbed */
+    emit(s, GPTPS_EV_QUEUED, "q", 9, 0);              /* refused: the span is now 3..9 */
+    emit(s, GPTPS_EV_QUEUED, "q", 10, 0); emit(s, GPTPS_EV_QUEUED, "q", 11, 0);
+    emit(s, GPTPS_EV_STARTED, "q", 7, 1); emit(s, GPTPS_EV_FINISHED, "q", 7, 2);
+    for (i = 9; i <= 11; ++i) { emit(s, GPTPS_EV_STARTED, "q", (gptps_handle)i, 1); emit(s, GPTPS_EV_FINISHED, "q", (gptps_handle)i, 2); }
+    emit(s, GPTPS_EV_QUEUED, "q", 7, 3);
+    c = total(s); h = health(s);
+    CHECK(c.pending == 0 && c.in_flight == 0 && h.handles_live == 0 && h.markers == 0);
+    CHECK(h.late_absorbed == 1);
+    gptps_stats_close(s);
+
+    /* reviving a marker needs the room a new entry would */
+    s = mk(0, 2, 2, 0);
+    CHECK(s != NULL); if (!s) return;
+    emit(s, GPTPS_EV_STARTED, "svc", 100, 1); emit(s, GPTPS_EV_FINISHED, "svc", 100, 2);   /* a marker */
+    emit(s, GPTPS_EV_QUEUED, "q", 1, 3); emit(s, GPTPS_EV_QUEUED, "q", 2, 3);             /* table full */
+    emit(s, GPTPS_EV_STARTED, "svc", 100, 4);         /* the service's next run */
+    h = health(s);
+    CHECK(h.handles_untracked == 1 && h.handles_live <= h.handles_cap && h.handles_live == 2);
+    emit(s, GPTPS_EV_FINISHED, "svc", 100, 5);
+    c = total(s);
+    CHECK(c.in_flight == 0 && c.pending == 2);
+    gptps_stats_close(s);
 }
 
 /* 10) a storm (TSan): emitters on several threads, a reader that snapshots, grows and
@@ -709,6 +884,8 @@ int main(void)
     test_oom();
     test_warn_rate();
     test_engine();
+    test_burst();
+    test_late();
 #if !defined(_WIN32)
     test_storm();
 #else
