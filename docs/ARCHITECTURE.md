@@ -613,7 +613,7 @@ same kind of step: `gptps_engine_counts` and its `gptps_engine_totals` are new, 
 `gptps_task_get_info` keeps its signature and values while its counters became O(1)
 (per-type counts the queue primitives keep - "per-type counts" in `src/engine.c`). ABI
 2.10 adds `gptps_settings_provisional` and `gptps_settings_hold` and appends
-`settings_provisional` to the host table: a settings file's keys apply whatever order it
+`settings_provisional` and `settings_hold` to the host table: a settings file's keys apply whatever order it
 lists them in (cfg_apply's passes in `src/engine.c`).
 
 ---

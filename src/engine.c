@@ -5914,8 +5914,10 @@ static const gptps_api_routines G_API = {
     /* --- ABI 2.8: is a type a SERVICE; a measurement by name */
     gptps_task_flags,
     gptps_event_measure,
-    /* --- ABI 2.10: a config file's value tried provisionally (a write accessor asks) */
-    gptps_settings_provisional
+    /* --- ABI 2.10: a config file's value tried provisionally (a write accessor asks);
+     * settings defined together, outside a setup */
+    gptps_settings_provisional,
+    gptps_settings_hold
 };
 
 /* Undo whatever a FAILED addon setup() managed to register before it gave up.

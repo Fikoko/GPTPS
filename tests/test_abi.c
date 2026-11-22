@@ -380,18 +380,22 @@ int main(void)
             CHECK(fn != NULL);
         }
         /* 2.10: gptps_settings_provisional and gptps_settings_hold, new; the host table
-         * appends settings_provisional, the last member, right after event_measure. */
+         * appends settings_provisional right after event_measure, then settings_hold, the
+         * last member. */
         {
             typedef char hp_after[(offsetof(gptps_api_routines, settings_provisional) ==
                                    offsetof(gptps_api_routines, event_measure) + sizeof(void (*)(void))) ? 1 : -1];
-            typedef char hp_last[(offsetof(gptps_api_routines, settings_provisional) + sizeof(void (*)(void)) ==
+            typedef char hh_after[(offsetof(gptps_api_routines, settings_hold) ==
+                                   offsetof(gptps_api_routines, settings_provisional) + sizeof(void (*)(void))) ? 1 : -1];
+            typedef char hp_last[(offsetof(gptps_api_routines, settings_hold) + sizeof(void (*)(void)) ==
                                   sizeof(gptps_api_routines)) ? 1 : -1];
             int (*fp)(gptps *, const char *) = gptps_settings_provisional;
             gptps_status (*fh)(gptps *, int) = gptps_settings_hold;
             gptps_api_routines api;
-            (void)sizeof(hp_after); (void)sizeof(hp_last);
+            (void)sizeof(hp_after); (void)sizeof(hh_after); (void)sizeof(hp_last);
             api.settings_provisional = gptps_settings_provisional;
-            CHECK(fp != NULL && fh != NULL && api.settings_provisional == fp);
+            api.settings_hold = gptps_settings_hold;
+            CHECK(fp != NULL && fh != NULL && api.settings_provisional == fp && api.settings_hold == fh);
         }
         /* The ABI this file guards. A new minor appends something: add its guards
          * above, then move this. */

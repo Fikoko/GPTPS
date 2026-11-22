@@ -5,6 +5,163 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+Closes the gaps 1.12.0 left. The dashboard's degrade mode now acts on every pressure
+condition a step can relieve, and says why for the two it cannot. It also gains an exact
+memory budget (`tui.budget_kb`) and on-view arming (`tui.arm = on_view`). `gptps_stats`
+gets an opt-in that removes the undercount trap for a burst before the first read. A
+settings file's outcome no longer depends on the order of its keys (core ABI 2.10). The
+amalgamation is strict C99 under mingw too, held in CI. Every released enum value, struct
+field offset, setting key, choice, range and default keeps its place. The one exception is
+the convenience macro `GPTPS_TUI_P_SHEDDABLE`, which grows; it is listed below.
+
+### Changed
+
+- **Settings files: the order of a file's keys no longer decides the outcome** (core,
+  ABI 2.10). Some write accessors check one setting against another, for example
+  `tui.kpi` against `tui.budget_kb`. When such an accessor refuses a value at open, at
+  `gptps_settings_reload`, or while settings are defined together, the value is tried again
+  after the file's other keys. These retries run in passes for as long as one more key
+  applies. Only a value still refused at the end is reported, once, with the same message,
+  error count and result as before.
+  - Type, range and choice refusals are not retried, and neither is `GPTPS_E_NOMEM`.
+  - A file whose keys all apply costs one pass; the worst case is O(n^2) accessor calls.
+  - Checks that conflict get the greedy result.
+  - A refusal that was put off is logged after the file's other keys, not in line order
+    (`gptps.h`, *THE FILE'S ORDER*).
+  - 1.12 applied a reload in file order, so a reload that raised both the tier and the
+    budget was refused if `kpi` came first.
+- **gptps_tui degrade acts on every condition a step can relieve.**
+  - Now acting:
+    - UNTRACKED is relieved by -latency, which frees the handle table.
+    - NOMEM and the new BUDGET are relieved by every tier step.
+    - TRUNCATED is relieved by -activity and -tasks, which mean fewer rows. It acts only
+      for a dashboard frame cut after its header.
+    - PANE is relieved by the new gentler step `GPTPS_TUI_SHED_PANE` (0x10, "-pane"), which
+      doubles the tasks, settings and detail panes' engine-read interval up to 60 s.
+  - Report-only: PROBLEMS_LOST (PROBLEMS is the floor and is never shed) and FOLDED
+    (folding is already the cheap fallback). They are collected in the new
+    `GPTPS_TUI_P_REPORT_ONLY` (0x009), and their PRESSURE text says why.
+  - Each step is now the first one, in the fixed order (pane, activity, percentiles,
+    latency, tasks), that would change what runs and relieves a condition present in the
+    window. The PROBLEMS floor and the sticky semantics are unchanged. A tier step takes
+    the ladder steps it implies.
+  - -latency now runs at `normal` while the ACTIVITY journal runs (1.12 went to `tasks`).
+  - The DEGRADE order's step numbers in the docs moved, because PANE comes first; the bit
+    values did not.
+  - `GPTPS_TUI_P_SHEDDABLE` grows from 0x142 to 0x3f6. It is a macro, so code built
+    against the 1.12 header keeps the old mask.
+  - `gptps_tui_health` appends `pane_shed_ms` and `shed_pressure_all`.
+- **gptps_tui_run with no terminal** counts every call, as before (the new `run_noops`),
+  but its WARN now comes at most once a minute; it fired on every call.
+
+### Added
+
+- **`gptps_settings_provisional(e, key)`** returns 1 only while a write accessor runs for a
+  file's value that will be tried again. The accessor can then refuse without counting or
+  logging, and only the last try reports. A live set made from a watcher meanwhile is not
+  provisional. (ABI 2.10)
+- **`gptps_settings_hold(e, hold)`**: while a thread holds, the config file's values for
+  the settings it defines wait (`gptps_register_setting`, `gptps_define_global`,
+  `gptps_define_task_setting`), and letting go applies them together.
+  - Only this hold's values are applied.
+  - A task registered or a resource defined while holding takes its values at once.
+  - Holds nest; another thread gets `GPTPS_E_BUSY`.
+  - The dashboard defines its settings under a hold, so a file's `tui` keys apply
+    together, in any order. (ABI 2.10)
+- **Host table:** `settings_provisional` and `settings_hold` are appended to
+  `gptps_api_routines`. Check `struct_size` first. (ABI 2.10)
+- **`tui.budget_kb`** (`cfg.budget_kb`, `gptps_tui_set_budget_kb`; 0, the default, means
+  no budget): an opt-in memory budget for the dashboard.
+  - The footprint is an exact formula of the dashboard's sizes, documented under MEMORY in
+    `gptps_tui.h`. `tests/test_tui_budget.c` holds it to the allocator, byte for byte, at
+    every tier. At the defaults it is 110 KiB (111704 bytes) on x86-64 Linux.
+  - Any change that would take the requested footprint past the budget is refused with
+    `GPTPS_E_INVAL` and changes nothing. One WARN names the figure needed: "tui.kpi=full
+    needs 110 KiB (111704 bytes: ...), over tui.budget_kb 64 (65536 bytes): refused,
+    nothing changed".
+  - The refusal covers install (which then returns NULL), `set_kpi`, `set_recent`,
+    `set_latency_window`, `add_task`/`add_task_ex`, the `m` key, the `tui.kpi` /
+    `tui.recent` / `tui.activity` / `tui.latency_window` writes, and a budget set below the
+    footprint.
+  - A settings file that raises or lowers the footprint together with `tui.budget_kb`
+    applies whole, in either key order. One whose footprint cannot fit its own budget is
+    refused once: one WARN, one count, one ERROR, `GPTPS_E_CONFIG`.
+  - The buffers a frame is made in stop growing at the budget, counted (one per pane pass),
+    WARNed at most once a minute and shown on the frame. Those buffers are the view, a
+    pane's cache, the frame buffers of `run` and `snapshot`, and `run`'s output buffer.
+  - The new pressure condition `GPTPS_TUI_P_BUDGET` (0x200) is raised by such a stop, and
+    degrade sheds for it as for NOMEM.
+  - Budgets are checked against the request, so `u` always fits.
+  - Dead letters held by the dead-letter view are outside the budget, because refusing
+    them would lose them.
+  - Health adds `budget_bytes`, `footprint_bytes`, `footprint_request_bytes`,
+    `runtime_bytes`, `budget_refusals`, `budget_stops` and `budget_need_bytes`.
+- **`tui.arm = always | on_view`** (`cfg.arm`, `gptps_tui_set_arm`; the default, `always`,
+  is 1.12's behaviour) and **`tui.disarm_ms`** (`cfg.disarm_ms`, `gptps_tui_set_disarm_ms`;
+  60000, range 100..86400000).
+  - With `on_view`, the layers above GAUGE run only from a view until `disarm_ms` pass
+    without one. Those layers are the PROBLEMS journal, the TASKS rows, the ACTIVITY
+    journal, the handle table and the percentiles. A view is a frame from `render`,
+    `snapshot` or `run`, or a key.
+  - Totals and gauges always run.
+  - `gptps_tui_health` decides the disarm; there is no timer and no thread. A running
+    `gptps_tui_run` counts as a view.
+  - Arming and disarming go through the storage protocol: built with the lock released,
+    swapped under it, freed after. Nothing is allocated under the lock or on the event
+    path, and tests check this.
+  - An arm that runs out of memory is counted every time, WARNed at most once a minute and
+    shown on the frame.
+  - A degrade shed survives a disarm and an arm, and a shed makes room for buffers stopped
+    at the budget.
+  - `on_view` from a settings file, or set before any view, starts the dashboard disarmed.
+  - The frame shows "recording since first view (Ns ago)" while the record is younger than
+    the session.
+  - Health adds `arm`, `armed`, `disarm_ms`, `record_ms`, `views`, `view_age_ms`, `arms`,
+    `disarms`, `arm_failures` and `run_noops`.
+- **An install hint:** an install that runs `full` with `tui.arm = always` and no terminal
+  logs one WARN naming what it costs and the settings that lower it. `gptps_tui_run` with
+  `cfg.interactive = 0` now says so (one WARN a dashboard) instead of returning silently.
+- **`GPTPS_STATS_GROW_ON_EVENT`** (`gptps_stats_config.flags` 0x2, opt-in): when the
+  handle table is full, the observer grows it, doubling up to `cfg.handles_max`, so that a
+  burst before the first read is tracked exactly.
+  - It grows with its lock released: unlock, allocate, relock, re-check, swap, and free the
+    old table after unlocking.
+  - This trades the zero-allocation event path for exact counts. The default stays off, and
+    a 1.12 library refuses the flag.
+  - A failed allocation is counted (`nomem`) and WARNed. The handle stays untracked, as
+    before, and no tracked entry is lost.
+- **gptps_stats names the exact size needed.** The untracked WARN and health give the
+  figure: "a burst of N live handles past a table of C: gptps_stats_reserve(s, P) ... or
+  GPTPS_STATS_GROW_ON_EVENT". Health appends `handles_peak`, `handles_needed` and
+  `grows_on_event`.
+
+### Fixed
+
+- **Portability:** every amalgamated file (`tools/amalgamate.sh --addons all`) now builds
+  with mingw-w64 `-std=c99 -pedantic -Wall -Wextra -Werror`. Two of the 14 failed in 1.12.
+  - The Windows `gptps_dl_sym` copies `GetProcAddress`'s FARPROC instead of casting a
+    function pointer to an object pointer.
+  - `gptps_xport.c` is no longer an empty translation unit on Windows, and neither are the
+    platform-gated backends on the other platform.
+  - The POSIX `gptps_dl_error` copies with a bounded `memcpy`.
+  - No behaviour change.
+- **Build:** no `-Wformat-truncation=2` warnings (gcc -O2 and -O3) are left in the files
+  1.13 touched, also when amalgamated; 1.12 had 21 in `gptps_tui.c` alone. Output is
+  unchanged for every in-range value.
+
+### CI
+
+- The amalgamation job (gcc and clang) and the windows job (mingw) compile every
+  amalgamated file, and every `src/*.c` and `addons/*.c`, on its own with
+  `-std=c99 -pedantic -Werror`. Clang's leg ignores the C11 extension warning that
+  glibc 2.43+'s `_Generic` string macros cause; gcc's leg still catches C11 code of our
+  own.
+- `hal_conformance` checks the `gptps_dl_error` contract.
+- New tests: `tui_budget`, `tui_arm` and `settings_order` (with the `addon_order`
+  plug-in), 120 in all. `settings_order` joins the s390x leg's dlopen exclusions.
+
 ## [1.12.0] - 2026-11-22
 
 O(1) task counts in the core (ABI 2.9), a hardened `gptps_stats`, pressure reporting with

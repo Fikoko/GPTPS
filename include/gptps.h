@@ -96,7 +96,7 @@ extern "C" {
  * host table (gptps_api_routines); 2.9 makes gptps_task_get_info's counters O(1) and
  * adds gptps_engine_counts (gptps_engine_totals); 2.10 adds gptps_settings_provisional
  * and gptps_settings_hold (a settings file's keys apply whatever order it lists them in)
- * and appends `settings_provisional` to the host table. Additive, and the loader
+ * and appends `settings_provisional` and `settings_hold` to the host table. Additive, and the loader
  * compares MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
 #define GPTPS_ABI_VERSION_MINOR 10u
@@ -1621,8 +1621,8 @@ GPTPS_API int gptps_settings_provisional(gptps *e, const char *key);
  * held or not. Inside an add-on's setup the setup's own waiting applies instead, and
  * its loader applies everything when the setup returns. A dashboard or other module
  * that defines several settings checked against each other holds around them
- * (addons/gptps_tui does). Not in the host table (2.10): a plug-in loaded at runtime
- * holds only through its setup's own waiting - define such settings in setup. */
+ * (addons/gptps_tui does). A plug-in loaded at runtime has it as the host table's
+ * settings_hold (2.10), for settings it defines outside its setup. */
 GPTPS_API gptps_status gptps_settings_hold(gptps *e, int hold);
 
 /* Watch for changes: `cb` fires (with the settings lock RELEASED) after each
@@ -1859,6 +1859,10 @@ typedef struct {
      * file's value tried provisionally (gptps_settings_provisional). Check struct_size
      * first. */
     int                  (*settings_provisional)(gptps *e, const char *key);
+    /* --- ABI 2.10, after it: gptps_settings_hold, for a plug-in that defines settings
+     * checked against each other OUTSIDE its setup (a setup already holds). Check
+     * struct_size first. */
+    gptps_status         (*settings_hold)(gptps *e, int hold);
 
     /* DELIBERATELY ABSENT, so the omissions read as decisions rather than oversights:
      *   open / open_ex / shutdown / step - engine LIFECYCLE is the host's. A module

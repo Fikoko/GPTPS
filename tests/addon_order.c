@@ -116,9 +116,15 @@ static gptps_status setup(gptps *e, const gptps_api_routines *api, char **err)
     };
     size_t i;
     (void)err;
-    if (api->struct_size <= offsetof(gptps_api_routines, settings_provisional) || !api->settings_provisional ||
-        !api->settings_watch || !api->register_setting)
+    if (api->struct_size <= offsetof(gptps_api_routines, settings_hold) || !api->settings_provisional ||
+        !api->settings_hold || !api->settings_watch || !api->register_setting)
         return GPTPS_E_ABI;
+    /* the host table's settings_hold is gptps_settings_hold: it nests on this thread,
+     * and a let-go it lacks is refused (a failure here fails the load, and the test) */
+    if (api->settings_hold(e, 1) != GPTPS_OK || api->settings_hold(e, 1) != GPTPS_OK ||
+        api->settings_hold(e, 0) != GPTPS_OK || api->settings_hold(e, 0) != GPTPS_OK ||
+        api->settings_hold(e, 0) != GPTPS_E_INVAL)
+        return GPTPS_E_INVAL;
     g_api = api; g_e = e;
     g_lo = 1; g_hi = 10;          /* a library a load left mapped keeps its statics: start over */
     g_calls_lo = g_calls_hi = g_refusals = g_heard_lo = g_heard_hi = g_prov = 0;
