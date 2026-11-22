@@ -136,6 +136,11 @@ static uint64_t tui_now_us(void)
  * a shorter copy made every 64..127-byte name a new row on every event, and one such task
  * used up all 64 rows. The label is display only. */
 #define TUI_NAME_CAP  (GPTPS_TASK_NAME_MAX + 1)
+/* Room for "%.1f" (or %8.1f, %.0f) of ANY finite double, with a few bytes of text after it:
+ * '-', 309 integer digits, '.', a digit = 312. The values printed so are small (a rate, a
+ * mean, a size in its unit), but the compiler cannot know that, and a buffer it can prove
+ * large enough is what keeps -Wformat-truncation=2 meaningful. */
+#define TUI_FBUF      320
 #define TUI_LABEL_CAP 64
 /* Task types past max_tasks fold into the '(other)' row; the distinct ones are counted by
  * a hash of the name in a set of this many slots (filled to 3/4, then "or more"). */
@@ -1636,13 +1641,15 @@ static int status_live(const char *status, uint64_t status_ms, uint64_t now)
 static const char *fmt_count(char *b, size_t cap, uint64_t v)
 {
     static const char sfx[] = "kMGTPE";
+    char f[TUI_FBUF];                   /* x < 999.5 below, so 4 bytes - but f holds any double */
     double x;
     int u = 0;
     if (v < 100000u) { snprintf(b, cap, "%llu", (unsigned long long)v); return b; }
     x = (double)v / 1000.0;
     while (x >= 999.5 && u < 5) { x /= 1000.0; ++u; }
-    if (x < 9.95) snprintf(b, cap, "%.1f%c", x, sfx[u]);
-    else          snprintf(b, cap, "%.0f%c", x, sfx[u]);
+    if (x < 9.95) snprintf(f, sizeof f, "%.1f%c", x, sfx[u]);
+    else          snprintf(f, sizeof f, "%.0f%c", x, sfx[u]);
+    copy_u8(b, cap, f);                 /* ASCII: cut where snprintf into b would cut */
     return b;
 }
 
@@ -1732,7 +1739,7 @@ static void setting_kind(const gptps_setting_info *in, char *out, size_t cap)
         case GPTPS_SETTING_ENUM: default: {
             const char *const *c;
             size_t k = (size_t)snprintf(out, cap, "one of:");
-            for (c = in->choices; c && *c && k < cap; ++c) k += (size_t)snprintf(out + k, cap - k, " %s", *c);
+            for (c = in->choices; c && *c && k < cap; ++c) k = appendf(out, cap, k, " %s", *c);
             break;
         }
     }
@@ -1749,7 +1756,11 @@ static void bytes_hint(const char *key, const char *v, char *out, size_t cap)
     if (kl < 6 || strcmp(key + kl - 6, "_bytes") != 0) return;
     x = strtod(v, NULL);
     while (x >= 1024.0 && u < 5) { x /= 1024.0; ++u; }
-    if (u >= 0) snprintf(out, cap, " (%.1f %s)", x, U[u]);
+    if (u >= 0) {
+        char f[TUI_FBUF];
+        snprintf(f, sizeof f, " (%.1f %s)", x, U[u]);
+        copy_u8(out, cap, f);           /* ASCII: cut where snprintf into out would cut */
+    }
 }
 
 /* The selected setting, explained: its key, what it does (word-wrapped to the
@@ -2062,17 +2073,16 @@ static size_t pc_footer(gptps_tui *t, char *buf, size_t cap, size_t pos, const c
 {
     const tui_pcache *c = &t->pc;
     uint64_t now = TUI_NOW_MS();
-    char ln[256], cost[32];
-    int n;
+    char ln[256], cost[TUI_FBUF];
+    size_t n;
     if (c->cost_us < 1000u) snprintf(cost, sizeof cost, "%llu us", (unsigned long long)c->cost_us);
     else                    snprintf(cost, sizeof cost, "%.1f ms", (double)c->cost_us / 1000.0);
     /* what was not read comes first: the line is cut to the width, and a loss is the part
      * that must show (at the end, 80 columns cut it once a pass took a millisecond) */
-    n = c->short_by ? snprintf(ln, sizeof ln, "  %s: %lu not read: %s; ", what, (unsigned long)c->short_by, PC_SHORT(c))
-                    : snprintf(ln, sizeof ln, "  %s: ", what);
-    if (n > 0 && (size_t)n < sizeof ln)
-        snprintf(ln + n, sizeof ln - (size_t)n, "%s, every %.1f s, age %llu s (R reads now)", cost,
-                 (double)c->every_ms / 1000.0, (unsigned long long)(now > c->read_ms ? (now - c->read_ms) / 1000u : 0u));
+    n = c->short_by ? appendf(ln, sizeof ln, 0, "  %s: %lu not read: %s; ", what, (unsigned long)c->short_by, PC_SHORT(c))
+                    : appendf(ln, sizeof ln, 0, "  %s: ", what);
+    (void)appendf(ln, sizeof ln, n, "%s, every %.1f s, age %llu s (R reads now)", cost,   /* ln: cut to the width below */
+                  (double)c->every_ms / 1000.0, (unsigned long long)(now > c->read_ms ? (now - c->read_ms) / 1000u : 0u));
     return appendf(buf, cap, pos, "%s%.*s%s\n", D, (int)u8_fit(ln, draw_width(t) - 1), ln, X);
 }
 
@@ -2322,7 +2332,8 @@ static size_t render_deadletter(gptps_tui *t, char *buf, size_t cap)
         pos = appendf(buf, cap, pos, "\n%s  %-16s %-10s %-22s %s%s\n", D, "task", "handle", "status", "why", X);
         for (i = (size_t)first; i < t->nheld && (int)(i - (size_t)first) < rows; ++i) {
             const tui_held *h = &t->held[i];
-            char pre[128], why[160], tn[GPTPS_TASK_NAME_MAX * 2 + 2];
+            /* pre: "> " cell " #" handle(20) " " status(22) " " NUL - sizeof tn + 48 provably holds it */
+            char tn[GPTPS_TASK_NAME_MAX * 2 + 2], pre[sizeof tn + 48], why[160];
             int pl, room, wl;
             if (h->refused != GPTPS_OK)
                 snprintf(why, sizeof why, "[re-submit refused: %s] %s", gptps_strerror(h->refused), h->why);
@@ -2475,10 +2486,10 @@ static int legend_text(gptps_tui *t, int W, char *out, size_t cap)
             }
             w = u8_cols(item);
             if (col > 6 && col + 2 + w > W - 1) {     /* the next row, indented */
-                pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "\n     ");
+                pos = appendf(out, cap, pos, "\n     ");
                 col = 5; ++rows;
             }
-            pos += (size_t)snprintf(out + pos, pos < cap ? cap - pos : 0, "%s%s", col > 5 ? "  " : " ", item);
+            pos = appendf(out, cap, pos, "%s%s", col > 5 ? "  " : " ", item);
             col += (col > 5 ? 2 : 1) + w;
             if (pos >= cap) { out[cap - 1] = 0; return rows; }
         }
@@ -2877,7 +2888,7 @@ static void shed_text(unsigned shed, char *out, size_t cap)
     out[0] = 0;
     for (k = 0; k < TUI_SHED_N; ++k)
         if ((shed & TUI_SHED[k].bit) && p < cap)
-            p += (size_t)snprintf(out + p, cap - p, "%s-%s", p ? " " : "", TUI_SHED[k].name);
+            p = appendf(out, cap, p, "%s-%s", p ? " " : "", TUI_SHED[k].name);
 }
 /* "cost, render": the conditions in `bits` */
 static void pnames(uint64_t bits, char *out, size_t cap)
@@ -2887,7 +2898,7 @@ static void pnames(uint64_t bits, char *out, size_t cap)
     out[0] = 0;
     for (k = 0; k < TUI_P_N; ++k)
         if ((bits & (1u << k)) && p < cap)
-            p += (size_t)snprintf(out + p, cap - p, "%s%s", p ? ", " : "", TUI_P_NAME[k]);
+            p = appendf(out, cap, p, "%s%s", p ? ", " : "", TUI_P_NAME[k]);
 }
 
 /* What one window found, copied out under mu to be formatted and logged without it. */
@@ -3193,7 +3204,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
     int i, color = v->color, uni = v->uni, W = v->W;
     const char *B = color ? "\x1b[1m" : "", *D = color ? "\x1b[2m" : "", *R = color ? "\x1b[31m" : "",
                *G = color ? "\x1b[32m" : "", *X = color ? "\x1b[0m" : "";
-    char stats[96], up[40], rt[32];
+    char stats[96], up[40], rt[TUI_FBUF];
 
     /* header: a framed title bar when color is on; a plain line otherwise */
     up[0] = 0;
@@ -3202,7 +3213,8 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
     else snprintf(rt, sizeof rt, "%s", v->rate_state == 2 ? "n/a" : "-");
     if (color) {
         int k;
-        snprintf(stats, sizeof stats, "%s%s%s done/s", up, up[0] ? "  " : "", rt);
+        /* up 39 + 2 + rt 40 + 7 + NUL <= 96; a rate needs 40 bytes only past 1e37/s */
+        snprintf(stats, sizeof stats, "%s%s%.40s done/s", up, up[0] ? "  " : "", rt);
         pos = titlebar(buf, cap, pos, t, W, stats);
         if (v->rule_W != W || v->rule_uni != uni) {        /* the rule: cached, by width and glyphs */
             size_t rp = (size_t)snprintf(v->rule, sizeof v->rule, "\x1b[2m");
@@ -3302,7 +3314,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
         }
         for (k = 0; k < 5 && kp < sizeof kl; ++k)    /* and, when any, the parts it lacks: a line of its own */
             if (v->miss & (1 << k))
-                kp += (size_t)snprintf(kl + kp, sizeof kl - kp, "%s%s", nm++ ? ", " : "no memory for: ", MISS[k]);
+                kp = appendf(kl, sizeof kl, kp, "%s%s", nm++ ? ", " : "no memory for: ", MISS[k]);
         if (nm) pos = appendf(buf, cap, pos, "%s%.*s%s\n", R, (int)u8_fit(kl, W - 1), kl, X);
     }
     if (v->pline[0]) {                   /* ADAPT: the last window's conditions, with what to change */
@@ -3350,7 +3362,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
         /* the types in the order first seen, then '(other)' once anything was folded there */
         for (i = 0; i < v->nrows; ++i) {
             const tui_vrow *k = &v->rows[i];
-            char key[8], pct[8], lat[24], mx[24], peak[32], lb[TUI_NAME_CAP * 2], c[5][16], pcs[64];
+            char key[8], pct[12], lat[TUI_FBUF], mx[24], peak[TUI_FBUF], lb[TUI_NAME_CAP * 2], c[5][16], pcs[64];
             uint64_t terminal = k->finished + k->dead + k->dropped;
             const char *pc = "";
             if (k->hotkey > 32 && k->hotkey < 127) snprintf(key, sizeof key, "[%c]", k->hotkey); else key[0] = 0;
@@ -3407,7 +3419,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
                                          D, v->act_on ? "" : "  problems only", X);
         for (i = v->nrec - 1; i >= 0; --i) {   /* oldest at the top */
             const tui_event *re = &v->recs[i];
-            char pre[128], nm[TUI_NAME_CAP * 2], why[sizeof re->why + TUI_TAIL_KEEP + 16];
+            char nm[TUI_NAME_CAP * 2], why[sizeof re->why + TUI_TAIL_KEEP + 16];
             const char *kc;
             int pl, room, wl = 0;
             double rel;
@@ -3419,7 +3431,7 @@ static size_t dash_format(const gptps_tui *t, tui_view *v, char *buf, size_t cap
             /* One terminal row each: the vertical fit counts rows, so a line that wrapped took
              * two and pushed the frame past the screen. The fixed fields are measured as
              * printed; the why text gets what is left. */
-            pl = snprintf(pre, sizeof pre, "  %6.1f %-8s %s #%llu", rel, kind_str(re->kind), tui_cell(re->name, nm, sizeof nm, 14),
+            pl = snprintf(NULL, 0, "  %6.1f %-8s %s #%llu", rel, kind_str(re->kind), tui_cell(re->name, nm, sizeof nm, 14),
                           (unsigned long long)re->handle);
             room = W - 1 - (pl < 0 ? 0 : pl) - 2;
             wl = (why[0] && room >= 4) ? (int)u8_fit(why, room) : 0;
@@ -4545,7 +4557,8 @@ static size_t frame_diff(const char *nw, const char *old, int full, char *o)
     for (i = 0, p = nw, q = old; i < nn; ++i, p = line_next(p), q = line_next(q)) {
         size_t pl = line_len(p), ql = q ? line_len(q) : 0;
         if (q && pl == ql && memcmp(p, q, pl) == 0) continue;
-        op += (size_t)snprintf(o + op, 24, "\x1b[%lu;1H", (unsigned long)(i + 1));
+        /* a frame has far fewer than 2^32 lines; %u keeps this in the 24 bytes a line has */
+        op += (size_t)snprintf(o + op, 24, "\x1b[%u;1H", (unsigned)(i + 1));
         memcpy(o + op, p, pl); op += pl;
         memcpy(o + op, "\x1b[K", 3); op += 3;
     }
@@ -5299,28 +5312,28 @@ static gptps_status tui_reconfig(gptps_tui *t, int lvl, int win, int plines, int
     }
     if (w.prob && t->pcap != w.prob) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
-        pos += (size_t)snprintf(what + pos, cap - pos, "the PROBLEMS journal (%lu bytes%s)",
-                                (unsigned long)((size_t)w.prob * sizeof(tui_event)), t->prob ? "; it keeps its old size" : "");
+        pos = appendf(what, cap, pos, "the PROBLEMS journal (%lu bytes%s)",
+                      (unsigned long)((size_t)w.prob * sizeof(tui_event)), t->prob ? "; it keeps its old size" : "");
     }
     if (w.tasks && !t->tasks && pos < cap) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
-        pos += (size_t)snprintf(what + pos, cap - pos, "%sthe TASKS table (%lu bytes; per-task counts are off)",
-                                pos ? " and " : "", (unsigned long)tasks_bytes(w.max_tasks));
+        pos = appendf(what, cap, pos, "%sthe TASKS table (%lu bytes; per-task counts are off)",
+                      pos ? " and " : "", (unsigned long)tasks_bytes(w.max_tasks));
     }
     if (w.act && t->acap != w.act && pos < cap) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
-        pos += (size_t)snprintf(what + pos, cap - pos, "%sthe ACTIVITY journal (%lu bytes%s)", pos ? " and " : "",
-                                (unsigned long)act_bytes(w.act, w.act_nm), t->act ? "; it keeps its old size" : "");
+        pos = appendf(what, cap, pos, "%sthe ACTIVITY journal (%lu bytes%s)", pos ? " and " : "",
+                      (unsigned long)act_bytes(w.act, w.act_nm), t->act ? "; it keeps its old size" : "");
     }
     if (w.tab && !t->tab && pos < cap) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
-        pos += (size_t)snprintf(what + pos, cap - pos, "%sthe latency table (%lu bytes; avg ms is off and the gauges "
-                                "are approximate)", pos ? " and " : "", (unsigned long)(trk_slots(win) * sizeof(tui_slot)));
+        pos = appendf(what, cap, pos, "%sthe latency table (%lu bytes; avg ms is off and the gauges "
+                      "are approximate)", pos ? " and " : "", (unsigned long)(trk_slots(win) * sizeof(tui_slot)));
     }
     if (w.hist && t->tasks && !t->hist && pos < cap) {
         st = GPTPS_E_NOMEM; t->h_nomem++;
-        snprintf(what + pos, cap - pos, "%sthe latency histograms (%lu bytes; the percentiles are off)",
-                 pos ? " and " : "", (unsigned long)hist_bytes(w.max_tasks));
+        (void)appendf(what, cap, pos, "%sthe latency histograms (%lu bytes; the percentiles are off)",
+                      pos ? " and " : "", (unsigned long)hist_bytes(w.max_tasks));
     }
     t->kpi = TUI_LADDER[tier];          /* what runs; kpi_req what was asked for */
     t->tier = tier;

@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <float.h>
 #include <locale.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -304,6 +305,27 @@ double gptps_strtod_c(const char *s, char **end)
     return v;
 }
 
+int gptps_fmt_cut(char *buf, size_t cap, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(cap ? buf : NULL, cap, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+size_t gptps_copy_cut(char *buf, size_t cap, const char *src)
+{
+    size_t n;
+    if (!cap) return 0;
+    n = strlen(src);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(buf, src, n);
+    buf[n] = 0;
+    return n;
+}
+
 void gptps_fmt_double_c(char *buf, size_t cap, double v)
 {
     const char *dp = localeconv()->decimal_point;
@@ -395,16 +417,16 @@ void gptps_settings_explain(gptps_setting_type type, int has_range, double min, 
         snprintf(range, sizeof range, " between %s and %s", a, b);
     }
     switch (type) {
-        case GPTPS_SETTING_INT:    snprintf(why, cap, "%s must be a whole number%s", v, range); break;
-        case GPTPS_SETTING_UINT:   snprintf(why, cap, "%s must be a whole number%s%s", v, *range ? "" : " of 0 or more", range); break;
-        case GPTPS_SETTING_DOUBLE: snprintf(why, cap, "%s must be a number%s", v, range); break;
-        case GPTPS_SETTING_BOOL:   snprintf(why, cap, "%s must be true or false", v); break;
-        case GPTPS_SETTING_STRING: snprintf(why, cap, "the value is longer than %d characters", GPTPS_SETTINGS_VALUE_MAX - 1); break;
+        case GPTPS_SETTING_INT:    gptps_fmt_cut(why, cap, "%s must be a whole number%s", v, range); break;
+        case GPTPS_SETTING_UINT:   gptps_fmt_cut(why, cap, "%s must be a whole number%s%s", v, *range ? "" : " of 0 or more", range); break;
+        case GPTPS_SETTING_DOUBLE: gptps_fmt_cut(why, cap, "%s must be a number%s", v, range); break;
+        case GPTPS_SETTING_BOOL:   gptps_fmt_cut(why, cap, "%s must be true or false", v); break;
+        case GPTPS_SETTING_STRING: gptps_fmt_cut(why, cap, "the value is longer than %d characters", GPTPS_SETTINGS_VALUE_MAX - 1); break;
         case GPTPS_SETTING_ENUM: {
             const char *const *c;
-            size_t k = (size_t)snprintf(why, cap, "%s must be one of:", v);
+            size_t k = (size_t)gptps_fmt_cut(why, cap, "%s must be one of:", v);
             for (c = choices; c && *c && k < cap; ++c)
-                k += (size_t)snprintf(why + k, cap - k, "%s %s", c == choices ? "" : ",", *c);
+                k += (size_t)gptps_fmt_cut(why + k, cap - k, "%s %s", c == choices ? "" : ",", *c);
             break;
         }
     }
@@ -469,7 +491,7 @@ int gptps_settings_closest(gptps_settings *r, const char *key, char *buf, size_t
     gptps_mutex_lock(r->m);
     for (e = r->head; e; e = e->next) {
         size_t d = gptps_edit_distance(key, e->key, limit);
-        if (d <= limit && d < best) { best = d; snprintf(buf, cap, "%s", e->key); }
+        if (d <= limit && d < best) { best = d; gptps_copy_cut(buf, cap, e->key); }
     }
     gptps_mutex_unlock(r->m);
     return best != (size_t)-1;
@@ -501,7 +523,7 @@ static gptps_status apply_entry(gptps_setting_entry *e, const char *value, char 
     if (writing) *writing = 1;
     st = e->write(e->target, value);     /* write_fn takes the target's own lock */
     if (writing) *writing = 0;
-    if (st != GPTPS_OK && why && whylen) snprintf(why, whylen, "%s was refused (%s)", value, gptps_strerror(st));
+    if (st != GPTPS_OK && why && whylen) gptps_fmt_cut(why, whylen, "%s was refused (%s)", value, gptps_strerror(st));
     return st;
 }
 
@@ -963,9 +985,12 @@ static int write_settings(gptps_settings *r, FILE *f, const char *text, const gp
                     /* the key as the line spells it, its last part in bytes instead */
                     const char *k = gptps_toml_key_at(t, (size_t)lines[i].entry);
                     char nk[512];
-                    size_t ind = 0, kl = strlen(k);
+                    size_t ind = 0, kl = strlen(k), pl = kl - 13;   /* less "max_memory_gb" */
                     while (ind < lines[i].len && save_ws((unsigned char)lines[i].start[ind])) ++ind;
-                    snprintf(nk, sizeof nk, "%.*smax_memory_bytes", (int)(kl - 13), k);
+                    /* the key is SAVE_GB_KEY or a tail of it, so pl <= 7: the bound only
+                     * says so where -Wformat-truncation can see it */
+                    if (pl > sizeof nk - sizeof "max_memory_bytes") pl = sizeof nk - sizeof "max_memory_bytes";
+                    snprintf(nk, sizeof nk, "%.*smax_memory_bytes", (int)pl, k);
                     fwrite(lines[i].start, 1, ind, f);
                     put_key(f, nk);
                     fputs(" = ", f);
@@ -1082,7 +1107,8 @@ gptps_status gptps_settings_save_to(gptps_settings *r, const char *path, const c
     tn = strlen(path) + 5;
     tmp = (char *)gptps_malloc(tn);
     if (!tmp) { st = GPTPS_E_NOMEM; goto out; }
-    snprintf(tmp, tn, "%s.tmp", path);
+    memcpy(tmp, path, tn - 5);
+    memcpy(tmp + tn - 5, ".tmp", 5);      /* path + ".tmp" + NUL: exactly tn */
 
     /* private from the start: nobody else can read the settings while they are
      * written, nor write into the file before it becomes the config (which can name

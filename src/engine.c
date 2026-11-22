@@ -3294,7 +3294,8 @@ static void cfg_say_parse(const char *err)
         const char *nl = strchr(p, '\n');
         int n = nl ? (int)(nl - p) : (int)strlen(p);
         char msg[700];
-        snprintf(msg, sizeof msg, "config %.*s", n, p);
+        /* cut to the room after "config " exactly as snprintf would cut the line */
+        snprintf(msg, sizeof msg, "config %.*s", n < (int)(sizeof msg - 8) ? n : (int)(sizeof msg - 8), p);
         gptps_log(NULL, GPTPS_LOG_ERROR, msg);
         p += n + (nl ? 1 : 0);
     }
@@ -3315,17 +3316,18 @@ static int cfg_kind_ok(gptps_setting_type type, gptps_toml_kind k, const char *t
         default:                   if (k != GPTPS_TOML_STRING) { want = "a \"string\""; text_wanted = 1; } break;
     }
     if (!want) return 1;
+    if (!why || !cap) return 0;          /* the verdict only (apply_task_config) */
     if (k == GPTPS_TOML_ARRAY) {
-        snprintf(why, cap, "expects %s, not a list", want);
+        gptps_fmt_cut(why, cap, "expects %s, not a list", want);
     } else if (k == GPTPS_TOML_STRING) {
         /* "4" for a number: say what would do. "four": the value is wrong, not the quotes. */
         int unquoted_ok = type == GPTPS_SETTING_BOOL ? (!strcmp(text, "true") || !strcmp(text, "false"))
                                                      : gptps_settings_plain_number(text, type != GPTPS_SETTING_DOUBLE);
-        snprintf(why, cap, "expects %s, not the string \"%s\"%s", want, text, unquoted_ok ? " - drop the quotes" : "");
+        gptps_fmt_cut(why, cap, "expects %s, not the string \"%s\"%s", want, text, unquoted_ok ? " - drop the quotes" : "");
     } else if (text_wanted) {
-        snprintf(why, cap, "expects a \"string\" - put %s in quotes", text);
+        gptps_fmt_cut(why, cap, "expects a \"string\" - put %s in quotes", text);
     } else {
-        snprintf(why, cap, "expects %s, not %s", want, text);
+        gptps_fmt_cut(why, cap, "expects %s, not %s", want, text);
     }
     return 0;
 }
@@ -3407,15 +3409,14 @@ static void apply_task_config(gptps *e, const char *name, gptps_task_def *def, i
         const task_key *k = &TASK_KEYS[i];
         const char *v;
         long j;
-        char no[8];
         snprintf(key, sizeof key, "task_defaults.%s", k->leaf);
         if ((j = gptps_toml_find_dotted(t, key)) >= 0 && (v = gptps_toml_text_at(t, (size_t)j)) != NULL &&
-            cfg_kind_ok(k->type, gptps_toml_kind_at(t, (size_t)j), v, no, sizeof no) &&
+            cfg_kind_ok(k->type, gptps_toml_kind_at(t, (size_t)j), v, NULL, 0) &&
             gval_ok(k->type, k->has_range, k->min, k->max, k->choices, v))
             task_key_put(k, v, def, priority);
         snprintf(key, sizeof key, "tasks.%s.%s", name, k->leaf);
         if ((j = gptps_toml_find_dotted(t, key)) >= 0 && (v = gptps_toml_text_at(t, (size_t)j)) != NULL &&
-            cfg_kind_ok(k->type, gptps_toml_kind_at(t, (size_t)j), v, no, sizeof no) &&
+            cfg_kind_ok(k->type, gptps_toml_kind_at(t, (size_t)j), v, NULL, 0) &&
             gval_ok(k->type, k->has_range, k->min, k->max, k->choices, v)) {
             task_key_put(k, v, def, priority);
             gptps_toml_claim_at(t, (size_t)j);
@@ -5273,6 +5274,7 @@ static gptps_status unregister_task(gptps *e, const char *task_name, unsigned fl
         snprintf(prefix, sizeof prefix, "tasks.%s.", task_name);
         for (s = e->registry; s; s = s->next) {
             char **grown;
+            size_t sl;
             if (s->removed || strncmp(s->name, task_name, nl) != 0 || s->name[nl] != '.') continue;
             if (nkeep == cap) {
                 cap = cap ? cap * 2 : 4;
@@ -5280,9 +5282,12 @@ static gptps_status unregister_task(gptps *e, const char *task_name, unsigned fl
                 if (!grown) break;               /* OOM: keep what we have; see below */
                 keep = grown;
             }
-            keep[nkeep] = (char *)gptps_malloc(strlen(s->name) + 8);
+            sl = strlen(s->name);
+            keep[nkeep] = (char *)gptps_malloc(sl + 8);
             if (!keep[nkeep]) break;
-            snprintf(keep[nkeep], strlen(s->name) + 8, "tasks.%s.", s->name);
+            memcpy(keep[nkeep], "tasks.", 6);    /* "tasks." name "." NUL: sl + 8 */
+            memcpy(keep[nkeep] + 6, s->name, sl);
+            memcpy(keep[nkeep] + 6 + sl, ".", 2);
             ++nkeep;
         }
         gptps_mutex_unlock(e->m);
@@ -5525,7 +5530,7 @@ gptps_status gptps_task_setting_str(gptps_ctx *ctx, const char *key, char *buf, 
     GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
     gptps_mutex_lock(e->m);
     for (L = ctx->reg->locals; L; L = L->next)
-        if (strcmp(L->schema->leaf, key) == 0) { snprintf(buf, cap, "%s", L->value); break; }
+        if (strcmp(L->schema->leaf, key) == 0) { gptps_copy_cut(buf, cap, L->value); break; }
     gptps_mutex_unlock(e->m);
     return L ? GPTPS_OK : GPTPS_E_NOTFOUND;
 }
@@ -5607,9 +5612,9 @@ gptps_status gptps_settings_set_ex(gptps *e, const char *key, const char *value,
     if (st == GPTPS_E_NOTFOUND && why && cap) {
         char guess[384];
         if (gptps_settings_closest(e->settings, key, guess, sizeof guess))
-            snprintf(why, cap, "no setting is named %s (did you mean %s?)", key, guess);
+            gptps_fmt_cut(why, cap, "no setting is named %s (did you mean %s?)", key, guess);
         else
-            snprintf(why, cap, "no setting is named %s", key);
+            gptps_fmt_cut(why, cap, "no setting is named %s", key);
     }
     return st;
 }
