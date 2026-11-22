@@ -17,9 +17,9 @@
  *      table) and TASKS (4: the name index), without the layers above them.
  *   5. The tasks pane on a busy engine (64 types, 20000 queued, pane_refresh_ms 100): the
  *      share of the time its passes spend in gptps_task_get_info - which holds the
- *      engine's lock and walks every queue - is <= 1.5% (the rule is 1%: a pass waits
- *      100x what the last took). 1.10 read every row on every frame: 116 ms a frame at
- *      64 types and 100k queued, 46% of the time at 250 ms.
+ *      engine's lock (and walked every queue before ABI 2.9; O(1) since) - is <= 1.5%
+ *      (the rule is 1%: a pass waits 100x what the last took). 1.10 read every row on
+ *      every frame: 116 ms a frame at 64 types and 100k queued, 46% of the time at 250 ms.
  *
  * Caches are part of the honest cost: the big table is 64 MiB, and with each new handle
  * hashed to a line of its own it read 2.8-3x here from cache and TLB misses alone (the

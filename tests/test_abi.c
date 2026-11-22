@@ -364,9 +364,24 @@ int main(void)
         (void)sizeof(ev_tail_grows); (void)sizeof(ev_tail_inside);
         (void)sizeof(dl_options_grows); (void)sizeof(dl_tail_grows);
         (void)sizeof(dl_measures_grow); (void)sizeof(dl_count_inside);
+        /* 2.9: gptps_engine_totals, new - struct_size first, then four uint64_t in
+         * order, its floor (GPTPS_ENGINE_TOTALS_MIN_SIZE) the end of `dead`. */
+        {
+            typedef char et_size_first[(offsetof(gptps_engine_totals, struct_size) == 0) ? 1 : -1];
+            typedef char et_order[
+                (offsetof(gptps_engine_totals, queued) >= sizeof(size_t) &&
+                 offsetof(gptps_engine_totals, delayed) == offsetof(gptps_engine_totals, queued) + 8 &&
+                 offsetof(gptps_engine_totals, running) == offsetof(gptps_engine_totals, delayed) + 8 &&
+                 offsetof(gptps_engine_totals, dead) == offsetof(gptps_engine_totals, running) + 8 &&
+                 offsetof(gptps_engine_totals, dead) + 8 <= sizeof(gptps_engine_totals)) ? 1 : -1];
+            typedef char et_wide[(sizeof(((gptps_engine_totals *)0)->queued) == 8) ? 1 : -1];
+            gptps_status (*fn)(gptps *, gptps_engine_totals *) = gptps_engine_counts;
+            (void)sizeof(et_size_first); (void)sizeof(et_order); (void)sizeof(et_wide);
+            CHECK(fn != NULL);
+        }
         /* The ABI this file guards. A new minor appends something: add its guards
          * above, then move this. */
-        CHECK(GPTPS_ABI_VERSION_MAJOR == 2u && GPTPS_ABI_VERSION_MINOR == 8u);
+        CHECK(GPTPS_ABI_VERSION_MAJOR == 2u && GPTPS_ABI_VERSION_MINOR == 9u);
     }
 
     /* 7) Every flag family: single, distinct bits, and the whole family listed. */

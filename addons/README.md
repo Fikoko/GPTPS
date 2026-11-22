@@ -587,8 +587,50 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   off by an out-of-order event is taken from the late one instead, as a lower bound.
   `tests/test_stats_order.c` runs 15 handle lifecycles - retries, cancels, REQUEUE
   cycles - through every order their events can arrive in.
-- **Cost:** one lock and one hash lookup per event. The handle table is bounded by the
-  engine's own queue.
+- **Cost:** one lock and one hash lookup per event, plus a hashed task-row lookup (FNV-1a,
+  one probe and one compare, whatever the number of types) on a handle's first event.
+  The event path allocates nothing (1.12): the task rows, the handle table and the
+  measurement tables are made at install, sized by `gptps_stats_install_ex(e, &cfg)`
+  (`gptps_stats_config`: `max_tasks` 256, `handles` 1024, `handles_max` 1<<20,
+  `measure_tables` 8 by default — about 0.25 MiB; out-of-range values are refused, never
+  clamped). What does not fit is counted and WARNed, at most once a minute per condition,
+  never grown into and never evicted: a task type past `max_tasks` counts in one
+  `(other)` row (always enumerated last, so its index moves up while real rows are
+  added; `GPTPS_STATS_ROW_OTHER` in a snapshot); a handle that finds every live entry
+  taken is not tracked for the rest of its life, counted once (the gauges undercount);
+  markers for handles whose `QUEUED` never came — work submitted before install, a
+  service's later runs — are bounded to the newest 64, the oldest dropped and counted.
+  The last 256 dropped or untracked handles are remembered, so a late `QUEUED` /
+  `RETRIED` for one moves no gauge (`late_absorbed`); one older than that still leaves
+  `pending` at +1 until the next resume. The handle table grows only outside the event
+  path: `gptps_stats_reserve(st, n)`, or any read (total, task, snapshot, health) that
+  finds it over half full or refusing, up to `handles_max` — allocated with the lock
+  released, swapped in under it, the old one freed after. So a host that submits more
+  than `handles` items before its first read (a start-up burst, a MANUAL engine filled
+  then stepped) must size the table with `install_ex` or `gptps_stats_reserve`: before
+  1.12 the table grew on the event path and such a burst was counted exactly.
+- **Switch:** `gptps_stats_set_enabled(st, 0)` makes the observer return before its lock
+  (a flag read); nothing is counted while off, so the totals miss those events.
+  Switching on again drops the handle table and zeroes the gauges: the gauges (and
+  samples) then cover only work queued after the resume, which
+  `gptps_stats_health` says (`resumes`, `gauges_since_ms`). Both transitions WARN.
+  `GPTPS_STATS_START_DISABLED` installs it off — observers are registered before the
+  first submit, so this is how a host makes stats optional at run time.
+- **Health:** `gptps_stats_health(st, &h)` — enabled, table capacity, live entries,
+  markers, handles untracked, markers dropped, late events absorbed, growths, rows in
+  use, types folded,
+  measurement tables used and refused, failed allocations (`nomem`: a growth, a host
+  fold's table) and the memory held.
+- **Snapshot:** `gptps_stats_snapshot(st, &total, &health, rows, sizeof rows[0], cap,
+  &needed)` reads the totals, the health and every task row under ONE lock acquisition,
+  so the rows add up to the totals (separate getters are each consistent, not with each
+  other). `GPTPS_E_FULL` with `needed` when `cap` is short.
+- **`struct_size`:** every getter fills the caller's struct only as far as its
+  `struct_size` says (1.12; before, the whole current struct): a 1.2–1.6 caller's size
+  gets the 1.2 fields, and a value below the 1.7 size — a caller that never set it —
+  gets the 1.7 fields, which every caller since has room for. The new structs
+  (`gptps_stats_config`, `_health_info`, `_row`) require theirs; a snapshot's row stride
+  is the caller's `row_size`.
 - **Not settings.** The counters are deliberately not registered in the settings
   registry: there is no `gptps_unregister_setting`, so a registered read callback
   would outlive `gptps_stats_close`. If a host wants them in the TUI, that is the
@@ -644,7 +686,12 @@ enabled automatically). Panes/metrics:
     each as a ratio, label `perf`), but cache misses still show: ~50-70 ns at 500k in
     flight in a 1<<20 window, ~50-60 ns at 1000 task types, ~90-170 ns for a FAILED
     event with a stderr tail. With several threads emitting, `minimal` and up also wait
-    for one another on the dashboard's one lock (no atomics in the drop-in build).
+    for one another on the dashboard's one lock (no atomics in the drop-in build). 1.12
+    measured lock stripes as the remedy and did not ship them: through a real engine at 8
+    threads the whole dashboard's cost to throughput is within run-to-run noise at every
+    tier, and an upper-bound model of stripes won nothing back, because the engine's own
+    lock serializes first
+    (docs/MEASUREMENTS.md, "Dashboard lock stripes").
     `off` is the tier for leaving the dashboard in place after you have stopped looking
     at it (counters do not advance while off); `minimal` and up still take one mutex per
     event. The released names and values are kept (`gptps_tui_kpi` 0..4); the new tiers
@@ -699,9 +746,11 @@ enabled automatically). Panes/metrics:
     `refresh_ms` in every mode. On Windows a console resize repaints by itself (the loop
     turns on `ENABLE_WINDOW_INPUT` while it runs).
   - **Engine-reading panes** (1.11). The tasks, settings and detail panes read the
-    engine — and `gptps_task_get_info` holds its lock while it walks every queue (1.10
-    read every row on every frame: 116 ms a frame at 64 types and 100k queued, 46% of the
-    time at 250 ms). Now an open pane reads the engine in **one pass into a cache**: when
+    engine, one call per task type or setting, each in the engine's lock. Before ABI 2.9
+    `gptps_task_get_info` walked every queue to count (~1 ms a call at 64 types and 100k
+    queued; 1.10 read every row on every frame — 116 ms a frame, 46% of the time at
+    250 ms); since 2.9 (1.12) it reads counters, O(1), so a pass costs microseconds a type
+    and the 1% rule below now rarely binds. An open pane reads the engine in **one pass into a cache**: when
     it opens, after a change made from it, on `R`, and every `cfg.pane_refresh_ms` (2 s) —
     or, when a pass is slow, 100× what the last one took, so the panes hold the engine's
     lock **at most 1% of the time**. Frames and `j`/`k` read only the cache, and the pane
@@ -713,6 +762,66 @@ enabled automatically). Panes/metrics:
     The dashboard's frames keep the same 1% for their own look at the engine (to clear the
     gauges' `>=`): each look is timed and the next waits 99× as long, and a frame is due
     when that wait ends. `gptps_tui_health` always looks, at the rate the host calls it.
+    Since 1.12 that look is one `gptps_engine_counts` call (O(1)) instead of a
+    `gptps_task_get_info` walk per type.
+  - **Pressure: report, and opt-in degrade** (1.12; `cfg.adapt`, `tui.adapt` =
+    `off` | `report` (default) | `degrade`). Nothing is added to the event path: once a
+    rate window (`cfg.rate_window_s`, 10 s), when a frame is made or health is read, the
+    dashboard compares the counters it already keeps with the window's start. A condition
+    shows a `PRESSURE:` line naming the setting to change, logs a WARN (at most one a
+    minute per condition) and sets `gptps_tui_health.pressure` (`GPTPS_TUI_P_*`):
+
+    | condition | when | suggestion |
+    |---|---|---|
+    | PROBLEMS lost | a failure record overwritten before any frame showed it | raise `tui.recent` |
+    | ACTIVITY lost | lifecycle records lost unseen at ≥ 1000/s | `tui.activity=0` |
+    | untracked | the latency table was full for a QUEUED | raise `tui.latency_window` |
+    | folded | a new type folded into `(other)` | raise `cfg.max_tasks` |
+    | truncated / no memory | a frame cut at 256 KiB / an allocation failed | lower `tui.recent`, `tui.activity` / `tui.kpi` |
+    | render | a frame took more than 1/10 of `refresh_ms` to make | raise `tui.refresh_ms` |
+    | pane | a pane pass slow enough to stretch past `cfg.pane_refresh_ms` | raise it, or leave the pane |
+    | cost | the **estimated** observer cost over `tui.cost_budget_pct` (default 5% of one core) | the highest `tui.kpi` that fits |
+
+    The cost is an estimate, labelled `est.`: the window's event rate × a unit cost per tier
+    (off 3, minimal 9, gauge 10, problems 10, tasks 21, normal 24, latency 38, full 38 ns;
+    35 at latency/full with the ACTIVITY journal off) — the upper end measured on one thread
+    with `tests/test_tui_perf.c`'s harness. An event takes nanoseconds and `gptps_now_ms`
+    has millisecond resolution, so it cannot be timed; contention is not in it. At 5%,
+    `full` reaches the budget near 1.3 million events a second.
+    `degrade` is the one opt-in exception to "report, never act", and it acts only when a
+    frame is made or health is read — with no viewer nothing acts. When a condition shedding
+    relieves (activity lost, render, cost) lasts **3 windows in a row**, one step is shed, a
+    WARN each, in this order: the ACTIVITY journal → the percentiles (`full` → `latency`) →
+    the handle table (→ `tasks`) → the TASKS rows (→ `problems`). A step that would change
+    nothing is passed over; `problems` is the floor (the totals, gauges and PROBLEMS journal
+    are never shed; a WARN says when nothing is left). **Sticky**: nothing comes back when
+    the pressure goes. What you asked for is kept — `tui.kpi` and `tui.activity` read back
+    the request, so `w` saves it, not the degraded state — and what runs is shown in
+    `gptps_tui_health` (`kpi`, `kpi_requested`, `shed`, `shed_pressure`, `degrade_steps`)
+    and under the header: `DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores
+    full`. Only an operator clears it: `u`, `gptps_tui_set_kpi` (any level), a `tui.kpi`
+    write, `gptps_tui_set_adapt` or a `tui.adapt` write build the request again; `m` clears
+    it too but steps up one tier from what runs (`full` degraded to `problems`, then `m`,
+    gives `tasks`).
+- **A host's numbers: `gptps_tui_source`** (1.12). A host that already aggregates — it
+  runs `gptps_stats`, say — can let the dashboard *show* its totals, gauges and TASKS rows
+  instead of counting the same events again: `gptps_tui_set_source(t, &src)` (NULL: back
+  to its own collection), then run the dashboard at `tui.kpi = off` (one flag read an
+  event, no lock) or `problems` (for the failure journal). The interface is one read-only
+  callback that fills a snapshot (`gptps_tui_source_totals` and an array of
+  `gptps_tui_source_row`, each read as far as its size); there is no reset and no close
+  in it, so the dashboard can never reset or close what the host owns. It is read once a
+  dashboard frame, before the copy-out, with the dashboard's lock released — never on the
+  event path, never by health or the other panes; while one is set the live loop polls it
+  every `refresh_ms`. A failed read is counted (`gptps_tui_health.source_errors`,
+  `source_status`), that frame shows the dashboard's own counts with a line saying so, and
+  a WARN is logged at most once a minute. Once `set_source` (or close) has returned, the
+  old source is never called again. done/s and peak start again when the totals change
+  hands. There is no link dependency: the `gptps_stats` adapter is
+  [`examples/dashboard_stats.c`](../examples/dashboard_stats.c) (`gptps_stats_snapshot`:
+  every row and the totals under one lock; avg / max ms there are run time), built and
+  run headless as the `example_dashboard_stats` test. Close order: `gptps_shutdown`,
+  `gptps_tui_close`, then `gptps_stats_close`.
 - **Host profiles.**
 
   | host | suggested | why |
@@ -730,7 +839,8 @@ enabled automatically). Panes/metrics:
 Live keys: hotkeys submit their task (a refused submit says why) · `k`/`j` scroll ·
 `m` steps the KPI tier up, `minimal` → `gauge` → `problems` → `tasks` → `normal` →
 `latency` → `full` → `minimal` (the rule: up one tier, wrapping to `minimal`, never into
-`off`; from `off` it goes to `minimal`) · `p` pauses/resumes · `s` settings · `t` tasks ·
+`off`; from `off` it goes to `minimal`) · `u` undoes a degrade (the requested tier
+again) · `p` pauses/resumes · `s` settings · `t` tasks ·
 `l` dead letters · `?` help · `q` quits. In the tasks, settings and detail panes `R` (or
 `r`) reads the engine again now; in the dead-letter view `r` re-submits all.
 

@@ -93,7 +93,9 @@ typedef enum {
      * is freed. MINIMAL and up are
      * cheap in work but NOT free in contention - each acquires one global
      * mutex per event, on every worker, the dispatcher and every submitting
-     * thread. This tier is for leaving the dashboard installed after you are done
+     * thread (1.12 measured lock stripes and did not ship them: through a real
+     * engine the engine's own lock serializes first - docs/MEASUREMENTS.md,
+     * "Dashboard lock stripes"). This tier is for leaving the dashboard installed after you are done
      * looking at it: the handle, the settings and the per-task labels all stay
      * valid, so raising the tier again costs nothing but the re-allocation.
      * Counters do not advance while OFF, so totals resume from where they stopped
@@ -122,6 +124,17 @@ typedef enum {
                                    * dashboard repaints the header once a minute */
     GPTPS_TUI_CLOCK_SECONDS       /* "up 9s", "up 4m09s", "up 3h07m09s": once a second */
 } gptps_tui_clock;
+
+/* cfg.adapt / tui.adapt (1.12): what the dashboard does about its own PRESSURE - see
+ * ADAPT at gptps_tui_health. 0 = the default. */
+typedef enum {
+    GPTPS_TUI_ADAPT_DEFAULT = 0,  /* = REPORT (also for a 1.11-layout caller) */
+    GPTPS_TUI_ADAPT_OFF,          /* nothing is computed: no PRESSURE line, no WARN, no shedding */
+    GPTPS_TUI_ADAPT_REPORT,       /* the PRESSURE line, a WARN per condition (at most one a
+                                   * minute each) and the health fields; nothing is changed */
+    GPTPS_TUI_ADAPT_DEGRADE       /* REPORT, and - opt-in - shed one collection step at a time
+                                   * while the pressure lasts (STICKY: only an operator undoes it) */
+} gptps_tui_adapt;
 
 /* When the live loop (gptps_tui_run) repaints. Tunable at runtime. See IDLE at
  * gptps_tui_run for what each costs when nothing happens. */
@@ -220,6 +233,12 @@ typedef struct {
     int         pane_refresh_ms;/* how often an open tasks / settings / detail pane reads the engine
                                 * again (0 => 2000; 100..600000; install-time) - or less often, when
                                 * a read is slow: see PANES at gptps_tui_run */
+    /* ---- 1.12: read only when struct_size covers them (0 = the default each) ---- */
+    int         adapt;         /* gptps_tui_adapt (0 => REPORT; out of range => install returns NULL,
+                                * with an ERROR). Also `tui.adapt`. See ADAPT at gptps_tui_health */
+    int         cost_budget_pct;/* the observer's ESTIMATED cost, in percent of one core, above which
+                                * it is a pressure condition (0 => 5; 1..100; else install returns
+                                * NULL, with an ERROR). Also `tui.cost_budget_pct` */
 } gptps_tui_config;
 
 /* Install the dashboard on engine `e` (registers an observer). cfg NULL => all
@@ -284,7 +303,8 @@ size_t gptps_tui_render(gptps_tui *t, char *buf, size_t cap);
  * refuses the submit - the type is paused or unknown, the queue is full, a constraint
  * denies it - the toast says why and it returns 0); 'q'/ESC
  * requests quit (returns -1); 'k'/'j' scroll the log (returns 2); 'm' steps the
- * KPI tier up (FULL wraps to MINIMAL; never into OFF) and 'p' toggles pause (returns 3, "reconfigured"); 's' opens the
+ * KPI tier up (FULL wraps to MINIMAL; never into OFF), 'u' restores the requested tier after a
+ * degrade (see ADAPT at gptps_tui_health) and 'p' toggles pause (returns 3, "reconfigured"); 's' opens the
  * settings editor and '?' toggles the help overlay (returns 4, "UI"); else 0. In the
  * tasks, settings and detail panes 'R' (or 'r') reads the engine again now (returns 4;
  * see PANES at gptps_tui_run) - in the dead-letter view 'r' still re-submits all. */
@@ -296,7 +316,9 @@ int gptps_tui_press(gptps_tui *t, int key);
  * and stops their per-event work; raising it builds them again. GPTPS_E_NOMEM when a
  * part the tier needs cannot be allocated: the tier is set, the dashboard runs
  * without that part (a journal, the TASKS table, the latency table and so avg ms and
- * the exact gauges, or the percentiles), and a WARN says so. */
+ * the exact gauges, or the percentiles), and a WARN says so. It is the operator's word on
+ * the tier: it clears what tui.adapt = degrade shed (see ADAPT at gptps_tui_health) and
+ * becomes the requested tier, which tui.kpi reads back. */
 gptps_status gptps_tui_set_kpi(gptps_tui *t, gptps_tui_kpi level);
 /* Resize the RECENT journals (1.11): `problems` lines for the PROBLEMS journal, `activity`
  * lines for the ACTIVITY journal; -1 leaves one as it is, 0 turns it off and frees it,
@@ -409,15 +431,184 @@ typedef struct {
     uint64_t pane_every_ms;       /* how often an open pane reads again: pane_refresh_ms, or
                                    * 100 times the last pass when that is longer */
     uint64_t bytes_panes;         /* the open pane's cache (0 on the dashboard) */
+    /* 1.12, ADAPT (see below) */
+    int      adapt;               /* the gptps_tui_adapt in effect (never DEFAULT) */
+    int      kpi_requested;       /* the tier asked for (set_kpi, tui.kpi, 'm', cfg.kpi); `kpi`
+                                   * above is what runs: lower only while something is shed */
+    uint64_t pressure;            /* GPTPS_TUI_P_* bits: the conditions of the last window */
+    uint64_t pressure_seen;       /* GPTPS_TUI_P_* bits: every condition any window has had */
+    uint64_t pressure_windows;    /* windows in a row with a condition shedding relieves
+                                   * (GPTPS_TUI_P_SHEDDABLE); DEGRADE sheds at 3 */
+    uint64_t windows;             /* windows evaluated since install */
+    uint64_t pressure_warns;      /* pressure / degrade WARNs logged */
+    uint64_t shed;                /* GPTPS_TUI_SHED_* bits: what DEGRADE has shed (0: nothing) */
+    uint64_t shed_pressure;       /* GPTPS_TUI_P_* bits: the conditions behind the last step */
+    uint64_t degrade_steps;       /* steps shed since install (cleared ones included) */
+    uint64_t event_rate;          /* events a second in the last window (from the totals) */
+    uint64_t cost_est_ppm;        /* the observer's ESTIMATED cost in the last window, in
+                                   * millionths of one core: event_rate x the unit cost of the
+                                   * tier in effect (see ADAPT) - an estimate, not a measurement */
+    uint64_t render_max_us;       /* the slowest frame made in the last window (render, snapshot
+                                   * or the live loop; any pane) */
+    /* 1.12, SOURCE (see gptps_tui_set_source) */
+    int      source;              /* 1 while a host source is set */
+    int      source_status;       /* what its last read returned (GPTPS_OK before any) */
+    uint64_t source_reads;        /* reads made (one a dashboard frame), since install */
+    uint64_t source_errors;       /* reads that failed, since install: those frames showed the
+                                   * dashboard's own counts, and said so */
+    uint64_t source_rows;         /* task rows the last good read said the source has */
 } gptps_tui_health_info;
+
+/* GPTPS_TUI_P_*: a pressure condition, one bit each (gptps_tui_health_info.pressure). */
+#define GPTPS_TUI_P_PROBLEMS_LOST 0x001u  /* PROBLEMS records overwritten before a frame showed them */
+#define GPTPS_TUI_P_ACTIVITY_LOST 0x002u  /* ACTIVITY records lost unseen, 1000 a second or more */
+#define GPTPS_TUI_P_UNTRACKED     0x004u  /* QUEUEDs the full latency table could not take */
+#define GPTPS_TUI_P_FOLDED        0x008u  /* new task types folded into '(other)' */
+#define GPTPS_TUI_P_TRUNCATED     0x010u  /* frames cut at 256 KiB */
+#define GPTPS_TUI_P_NOMEM         0x020u  /* allocations that failed */
+#define GPTPS_TUI_P_RENDER        0x040u  /* a frame took more than a tenth of refresh_ms to make */
+#define GPTPS_TUI_P_PANE          0x080u  /* an engine read was slow enough to stretch its interval */
+#define GPTPS_TUI_P_COST          0x100u  /* the estimated observer cost is over cost_budget_pct */
+/* the conditions shedding relieves - the only ones DEGRADE acts on */
+#define GPTPS_TUI_P_SHEDDABLE (GPTPS_TUI_P_ACTIVITY_LOST | GPTPS_TUI_P_RENDER | GPTPS_TUI_P_COST)
+/* GPTPS_TUI_SHED_*: a DEGRADE step (gptps_tui_health_info.shed), in the order they are shed */
+#define GPTPS_TUI_SHED_ACTIVITY    0x1u   /* 1: the ACTIVITY journal off ("-activity") */
+#define GPTPS_TUI_SHED_PERCENTILES 0x2u   /* 2: FULL -> LATENCY, the histograms ("-percentiles") */
+#define GPTPS_TUI_SHED_LATENCY     0x4u   /* 3: -> TASKS, the handle table: avg ms, exact gauges ("-latency") */
+#define GPTPS_TUI_SHED_TASKS       0x8u   /* 4: -> PROBLEMS, the TASKS rows and mem.peak ("-tasks") */
 
 /* Fill *out (struct_size bytes of it; the rest of a newer struct is left alone, and
  * out->struct_size is kept). GPTPS_E_INVAL for a NULL argument or a struct_size that
  * does not reach journal_not_shown. Thread-safe; takes the dashboard's lock briefly, and
- * while the gauges are a lower bound it asks the engine (gptps_task_get_info) whether it
- * is idle, on every call (not held to the frames' 1%: poll it at a rate you can spare) - so it may be called from an observer, which runs with the engine lock
+ * while the gauges are a lower bound it asks the engine (gptps_engine_counts, O(1) since 1.12)
+ * whether it is idle, on every call (not held to the frames' 1%), and once a rate window
+ * it evaluates ADAPT (below) - with DEGRADE that may shed a step, freeing memory - so it may be called from an observer, which runs with the engine lock
  * released, but not from a callback gptps.h (THREADING) forbids to call the engine. */
 gptps_status gptps_tui_health(gptps_tui *t, gptps_tui_health_info *out);
+
+/* ADAPT (1.12). The dashboard watches its own cost and losses - with nothing added to the
+ * event path: every condition is computed from counters it already keeps, once a rate
+ * window (cfg.rate_window_s, 10 s), when a frame is made (render, snapshot, the live loop)
+ * or health is read. With no viewer and no health call nothing is computed at all. A
+ * window's conditions (GPTPS_TUI_P_*), each from what changed in that window:
+ *   PROBLEMS_LOST  PROBLEMS records lost unseen          -> raise tui.recent
+ *   ACTIVITY_LOST  ACTIVITY records lost unseen at 1000/s -> tui.activity=0 (a log
+ *                  or more (a log scrolling too fast to     scrolling that fast is not read)
+ *                  read; a few lost between frames are not pressure)
+ *   UNTRACKED      items the latency table had no room for -> raise tui.latency_window
+ *   FOLDED         types folded into '(other)'             -> raise cfg.max_tasks
+ *   TRUNCATED      frames cut at 256 KiB                   -> lower tui.recent / tui.activity
+ *   NOMEM          failed allocations                      -> a lower tui.kpi
+ *   RENDER         the slowest frame took more than 10% of  -> raise tui.refresh_ms
+ *                  refresh_ms to make
+ *   PANE           a pane pass (or the idle check) slow      -> raise cfg.pane_refresh_ms, or
+ *                  enough to stretch its interval past        leave the pane
+ *                  cfg.pane_refresh_ms (the 1% rule)
+ *   COST           the ESTIMATED observer cost over         -> the highest tui.kpi that fits
+ *                  cost_budget_pct (5% of one core)
+ * The cost is an estimate, labelled "est" wherever it is shown: the event rate (from the
+ * totals) times a unit cost per tier - OFF 3, MINIMAL 9, GAUGE 10, PROBLEMS 10, TASKS 21,
+ * NORMAL 24, LATENCY 38, FULL 38 ns (35 at LATENCY / FULL with the ACTIVITY journal off),
+ * the upper end measured on one thread (gcc -O2, x86-64, the KPI table above;
+ * tests/test_tui_perf.c's harness). It cannot be timed: gptps_now_ms has millisecond
+ * resolution and an event takes nanoseconds. Contention between emitting threads is not in
+ * it. At the default 5% FULL reaches it at about 1.3 million events a second.
+ * REPORT (the default): any condition shows a PRESSURE line on the dashboard naming it and
+ * the setting to change ("PRESSURE: ACTIVITY lost 41k unseen: tui.activity=0"), logs a WARN
+ * - at most once a minute per condition - and sets the health fields. Nothing is changed.
+ * DEGRADE (opt-in; the one exception to "report, never act", and it acts only when a frame
+ * is made or health is read): when a condition shedding relieves (GPTPS_TUI_P_SHEDDABLE:
+ * ACTIVITY_LOST, RENDER, COST) lasts 3 windows in a row, one step is shed, in this order -
+ * GPTPS_TUI_SHED_ACTIVITY, _PERCENTILES (FULL -> LATENCY), _LATENCY (-> TASKS), _TASKS (->
+ * PROBLEMS) - a step that would change nothing is passed over, and after a step the count
+ * starts again. PROBLEMS is the floor: the totals, the gauges and the PROBLEMS journal are
+ * never shed; at the floor a WARN says there is nothing left. Each step logs a WARN. What
+ * was asked for is kept: tui.kpi, tui.activity and set_kpi's level read back as requested
+ * (so a file saved with 'w' holds the request, not the degraded state); what runs is the
+ * request minus what is shed - health.kpi, health.shed, and the line under the header:
+ * "DEGRADED: -activity -percentiles (pressure: cost) - 'u' restores full". STICKY:
+ * nothing is restored when the pressure goes. It is cleared only by an operator. The request
+ * is built again by gptps_tui_set_kpi (any level, the same one too), a tui.kpi write, the
+ * 'u' key, gptps_tui_set_adapt or a tui.adapt write; the 'm' key clears it too, but steps
+ * up one tier from what RUNS (FULL degraded to PROBLEMS, then 'm': TASKS). */
+gptps_status gptps_tui_set_adapt(gptps_tui *t, gptps_tui_adapt mode);   /* DEFAULT => REPORT; else
+                                   * GPTPS_E_INVAL. Clears what DEGRADE shed (above) */
+/* The estimated-cost budget, in percent of one core: 1..100 (else GPTPS_E_INVAL). Also
+ * `tui.cost_budget_pct`. */
+gptps_status gptps_tui_set_cost_budget(gptps_tui *t, int pct);
+
+/* SOURCE (1.12). A host that already aggregates - it runs gptps_stats, say - can let the
+ * dashboard SHOW its numbers instead of collecting its own: the header's totals and gauges
+ * (and so done/s and peak) and the TASKS rows then come from the source, and the dashboard's
+ * own collection can be turned down to what the source does not give (tui.kpi = off, or
+ * problems for the failure journal). The interface is read-only: one callback that fills
+ * a snapshot. There is no reset and no close in it, so the dashboard can never reset or
+ * close what the host owns - not on set_source, not on any key or setting, not in
+ * gptps_tui_close.
+ *
+ * WHEN it is read: once per dashboard frame (gptps_tui_render, gptps_tui_snapshot, the live
+ * loop) on the thread making it, just before the frame's copy-out, with the dashboard's own
+ * lock released (only its render lock is held, so the callback may take the host's locks and
+ * may call gptps_tui_health; it must not render, snapshot or set_source this dashboard).
+ * NEVER on the event path: events cost what tui.kpi says, and nothing for the source. The
+ * other panes (tasks, settings, detail, dead letters) do not read it. While a source is set
+ * the live loop polls it: a frame is due every refresh_ms (it writes only lines that changed).
+ *
+ * ERRORS: a read that returns anything but GPTPS_OK is counted (gptps_tui_health
+ * source_errors, source_status), that frame shows the dashboard's own counts with a line
+ * saying so ("source <name>: read failed (...), N errors - own counts shown"), and a WARN is
+ * logged - at most once a minute. The next frame reads again.
+ *
+ * OWNERSHIP: ctx and the callback stay the host's. The dashboard copies the gptps_tui_source
+ * (and its name) at set_source; once gptps_tui_set_source (another source, or NULL) or
+ * gptps_tui_close has returned, the old one is never called again, so the host may then
+ * free it. Close order: gptps_shutdown, gptps_tui_close (or set_source(t, NULL)), then the
+ * host's own (gptps_stats_close). No link dependency: the dashboard knows nothing of
+ * gptps_stats; examples/dashboard_stats.c is the adapter (gptps_stats_snapshot: totals and
+ * every row under one lock). */
+typedef struct {
+    size_t   struct_size;         /* set by the dashboard; the source fills what it covers */
+    uint64_t queued, started, finished, failed, retried, dead, dropped;
+    uint64_t cancelled;           /* FAILED with GPTPS_E_CANCELLED (part of failed) */
+    uint64_t pending, in_flight;  /* the gauges */
+    int      gauges;              /* gptps_tui_gauges: EXACT (no mark), LOWER_BOUND ('>='), APPROX
+                                   * ('~'), or SUM (no gauges: `pending` is what is queued or
+                                   * running, as one sum). Anything else is shown as APPROX */
+} gptps_tui_source_totals;
+
+#define GPTPS_TUI_SOURCE_NAME    128      /* a row's name, with its NUL (= GPTPS_TASK_NAME_MAX + 1) */
+#define GPTPS_TUI_SRC_ROW_LATENCY 0x1u    /* flags: lat_* hold this row's latency */
+typedef struct {
+    size_t   struct_size;         /* the dashboard sets row_size instead; ignored */
+    uint32_t flags;               /* GPTPS_TUI_SRC_ROW_* */
+    char     name[GPTPS_TUI_SOURCE_NAME]; /* the task type; a gptps_tui_add_task label and hotkey
+                                   * for that name are shown with it. Cut at its last byte */
+    uint64_t started, finished, failed, dead, dropped;
+    uint64_t lat_n, lat_sum_ms, lat_max_ms;  /* avg ms and max ms (the source says what latency
+                                   * it is: the stats adapter's is run time); lat_n 0: "--" */
+} gptps_tui_source_row;
+
+/* Fill *totals (struct_size bytes of it) and rows[0 .. min(cap, rows there are)) - an array
+ * of `cap` elements of `row_size` bytes each, row_size >= the 1.12 sizeof(gptps_tui_source_row);
+ * fill each row only as far as row_size covers - and set *nrows to the rows there are (more
+ * than cap: the frame says "+N more"). cap is what the frame has room for (at most its height).
+ * Totals and rows should be one consistent snapshot. Return GPTPS_OK, or any error (above). */
+typedef gptps_status (*gptps_tui_source_read_fn)(void *ctx, gptps_tui_source_totals *totals,
+                                                 gptps_tui_source_row *rows, size_t row_size,
+                                                 size_t cap, size_t *nrows);
+typedef struct {
+    size_t                   struct_size; /* = sizeof(gptps_tui_source) */
+    void                    *ctx;         /* the host's: passed to read, never freed */
+    gptps_tui_source_read_fn read;        /* required */
+    const char              *name;        /* shown on the kpi line ("source:<name>"; NULL =>
+                                           * "host"); copied, up to 31 bytes */
+} gptps_tui_source;
+
+/* Set (src) or clear (NULL: the dashboard's own collection again) the source. GPTPS_E_INVAL
+ * for a NULL t, or a src with a struct_size below this layout's or no read. Waits for a frame
+ * being made to finish (see OWNERSHIP). done/s and peak start again from the next frame
+ * (the counts they are made from changed hands); the error and read counts are kept. */
+gptps_status gptps_tui_set_source(gptps_tui *t, const gptps_tui_source *src);
 
 /* Render one frame to the configured output stream right now ("once" / on-demand),
  * independent of the live loop or mode. */
@@ -456,10 +647,13 @@ void gptps_tui_snapshot(gptps_tui *t);
  * table and the tasks pane are fitted to the terminal's height ("+N more").
  *
  * PANES (1.11). The tasks, settings and detail panes show what they read from the engine,
- * and gptps_task_get_info holds the engine's lock while it walks every queue (1.10 read
- * every row on every frame: 116 ms a frame at 64 types and 100k queued - 46% of the time at
- * 250 ms, stalling submit and dispatch). Now an open pane reads the engine in ONE pass into
- * a cache: when it opens, after a change made from it (an edit, pause, clone, new, delete),
+ * one call per task type or setting, each in the engine's lock. Before ABI 2.9 (1.12) a
+ * gptps_task_get_info call walked every queue to count - ~1 ms a call at 64 types and 100k
+ * queued, 116 ms for a 1.10 frame that read every row - and 1.10 read every row on every
+ * frame (46% of the time at 250 ms, stalling submit and dispatch); since 2.9 it reads
+ * counters the engine keeps, O(1) a call, so a pass costs microseconds a type. The rule
+ * below stays, as a bound that now rarely binds. An open pane reads the engine in ONE pass
+ * into a cache: when it opens, after a change made from it (an edit, pause, clone, new, delete),
  * on 'R', and then every pane_refresh_ms (2 s) - or, when a pass took more than 1% of that,
  * 100x what it took, so the panes hold the engine's lock at most 1% of the time. Its frames
  * and j/k read only the cache (no engine call between passes), and a value set elsewhere
@@ -473,7 +667,8 @@ void gptps_tui_snapshot(gptps_tui *t);
  * engine read - asking whether the engine is idle, to clear the gauges' '>=' - follows the
  * same 1% rule: each look is timed and the next waits 99x as long, however often frames
  * are rendered (a frame is then due when the hold ends, so an engine gone idle clears
- * '>=' then). gptps_tui_health, install and a tier change always look.
+ * '>=' then). gptps_tui_health, install and a tier change always look. Since 1.12 the look
+ * is one gptps_engine_counts call (ABI 2.9, O(1)) instead of a gptps_task_get_info per type.
  *
  * HOST PROFILES.
  *   - Embedded / MANUAL (no thread; render or snapshot only): no loop, no pipe, no timer -

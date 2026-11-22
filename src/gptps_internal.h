@@ -75,6 +75,9 @@ typedef char gptps__task_def_flags_is_widest[(sizeof(((gptps_task_def *)0)->flag
  * is never mistaken for one that has them. */
 #define GPTPS_ADDON_INFO_MIN_SIZE     GPTPS_LAST_FIELD_END(gptps_addon_info, enabled)
 #define GPTPS_TASK_INFO_MIN_SIZE      GPTPS_LAST_FIELD_END(gptps_task_info, dead)
+/* gptps_engine_totals (ABI 2.9) was born with a floor: its first layout, ending at
+ * `dead`. A field appended later is written only through GPTPS_STRUCT_HAS. */
+#define GPTPS_ENGINE_TOTALS_MIN_SIZE  GPTPS_LAST_FIELD_END(gptps_engine_totals, dead)
 #define GPTPS_SETTING_INFO_MIN_SIZE   GPTPS_LAST_FIELD_END(gptps_setting_info, defval)
 #define GPTPS_SETTING_INFO_COPY_SIZE  GPTPS_LAST_FIELD_END(gptps_setting_info, desc_copy)
 /* Same tail-padding hazard as gptps_task_def above, same remedy: `flags` must stay the

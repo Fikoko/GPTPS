@@ -58,22 +58,10 @@ static void reset_tui(void)
     mu_unlock(&tui->mu);
 }
 
-static gptps_stats *fresh_stats(void)
-{
-    gptps_stats *s = (gptps_stats *)calloc(1, sizeof *s);
-    if (!s) return NULL;
-    s->total.struct_size = sizeof s->total;
-    apx_mutex_init(&s->mu);
-    return s;
-}
-static void discard_stats(gptps_stats *s)
-{
-    size_t i;
-    for (i = 0; i < s->ntasks; ++i) free(s->tasks[i].name);
-    free(s->tasks); free(s->tab);
-    apx_mutex_destroy(&s->mu);
-    free(s);
-}
+/* gptps_stats with its installed sizing and no engine, fed by hand (1.12: its tables
+ * are made at construction, so a calloc'd struct no longer is one). */
+static gptps_stats *fresh_stats(void) { return st_new(NULL, ST_DEF_MTABS); }
+static void discard_stats(gptps_stats *s) { gptps_stats_close(s); }
 
 static void feed(gptps_stats *s, const ev_spec *e)
 {

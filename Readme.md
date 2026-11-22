@@ -442,6 +442,8 @@ without recompiling or restarting:
 size_t n = gptps_task_count(e);                       /* enumerate for a UI ... */
 gptps_task_info ti = { .struct_size = sizeof ti };
 gptps_task_get_info(e, 0, &ti);                       /* name, exec, prio, queued/running/dead */
+gptps_engine_totals tot = { .struct_size = sizeof tot };
+gptps_engine_counts(e, &tot);                         /* engine-wide queued/delayed/running/dead */
 uint64_t fl; gptps_task_flags(e, "resize", &fl);      /* GPTPS_TASK_* by name, race-free */
 
 gptps_set_task_enabled(e, "resize", 0);               /* pause: reject new submits, reversibly */
@@ -449,6 +451,12 @@ gptps_clone_task(e, "resize", "resize_hi");           /* duplicate, then retune 
 gptps_unregister_task(e, "resize", GPTPS_REMOVE_DRAIN);   /* finish in-flight work, then remove */
 ```
 
+- **Counters cost O(1)** (ABI 2.9): the engine keeps each type's queued / running / dead
+  counts as items move between its queues, so `gptps_task_get_info` no longer walks every
+  item under the engine lock (it did: about 1 ms a call at 64 types and 100k queued,
+  116 ms for a 64-row dashboard frame), and
+  `gptps_engine_counts` gives the engine-wide totals the same way. A dashboard or a host
+  can poll them as often as it likes.
 - **Removal policy** (the `flags`): `GPTPS_REMOVE_REJECT_IF_BUSY` (default — refuse with
   `GPTPS_E_BUSY` while work is outstanding), `GPTPS_REMOVE_DRAIN` (stop new submits, let
   queued + in-flight finish, then free), or `GPTPS_REMOVE_CANCEL` (drop queued, cancel
@@ -645,10 +653,23 @@ that scrolled away between two frames.
 - **Interactive:** hotkeys submit tasks; `k`/`j` scroll the event log; `m` dials the
   dashboard's own CPU/RAM cost live, one tier up the ladder a press (minimal, gauge,
   problems, tasks, normal, latency, full, then minimal again; `off` is set, never
-  stepped into); `p` pauses; `s` opens the live
+  stepped into); `u` undoes a degrade (below); `p` pauses; `s` opens the live
   **settings editor**, which explains the selected setting, says why it refuses a value,
   and saves your changes into the config file in place (`w`); `?` shows a help overlay of
   every key.
+- **Pressure (1.12):** the dashboard watches its own losses and estimated cost once a
+  rate window, from counters it already keeps (nothing on the event path), and shows a
+  `PRESSURE:` line naming the setting to change (`tui.adapt = report`, the default; a WARN
+  at most once a minute per condition). `tui.adapt = degrade` opts in to shedding one step
+  at a time while it lasts (ACTIVITY journal, percentiles, latency table, TASKS rows; never
+  below `problems`), sticky until you press `u` or set `tui.kpi`. See
+  [addons/README.md](addons/README.md#tui--real-time-terminal-dashboard).
+- **A host's numbers (1.12):** a host that already runs `gptps_stats` can feed the
+  dashboard its totals, gauges and per-task rows through the read-only `gptps_tui_source`
+  (`gptps_tui_set_source`), and run the dashboard's own collection at `off` — read once a
+  frame, never on the event path, a failed read shown and counted; the dashboard never
+  resets or closes the host's stats. The adapter is
+  [`examples/dashboard_stats.c`](examples/dashboard_stats.c) (no link between the add-ons).
 - **Task control plane:** `t` opens a **task manager** — list every type with its
   queued/running/dead counts, inspect one to edit its settings inline, pause/resume (`a`),
   clone (`c`), create a `GPTPS_EXEC_PROGRAM` task from a typed name + argv (`n`), or delete
@@ -975,9 +996,9 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **59** public functions · **ABI 2.8** (append-only; 2.0 was the first
+At a glance: **60** public functions · **ABI 2.9** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **108** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **117** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass - and a release tag publishes nothing until all of
 them have passed at that tag (`release.yml` runs `ci.yml` as its gate).
 

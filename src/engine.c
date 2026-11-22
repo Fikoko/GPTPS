@@ -152,6 +152,15 @@ typedef struct gptps_reg {
     struct gptps      *engine;     /* back-pointer (settings write_fns lock engine->m) */
     struct gptps_res_cell *res_cells; /* owned: its tasks.<name>.resources.<r> settings' cells */
     struct gptps_reg  *next;
+    /* ABI 2.9: how many of its items each engine queue holds, indexed by GPTPS_Q_*
+     * (INTAKE .. DEAD; slot 0 unused). Kept by the queue primitives themselves -
+     * fifo_push / fifo_pop / fifo_remove, intake_insert / intake_unlink - and by
+     * item_own_name, which severs a dead letter from its type, so no caller keeps
+     * them and none can forget to. gptps_task_get_info reads them in O(1) where it
+     * used to walk six queues under e->m (~1 ms a call at 64 types and 100k queued;
+     * 116 ms for a dashboard frame that read all 64 rows).
+     * See "per-type counts". Under e->m. */
+    size_t             nq[8];
 } gptps_reg;
 
 /* A generic per-task setting schema: materialized as tasks.<name>.<leaf> on every
@@ -490,8 +499,28 @@ struct gptps {
 /* fifo helpers                                                              */
 /* ------------------------------------------------------------------------- */
 
+/* per-type counts. Every move into or out of an engine queue goes through the five
+ * primitives below and the intake pair, and each moves the item's type's count for
+ * that queue with it: an engine queue's `id` is its GPTPS_Q_* slot in r->nq; a local
+ * list's (GPTPS_Q_NONE) moves nothing. So r->nq[q] is, by construction, the number
+ * of items in queue q whose `reg` is r - the value gptps_task_get_info used to count
+ * by walking. The one other way an item stops naming its type is item_own_name,
+ * which gives up a dead letter's `reg` while it stays in the queue: it takes its
+ * count back first. GPTPS_COUNTS_CHECK compiles counts_verify, which re-counts by
+ * the walk (tests/test_counts.c drives it after every step of a random run). */
+static void qcount_in(gptps_item *it, unsigned char id)
+{
+    if (id != GPTPS_Q_NONE && it->reg) it->reg->nq[id] += 1;
+}
+static void qcount_out(gptps_item *it)
+{
+    if (it->where >= GPTPS_Q_INTAKE && it->where <= GPTPS_Q_DEAD && it->reg)
+        it->reg->nq[it->where] -= 1;
+}
+
 static void fifo_push(gptps_fifo *q, gptps_item *it)
 {
+    qcount_in(it, q->id);
     it->next = NULL;
     it->prev = q->tail;
     if (q->tail) q->tail->next = it; else q->head = it;
@@ -507,6 +536,7 @@ static gptps_item *fifo_pop(gptps_fifo *q)
         if (q->head) q->head->prev = NULL; else q->tail = NULL;
         it->next = it->prev = NULL;
         q->count -= 1;
+        qcount_out(it);
         it->where = GPTPS_Q_NONE;
     }
     return it;
@@ -518,6 +548,7 @@ static void fifo_remove(gptps_fifo *q, gptps_item *target)
     if (target->next) target->next->prev = target->prev; else q->tail = target->prev;
     target->next = target->prev = NULL;
     q->count -= 1;
+    qcount_out(target);
     target->where = GPTPS_Q_NONE;
 }
 
@@ -768,6 +799,7 @@ static void intake_insert(gptps *e, gptps_item *it)
     if (it->next) it->next->prev = it; else q->tail = it;
     if (prev) prev->next = it; else q->head = it;
     q->count += 1;
+    qcount_in(it, GPTPS_Q_INTAKE);
     it->where = GPTPS_Q_INTAKE;
 }
 
@@ -792,6 +824,7 @@ static void intake_unlink(gptps *e, gptps_item *it)
     if (it->next) it->next->prev = prev; else q->tail = prev;
     q->count -= 1;
     it->next = it->prev = NULL;
+    qcount_out(it);
     it->where = GPTPS_Q_NONE;
 }
 
@@ -4467,6 +4500,38 @@ static unsigned reg_live_refs(const gptps *e, const gptps_reg *r)
          + fifo_count_reg(&e->running_items, r);
 }
 
+#ifdef GPTPS_COUNTS_CHECK
+/* Test-only (tests/test_counts.c compiles engine.c with GPTPS_COUNTS_CHECK): re-count
+ * everything the per-type counts and each queue's own count claim, by walking, and
+ * return how many disagree - 0 when "per-type counts" holds. Every registered type
+ * (one still settling and one draining included) and every retired one, which still
+ * owns dead letters. Caller holds e->m. */
+static unsigned counts_verify(gptps *e)
+{
+    const gptps_fifo *qs[6];
+    const gptps_reg *lists[2];
+    unsigned bad = 0, l, k;
+    qs[0] = &e->intake; qs[1] = &e->delayed; qs[2] = &e->ready;
+    qs[3] = &e->running_items; qs[4] = &e->done; qs[5] = &e->dead_letter;
+    for (k = 0; k < 6; ++k) {
+        const gptps_item *it; size_t n = 0;
+        for (it = qs[k]->head; it; it = it->next) {
+            ++n;
+            if (it->where != qs[k]->id) ++bad;
+        }
+        if (n != qs[k]->count) ++bad;
+    }
+    lists[0] = e->registry; lists[1] = e->retired;
+    for (l = 0; l < 2; ++l) {
+        const gptps_reg *r;
+        for (r = lists[l]; r; r = r->next)
+            for (k = 0; k < 6; ++k)
+                if (fifo_count_reg(qs[k], r) != r->nq[qs[k]->id]) ++bad;
+    }
+    return bad;
+}
+#endif
+
 /* Unlink every item in q referencing r and move it to `out` (caller holds e->m).
  * The items are NOT freed here: they are still submitted handles that owe their
  * observer a terminal event, and events must be emitted with the lock RELEASED.
@@ -4592,6 +4657,7 @@ static int item_own_name(gptps_item *it)
         memcpy(cp, nm, L);
         it->name_owned = cp;
     }
+    qcount_out(it);                   /* it no longer counts as its type's (see "per-type counts") */
     it->reg = NULL; it->def = NULL;   /* only name_owned is read hereafter */
     return 1;
 }
@@ -4684,14 +4750,34 @@ gptps_status gptps_task_get_info(gptps *e, size_t index, gptps_task_info *out)
     out->name = r->name; out->exec = r->def.exec; out->priority = r->priority;
     out->default_cost = r->def.default_cost; out->default_policy = r->def.default_policy;
     out->enabled = r->enabled ? 1 : 0; out->removed = r->removed ? 1 : 0;
-    out->queued  = fifo_count_reg(&e->intake, r) + fifo_count_reg(&e->delayed, r);
-    out->running = fifo_count_reg(&e->ready, r) + fifo_count_reg(&e->running_items, r) + fifo_count_reg(&e->done, r);
-    out->dead    = fifo_count_reg(&e->dead_letter, r);
+    /* O(1): the counts the queue primitives keep (see "per-type counts") - the same
+     * values the walk over the six queues gave, which held e->m for ~1 ms a call at
+     * 64 types and 100k queued (116 ms for a 64-row dashboard frame). */
+    out->queued  = (uint32_t)(r->nq[GPTPS_Q_INTAKE] + r->nq[GPTPS_Q_DELAYED]);
+    out->running = (uint32_t)(r->nq[GPTPS_Q_READY] + r->nq[GPTPS_Q_RUNNING] + r->nq[GPTPS_Q_DONE]);
+    out->dead    = (uint32_t)r->nq[GPTPS_Q_DEAD];
     /* appended past the floor: only write it if the caller's struct actually has it */
     if (GPTPS_STRUCT_HAS(gptps_task_info, out, flags))
         out->flags = GPTPS_STRUCT_HAS(gptps_task_def, &r->def, flags) ? r->def.flags : 0u;
     if (GPTPS_STRUCT_HAS(gptps_task_info, out, name_copy))   /* ABI 2.8; names are <= GPTPS_TASK_NAME_MAX */
         snprintf(out->name_copy, sizeof out->name_copy, "%s", r->name);
+    gptps_mutex_unlock(e->m);
+    return GPTPS_OK;
+}
+
+gptps_status gptps_engine_counts(gptps *e, gptps_engine_totals *out)
+{
+    if (!e || !out) return GPTPS_E_INVAL;
+    if (out->struct_size < GPTPS_ENGINE_TOTALS_MIN_SIZE) return GPTPS_E_INVAL;
+    GPTPS_REFUSE_AFTER_FORK(e, GPTPS_E_SHUTDOWN);
+    gptps_mutex_lock(e->m);
+    /* Each engine queue's own count, which fifo_push / fifo_pop / fifo_remove and the
+     * intake pair keep: O(1), whatever the depth. */
+    out->queued  = (uint64_t)e->intake.count + (uint64_t)e->delayed.count;
+    out->delayed = (uint64_t)e->delayed.count;
+    out->running = (uint64_t)e->ready.count + (uint64_t)e->running_items.count
+                 + (uint64_t)e->done.count;
+    out->dead    = (uint64_t)e->dead_letter.count;
     gptps_mutex_unlock(e->m);
     return GPTPS_OK;
 }
