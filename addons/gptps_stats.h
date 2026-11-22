@@ -36,12 +36,28 @@
  * Bounded (1.12): everything the event path touches is allocated at install - the task
  * rows (cfg.max_tasks, then an '(other)' row), the handle table (cfg.handles live
  * entries plus GPTPS_STATS_ORPHANS markers), the measurement tables
- * (cfg.measure_tables). The observer never allocates, rehashes or grows anything; it
- * counts what does not fit (gptps_stats_health) and WARNs, at most once a minute per
- * condition. The handle table grows only OUTSIDE the event path: gptps_stats_reserve,
+ * (cfg.measure_tables). The observer never allocates, rehashes or grows anything (unless
+ * GPTPS_STATS_GROW_ON_EVENT, below); it counts what does not fit (gptps_stats_health)
+ * and WARNs, at most once a minute per condition. The handle table grows only OUTSIDE
+ * the event path by default: gptps_stats_reserve,
  * or a reader (total / task / task_at / snapshot / health) that finds it more than half
  * full, up to cfg.handles_max - allocated with the lock released, swapped (rehashed) in
  * under it, the old one freed after. A host that never reads should size it at install.
+ * When it did not fit, the untracked WARN and gptps_stats_health give the figure
+ * (1.13): handles_peak, the most handles live at once (tracked plus untracked, each
+ * refused handle counted once - see the field), and handles_needed, the
+ * gptps_stats_reserve argument that would have held them. With the flag on and the table
+ * stopped at cfg.handles_max, the WARN names a larger handles_max instead of the flag.
+ *
+ * Growth on the event path (1.13, opt-in): GPTPS_STATS_GROW_ON_EVENT in cfg.flags lets
+ * the observer itself grow the full table, by doubling up to cfg.handles_max, so a burst
+ * before the first read is tracked exactly. It TRADES the zero-allocation event path for
+ * exact counts: the event that finds the table full unlocks, allocates, relocks,
+ * re-checks (another thread may have grown it meanwhile), swaps the bigger table in and
+ * frees the old one after unlocking - the readers' protocol, so the lock is never held
+ * across calloc / free - and that one event pays a rehash. If the allocation fails it is
+ * counted (health.nomem) and WARNed, and the handle stays untracked as without the flag;
+ * nothing tracked is lost. Default off.
  *
  * Runtime switch (1.12): gptps_stats_set_enabled(s, 0) makes the observer return before
  * it takes its lock (a flag read, nothing else). Events while off are not counted
@@ -168,6 +184,12 @@ gptps_stats *gptps_stats_install(gptps *e);
  * least sizeof this 1.12 layout; fields appended later are read only when it covers
  * them. */
 #define GPTPS_STATS_START_DISABLED 0x1u  /* flags: install with the observer off (see set_enabled) */
+#define GPTPS_STATS_GROW_ON_EVENT  0x2u  /* flags (1.13): the observer grows the full handle table
+                                          * itself, up to handles_max, allocating with its lock
+                                          * released (see "Growth on the event path"). Exact counts
+                                          * for a pre-read burst, at the price of an event path that
+                                          * may allocate. A 1.12 library refuses this flag (install
+                                          * returns NULL with a WARN). */
 typedef struct {
     size_t   struct_size;          /* = sizeof(gptps_stats_config) */
     uint32_t max_tasks;            /* task rows (0 => 256; 1..65536). Rows are found by an FNV-1a
@@ -188,10 +210,14 @@ typedef struct {
                                     * the gauges then undercount. Only a read grows the table, so a
                                     * host that submits more than this many items before it first
                                     * reads the stats (a burst at start-up, a MANUAL engine filled
-                                    * then stepped) must size it here or with gptps_stats_reserve.
-                                    * Before 1.12 the table grew on the event path without bound. */
-    uint32_t handles_max;          /* how far reads may grow the table (0 => max(handles, 1<<20);
-                                    * handles..1<<24; = handles: never grow by itself) */
+                                    * then stepped) must size it here or with gptps_stats_reserve -
+                                    * health.handles_needed says to what - or set
+                                    * GPTPS_STATS_GROW_ON_EVENT. Before 1.12 the table grew on the
+                                    * event path without bound; with that flag it grows there up to
+                                    * handles_max. */
+    uint32_t handles_max;          /* how far reads (and GPTPS_STATS_GROW_ON_EVENT) may grow the table
+                                    * (0 => max(handles, 1<<20); handles..1<<24; = handles: never grow
+                                    * by itself) */
     uint32_t measure_tables;       /* task types that may keep measurement rows (0 => 8; 1..65536),
                                     * GPTPS_STATS_MEASURE_ROWS rows (about 6 KiB) each, allocated at
                                     * install. A type whose first measurement finds none left keeps no
@@ -199,7 +225,7 @@ typedef struct {
                                     * health.measure_tables_refused (the engine's rows still fold
                                     * them). gptps_stats_measure_fold, a host call, allocates one
                                     * instead when they run out. */
-    uint32_t flags;                /* GPTPS_STATS_START_DISABLED */
+    uint32_t flags;                /* GPTPS_STATS_START_DISABLED, GPTPS_STATS_GROW_ON_EVENT */
 } gptps_stats_config;
 
 /* Install with sizing (cfg NULL: every default). */
@@ -246,10 +272,25 @@ typedef struct {
     uint64_t measure_tables_cap;   /* cfg.measure_tables */
     uint64_t measure_tables_used;
     uint64_t measure_tables_refused; /* first measurements of a type that found no table left */
-    uint64_t nomem;                /* allocations that failed: a growth, a host fold's table */
+    uint64_t nomem;                /* allocations that failed: a growth (a read's, a reserve's or,
+                                    * with GPTPS_STATS_GROW_ON_EVENT, the observer's), a host
+                                    * fold's table */
     uint64_t memory_bytes;         /* what this object holds */
     uint64_t late_absorbed;        /* late QUEUED / RETRIED events of a dropped marker or of an
                                     * untracked handle: counted in the totals, no gauge moved */
+    /* ---- 1.13 (read only if struct_size covers them) ---- */
+    uint64_t handles_peak;         /* the most handles live at once since install: table entries
+                                    * plus handles the full table refused that had not ended yet
+                                    * (a refused handle's terminal event takes it off). Each
+                                    * refused handle counts once, however its events interleave
+                                    * (STARTED before QUEUED, retries). Exact while at most 256
+                                    * refused handles are live at once; past that, a span handle
+                                    * never refused can stand in for an older refused one for a
+                                    * while (the count comes back), and a refused STARTED whose
+                                    * late QUEUED comes after 256 newer refusals counts twice */
+    uint64_t handles_needed;       /* the gptps_stats_reserve(s, n) that would have tracked them all:
+                                    * the next power of two >= handles_peak (at most 1<<24) */
+    uint64_t grows_on_event;       /* of `grows`, those made by the observer (GPTPS_STATS_GROW_ON_EVENT) */
 } gptps_stats_health_info;
 gptps_status gptps_stats_health(gptps_stats *s, gptps_stats_health_info *out);
 

@@ -19,6 +19,10 @@
  *   10) a storm: emitters, a reader and the switch on several threads (TSan)
  *   11) late events: a dropped marker's late QUEUED / RETRIED and an untracked handle's
  *       later events move no gauge; reviving a marker needs room
+ *   12) (1.13) the exact sizing figure (handles_peak / handles_needed, in the WARNs and
+ *       health), and GPTPS_STATS_GROW_ON_EVENT: a burst tracked exactly, by hand and on
+ *       a real engine; handles_max; OOM while growing; the re-check after relocking;
+ *       a storm with growth racing reads and reserve (TSan)
  */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
@@ -723,15 +727,21 @@ static void test_burst(void)
     d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
     d.default_policy.struct_size = sizeof d.default_policy;
     CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    log_begin();
     for (i = 0; i < 200; ++i) CHECK(gptps_submit(e, "ok", NULL, 0, &h) == GPTPS_OK);
     c = total(s);
     CHECK(c.queued == 200 && c.pending == 16);       /* the table holds 16: documented undercount */
+    /* (1.13) the first read names the exact figure the burst needed */
+    CHECK(log_count("a burst of 200 live handles past a table of 16: gptps_stats_reserve(s, 256) "
+                    "(the next power of two >= the peak live handles) or GPTPS_STATS_GROW_ON_EVENT") == 1);
+    log_end();
     for (i = 0; i < 400; ++i) { ran = 0; if (gptps_step(e, &ran) != GPTPS_OK) break; }
     c = total(s);
     CHECK(c.finished == 200 && c.pending == 0 && c.in_flight == 0);
     CHECK(c.wait_samples == 16 && c.run_samples == 16);
     hi = health(s);
     CHECK(hi.handles_untracked == 184 && hi.orphans_dropped == 0 && hi.markers == 0 && hi.handles_live == 0);
+    CHECK(hi.handles_peak == 200 && hi.handles_needed == 256);
     CHECK(gptps_shutdown(e) == GPTPS_OK);
     gptps_stats_close(s);
 }
@@ -806,6 +816,304 @@ static void test_late(void)
     gptps_stats_close(s);
 }
 
+/* 12) (1.13) the sizing figures, and GPTPS_STATS_GROW_ON_EVENT */
+static gptps_stats *mkf(uint32_t handles, uint32_t handles_max, uint32_t flags)
+{
+    gptps_stats_config c;
+    memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c; c.handles = handles; c.handles_max = handles_max; c.flags = flags;
+    return st_new(&c, ST_DEF_MTABS);
+}
+static void test_figures(void)
+{
+    gptps_stats *s = mk(0, 4, 4, 0);
+    gptps_stats_health_info h;
+    int i;
+    CHECK(s != NULL); if (!s) return;
+    log_begin();
+    for (i = 1; i <= 10; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    /* the event path speaks at the burst's start, with the figure so far ... */
+    CHECK(log_count("the handle table is full: a burst of 5 live handles (so far) past a table of 4: "
+                    "gptps_stats_reserve(s, 8)") == 1);
+    CHECK(log_count("GPTPS_STATS_GROW_ON_EVENT") == 1);
+    h = health(s);                                    /* ... a read, after it, with the exact one */
+    CHECK(h.handles_peak == 10 && h.handles_needed == 16 && h.handles_untracked == 6);
+    CHECK(log_count("handles went untracked: a burst of 10 live handles past a table of 4: "
+                    "gptps_stats_reserve(s, 16) (the next power of two >= the peak live handles) or "
+                    "GPTPS_STATS_GROW_ON_EVENT") == 1);
+    h = health(s);                                    /* nothing new refused: no second WARN */
+    CHECK(log_count("handles went untracked") == 1);
+    log_end();
+    /* the refused handles end: they leave the live count, the peak stays */
+    for (i = 1; i <= 10; ++i) { emit(s, GPTPS_EV_STARTED, "q", (gptps_handle)i, 1); emit(s, GPTPS_EV_FINISHED, "q", (gptps_handle)i, 2); }
+    CHECK(s->untracked_live == 0 && st_live(s) == 0);
+    for (i = 11; i <= 14; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    h = health(s);
+    CHECK(h.handles_peak == 10 && h.handles_needed == 16 && h.handles_untracked == 6 && h.handles_live == 4);
+    /* the figure is one that works: reserved to it, the same burst is tracked */
+    CHECK(gptps_stats_reserve(s, (size_t)h.handles_needed) == GPTPS_OK);
+    for (i = 21; i <= 26; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    h = health(s);
+    CHECK(h.handles_untracked == 6 && h.handles_live == 10 && total(s).pending == 10);
+    /* a 1.12 caller's health gets the 1.12 fields only */
+    {   unsigned char hb[sizeof(gptps_stats_health_info)];
+        gptps_stats_health_info *hp = (gptps_stats_health_info *)(void *)hb;
+        memset(hb, 0xCD, sizeof hb);
+        hp->struct_size = ST_HEALTH_MIN;
+        CHECK(gptps_stats_health(s, hp) == GPTPS_OK && hp->struct_size == ST_HEALTH_MIN);
+        CHECK(hb[ST_HEALTH_MIN] == 0xCD && hb[sizeof hb - 1] == 0xCD); }
+    gptps_stats_close(s);
+    /* nothing refused: the figure is the table that held the peak */
+    s = mk(0, 0, 0, 0);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 3; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    h = health(s);
+    CHECK(h.handles_peak == 3 && h.handles_needed == 4 && h.handles_untracked == 0 && h.grows_on_event == 0);
+    gptps_stats_close(s);
+}
+static gptps_stats *g_s;
+static void g_reserve(void) { (void)gptps_stats_reserve(g_s, 4096); }
+static void g_switch_off(void) { (void)gptps_stats_set_enabled(g_s, 0); }
+static void test_grow_on_event(void)
+{
+    gptps_stats *s;
+    gptps_stats_health_info h;
+    gptps_stats_counters c;
+    uint64_t r_pending = 0, r_flight = 0, r_wait = 0, r_run = 0;
+    int i, a0;
+    /* the flag is accepted; an unknown one is still refused */
+    CHECK(mkf(4, 0, GPTPS_STATS_GROW_ON_EVENT | 0x4u) == NULL);
+    /* a burst before any read, by hand: every handle tracked, the gauges equal a reference */
+    s = mkf(4, 0, GPTPS_STATS_GROW_ON_EVENT);
+    CHECK(s != NULL); if (!s) return;
+    t_alloc_locked = 0; t_free_locked = 0; a0 = allocs();
+    log_begin();
+    for (i = 1; i <= 3000; ++i) { emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, (uint64_t)i); ++r_pending; }
+    for (i = 1; i <= 2000; ++i) { emit(s, GPTPS_EV_STARTED, "q", (gptps_handle)i, 5000); --r_pending; ++r_flight; ++r_wait; }
+    for (i = 1; i <= 1200; ++i) {
+        if (i % 3) emit(s, GPTPS_EV_FINISHED, "q", (gptps_handle)i, 6000);
+        else emit_a(s, GPTPS_EV_FAILED, "q", (gptps_handle)i, GPTPS_E_CANCELLED, 6000, 1);
+        --r_flight; ++r_run;
+    }
+    CHECK(nwarn == 0);                                /* nothing lost, nothing to say */
+    log_end();
+    CHECK(t_alloc_locked == 0 && t_free_locked == 0); /* allocated and freed with the lock released */
+    CHECK(allocs() > a0);                             /* the event path did allocate: the trade */
+    memset(&c, 0, sizeof c); c.struct_size = sizeof c;
+    CHECK(gptps_stats_task(s, "q", &c) == GPTPS_OK);
+    CHECK(c.pending == r_pending && c.in_flight == r_flight && c.wait_samples == r_wait && c.run_samples == r_run);
+    c = total(s);
+    CHECK(c.queued == 3000 && c.pending == r_pending && c.in_flight == r_flight);
+    CHECK(c.wait_samples == r_wait && c.run_samples == r_run && c.wait_ms_max == 4999);
+    h = health(s);
+    CHECK(h.handles_untracked == 0 && h.handles_live == 1800 && h.handles_peak == 3000 && h.nomem == 0);
+    CHECK(h.handles_cap == 4096 && h.grows_on_event == 10 && h.grows == 10);   /* 4 -> 4096, doubling */
+    gptps_stats_close(s);
+
+    /* up to handles_max, then untracked as without the flag */
+    s = mkf(4, 6, GPTPS_STATS_GROW_ON_EVENT);
+    CHECK(s != NULL); if (!s) return;
+    log_begin();
+    for (i = 1; i <= 20; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    h = health(s);
+    /* the flag is on and stopped at handles_max: the WARNs name handles_max, not the flag */
+    CHECK(log_count("the handle table is full") == 1 && log_count("handles went untracked") == 1);
+    CHECK(log_count("gptps_stats_reserve(s, 8) (the next power of two >= the peak live handles) or a cfg.handles_max "
+                    "of at least that (GPTPS_STATS_GROW_ON_EVENT stops at it)") == 1);
+    CHECK(log_count("gptps_stats_reserve(s, 32) (the next power of two >= the peak live handles) or a cfg.handles_max "
+                    "of at least that") == 1);
+    CHECK(log_count("or GPTPS_STATS_GROW_ON_EVENT;") == 0);
+    log_end();
+    CHECK(h.handles_cap == 6 && h.grows_on_event == 1 && h.handles_untracked == 14 && h.handles_live == 6);   /* 4 -> 6, not 8 */
+    CHECK(h.handles_peak == 20 && h.handles_needed == 32);
+    gptps_stats_close(s);
+
+    /* OOM while the event grows the table: counted, WARNed, the handle untracked, no
+     * tracked entry lost; the next event's growth succeeds */
+    s = mkf(4, 0, GPTPS_STATS_GROW_ON_EVENT);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 4; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    log_begin();
+    t_calloc_fail = 1;
+    emit(s, GPTPS_EV_QUEUED, "q", 5, 0);
+    t_calloc_fail = 0;
+    CHECK(log_count("no memory to grow the handle table to 8 entries") == 1);
+    CHECK(log_count("the handle table is full") == 1);
+    log_end();
+    CHECK(s->nomem == 1 && s->untracked == 1 && s->live_cap == 4 && st_live(s) == 4);
+    for (i = 1; i <= 4; ++i) CHECK(tab_find(s, (gptps_handle)i) != NULL);   /* every tracked entry kept */
+    emit(s, GPTPS_EV_QUEUED, "q", 6, 0);              /* memory again: grown, tracked */
+    CHECK(s->live_cap == 8 && st_live(s) == 5 && s->grows_event == 1);
+    for (i = 1; i <= 6; ++i) { emit(s, GPTPS_EV_STARTED, "q", (gptps_handle)i, 1); emit(s, GPTPS_EV_FINISHED, "q", (gptps_handle)i, 3); }
+    c = total(s); h = health(s);
+    CHECK(c.pending == 0 && c.in_flight == 0 && c.queued == 6 && c.finished == 6);
+    CHECK(c.wait_samples == 5 && c.run_samples == 5);   /* handle 5 untracked to its end */
+    CHECK(h.nomem == 1 && h.handles_untracked == 1 && h.handles_live == 0);
+    gptps_stats_close(s);
+
+    /* a marker revived on a full table is a live entry again: the flag grows for it too */
+    s = mkf(4, 0, GPTPS_STATS_GROW_ON_EVENT);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 4; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    emit_a(s, GPTPS_EV_FAILED, "q", 10, GPTPS_E_CANCELLED, 1, 1);   /* outran its QUEUED: a marker */
+    CHECK(st_live(s) == 4 && s->live_cap == 4 && s->ndone == 1 && s->grows_event == 0);
+    emit_a(s, GPTPS_EV_STARTED, "q", 10, GPTPS_OK, 2, 2);           /* revived: needs a live entry */
+    CHECK(s->untracked == 0 && s->grows_event == 1 && s->live_cap == 8 && st_live(s) == 5);
+    CHECK(s->total.in_flight == 1 && s->total.pending == 4);
+    emit_a(s, GPTPS_EV_FINISHED, "q", 10, GPTPS_OK, 5, 2);
+    CHECK(s->total.in_flight == 0 && s->total.run_samples == 1 && s->untracked == 0);
+    gptps_stats_close(s);
+
+    /* the re-check after relocking: another thread grows the table while this event
+     * allocates - the loser's table is freed with the lock released, and the event is
+     * tracked in the winner's */
+    s = mkf(4, 0, GPTPS_STATS_GROW_ON_EVENT);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 4; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    g_s = s; t_free_locked = 0; t_alloc_locked = 0;
+    t_calloc_hook = g_reserve;
+    emit(s, GPTPS_EV_QUEUED, "q", 5, 0);
+    CHECK(t_calloc_hook == NULL && t_free_locked == 0 && t_alloc_locked == 0);
+    t_calloc_hook = NULL;                             /* (a mutant that never allocated must not run it later) */
+    CHECK(s->live_cap == 4096 && s->grows_event == 0 && s->grows == 1 && st_live(s) == 5 && s->untracked == 0);
+    CHECK(total(s).pending == 5);
+    /* ... or switches the observer off: the event is not counted (off means off) */
+    for (i = 6; i <= 4096; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    CHECK(st_live(s) == 4096 && s->total.queued == 4096);   /* full (no read: a read would grow it) */
+    log_begin();
+    t_calloc_hook = g_switch_off;
+    emit(s, GPTPS_EV_QUEUED, "q", 5000, 0);
+    log_end();
+    CHECK(t_calloc_hook == NULL && gptps_stats_enabled(s) == 0);
+    t_calloc_hook = NULL;
+    CHECK(s->total.queued == 4096 && s->untracked == 0 && st_live(s) == 4096 && s->grows_event == 0 && s->live_cap == 4096);
+    gptps_stats_close(s);
+
+    /* without the flag the event path still allocates nothing */
+    s = mkf(4, 0, 0);
+    CHECK(s != NULL); if (!s) return;
+    a0 = allocs();
+    for (i = 1; i <= 100; ++i) emit(s, GPTPS_EV_QUEUED, "q", (gptps_handle)i, 0);
+    CHECK(allocs() == a0 && s->untracked == 96);
+    gptps_stats_close(s);
+}
+
+/* 12b) the burst on a real engine (a MANUAL engine filled, then stepped) with the flag:
+ * every handle tracked exactly, before any read */
+static void test_burst_grow(void)
+{
+    gptps *e = NULL; gptps_config cfg; gptps_task_def d; gptps_stats_config sc;
+    gptps_stats *s; gptps_handle h; size_t ran; int i;
+    gptps_stats_counters c;
+    gptps_stats_health_info hi;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.struct_size = sizeof cfg; cfg.mode = GPTPS_RUN_MANUAL;
+    cfg.limits.struct_size = sizeof cfg.limits; cfg.limits.max_concurrent_tasks = 1; cfg.limits.max_memory_bytes = 1 << 20;
+    CHECK(gptps_open_ex(&cfg, &e) == GPTPS_OK && e);
+    if (!e) return;
+    memset(&sc, 0, sizeof sc);
+    sc.struct_size = sizeof sc; sc.handles = 16; sc.flags = GPTPS_STATS_GROW_ON_EVENT;
+    s = gptps_stats_install_ex(e, &sc);
+    CHECK(s != NULL);
+    if (!s) { gptps_shutdown(e); return; }
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d; d.name = "ok"; d.run = t_ok; d.exec = GPTPS_EXEC_INPROC;
+    d.default_cost.struct_size = sizeof d.default_cost; d.default_cost.mem_bytes = 1;
+    d.default_policy.struct_size = sizeof d.default_policy;
+    CHECK(gptps_register_task(e, &d) == GPTPS_OK);
+    for (i = 0; i < 200; ++i) CHECK(gptps_submit(e, "ok", NULL, 0, &h) == GPTPS_OK);
+    c = total(s);
+    CHECK(c.queued == 200 && c.pending == 200);       /* exact: no undercount */
+    for (i = 0; i < 400; ++i) { ran = 0; if (gptps_step(e, &ran) != GPTPS_OK) break; }
+    c = total(s);
+    CHECK(c.finished == 200 && c.pending == 0 && c.in_flight == 0);
+    CHECK(c.wait_samples == 200 && c.run_samples == 200);
+    hi = health(s);
+    CHECK(hi.handles_untracked == 0 && hi.handles_live == 0 && hi.handles_peak == 200 && hi.grows_on_event == 4);
+    CHECK(gptps_shutdown(e) == GPTPS_OK);
+    gptps_stats_close(s);
+}
+
+/* 12d) (1.13) the live count of refused handles is exact: each refused handle counts
+ * once, however its events interleave, and only a handle that was counted is taken off */
+static void test_untracked_live(void)
+{
+    gptps_stats *s;
+    gptps_stats_health_info h;
+    gptps_handle i;
+    /* STARTED outruns QUEUED on a full table: the late QUEUED counts the handle no
+     * second time (at most 5 live at once: 4 tracked, 1 refused) */
+    s = mk(0, 4, 4, 0);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 4; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    for (i = 101; i <= 150; ++i) {
+        emit(s, GPTPS_EV_STARTED, "q", i, 1);
+        emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+        emit(s, GPTPS_EV_FINISHED, "q", i, 2);
+    }
+    CHECK(s->untracked_live == 0 && s->peak == 5);
+    for (i = 1; i <= 4; ++i) { emit(s, GPTPS_EV_STARTED, "q", i, 1); emit(s, GPTPS_EV_FINISHED, "q", i, 2); }
+    h = health(s);
+    CHECK(h.handles_peak == 5 && h.handles_needed == 8 && h.handles_live == 0 && s->untracked_live == 0);
+    gptps_stats_close(s);
+
+    /* a handle inside the refused span that was never refused (its QUEUED still on the
+     * way): it is live, so it counts, and its end takes off itself - not a refused one */
+    s = mk(0, 4, 4, 0);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 4; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    emit(s, GPTPS_EV_QUEUED, "q", 5, 0);
+    emit(s, GPTPS_EV_QUEUED, "q", 9, 0);              /* refused: the span is 5..9 */
+    CHECK(s->untracked_live == 2);
+    for (i = 6; i <= 8; ++i) {
+        emit(s, GPTPS_EV_STARTED, "q", i, 1);
+        CHECK(s->untracked_live == 3);
+        emit(s, GPTPS_EV_FINISHED, "q", i, 2);
+        emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+        CHECK(s->untracked_live == 2);                /* 5 and 9 still live */
+    }
+    CHECK(s->peak == 7 && st_live(s) == 4);
+    emit(s, GPTPS_EV_STARTED, "q", 5, 1); emit(s, GPTPS_EV_FINISHED, "q", 5, 2);
+    emit(s, GPTPS_EV_STARTED, "q", 9, 1); emit(s, GPTPS_EV_FINISHED, "q", 9, 2);
+    CHECK(s->untracked_live == 0);
+    gptps_stats_close(s);
+
+    /* more refused handles than the absorb set holds, each failing and retrying: the
+     * RETRIED of one whose absorb entry aged out counts it no second time */
+    s = mk(0, 4, 4, 0);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 4; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    for (i = 101; i <= 700; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    CHECK(s->untracked_live == 600 && s->peak == 604);
+    for (i = 101; i <= 700; ++i) emit(s, GPTPS_EV_STARTED, "q", i, 1);
+    for (i = 101; i <= 700; ++i) emit_a(s, GPTPS_EV_FAILED, "q", i, GPTPS_E_INVAL, 2, 1);
+    for (i = 101; i <= 700; ++i) emit_a(s, GPTPS_EV_RETRIED, "q", i, GPTPS_OK, 3, 2);
+    for (i = 101; i <= 700; ++i) emit_a(s, GPTPS_EV_STARTED, "q", i, GPTPS_OK, 4, 2);
+    CHECK(s->untracked_live == 600 && s->peak == 604);
+    for (i = 101; i <= 700; ++i) emit_a(s, GPTPS_EV_FINISHED, "q", i, GPTPS_OK, 5, 2);
+    CHECK(s->untracked_live == 0 && s->peak == 604 && st_live(s) == 4);
+    h = health(s);
+    CHECK(h.handles_peak == 604 && h.handles_needed == 1024);
+    gptps_stats_close(s);
+
+    /* a resume forgets the refused handles still live: the peak after it counts none */
+    s = mk(0, 4, 4, 0);
+    CHECK(s != NULL); if (!s) return;
+    for (i = 1; i <= 10; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    CHECK(s->peak == 10 && s->untracked_live == 6);
+    CHECK(gptps_stats_set_enabled(s, 0) == GPTPS_OK && gptps_stats_set_enabled(s, 1) == GPTPS_OK);
+    CHECK(s->untracked_live == 0 && s->peak == 10);
+    for (i = 21; i <= 24; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    emit(s, GPTPS_EV_QUEUED, "q", 3, 0);              /* refused anew: the span is 3..47 */
+    for (i = 40; i <= 46; ++i) emit(s, GPTPS_EV_QUEUED, "q", i, 0);
+    CHECK(s->peak == 12 && s->untracked_live == 8);
+    /* ... and the end of a handle refused before it - inside the new span - takes off
+     * none of the new ones */
+    emit(s, GPTPS_EV_FINISHED, "q", 7, 2);
+    CHECK(s->untracked_live == 8);
+    gptps_stats_close(s);
+}
+
 /* 10) a storm (TSan): emitters on several threads, a reader that snapshots, grows and
  * switches the observer off and on. Each round reads the engine clock: when the switch
  * is off the observer takes no lock, and a loop with no HAL or pthread call is one the
@@ -870,6 +1178,103 @@ static void test_storm(void)
         CHECK(h.handles_live == 0 && h.markers <= GPTPS_STATS_ORPHANS); }
     gptps_stats_close(storm_s);
 }
+
+/* 12c) a storm with GPTPS_STATS_GROW_ON_EVENT (TSan): emitters queue batches - more
+ * live handles than the table holds - while a reader snapshots and reserves, so
+ * event-path growth races reader growth and reserve. A table grows only so far, so the
+ * run is cut into short phases, each on a fresh table, and within one the batches ramp
+ * up: the event path keeps growing through the whole run, not only at its start. Nothing is switched off, so every handle must be
+ * tracked: the samples equal the handles, exactly. */
+#define STORM_BATCH_MAX 512
+static uint64_t storm_made[4];
+static uint64_t storm_t0;                         /* the phase's start: the ramp's clock */
+static void *storm_emit_batch(void *arg)
+{
+    int me = (int)(intptr_t)arg, batch = 4;
+    gptps_handle base = (gptps_handle)(me + 1) * 100000000u, n = 0;
+    uint64_t made = 0;
+    while (!__atomic_load_n(&storm_stop, __ATOMIC_ACQUIRE)) {
+        uint64_t t = gptps_now_ms(NULL);
+        int j;
+        for (j = 1; j <= batch; ++j) emit(storm_s, GPTPS_EV_QUEUED, "g", base + n + (gptps_handle)j, t);
+        for (j = 1; j <= batch; ++j) {
+            gptps_handle h = base + n + (gptps_handle)j;
+            emit(storm_s, GPTPS_EV_STARTED, "g", h, t);
+            if (j % 5 == 0) emit_a(storm_s, GPTPS_EV_FAILED, "g", h, GPTPS_E_CANCELLED, t, 1);
+            else emit(storm_s, GPTPS_EV_FINISHED, "g", h, t);
+        }
+        n += (gptps_handle)batch; made += (uint64_t)batch;
+        /* ramp over the phase's 20 ms: the table keeps having to grow */
+        batch = 4 + (int)((t - __atomic_load_n(&storm_t0, __ATOMIC_ACQUIRE)) * 25);
+        if (batch > STORM_BATCH_MAX) batch = STORM_BATCH_MAX;
+    }
+    storm_made[me] = made;
+    return NULL;
+}
+static void *storm_read_grow(void *arg)
+{
+    gptps_stats_row rows[4];
+    int i = 0;
+    (void)arg;
+    while (!__atomic_load_n(&storm_stop, __ATOMIC_ACQUIRE)) {
+        gptps_stats_counters c; gptps_stats_health_info h; size_t need;
+        memset(&c, 0, sizeof c); c.struct_size = sizeof c;
+        memset(&h, 0, sizeof h); h.struct_size = sizeof h;
+        (void)gptps_stats_snapshot(storm_s, &c, &h, rows, sizeof rows[0], 4, &need);
+        if (++i % 5 == 0) (void)gptps_stats_reserve(storm_s, (size_t)(i % 64) + 4);
+        /* reads that grow the table at every look would leave the event path nothing to
+         * grow: every other look waits out a millisecond, so batches fill the table
+         * between reads while reads still race the event path's growth */
+        if (i & 1) { uint64_t t = gptps_now_ms(NULL); while (gptps_now_ms(NULL) == t && !__atomic_load_n(&storm_stop, __ATOMIC_ACQUIRE)) { } }
+    }
+    return NULL;
+}
+static void test_storm_grow(void)
+{
+    uint64_t end = gptps_now_ms(NULL) + 600, all = 0, grows = 0, ev_grows = 0;
+    int phases = 0, ev_phases = 0;
+    gptps_set_log_sink(quiet_sink, NULL);
+    __atomic_store_n(&storm_warns, 0, __ATOMIC_SEQ_CST);
+    while (phases < 4 || gptps_now_ms(NULL) < end) {
+        pthread_t th[5];
+        int i, made = 0;
+        uint64_t until, sum = 0;
+        storm_s = mkf(4, 1u << 16, GPTPS_STATS_GROW_ON_EVENT);
+        CHECK(storm_s != NULL); if (!storm_s) return;
+        __atomic_store_n(&storm_stop, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&storm_t0, gptps_now_ms(NULL), __ATOMIC_RELEASE);
+        for (i = 0; i < 4; ++i) { storm_made[i] = 0; if (pthread_create(&th[made], NULL, storm_emit_batch, (void *)(intptr_t)i) == 0) ++made; }
+        if (pthread_create(&th[made], NULL, storm_read_grow, NULL) == 0) ++made;
+        until = gptps_now_ms(NULL) + 20;
+        while (gptps_now_ms(NULL) < until) {
+            gptps_stats_health_info h; uint64_t t = gptps_now_ms(NULL);
+            memset(&h, 0, sizeof h); h.struct_size = sizeof h;
+            (void)gptps_stats_health(storm_s, &h);
+            while (gptps_now_ms(NULL) == t) { }       /* a look a millisecond, as the reader */
+        }
+        __atomic_store_n(&storm_stop, 1, __ATOMIC_RELEASE);
+        for (i = 0; i < made; ++i) pthread_join(th[i], NULL);
+        CHECK(made == 5);
+        for (i = 0; i < 4; ++i) sum += storm_made[i];
+        {   gptps_stats_counters c = total(storm_s);
+            gptps_stats_health_info h = health(storm_s);
+            CHECK(sum > 0 && c.queued == sum && c.terminal == sum);
+            CHECK(c.pending == 0 && c.in_flight == 0);
+            CHECK(c.wait_samples == sum && c.run_samples == sum);   /* every handle tracked */
+            CHECK(h.handles_untracked == 0 && h.nomem == 0 && h.handles_live == 0 && h.markers == 0);
+            CHECK(h.handles_peak <= 4 * STORM_BATCH_MAX && h.handles_cap >= h.handles_peak);
+            all += sum; grows += h.grows; ev_grows += h.grows_on_event;
+            if (h.grows_on_event) ++ev_phases; }
+        gptps_stats_close(storm_s);
+        ++phases;
+    }
+    log_end();
+    CHECK(__atomic_load_n(&storm_warns, __ATOMIC_SEQ_CST) == 0);   /* nothing lost, nothing said */
+    CHECK(ev_grows > 0);                              /* the event path did race the readers */
+    printf("storm with growth: %d phases (%d with event-path growth), %llu handles, %llu growths (%llu on the "
+           "event path)\n", phases, ev_phases, (unsigned long long)all, (unsigned long long)grows,
+           (unsigned long long)ev_grows);
+}
 #endif
 
 int main(void)
@@ -886,8 +1291,13 @@ int main(void)
     test_engine();
     test_burst();
     test_late();
+    test_figures();
+    test_grow_on_event();
+    test_burst_grow();
+    test_untracked_live();
 #if !defined(_WIN32)
     test_storm();
+    test_storm_grow();
 #else
     printf("skip: the storm test (POSIX threads)\n");
 #endif

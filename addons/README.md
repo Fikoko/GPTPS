@@ -608,7 +608,26 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   released, swapped in under it, the old one freed after. So a host that submits more
   than `handles` items before its first read (a start-up burst, a MANUAL engine filled
   then stepped) must size the table with `install_ex` or `gptps_stats_reserve`: before
-  1.12 the table grew on the event path and such a burst was counted exactly.
+  1.12 the table grew on the event path and such a burst was counted exactly. When a
+  burst did not fit, the WARN and the health give the exact figure (1.13): `"a burst of
+  N live handles past a table of C: gptps_stats_reserve(s, P) ... or
+  GPTPS_STATS_GROW_ON_EVENT"`, where `P` (`health.handles_needed`) is the next power of
+  two at or above the peak of live handles (`health.handles_peak`: table entries plus
+  refused handles not yet ended, each counted once however its events interleave —
+  STARTED before QUEUED, retries). The event path's WARN speaks at the burst's start
+  (the figure so far); the first read after it repeats it with the final figure. With
+  the flag below on and the table stopped at `handles_max`, the WARN names "a
+  cfg.handles_max of at least that" instead of the flag.
+- **Growth on the event path (1.13, opt-in):** `GPTPS_STATS_GROW_ON_EVENT` in
+  `gptps_stats_config.flags` lets the observer grow the full table itself, doubling up
+  to `handles_max`, so a pre-read burst is tracked exactly. It trades the
+  zero-allocation event path for exact counts: the event that finds the table full
+  unlocks, allocates, relocks, re-checks (another thread may have grown it, or switched
+  the observer off), swaps the rehashed table in and frees the old one after unlocking —
+  the lock is never held across `calloc` / `free`. A failed allocation is counted
+  (`nomem`) and WARNed, and that handle stays untracked exactly as without the flag;
+  no tracked entry is lost. `health.grows_on_event` counts these growths. Default off;
+  a 1.12 library refuses the flag (install returns NULL with a WARN).
 - **Switch:** `gptps_stats_set_enabled(st, 0)` makes the observer return before its lock
   (a flag read); nothing is counted while off, so the totals miss those events.
   Switching on again drops the handle table and zeroes the gauges: the gauges (and
@@ -617,8 +636,9 @@ gptps_stats_task(st, "resize", &c);                 // one task type
   `GPTPS_STATS_START_DISABLED` installs it off — observers are registered before the
   first submit, so this is how a host makes stats optional at run time.
 - **Health:** `gptps_stats_health(st, &h)` — enabled, table capacity, live entries,
-  markers, handles untracked, markers dropped, late events absorbed, growths, rows in
-  use, types folded,
+  markers, handles untracked, markers dropped, late events absorbed, growths (and, 1.13,
+  those on the event path), the peak of live handles and the reserve that holds it
+  (1.13), rows in use, types folded,
   measurement tables used and refused, failed allocations (`nomem`: a growth, a host
   fold's table) and the memory held.
 - **Snapshot:** `gptps_stats_snapshot(st, &total, &health, rows, sizeof rows[0], cap,
