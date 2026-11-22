@@ -31,6 +31,9 @@
  *  9) Under a hold, a task registered (or a resource defined) takes the file's values
  *     at once - its resource cost is in force before the let-go; a per-task setting
  *     defined under the hold waits for it, as a setting does.
+ * 10) At definition time too, a chain x <= y <= z defined under a hold, with the file
+ *     raising it in the worst order (x, y, z), takes a pass per link: applied whole,
+ *     nothing counted, nothing logged - either order of the file's keys.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -391,6 +394,27 @@ static void test_plugin(int o)
 }
 #endif
 
+/* ---- 10) a chain at definition time ---- */
+static void test_chain_define(int o)
+{
+    gptps *e;
+    reset();
+    e = open_with(o ? "[chain]\nz = 30\ny = 20\nx = 10\n" : "[chain]\nx = 10\ny = 20\nz = 30\n");
+    if (!e) return;
+    g_e = e;
+    log_clear();
+    CHECK(gptps_settings_hold(e, 1) == GPTPS_OK);
+    define(e, "chain.x", rd_x, wr_x);
+    define(e, "chain.y", rd_y, wr_y);
+    define(e, "chain.z", rd_z, wr_z);
+    CHECK(x_v == 1 && y_v == 2 && z_v == 3);           /* the values wait while it holds */
+    CHECK(gptps_settings_hold(e, 0) == GPTPS_OK);
+    CHECK(x_v == 10 && y_v == 20 && z_v == 30);
+    CHECK(chain_refusals == 0 && log_count("refused") == 0 && gptps_config_check(e) == GPTPS_OK);
+    gptps_shutdown(e);
+    g_e = NULL;
+}
+
 int main(void)
 {
     int o;
@@ -398,6 +422,7 @@ int main(void)
     for (o = 0; o < 2; ++o) {
         test_host(o);
         test_hold_task(o);
+        test_chain_define(o);
 #ifdef ADDON_ORDER_PATH
         test_plugin(o);
 #endif
