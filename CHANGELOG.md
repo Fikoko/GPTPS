@@ -5,7 +5,7 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.12.0] - 2026-11-22
 
 O(1) task counts in the core (ABI 2.9), a hardened `gptps_stats`, pressure reporting with
 an opt-in sticky degrade mode for the dashboard, a way to feed the dashboard from a host's
