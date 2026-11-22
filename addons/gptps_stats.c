@@ -9,7 +9,8 @@
  * event path allocates nothing: the task rows, their name index, the handle table and
  * the measurement tables are all made at install (1.12), and what does not fit is
  * counted, never grown into. The handle table grows only outside the event path (see
- * "growth" below).
+ * "growth" below) - unless the host opts in to GPTPS_STATS_GROW_ON_EVENT (1.13), which
+ * lets the observer grow it, allocating with the lock released.
  *
  * Accounting, per handle, driven by the core's event contract (a ONE-SHOT handle
  * reaches exactly one terminal event; FAILED is per attempt):
@@ -91,7 +92,7 @@
 #define ST_ABSORB_SLOTS 512u
 
 enum { ST_NONE = 0, ST_PENDING, ST_RUNNING, ST_LIMBO, ST_DONE };
-enum { W_UNTRACKED = 0, W_FOLD, W_ORPHAN, W_NOMEM, W_MEASURE, W_N };
+enum { W_UNTRACKED = 0, W_FOLD, W_ORPHAN, W_NOMEM, W_MEASURE, W_NEEDED, W_N };
 
 typedef struct {
     gptps_handle handle;     /* 0 = empty slot */
@@ -171,8 +172,13 @@ struct gptps_stats {
     gptps_handle          ab_set[ST_ABSORB_SLOTS];
     /* the span of handles the full table refused: their later events stay untracked */
     gptps_handle          rf_lo, rf_hi;
+    /* (1.13) sizing figures: handles refused and not yet ended (a refused handle's
+     * terminal event takes one off), and the peak of live entries plus those - the
+     * table a burst needed. GPTPS_STATS_GROW_ON_EVENT: the observer grows the table. */
+    uint64_t              untracked_live, peak;
+    int                   grow_ev;
     /* health */
-    uint64_t              untracked, untracked_seen, orphans_dropped, grows, nomem;
+    uint64_t              untracked, untracked_seen, orphans_dropped, grows, nomem, grows_event;
     uint64_t              mtab_refused, resumes, resumed_ms, late_absorbed;
     /* WARN rate limit: when each condition last spoke */
     uint64_t              w_last[W_N];
@@ -351,24 +357,22 @@ static void st_orphan(gptps_stats *s, gptps_handle h, st_warns *w)
  * table is freed after it is dropped. Never on the event path: gptps_stats_reserve, and
  * readers that find the table more than half full (or a handle refused since the last
  * look), up to handles_max. */
-static gptps_status st_grow(gptps_stats *s, size_t live_cap)
+/* mu held: a failed growth, counted and WARNed. */
+static void st_grow_nomem(gptps_stats *s, size_t live_cap, st_warns *w)
 {
-    size_t ncap = st_slots_for(live_cap), i;
-    stats_slot *nt = (stats_slot *)calloc(ncap, sizeof *nt), *old;
-    st_warns w; w.n = 0;
-    apx_mutex_lock(&s->mu);
-    if (!nt) {
-        char *m;
-        s->nomem++;
-        if (st_warn_due(s, W_NOMEM) && (m = st_warn_slot(&w)) != NULL)
-            snprintf(m, ST_WARN_LEN, "gptps_stats: no memory to grow the handle table to %lu entries; it stays at %lu, and "
-                     "handles past it are not tracked (gptps_stats_health.nomem = %llu)",
-                     (unsigned long)live_cap, (unsigned long)s->live_cap, (unsigned long long)s->nomem);
-        apx_mutex_unlock(&s->mu);
-        st_warn_flush(&w);
-        return GPTPS_E_NOMEM;
-    }
-    if (s->live_cap >= live_cap) { apx_mutex_unlock(&s->mu); free(nt); return GPTPS_OK; }   /* another grew it */
+    char *m;
+    s->nomem++;
+    if (st_warn_due(s, W_NOMEM) && (m = st_warn_slot(w)) != NULL)
+        snprintf(m, ST_WARN_LEN, "gptps_stats: no memory to grow the handle table to %lu entries; it stays at %lu, and "
+                 "handles past it are not tracked (gptps_stats_health.nomem = %llu)",
+                 (unsigned long)live_cap, (unsigned long)s->live_cap, (unsigned long long)s->nomem);
+}
+/* mu held: rehash every entry into nt (ncap zeroed slots) and swap it in. Returns the
+ * old table, for the caller to free once the lock is dropped. */
+static stats_slot *st_swap_in(gptps_stats *s, stats_slot *nt, size_t ncap, size_t live_cap)
+{
+    stats_slot *old;
+    size_t i;
     for (i = 0; i < s->tabcap; ++i) {
         const stats_slot *o = &s->tab[i];
         if (o->handle) {
@@ -378,22 +382,68 @@ static gptps_status st_grow(gptps_stats *s, size_t live_cap)
         }
     }
     old = s->tab; s->tab = nt; s->tabcap = ncap; s->live_cap = live_cap; s->grows++;
+    return old;
+}
+static gptps_status st_grow(gptps_stats *s, size_t live_cap)
+{
+    size_t ncap = st_slots_for(live_cap);
+    stats_slot *nt = (stats_slot *)calloc(ncap, sizeof *nt), *old;
+    st_warns w; w.n = 0;
+    apx_mutex_lock(&s->mu);
+    if (!nt) {
+        st_grow_nomem(s, live_cap, &w);
+        apx_mutex_unlock(&s->mu);
+        st_warn_flush(&w);
+        return GPTPS_E_NOMEM;
+    }
+    if (s->live_cap >= live_cap) { apx_mutex_unlock(&s->mu); free(nt); return GPTPS_OK; }   /* another grew it */
+    old = st_swap_in(s, nt, ncap, live_cap);
     apx_mutex_unlock(&s->mu);
     free(old);
     return GPTPS_OK;
 }
-/* mu held, by a reader: the live capacity to grow to now, or 0. */
-static size_t st_grow_want(gptps_stats *s)
+/* (1.13) The gptps_stats_reserve figure that would have tracked every handle: the
+ * next power of two at or above the peak of live handles (tracked plus untracked), at
+ * most 1<<24. */
+static uint64_t st_needed(const gptps_stats *s)
+{
+    size_t p = st_pow2(s->peak ? (size_t)s->peak : 1);
+    return p > ST_MAX_HANDLES ? ST_MAX_HANDLES : p;
+}
+/* mu held: note the live handles now (tracked entries plus refused ones not yet over). */
+static void st_peak(gptps_stats *s)
+{
+    uint64_t d = (uint64_t)st_live(s) + s->untracked_live;
+    if (d > s->peak) s->peak = d;
+}
+/* mu held, by a reader: the live capacity to grow to now, or 0. A reader that finds
+ * handles refused since the last look also says, once a minute, the exact figure the
+ * burst needed - known only now, after it (the event path's WARN spoke at its start,
+ * when the burst's size was not known yet). */
+static size_t st_grow_want(gptps_stats *s, st_warns *w)
 {
     size_t want;
     int refused = s->untracked != s->untracked_seen;
+    char *m;
     s->untracked_seen = s->untracked;
+    if (refused && st_warn_due(s, W_NEEDED) && (m = st_warn_slot(w)) != NULL)
+        snprintf(m, ST_WARN_LEN, "gptps_stats: handles went untracked: a burst of %llu live handles past a table of %lu: "
+                 "gptps_stats_reserve(s, %llu) (the next power of two >= the peak live handles) or "
+                 "GPTPS_STATS_GROW_ON_EVENT; %llu event(s) not tracked so far, the pending / in-flight gauges "
+                 "undercount (gptps_stats_health.handles_needed)",
+                 (unsigned long long)s->peak, (unsigned long)s->live_cap, (unsigned long long)st_needed(s),
+                 (unsigned long long)s->untracked);
     if (s->live_cap >= s->handles_max) return 0;
     if (!refused && st_live(s) * 2 <= s->live_cap) return 0;
     want = s->live_cap * 2;
     return want > s->handles_max ? s->handles_max : want;
 }
-static void st_grow_after(gptps_stats *s, size_t want) { if (want) (void)st_grow(s, want); }
+/* After a reader drops the lock: its WARN, then the growth it asked for. */
+static void st_grow_after(gptps_stats *s, size_t want, const st_warns *w)
+{
+    st_warn_flush(w);
+    if (want) (void)st_grow(s, want);
+}
 
 /* ---- task rows ---- */
 static stats_task *st_row(gptps_stats *s, uint32_t ti) { return &s->rows[ti]; }
@@ -622,12 +672,17 @@ static void st_untracked(gptps_stats *s, gptps_handle h, st_warns *w)
     if (h) {
         if (!s->rf_hi || h < s->rf_lo) s->rf_lo = h;
         if (h > s->rf_hi) s->rf_hi = h;
+        s->untracked_live++;                     /* live, but not in the table: the peak counts it */
+        st_peak(s);
     }
     if (st_warn_due(s, W_UNTRACKED) && (m = st_warn_slot(w)) != NULL)
-        snprintf(m, ST_WARN_LEN, "gptps_stats: the handle table is full (%lu live entries; cfg.handles, gptps_stats_reserve, "
-                 "or read the stats so it can grow up to cfg.handles_max = %lu): %llu event(s) not tracked so far, "
-                 "and the pending / in-flight gauges undercount; size it for the most items submitted between reads",
-                 (unsigned long)s->live_cap, (unsigned long)s->handles_max, (unsigned long long)s->untracked);
+        snprintf(m, ST_WARN_LEN, "gptps_stats: the handle table is full: a burst of %llu live handles (so far) past a table "
+                 "of %lu: gptps_stats_reserve(s, %llu) (the next power of two >= the peak live handles) or "
+                 "GPTPS_STATS_GROW_ON_EVENT; %llu event(s) not tracked so far and the pending / in-flight gauges "
+                 "undercount (reads grow it up to cfg.handles_max = %lu; the figure once the burst is over: "
+                 "gptps_stats_health.handles_needed)",
+                 (unsigned long long)s->peak, (unsigned long)s->live_cap, (unsigned long long)st_needed(s),
+                 (unsigned long long)s->untracked, (unsigned long)s->handles_max);
 }
 
 /* Event ORDER is not guaranteed across threads (see EVENT ORDER in gptps.h). Two
@@ -692,6 +747,7 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
              * still on its way): untracked, already counted; its late QUEUED, if one
              * comes, is absorbed */
             if (ev->kind == GPTPS_EV_STARTED || st_terminal(ev)) st_ab_add(s, ev->handle);
+            if (st_terminal(ev) && s->untracked_live) s->untracked_live--;   /* it is over */
         /* A terminal event may always take an entry: it becomes a marker at once, and
          * the orphan FIFO bounds those. Anything else needs a live entry's room. */
         } else if (!st_terminal(ev) && st_live(s) >= s->live_cap) st_untracked(s, ev->handle, w);
@@ -813,17 +869,69 @@ static void observe_locked(gptps_stats *s, const gptps_event *ev, st_warns *w)
     default:
         break;
     }
+    st_peak(s);
+}
+
+/* mu held: would this event need a live entry - a new handle's, or a marker revived -
+ * where observe_locked asks for room? The same cases as its room checks, in its order;
+ * only asked when every live entry is taken. */
+static int st_needs_room(gptps_stats *s, const gptps_event *ev)
+{
+    stats_slot *slot;
+    if (ev->kind == GPTPS_EV_SAMPLE || !ev->handle) return 0;
+    slot = tab_find(s, ev->handle);
+    if (!slot) {
+        int late = ev->kind == GPTPS_EV_QUEUED || ev->kind == GPTPS_EV_RETRIED;
+        if (late && s->ab_n && st_ab_has(s, ev->handle)) return 0;
+        if (!late && st_refused(s, ev->handle)) return 0;
+        return !st_terminal(ev);
+    }
+    return slot->state == ST_DONE &&
+           (ev->kind == GPTPS_EV_STARTED || (ev->kind == GPTPS_EV_FAILED && ev->status != GPTPS_E_CANCELLED));
+}
+
+/* GPTPS_STATS_GROW_ON_EVENT (1.13): mu held, every live entry taken, and this event
+ * needs one - grow on the event path instead of leaving the handle untracked. The
+ * readers' storage protocol: unlock, allocate, relock, re-check (while the lock was down
+ * another thread may have grown the table, filled it again, switched the observer off or
+ * resumed it), swap, and free the old table only with the lock dropped - the caller
+ * frees what this returns. Each pass the capacity rises (this thread's swap or
+ * another's) toward handles_max, so the loop ends. A failed allocation is counted (nomem,
+ * WARNed) and the event goes on to observe_locked, which leaves the handle untracked
+ * exactly as without the flag; no tracked entry is touched. */
+static stats_slot *st_grow_on_event(gptps_stats *s, const gptps_event *ev, st_warns *w)
+{
+    stats_slot *gone = NULL;
+    while (s->on && st_live(s) >= s->live_cap && s->live_cap < s->handles_max && st_needs_room(s, ev)) {
+        size_t want = s->live_cap * 2, ncap;
+        stats_slot *nt;
+        if (want > s->handles_max) want = s->handles_max;
+        ncap = st_slots_for(want);
+        apx_mutex_unlock(&s->mu);
+        free(gone);                              /* an earlier pass's old table or loser */
+        nt = (stats_slot *)calloc(ncap, sizeof *nt);
+        apx_mutex_lock(&s->mu);
+        gone = NULL;
+        if (!nt) { st_grow_nomem(s, want, w); break; }
+        if (!s->on || s->live_cap >= want) { gone = nt; continue; }   /* switched off, or another grew it: look again */
+        gone = st_swap_in(s, nt, ncap, want);
+        s->grows_event++;
+    }
+    return gone;
 }
 
 static void stats_observe(const gptps_event *ev, void *ud)
 {
     gptps_stats *s = (gptps_stats *)ud;
+    stats_slot *gone = NULL;
     st_warns w;
     if (!ST_FLAG_GET(&s->on)) return;           /* switched off: not even the lock */
     w.n = 0;
     apx_mutex_lock(&s->mu);
+    if (s->on && s->grow_ev && st_live(s) >= s->live_cap) gone = st_grow_on_event(s, ev, &w);
     if (s->on) observe_locked(s, ev, &w);
     apx_mutex_unlock(&s->mu);
+    free(gone);                                  /* the table it replaced, with the lock released */
     st_warn_flush(&w);
 }
 
@@ -849,7 +957,7 @@ static gptps_stats *st_new(const gptps_stats_config *cfg, uint32_t def_mtabs)
     if (!c.measure_tables) c.measure_tables = def_mtabs;
     if (c.max_tasks > ST_MAX_TASKS || c.handles > ST_MAX_HANDLES || c.handles_max < c.handles ||
         c.handles_max > ST_MAX_HANDLES || c.measure_tables > ST_MAX_MTABS ||
-        (c.flags & ~GPTPS_STATS_START_DISABLED)) {
+        (c.flags & ~(GPTPS_STATS_START_DISABLED | GPTPS_STATS_GROW_ON_EVENT))) {
         char m[256];
         snprintf(m, sizeof m, "gptps_stats: config refused: max_tasks %u (1..%u), handles %u (1..%u), handles_max %u "
                  "(handles..%u), measure_tables %u (1..%u), flags 0x%x", (unsigned)c.max_tasks, ST_MAX_TASKS,
@@ -883,6 +991,7 @@ static gptps_stats *st_new(const gptps_stats_config *cfg, uint32_t def_mtabs)
     memcpy(s->rows[s->max_tasks].name, GPTPS_STATS_OTHER_NAME, sizeof GPTPS_STATS_OTHER_NAME);
     s->rows[s->max_tasks].c.struct_size = sizeof s->rows[s->max_tasks].c;
     s->on = (c.flags & GPTPS_STATS_START_DISABLED) ? 0 : 1;
+    s->grow_ev = (c.flags & GPTPS_STATS_GROW_ON_EVENT) ? 1 : 0;
     apx_mutex_init(&s->mu);
     return s;
 }
@@ -944,6 +1053,7 @@ gptps_status gptps_stats_set_enabled(gptps_stats *s, int on)
         memset(s->ab_set, 0, sizeof s->ab_set);
         s->ab_head = s->ab_n = 0;
         s->rf_lo = s->rf_hi = 0;
+        s->untracked_live = 0;                   /* the peak stays: a sizing figure since install */
         s->total.pending = s->total.in_flight = 0;
         for (i = 0; i <= s->max_tasks; ++i) s->rows[i].c.pending = s->rows[i].c.in_flight = 0;
         s->resumes++;
@@ -1013,6 +1123,9 @@ static void st_health_out(gptps_stats *s, gptps_stats_health_info *out)
     h.nomem = s->nomem;
     h.memory_bytes = st_memory(s);
     h.late_absorbed = s->late_absorbed;
+    h.handles_peak = s->peak;
+    h.handles_needed = st_needed(s);
+    h.grows_on_event = s->grows_event;
     if (n > sizeof h) n = sizeof h;
     h.struct_size = n;
     memcpy(out, &h, n);
@@ -1021,24 +1134,28 @@ static void st_health_out(gptps_stats *s, gptps_stats_health_info *out)
 gptps_status gptps_stats_health(gptps_stats *s, gptps_stats_health_info *out)
 {
     size_t want;
+    st_warns w;
     if (!s || !out || out->struct_size < ST_HEALTH_MIN) return GPTPS_E_INVAL;
+    w.n = 0;
     apx_mutex_lock(&s->mu);
     st_health_out(s, out);
-    want = st_grow_want(s);
+    want = st_grow_want(s, &w);
     apx_mutex_unlock(&s->mu);
-    st_grow_after(s, want);
+    st_grow_after(s, want, &w);
     return GPTPS_OK;
 }
 
 gptps_status gptps_stats_total(gptps_stats *s, gptps_stats_counters *out)
 {
     size_t want;
+    st_warns w;
     if (!s || !out) return GPTPS_E_INVAL;
+    w.n = 0;
     apx_mutex_lock(&s->mu);
     st_cnt_out(out, &s->total);
-    want = st_grow_want(s);
+    want = st_grow_want(s, &w);
     apx_mutex_unlock(&s->mu);
-    st_grow_after(s, want);
+    st_grow_after(s, want, &w);
     return GPTPS_OK;
 }
 
@@ -1046,13 +1163,15 @@ gptps_status gptps_stats_task(gptps_stats *s, const char *task, gptps_stats_coun
 {
     stats_task *k;
     size_t want;
+    st_warns w;
     gptps_status st = GPTPS_E_NOTFOUND;
     if (!s || !task || !out) return GPTPS_E_INVAL;
+    w.n = 0;
     apx_mutex_lock(&s->mu);
     if ((k = st_row_find(s, task)) != NULL) { st_cnt_out(out, &k->c); st = GPTPS_OK; }
-    want = st_grow_want(s);
+    want = st_grow_want(s, &w);
     apx_mutex_unlock(&s->mu);
-    st_grow_after(s, want);
+    st_grow_after(s, want, &w);
     return st;
 }
 
@@ -1080,17 +1199,19 @@ gptps_status gptps_stats_task_at(gptps_stats *s, size_t index,
 {
     stats_task *k;
     size_t want;
+    st_warns w;
     gptps_status st = GPTPS_E_NOTFOUND;
     if (!s) return GPTPS_E_INVAL;
+    w.n = 0;
     apx_mutex_lock(&s->mu);
     if ((k = st_row_at(s, index)) != NULL) {
         copy_out(name_buf, name_cap, k->name);
         if (out) st_cnt_out(out, &k->c);
         st = GPTPS_OK;
     }
-    want = st_grow_want(s);
+    want = st_grow_want(s, &w);
     apx_mutex_unlock(&s->mu);
-    st_grow_after(s, want);
+    st_grow_after(s, want, &w);
     return st;
 }
 
@@ -1100,10 +1221,12 @@ gptps_status gptps_stats_snapshot(gptps_stats *s, gptps_stats_counters *total,
                                   size_t *needed)
 {
     size_t nrows, i, want, rn, cn;
+    st_warns w;
     if (!s || (rows && cap && row_size < ST_ROW_MIN) || (!rows && cap) ||
         (health && health->struct_size < ST_HEALTH_MIN)) return GPTPS_E_INVAL;
     rn = row_size < sizeof(gptps_stats_row) ? row_size : sizeof(gptps_stats_row);
     cn = rn > offsetof(gptps_stats_row, c) ? rn - offsetof(gptps_stats_row, c) : 0;
+    w.n = 0;
     apx_mutex_lock(&s->mu);
     nrows = st_nrows(s);
     if (total) st_cnt_out(total, &s->total);
@@ -1119,9 +1242,9 @@ gptps_status gptps_stats_snapshot(gptps_stats *s, gptps_stats_counters *total,
         r.c.struct_size = cn;
         memcpy((char *)rows + i * row_size, &r, rn);
     }
-    want = st_grow_want(s);
+    want = st_grow_want(s, &w);
     apx_mutex_unlock(&s->mu);
-    st_grow_after(s, want);
+    st_grow_after(s, want, &w);
     if (needed) *needed = nrows;
     return nrows > cap ? GPTPS_E_FULL : GPTPS_OK;
 }
