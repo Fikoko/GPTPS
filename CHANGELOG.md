@@ -5,7 +5,7 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
-## [Unreleased]
+## [1.14.0] - 2026-11-23
 
 The morning re-drive of a night window, from the pilot's report on Fikoko/GPTPS#12: a
 shutdown now hands the host every dead letter it leaves, and a dead letter says how
