@@ -66,6 +66,12 @@ its place.
     no bound; and results printed but never checked.
 - `test_shutdown_dl` covers the hand-over, including the item a MANUAL step admitted
   for the next step, and `attempts_run` on both the worker and the MANUAL path.
+- Under ASan and TSan, the pilot's PROGRAM jobs declare no memory cost. A declared
+  cost becomes `RLIMIT_AS` in the forked child before `exec`, while the sanitizer's
+  runtime is still running there. A sanitizer allocation at that moment fails, and the
+  child exits 66 ("ThreadSanitizer: out of memory") instead of running the job. This
+  happened once on CI's TSan leg, and a stand-alone program reproduces it. Production
+  builds are not instrumented, so they are unaffected.
 
 ## [1.13.1] - 2026-11-23
 

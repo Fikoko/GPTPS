@@ -38,6 +38,25 @@
 #  define _POSIX_C_SOURCE 200809L   /* nanosleep, mkdir */
 #endif
 #include "gptps.h"
+
+/* Sanitizer builds declare no memory cost. A PROGRAM job's declared memory becomes
+ * RLIMIT_AS in the forked child before exec, and a sanitized child still runs its
+ * runtime there: one allocation it needs then (TSan's sync allocator, say) fails and
+ * it exits 66 ("ThreadSanitizer: out of memory") instead of running the job - now and
+ * then, by what the runtime held at the fork (seen once on CI's TSan leg). The cap is
+ * production behaviour, not what these tests are about. */
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#  define PILOT_SANITIZED 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#    define PILOT_SANITIZED 1
+#  endif
+#endif
+#if defined(PILOT_SANITIZED)
+#  define PILOT_JOB_MEM 0u
+#else
+#  define PILOT_JOB_MEM (64u << 20)
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -54,6 +73,7 @@ static void make_dir(const char *p) { (void)_mkdir(p); }
 #else
 #include <sys/stat.h>
 #include <time.h>
+
 static void sleep_ms(unsigned ms)
 {
     struct timespec ts;
@@ -228,7 +248,7 @@ static gptps *open_engine(void)
     d.struct_size = sizeof d;
     d.exec = GPTPS_EXEC_PROGRAM;
     d.default_cost.struct_size = sizeof d.default_cost;
-    d.default_cost.mem_bytes = 64u << 20;
+    d.default_cost.mem_bytes = PILOT_JOB_MEM;   /* 64 MB; none when sanitized */
     d.default_policy.struct_size = sizeof d.default_policy;
     d.default_policy.max_retries = 0;
     d.default_policy.on_failure = GPTPS_ON_FAILURE_DEAD_LETTER;
