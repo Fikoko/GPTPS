@@ -5,6 +5,27 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [1.13.1] - 2026-11-23
+
+Documentation only: no code, ABI or behaviour change. From the pilot's night-window report.
+
+### Fixed
+
+- **`gptps_dead_letter.attempts` says what it counts.** It is the attempt the item had
+  reached, and a retry counts from when it is scheduled. So a retry refused before it ran
+  is counted too: a constraint's `E_DENIED` (for example `gptps_retry`'s NEVER rule) or a
+  missed deadline. An item refused before its first run reports 1. The attempts that ran
+  are the FAILED events its handle got. Under `on_failure = requeue` the count restarts at
+  1 each cycle. The header said "attempts made before giving up", which read as attempts
+  that ran.
+- **Drain before `gptps_shutdown`.** Once `gptps_shutdown` returns `GPTPS_OK`, the engine
+  is freed, together with every dead letter it still retains, so a later
+  `gptps_dead_letter_drain` is a use after free that the API cannot detect. This is now
+  stated at `gptps_shutdown`, at `gptps_dead_letter_drain` and in the Readme. The header
+  also claimed that the dead letters made by shutdown's own grace could be drained. They
+  cannot: they are freed with the engine, and an observer sees only their `DEAD_LETTERED`
+  events, without payloads.
+
 ## [1.13.0] - 2026-11-22
 
 Closes the gaps 1.12.0 left. The dashboard's degrade mode now acts on every pressure

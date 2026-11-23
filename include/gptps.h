@@ -111,8 +111,8 @@ extern "C" {
  * between minors is spent; ABI 2.0 (see above) was the last use of it. */
 #define GPTPS_VERSION_MAJOR 1
 #define GPTPS_VERSION_MINOR 13
-#define GPTPS_VERSION_PATCH 0
-#define GPTPS_VERSION_STRING "1.13.0"
+#define GPTPS_VERSION_PATCH 1
+#define GPTPS_VERSION_STRING "1.13.1"
 
 /* --- export / visibility ------------------------------------------------- */
 /* Default build is a STATIC library, so GPTPS_API is undecorated. Define
@@ -1070,7 +1070,10 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * with status GPTPS_E_SHUTDOWN. So is a REQUEUE item that runs out of retries
  * during the drain, which never schedules another cycle - a GPTPS_EV_DEAD_LETTERED,
  * while the attempt's own status stays on its FAILED. The dead letters both paths
- * retain (gptps_dead_letter_drain) carry that status too.
+ * make carry that status too - but they are FREED with the engine when
+ * gptps_shutdown returns, like every dead letter still retained: nothing can drain
+ * them. An observer sees their GPTPS_EV_DEAD_LETTERED (handle, task, status), not
+ * their payload.
  * Both events carry GPTPS_EV_FLAG_SHUTDOWN (ABI 2.3). The engine does not reserve
  * the status: a task body may return GPTPS_E_SHUTDOWN too, and when that return ends
  * the item its DEAD_LETTERED / DROPPED carries the status but not the flag.
@@ -1080,7 +1083,13 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * (THREADED), free the engine that gptps_step is standing on (MANUAL), or free it
  * under the call that made the callback - a submit, cancel, removal, drain or
  * settings call, an add-on load, disable or emit, or gptps_shutdown itself. Signal
- * your main thread and shut down from there. */
+ * your main thread and shut down from there.
+ *
+ * ONCE IT RETURNS GPTPS_OK, `e` IS FREED (it is not when it refuses: GPTPS_E_BUSY,
+ * GPTPS_E_INVAL, or GPTPS_E_SHUTDOWN in a forked child): every later call with it -
+ * gptps_dead_letter_drain included - is a use after free, which the API cannot
+ * detect. Drain (or count) the dead letters you want BEFORE calling it; the ones it
+ * still holds are freed with it. */
 GPTPS_API gptps_status gptps_shutdown(gptps *e);
 
 /* ============================================================================
@@ -1312,7 +1321,13 @@ typedef struct {
     gptps_handle handle;        /* the original submit handle */
     const char  *task_name;
     gptps_status status;        /* the terminal failure status */
-    uint32_t     attempts;      /* attempts made before giving up */
+    uint32_t     attempts;      /* the attempt the item had reached: 1 for the first. A retry
+                                 * counts from when it is SCHEDULED, so one refused before it
+                                 * ran (a constraint's E_DENIED - gptps_retry's NEVER rule -
+                                 * or a missed deadline) is counted too, and an item refused
+                                 * before its first run reports 1. Attempts that RAN are the
+                                 * FAILED events its handle got. Under on_failure = requeue,
+                                 * counted within the current cycle (each cycle starts at 1). */
     const void  *payload;       /* original payload (valid only for the callback) */
     size_t       payload_len;
     /* ABI 2.6: the per-submit options the item was given (gptps_submit_ex), ready to
@@ -1351,7 +1366,9 @@ typedef void (*gptps_dead_letter_cb)(const gptps_dead_letter *dl, void *user_dat
  * Each dead letter's task_name is copied before any callback runs, since a callback
  * may unregister the type. If memory runs out for a copy, the drain stops at that
  * dead letter: it and those after it stay retained, in order, for the next drain,
- * and the count returned is less than gptps_dead_letter_count said. */
+ * and the count returned is less than gptps_dead_letter_count said.
+ * Call it BEFORE gptps_shutdown: shutdown frees the engine and every dead letter it
+ * still retains, and a drain after it is a use after free (see gptps_shutdown). */
 GPTPS_API size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_data);
 
 /* ============================================================================

@@ -230,7 +230,7 @@ d.default_policy.on_failure            = GPTPS_ON_FAILURE_DEAD_LETTER;  /* or _D
 
 In-process tasks must poll `gptps_is_cancelled()` to honor the timeout. Tasks that
 exhaust their retries are kept in the dead-letter list — reprocess them with
-`gptps_dead_letter_drain()`.
+`gptps_dead_letter_drain()`, before `gptps_shutdown()` (which frees them with the engine).
 
 **3. Cap how much runs at once (the budget).** Open with explicit limits (or a
 [config file](#configuration-file-optional), so you can re-tune without recompiling):
@@ -848,7 +848,10 @@ counting allocator in `tests/test_bounded.c` holds it to that, in both modes;
   `retry_backoff_seconds`, `on_failure` = `dead_letter` (default) / `drop` / `requeue`.
 - **Dead letter:** tasks that exhaust retries (or that a constraint denies) are retained.
   `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
-  the callback may re-submit to retry — and empties the list (`gptps_shutdown()` frees the rest);
+  the callback may re-submit to retry — and empties the list. Drain **before**
+  `gptps_shutdown()`: it frees the engine and every dead letter still retained, including
+  those it makes itself for work its grace ended (an observer sees their `DEAD_LETTERED`
+  events, not their payloads), and any call after it is a use after free;
   if memory runs out copying a task's name, it stops there and leaves the rest for the next drain.
   The list is capped at `limits.max_dead_letters` (default 1024, oldest evicted, `0` =
   unbounded; at open, `cfg.max_dead_letters`, where `GPTPS_LIMIT_NONE` is unbounded);
