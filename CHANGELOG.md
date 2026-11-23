@@ -7,7 +7,8 @@ the release version and is documented in `include/gptps.h`.
 
 ## [1.13.1] - 2026-11-23
 
-Documentation only: no code, ABI or behaviour change. From the pilot's night-window report.
+Documentation and one test: no library code, ABI or behaviour change. From the pilot's
+night-window report.
 
 ### Fixed
 
@@ -25,6 +26,16 @@ Documentation only: no code, ABI or behaviour change. From the pilot's night-win
   also claimed that the dead letters made by shutdown's own grace could be drained. They
   cannot: they are freed with the engine, and an observer sees only their `DEAD_LETTERED`
   events, without payloads.
+
+### Tests
+
+- **`tui_perf`'s tail gate is reliable on MSVC.** It compared a FAILED with a 64 KiB
+  newline-free tail against one with no tail (at most 3x). In MSVC's unoptimised Debug CI
+  build that measured 3.4x twice, because it weighed the fixed 512-byte scan against the
+  bare event. It now compares the 64 KiB tail with a 512-byte one (`TUI_WHY_SCAN`, the
+  window the scan reads), at most 2x. That measures what the gate is for, whether the scan
+  grows with the tail, in any build: about 1.0x in Release, 1.06x at -O0, and a failure for
+  a scan of the whole tail.
 
 ## [1.13.0] - 2026-11-22
 

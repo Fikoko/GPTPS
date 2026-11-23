@@ -11,8 +11,12 @@
  *      1.10 ring scanned its window for every FINISHED (89 ns at 1024, 4.5 us at 65536).
  *   2. NORMAL, 1000 task types vs 1, the same events: <= 1.5x. The 1.10 lookup compared
  *      the name with every row (33 -> 250 ns an event from 1 to 64 types).
- *   3. A FAILED with a 64 KiB stderr tail holding no newline vs one with no tail: <= 3x.
- *      The 1.10 "why" walked the whole tail looking for a line start (28 us measured).
+ *   3. A FAILED with a 64 KiB stderr tail holding no newline vs one with a 512-byte tail
+ *      (TUI_WHY_SCAN, the window the "why" looks at): <= 2x. The 1.10 "why" walked the
+ *      whole tail looking for a line start (28 us measured). Both sides scan the same
+ *      bounded window, so the ratio says O(tail) or not whatever the build; until 1.13.1
+ *      the cheap side had no tail at all, which also weighed the fixed scan against the
+ *      bare event - near the 3x bar in MSVC's unoptimised Debug build (3.4x there).
  *   4. The same two gates at the tiers that add those layers, LATENCY (6: the handle
  *      table) and TASKS (4: the name index), without the layers above them.
  *   5. The tasks pane on a busy engine (64 types, 20000 queued, pane_refresh_ms 100): the
@@ -120,13 +124,13 @@ static double run_types(gptps_tui *t, long n, int types)
 
 /* 3: FAILED, with or without a 64 KiB tail that has no newline */
 static char bigtail[65536];
-static double run_failed(gptps_tui *t, long n, int with_tail)
+static double run_failed(gptps_tui *t, long n, int with_tail)   /* 1: 64 KiB tail; 2: TUI_WHY_SCAN */
 {
     gptps_event e = mk(GPTPS_EV_FAILED, "f", 1);
     long i;
     double t0 = now_ms();
     e.status = GPTPS_E_TASK;
-    if (with_tail) { e.stderr_tail = bigtail; e.stderr_tail_len = sizeof bigtail; }
+    if (with_tail) { e.stderr_tail = bigtail; e.stderr_tail_len = with_tail == 2 ? (size_t)TUI_WHY_SCAN : sizeof bigtail; }
     for (i = 0; i < n; ++i) { e.handle = (gptps_handle)(i + 1); tui_on_event(&e, t); }
     return now_ms() - t0;
 }
@@ -239,8 +243,8 @@ int main(void)
         r = gate("NORMAL 1000 types vs 1", r_types, C, 1, C, 1000, 1.5);
         CHECK(r <= 1.5);
         CHECK(C->ntasks == 1001 && C->nfold == 0);
-        r = gate("FAILED 64 KiB newline-free tail vs none", r_failed, C, 0, C, 1, 3.0);
-        CHECK(r <= 3.0);
+        r = gate("FAILED 64 KiB newline-free tail vs 512 B", r_failed, C, 2, C, 1, 2.0);
+        CHECK(r <= 2.0);
     }
     /* 4: the layers at their own tiers - LATENCY has the handle table and no histogram,
      * TASKS the name index and nothing above it (no ACTIVITY journal) */
