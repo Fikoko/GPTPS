@@ -145,11 +145,11 @@ CI's two commands, for each seed in turn:
 for s in $(seq 1 500); do
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_STRESS_SEED=$s GPTPS_STRESS_MS=1500 \
     ctest --test-dir build-sim -j4 --no-tests=error \
-    -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui)$' \
+    -E '_perf$|^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|xport|xport_engine|xport_opts|xport_measure|gptps_bench_pool|gptps_bench_balance|tui|pilot_pass2|pilot_pass4)$' \
     > sim-$s.log 2>&1 || echo "seed $s failed: see sim-$s.log"
   GPTPS_SIM_SEED=$s GPTPS_SIM_CPUS=4 GPTPS_SIM_PACE=1 \
     ctest --test-dir build-sim --no-tests=error \
-    -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui)$' \
+    -R '^(hal_conformance|oop|program|program_helper|program_launch|program_stop|retry_addon|engine_fixes|exec_faults|durable_crash|hang|example_program|example_wasm|example_edge_ai|measure|caps|adapt|adapt_program|tui|pilot_pass2|pilot_pass4)$' \
     > sim-paced-$s.log 2>&1 || echo "seed $s failed paced: see sim-paced-$s.log"
 done
 ```
@@ -167,6 +167,7 @@ The tests the first command leaves out, and why:
 | `caps`, `adapt`, `adapt_program` | Their jobs are child processes (`GPTPS_EXEC_OOP`): the CPU / I/O caps are a process executor's, and adapt learns from what process jobs measure. Paced, with the tests above. |
 | `engine_fixes` | Its cancel-before-deadline and grace checks race a PROGRAM job against real deadlines (a job whose TERM handler sleeps 2.5 s, a 2 s timeout). On the virtual clock the deadline can pass before the cancel lands. Paced, with the tests above. |
 | `tui` | Its failure-why checks run PROGRAM jobs and read their exit code and stderr tail. Paced, with the tests above. |
+| `pilot_pass2`, `pilot_pass4` | A pilot user's night-window harnesses ([`tests/pilot/`](../tests/pilot/README.md)): their jobs are PROGRAM children (the ERP's batch executables), and pass two times a retry's wait in real ms. Paced, with the tests above. (`pilot_pass1` is not left out: its jobs are in-process and spin on `gptps_now_ms`, a clock read the simulation sees. `pilot_pass3` is built on Windows only.) |
 | `tui_unit` | Not left out: it runs on every seed. Built on this HAL (CMake defines `GPTPS_TEST_HAL_SIM`), it leaves out one check, saying so - the live loop on a pseudo-terminal, which waits in `poll()`, a real block the simulation does not see, while it holds the baton (seed 780 stopped there as a stall). The native legs run it. Its storm test's emitters read the engine clock each round: at `off` the observer returns before its lock, and a loop with no HAL or pthread call is one the simulation cannot switch away from. |
 | `xport`, `xport_engine`, `xport_opts`, `xport_measure` | Not runnable on it. A reader thread blocks in `read()` on a worker's socket while it holds the baton, and the request that reply needs is written by a thread that cannot run until it returns. |
 

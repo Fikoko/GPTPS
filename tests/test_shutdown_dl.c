@@ -222,6 +222,26 @@ static void test_shutdown_ex(void)
     CHECK(count_of("N") == 1 && count_of("W") == 1 && count_of("Q1") == 1 && count_of("Q2") == 1);
     CHECK(in_cb_submit == GPTPS_E_SHUTDOWN && in_cb_shut == GPTPS_E_BUSY && in_cb_shut_ex == GPTPS_E_BUSY);
 
+    /* 2b) a MANUAL host that steps once and shuts down: the step ran one item and
+     * admitted the next into `ready` for the next step - never started, it is handed
+     * over too (GPTPS_E_SHUTDOWN, attempts_run 0), not cancelled and freed */
+    e = open_engine(GPTPS_RUN_MANUAL, 0);
+    if (!e) return;
+    reg(e, "ok", run_ok, 0, 0);
+    CHECK(gptps_submit(e, "ok", "R1", 2, &h) == GPTPS_OK);
+    CHECK(gptps_submit(e, "ok", "R2", 2, &h) == GPTPS_OK);
+    CHECK(gptps_submit(e, "ok", "R3", 2, &h) == GPTPS_OK);
+    {
+        size_t ran = 0;
+        CHECK(gptps_step(e, &ran) == GPTPS_OK && ran == 1);   /* R1 ran */
+    }
+    memset(&so, 0, sizeof so); so.struct_size = sizeof so; so.dead_letter = collect;
+    nseen = 0;
+    CHECK(gptps_shutdown_ex(e, &so) == GPTPS_OK);
+    CHECK(nseen == 2 && find("R1") == NULL);
+    CHECK((s = find("R2")) != NULL && s->status == GPTPS_E_SHUTDOWN && s->runs == 0);
+    CHECK((s = find("R3")) != NULL && s->status == GPTPS_E_SHUTDOWN && s->runs == 0);
+
     /* 4) NULL options, and options without a callback: plain shutdown */
     e = open_engine(GPTPS_RUN_MANUAL, 0);
     if (!e) return;

@@ -1108,6 +1108,63 @@ target_include_directories(test_shutdown_dl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 target_link_libraries(test_shutdown_dl PRIVATE gptps)
 add_test(NAME shutdown_dl COMMAND test_shutdown_dl)
 set_tests_properties(shutdown_dl PROPERTIES TIMEOUT 60)
+
+# A pilot user's night-window harnesses (nightops00dev, MIT; Fikoko/GPTPS#12), folded
+# in as regression tests - see tests/pilot/README.md. The helpers are the ERP's batch
+# executables; each test finds them by the absolute path CMake passes, and the licence
+# marker lives in a directory of the test's own (PILOT_WORK_DIR), so parallel ctest
+# runs never share it. pilot_pass3 is Windows-only (Ctrl+Break, CreateThread). The
+# helpers are the JOBS, run under RLIMIT_AS (their declared 64 MB), which a
+# sanitizer's shadow-memory reservation never fits: built without one, as fake_infer.
+add_executable(pilot_erp_job tests/pilot/erp_job.c)
+add_executable(pilot_erp_redrive_job tests/pilot/erp_redrive_job.c)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    foreach(_pilot_helper pilot_erp_job pilot_erp_redrive_job)
+        target_compile_options(${_pilot_helper} PRIVATE -fno-sanitize=all)
+        target_link_options(${_pilot_helper} PRIVATE -fno-sanitize=all)
+    endforeach()
+endif()
+if(TARGET gptps_sched)
+add_executable(pilot_pass1_edf tests/pilot/pilot_pass1_edf.c)              # EDF + shed_late
+target_include_directories(pilot_pass1_edf PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(pilot_pass1_edf PRIVATE gptps_sched)
+add_test(NAME pilot_pass1 COMMAND pilot_pass1_edf)
+set_tests_properties(pilot_pass1 PROPERTIES TIMEOUT 60)
+endif()
+if(TARGET gptps_retry)
+add_executable(pilot_pass2_retry tests/pilot/pilot_pass2_retry.c)          # gptps_retry + stderr tails
+target_include_directories(pilot_pass2_retry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/addons)
+target_link_libraries(pilot_pass2_retry PRIVATE gptps_retry)
+target_compile_definitions(pilot_pass2_retry PRIVATE ERP_JOB_PATH="$<TARGET_FILE:pilot_erp_job>")
+add_dependencies(pilot_pass2_retry pilot_erp_job)
+add_test(NAME pilot_pass2 COMMAND pilot_pass2_retry)
+set_tests_properties(pilot_pass2 PROPERTIES TIMEOUT 60)
+endif()
+if(WIN32)
+add_executable(pilot_erp_stop_job tests/pilot/erp_stop_job.c)
+add_executable(pilot_pass3_grace_win tests/pilot/pilot_pass3_grace_win.c)  # stop_grace_ms rollback + re-drive
+target_include_directories(pilot_pass3_grace_win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(pilot_pass3_grace_win PRIVATE gptps)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/pilot_pass3.d)
+target_compile_definitions(pilot_pass3_grace_win PRIVATE
+    ERP_STOP_JOB_PATH="$<TARGET_FILE:pilot_erp_stop_job>"
+    ERP_REDRIVE_JOB_PATH="$<TARGET_FILE:pilot_erp_redrive_job>"
+    PILOT_WORK_DIR="${CMAKE_CURRENT_BINARY_DIR}/pilot_pass3.d")
+add_dependencies(pilot_pass3_grace_win pilot_erp_stop_job pilot_erp_redrive_job)
+add_test(NAME pilot_pass3 COMMAND pilot_pass3_grace_win)
+set_tests_properties(pilot_pass3 PROPERTIES TIMEOUT 60)
+endif()
+add_executable(pilot_pass4_shutdown tests/pilot/pilot_pass4_shutdown.c)    # shutdown_ex hand-over, morning re-drive
+target_include_directories(pilot_pass4_shutdown PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(pilot_pass4_shutdown PRIVATE gptps)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/pilot_pass4.d)
+target_compile_definitions(pilot_pass4_shutdown PRIVATE
+    ERP_JOB_PATH="$<TARGET_FILE:pilot_erp_job>"
+    ERP_REDRIVE_JOB_PATH="$<TARGET_FILE:pilot_erp_redrive_job>"
+    PILOT_WORK_DIR="${CMAKE_CURRENT_BINARY_DIR}/pilot_pass4.d")
+add_dependencies(pilot_pass4_shutdown pilot_erp_job pilot_erp_redrive_job)
+add_test(NAME pilot_pass4 COMMAND pilot_pass4_shutdown)
+set_tests_properties(pilot_pass4 PROPERTIES TIMEOUT 60)
 add_executable(test_engine_fixes tests/test_engine_fixes.c)
 target_include_directories(test_engine_fixes PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_engine_fixes PRIVATE gptps)

@@ -36,7 +36,9 @@ its place.
 
 - **MANUAL: work still waiting at shutdown ends by its policy.** A MANUAL host that
   stops stepping and shuts down with work still queued, waiting to retry, between
-  REQUEUE cycles or DEFERred now sees each item end as `GPTPS_EV_DEAD_LETTERED` (or
+  REQUEUE cycles or DEFERred - or admitted by its last `gptps_step` for the next one
+  to run, which a host that steps and then shuts down always has - now sees each item
+  end as `GPTPS_EV_DEAD_LETTERED` (or
   `GPTPS_EV_DROPPED` under `on_failure = drop`), with status `GPTPS_E_SHUTDOWN` and
   `GPTPS_EV_FLAG_SHUTDOWN`. That is what a THREADED engine already did when its grace
   ran out, and what the header already described.
@@ -47,6 +49,23 @@ its place.
   - The durable queue keeps such work pending as before, because the shutdown flag
     decides.
   - Running work cancelled by the grace and stopped services end as before.
+
+### Tests
+
+- **The pilot's night-window harnesses are regression tests** (`tests/pilot/`, adapted
+  from nightops00dev's harnesses under MIT, with thanks; see `tests/pilot/README.md`):
+  - `pilot_pass1`: deadline-first start order, and `shed_late` refusing late work.
+  - `pilot_pass2`: `gptps_retry` exit-code rules, the stderr tail on each dead letter,
+    and `attempts_run`.
+  - `pilot_pass3` (Windows): the Ctrl+Break rollback within `stop_grace_ms`, and a
+    morning re-drive.
+  - `pilot_pass4` (new): a night ended by `gptps_shutdown_ex`, then a morning re-drive
+    of every dead letter it handed over.
+  - While adapting them we fixed a few harness bugs: a `strstr` on the stderr tail,
+    which is not NUL-terminated; a dead-letter check that could not fail; waits with
+    no bound; and results printed but never checked.
+- `test_shutdown_dl` covers the hand-over, including the item a MANUAL step admitted
+  for the next step, and `attempts_run` on both the worker and the MANUAL path.
 
 ## [1.13.1] - 2026-11-23
 

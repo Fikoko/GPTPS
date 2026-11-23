@@ -7135,7 +7135,19 @@ gptps_status gptps_shutdown_ex(gptps *e, const gptps_shutdown_options *opt)
         gptps_pending_ev p;
         int drop;
         gptps_mutex_lock(e->m);
-        if ((it = fifo_pop(&e->delayed)) == NULL && (it = intake_pop(e)) == NULL) break;   /* lock held */
+        /* A MANUAL step's closing pass admits the next item into `ready` for the
+         * next step to run: an item that never started, waiting like the queued
+         * ones, and the one a host that steps and then shuts down always has. It
+         * ends the same way. One that was cancelled (a service stopped above, a
+         * gptps_cancel, a type being removed) still ends FAILED / GPTPS_E_CANCELLED
+         * below, as the step would have ended it. */
+        it = NULL;
+        if (e->manual)
+            for (it = e->ready.head; it; it = it->next)
+                if (!it->started && !it->cancelled &&
+                    !(it->reg && it->reg->removed && it->reg->cancelling)) break;
+        if (it) fifo_remove(&e->ready, it);
+        else if ((it = fifo_pop(&e->delayed)) == NULL && (it = intake_pop(e)) == NULL) break;   /* lock held */
         drop = (it->policy.on_failure == GPTPS_ON_FAILURE_DROP);
         it->outcome = GPTPS_E_SHUTDOWN;
         p.kind = drop ? GPTPS_EV_DROPPED : GPTPS_EV_DEAD_LETTERED;
