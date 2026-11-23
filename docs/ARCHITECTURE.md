@@ -614,7 +614,10 @@ same kind of step: `gptps_engine_counts` and its `gptps_engine_totals` are new, 
 (per-type counts the queue primitives keep - "per-type counts" in `src/engine.c`). ABI
 2.10 adds `gptps_settings_provisional` and `gptps_settings_hold` and appends
 `settings_provisional` and `settings_hold` to the host table: a settings file's keys apply whatever order it
-lists them in (cfg_apply's passes in `src/engine.c`).
+lists them in (cfg_apply's passes in `src/engine.c`). 2.11 adds `gptps_shutdown_ex` (a dead-letter
+callback in `gptps_shutdown_options`: every dead letter a shutdown leaves, the ones it
+made itself included, goes to the host before the engine is freed) and appends
+`attempts_run` to `gptps_dead_letter`.
 
 ---
 

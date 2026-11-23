@@ -206,6 +206,7 @@ calls `dlopen`, so it needs `-ldl`). Pick which add-ons get built with
 | `gptps_step(e, &ran)` | MANUAL mode: pump the engine on the calling thread (no worker threads) |
 | `gptps_set_allocator(&a)` | redirect all core allocation to a custom `malloc`/`realloc`/`free` |
 | `gptps_shutdown(e)` | drain in-flight + queued work (bounded by `limits.shutdown_grace_ms`), then free |
+| `gptps_shutdown_ex(e, &opt)` | the same, handing every dead letter left (those it made included) to `opt.dead_letter` first |
 
 Inside a task you get a `gptps_ctx *`: `gptps_payload()`, `gptps_is_cancelled()` (poll it
 for cooperative timeout), `gptps_result_set()` / `gptps_result_set_nocopy()`.
@@ -230,7 +231,8 @@ d.default_policy.on_failure            = GPTPS_ON_FAILURE_DEAD_LETTER;  /* or _D
 
 In-process tasks must poll `gptps_is_cancelled()` to honor the timeout. Tasks that
 exhaust their retries are kept in the dead-letter list — reprocess them with
-`gptps_dead_letter_drain()`, before `gptps_shutdown()` (which frees them with the engine).
+`gptps_dead_letter_drain()`, before `gptps_shutdown()` (which frees them with the engine),
+or have `gptps_shutdown_ex()` hand them over as it shuts down.
 
 **3. Cap how much runs at once (the budget).** Open with explicit limits (or a
 [config file](#configuration-file-optional), so you can re-tune without recompiling):
@@ -850,8 +852,12 @@ counting allocator in `tests/test_bounded.c` holds it to that, in both modes;
   `gptps_dead_letter_drain()` hands each back to a callback — with the engine lock released, so
   the callback may re-submit to retry — and empties the list. Drain **before**
   `gptps_shutdown()`: it frees the engine and every dead letter still retained, including
-  those it makes itself for work its grace ended (an observer sees their `DEAD_LETTERED`
-  events, not their payloads), and any call after it is a use after free;
+  those it makes itself for work it ended (an observer sees their `DEAD_LETTERED`
+  events, not their payloads), and any call after it is a use after free. Or shut down
+  with `gptps_shutdown_ex(e, &opt)` (ABI 2.11): its `opt.dead_letter` callback gets every
+  dead letter left, the ones shutdown made included, before the engine is freed — the
+  morning re-drive of work a night window's shutdown cut off. Each dead letter's
+  `attempts_run` says how many of its `attempts` actually ran;
   if memory runs out copying a task's name, it stops there and leaves the rest for the next drain.
   The list is capped at `limits.max_dead_letters` (default 1024, oldest evicted, `0` =
   unbounded; at open, `cfg.max_dead_letters`, where `GPTPS_LIMIT_NONE` is unbounded);
@@ -1005,9 +1011,9 @@ amalgamation.
 Each add-on is its own installable library (`gptps::pool`, …) with a header, a `.pc` file
 and an amalgamation pair, so you can take a subset without cloning.
 
-At a glance: **62** public functions · **ABI 2.10** (append-only; 2.0 was the first
+At a glance: **63** public functions · **ABI 2.11** (append-only; 2.0 was the first
 and, by design, the last breaking change) · **14** add-on modules + 1 example binary
-plug-in · **120** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
+plug-in · **121** tests · **14** CI runs (13 job definitions; `build-test` is a 2-way
 matrix), every one required to pass - and a release tag publishes nothing until all of
 them have passed at that tag (`release.yml` runs `ci.yml` as its gate).
 

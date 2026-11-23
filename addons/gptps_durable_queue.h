@@ -26,18 +26,17 @@
  * pending, and the next run's gptps_dq_recover re-submits it:
  *   - gptps_cancel(e, handle) stops the current execution only. The engine
  *     reports it as FAILED / GPTPS_E_CANCELLED, which is also how it reports
- *     running work the grace cancels, stopped services and work a MANUAL host
- *     leaves unstepped, so this add-on cannot tell an operator's cancel from a
- *     teardown's and treats both as "not done". The record stays
+ *     running work the grace cancels and stopped services, so this add-on cannot
+ *     tell an operator's cancel from a teardown's and treats both as "not done". The record stays
  *     pending - and counted by gptps_dq_pending - for the rest of this run,
  *     unless gptps_dq_cancel retracts it or the execution FINISHED before the
  *     cancel reached it. To withdraw the work, use gptps_dq_cancel.
- *   - Work that shutdown gives up on: whatever a MANUAL host leaves unstepped,
- *     running work the grace cancels and stopped services (FAILED /
- *     GPTPS_E_CANCELLED); work still queued or in backoff when
- *     limits.shutdown_grace_ms expires, and a REQUEUE item the drain will not start
- *     again (DEAD_LETTERED, or DROPPED under on_failure = drop, marked
- *     GPTPS_EV_FLAG_SHUTDOWN - see gptps_shutdown). Teardown ending work is not a
+ *   - Work that shutdown gives up on: running work the grace cancels and stopped
+ *     services (FAILED / GPTPS_E_CANCELLED); work still queued or in backoff when
+ *     limits.shutdown_grace_ms expires or a MANUAL host stops stepping (until 1.14
+ *     the latter was FAILED / GPTPS_E_CANCELLED), and a REQUEUE item the drain
+ *     will not start again (DEAD_LETTERED, or DROPPED under on_failure = drop,
+ *     marked GPTPS_EV_FLAG_SHUTDOWN - see gptps_shutdown). Teardown ending work is not a
  *     verdict on it, so it is neither quarantined nor lost.
  *   A body that itself returns GPTPS_E_SHUTDOWN is still judged by its policy:
  *   its dead letter or drop carries that status but not the flag, so it is

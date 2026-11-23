@@ -564,9 +564,13 @@ static void obs_host(const gptps_event *ev, void *ud)
         }
         if (strcmp(ev->task_name, "u") == 0 && get(&g_rc_unreg) == 999)
             set(&g_rc_unreg, (int)gptps_shutdown(g_engine));
-        if (strcmp(ev->task_name, "t") == 0)
-            set(&g_rc_teardown, (int)gptps_shutdown(g_engine));
     }
+    /* 1.14: work a MANUAL host leaves queued ends by its policy at teardown - the
+     * DEAD_LETTERED / GPTPS_E_SHUTDOWN a THREADED grace gives it (it was FAILED /
+     * GPTPS_E_CANCELLED) - and a shutdown from that callback is refused the same way */
+    if (ev->kind == GPTPS_EV_DEAD_LETTERED && ev->status == GPTPS_E_SHUTDOWN &&
+        (ev->flags & GPTPS_EV_FLAG_SHUTDOWN) && strcmp(ev->task_name, "t") == 0)
+        set(&g_rc_teardown, (int)gptps_shutdown(g_engine));
 }
 
 /* The event callback's half of submit's guard (the case above uses an observer). */

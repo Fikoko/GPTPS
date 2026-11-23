@@ -96,10 +96,12 @@ extern "C" {
  * host table (gptps_api_routines); 2.9 makes gptps_task_get_info's counters O(1) and
  * adds gptps_engine_counts (gptps_engine_totals); 2.10 adds gptps_settings_provisional
  * and gptps_settings_hold (a settings file's keys apply whatever order it lists them in)
- * and appends `settings_provisional` and `settings_hold` to the host table. Additive, and the loader
- * compares MAJOR only, so no existing add-on is refused. */
+ * and appends `settings_provisional` and `settings_hold` to the host table; 2.11 adds
+ * gptps_shutdown_ex (gptps_shutdown_options: the dead letters a shutdown leaves, to the
+ * host before the engine is freed) and appends `attempts_run` to gptps_dead_letter.
+ * Additive, and the loader compares MAJOR only, so no existing add-on is refused. */
 #define GPTPS_ABI_VERSION_MAJOR 2u
-#define GPTPS_ABI_VERSION_MINOR 10u
+#define GPTPS_ABI_VERSION_MINOR 11u
 #define GPTPS_ABI_MAGIC         0x47505450u /* "GPTP" */
 
 /* --- release version (distinct from the ABI version above) ----------------
@@ -1069,11 +1071,13 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * policy: GPTPS_EV_DEAD_LETTERED, or GPTPS_EV_DROPPED under on_failure = drop,
  * with status GPTPS_E_SHUTDOWN. So is a REQUEUE item that runs out of retries
  * during the drain, which never schedules another cycle - a GPTPS_EV_DEAD_LETTERED,
- * while the attempt's own status stays on its FAILED. The dead letters both paths
- * make carry that status too - but they are FREED with the engine when
- * gptps_shutdown returns, like every dead letter still retained: nothing can drain
- * them. An observer sees their GPTPS_EV_DEAD_LETTERED (handle, task, status), not
- * their payload.
+ * while the attempt's own status stays on its FAILED. A MANUAL engine's waiting
+ * work ends the same way at gptps_shutdown, whatever the grace (no step runs it
+ * then; until 1.14 it ended FAILED / GPTPS_E_CANCELLED and was freed). The dead
+ * letters these paths make carry that status too. gptps_shutdown frees them with
+ * the engine, like every dead letter still retained - an observer sees only their
+ * GPTPS_EV_DEAD_LETTERED (handle, task, status), not their payload;
+ * gptps_shutdown_ex (ABI 2.11) hands each one, payload and all, to the host first.
  * Both events carry GPTPS_EV_FLAG_SHUTDOWN (ABI 2.3). The engine does not reserve
  * the status: a task body may return GPTPS_E_SHUTDOWN too, and when that return ends
  * the item its DEAD_LETTERED / DROPPED carries the status but not the flag.
@@ -1089,7 +1093,9 @@ GPTPS_API gptps_status gptps_step(gptps *e, size_t *out_ran);
  * GPTPS_E_INVAL, or GPTPS_E_SHUTDOWN in a forked child): every later call with it -
  * gptps_dead_letter_drain included - is a use after free, which the API cannot
  * detect. Drain (or count) the dead letters you want BEFORE calling it; the ones it
- * still holds are freed with it. */
+ * still holds are freed with it - or use gptps_shutdown_ex, below, which hands them
+ * over first (declared after the dead-letter API). gptps_shutdown(e) is
+ * gptps_shutdown_ex(e, NULL). */
 GPTPS_API gptps_status gptps_shutdown(gptps *e);
 
 /* ============================================================================
@@ -1352,6 +1358,13 @@ typedef struct {
      * it. */
     const gptps_measure *measures;
     size_t               n_measures;
+    /* ABI 2.11: the attempts that RAN - each one execute() started, a start that failed
+     * (start.error) included - in the same span `attempts` counts (a requeue cycle, a
+     * service restart start again at 0). attempts - attempts_run is the attempts
+     * scheduled and refused before they ran (a constraint's E_DENIED, a missed
+     * deadline, a cancel); 0 for an item refused before its first run. Read only if
+     * struct_size covers it. */
+    uint32_t             attempts_run;
 } gptps_dead_letter;
 
 /* Current number of retained dead-lettered tasks (does not drain). */
@@ -1370,6 +1383,32 @@ typedef void (*gptps_dead_letter_cb)(const gptps_dead_letter *dl, void *user_dat
  * Call it BEFORE gptps_shutdown: shutdown frees the engine and every dead letter it
  * still retains, and a drain after it is a use after free (see gptps_shutdown). */
 GPTPS_API size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_data);
+
+/* ABI 2.11: gptps_shutdown, and the dead letters it leaves. */
+typedef struct {
+    size_t               struct_size;   /* = sizeof(gptps_shutdown_options) */
+    /* Called once for every dead letter the engine still retains when its work has
+     * ended - the ones never drained, AND the ones this shutdown made itself: work
+     * its grace ended (queued, waiting to retry, between REQUEUE cycles, DEFERred),
+     * status GPTPS_E_SHUTDOWN - oldest first, as gptps_dead_letter_drain would hand
+     * them over, before any add-on is torn down and before the engine is freed. So a
+     * night that ends in a shutdown can still re-drive in the morning what it cut off.
+     * NULL: they are freed, as gptps_shutdown does.
+     *   The dead letter (payload, stderr tail, measures) is valid only for the call:
+     * copy what you keep. The engine is stopping: a gptps_submit from the callback is
+     * refused with GPTPS_E_SHUTDOWN (keep the dead letter and submit it to the next
+     * engine), and gptps_shutdown / gptps_shutdown_ex from it with GPTPS_E_BUSY.
+     * Called on the thread that called gptps_shutdown_ex. A dead letter the
+     * limits.max_dead_letters cap evicted is not among them (it is counted in
+     * stats.dead_letters_evicted). */
+    gptps_dead_letter_cb dead_letter;
+    void                *dead_letter_user_data;
+} gptps_shutdown_options;
+
+/* gptps_shutdown, with `opt` (NULL: exactly gptps_shutdown). GPTPS_E_INVAL when
+ * opt->struct_size is smaller than the 2.11 struct; otherwise as gptps_shutdown, and
+ * `e` is freed when it returns GPTPS_OK. */
+GPTPS_API gptps_status gptps_shutdown_ex(gptps *e, const gptps_shutdown_options *opt);
 
 /* ============================================================================
  * SETTINGS - a unified, typed, introspectable + validated configuration registry.

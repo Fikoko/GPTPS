@@ -76,6 +76,9 @@ typedef struct gptps_item {
     int64_t               sched_score;/* admission ordering key: priority by default, or the scheduler hook's score (stamped per pass) */
     uint32_t              skips;     /* times a backfill admission jumped ahead while budget-blocked */
     uint32_t              attempt;   /* 1 = first try */
+    uint32_t              runs;      /* ABI 2.11: attempts execute() started, in the span
+                                      * `attempt` counts (reset with it); the dead
+                                      * letter's attempts_run */
     uint64_t              enqueue_ms;    /* monotonic ms when first submitted (for the scheduler seam: age/deadline/FIFO) */
     uint64_t              intake_seq;    /* order it last ENTERED intake: breaks score ties oldest-first */
     uint64_t              deadline_ms;   /* 0 = no timeout */
@@ -1669,6 +1672,7 @@ static void *worker_main(void *arg)
         it->deadline_ms = attempt_deadline(it);
         cancel_clear(it);
         it->started = 1;                   /* execute() will emit STARTED + a terminal event */
+        it->runs += 1;                     /* an attempt that runs (attempts_run) */
         fifo_push(&e->running_items, it);
         gptps_cond_signal(e->cv_disp);     /* let dispatcher track the new deadline */
         gptps_mutex_unlock(e->m);
@@ -1938,7 +1942,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                  * task's OK is always terminal. */
                 if (it->reg && it->reg->service && !it->reg->retire_on_ok &&
                     !it->cancelled && !it->reg->removed && !e->stopping) {
-                    it->attempt = 1;
+                    it->attempt = 1; it->runs = 0;
                     it->not_before_ms = requeue_at(now, it->policy.retry_backoff_seconds);
                     fifo_push(&e->delayed, it);
                 } else {
@@ -2077,7 +2081,7 @@ static void engine_pass(gptps *e, gptps_pending_ev *pend, int *out_npend,
                         } else {
                             /* re-enqueue via delayed so retry_backoff is honored,
                              * floored so a zero backoff cannot busy-loop a core */
-                            it->attempt = 1;
+                            it->attempt = 1; it->runs = 0;
                             it->not_before_ms = requeue_at(now, it->policy.retry_backoff_seconds);
                             fifo_push(&e->delayed, it);
                         }
@@ -6515,6 +6519,7 @@ static gptps_status submit_internal(gptps *e, const char *task_name,
     it->priority = r->priority;
     it->skips = 0;
     it->attempt = 1;
+    it->runs = 0;
     it->enqueue_ms = gptps_hal_monotonic_ms();   /* age basis for the scheduler seam */
 
     /* per-submit overrides (gptps_submit_ex): only flagged fields apply */
@@ -6888,6 +6893,7 @@ size_t gptps_dead_letter_drain(gptps *e, gptps_dead_letter_cb cb, void *user_dat
             dl.stderr_tail_len = it->err_len;
             dl.measures = it->last_n ? it->last_m : NULL;
             dl.n_measures = it->last_n;
+            dl.attempts_run = it->runs;
             cb(&dl, user_data);
         }
         item_free(e, it);
@@ -6968,6 +6974,7 @@ run_ready:
         it->deadline_ms = attempt_deadline(it);
         cancel_clear(it);
         it->started = 1;                   /* execute() will emit STARTED + a terminal event */
+        it->runs += 1;                     /* an attempt that runs (attempts_run) */
         fifo_push(&e->running_items, it);
         gptps_mutex_unlock(e->m);
 
@@ -7034,14 +7041,26 @@ static void stop_services(gptps *e, gptps_fifo *out)
 
 gptps_status gptps_shutdown(gptps *e)
 {
+    return gptps_shutdown_ex(e, NULL);
+}
+
+gptps_status gptps_shutdown_ex(gptps *e, const gptps_shutdown_options *opt)
+{
     unsigned i;
     gptps_reg *r;
     gptps_item *it;
     gptps_fifo dropped;                 /* queued work this teardown terminated */
     gptps_event_cb cb; void *ud;
     gptps_cb_thread *in;
+    gptps_dead_letter_cb dl_cb = NULL;  /* ABI 2.11: the dead letters left, to the host */
+    void *dl_ud = NULL;
 
     if (!e) return GPTPS_E_INVAL;
+    if (opt) {                          /* the 2.11 struct is the floor: it is the first */
+        if (opt->struct_size < offsetof(gptps_shutdown_options, dead_letter_user_data) + sizeof(void *))
+            return GPTPS_E_INVAL;
+        dl_cb = opt->dead_letter; dl_ud = opt->dead_letter_user_data;
+    }
     /* An engine created before a fork() is unusable in the child (see
      * submit_internal), and shutdown is the worst entry point to let through: it
      * joins dispatcher/worker pthread_t's that do not exist here and frees the
@@ -7101,7 +7120,37 @@ gptps_status gptps_shutdown(gptps *e)
      * drain_cancelled skips only items whose terminal event execute() already
      * reported, so nothing is double-counted - and nothing parked between attempts
      * is dropped. */
-    gptps_mutex_lock(e->m);
+    /* 1.14: work that never got its turn - still queued, or waiting to retry, between
+     * REQUEUE cycles, DEFERred - ends by its policy here exactly as step 3b ends it
+     * when a THREADED grace runs out: GPTPS_EV_DEAD_LETTERED (retained - so
+     * gptps_shutdown_ex hands it to the host below - or freed with the engine) or,
+     * under on_failure = drop, GPTPS_EV_DROPPED, with status GPTPS_E_SHUTDOWN and
+     * GPTPS_EV_FLAG_SHUTDOWN. A THREADED engine's dispatcher has emptied these queues
+     * before it exited, so this is the MANUAL host that stopped stepping; until 1.14
+     * its queued work ended FAILED / GPTPS_E_CANCELLED and was freed, unrecoverable,
+     * though the docs said otherwise. One item at a time: its event is emitted with
+     * the lock released. Services were detached above (stop_services) and end as
+     * before. */
+    for (;;) {
+        gptps_pending_ev p;
+        int drop;
+        gptps_mutex_lock(e->m);
+        if ((it = fifo_pop(&e->delayed)) == NULL && (it = intake_pop(e)) == NULL) break;   /* lock held */
+        drop = (it->policy.on_failure == GPTPS_ON_FAILURE_DROP);
+        it->outcome = GPTPS_E_SHUTDOWN;
+        p.kind = drop ? GPTPS_EV_DROPPED : GPTPS_EV_DEAD_LETTERED;
+        p.handle = it->handle;
+        ev_set_name(p.name, item_name(it));
+        p.status = GPTPS_E_SHUTDOWN;
+        p.attempt = it->attempt; p.mem = it->cost.mem_bytes;
+        p.result = NULL; p.result_len = 0; p.err = NULL; p.err_len = 0;
+        p.flags = GPTPS_EV_FLAG_SHUTDOWN;
+        if (drop) item_drop(e, it); else dead_letter_push(e, it);
+        cb = e->ev_cb; ud = e->ev_ud;
+        gptps_mutex_unlock(e->m);
+        emit_now(e, cb, ud, &p);
+    }
+    /* the loop broke with e->m held */
     while ((it = fifo_pop(&e->intake))        != NULL) fifo_push(&dropped, it);
     e->intake_root = NULL;                    /* intake is empty: so is its tree */
     while ((it = fifo_pop(&e->delayed))       != NULL) fifo_push(&dropped, it);
@@ -7112,6 +7161,18 @@ gptps_status gptps_shutdown(gptps *e)
     cb = e->ev_cb; ud = e->ev_ud;
     gptps_mutex_unlock(e->m);
     drain_cancelled(e, &dropped, cb, ud);
+
+    /* ABI 2.11 (gptps_shutdown_ex): every dead letter left - never drained, or made
+     * just above for work the grace ended - to the host, now: all work has ended and
+     * had its terminal event, the task types still name them, no add-on is torn down
+     * yet, and nothing is freed. The engine is stopping, so a submit from the callback
+     * is refused (GPTPS_E_SHUTDOWN), and this thread is inside a callback (`in`), so a
+     * shutdown from it is GPTPS_E_BUSY. What the callback is not given (a name copy
+     * that ran out of memory stops a drain there) is freed below, as before. */
+    if (dl_cb) {
+        size_t got;
+        do { got = gptps_dead_letter_drain(e, dl_cb, dl_ud); } while (got > 0 && gptps_dead_letter_count(e) > 0);
+    }
 
     /* tear down add-ons (threads joined => no task code runs; last calls into
      * each .so, then unload) */

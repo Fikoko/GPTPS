@@ -397,9 +397,24 @@ int main(void)
             api.settings_hold = gptps_settings_hold;
             CHECK(fp != NULL && fh != NULL && api.settings_provisional == fp && api.settings_hold == fh);
         }
+        /* 2.11: gptps_shutdown_ex + gptps_shutdown_options, new; gptps_dead_letter
+         * appends attempts_run after n_measures, its last member. */
+        {
+            typedef char dl_run_after[(offsetof(gptps_dead_letter, attempts_run) >=
+                                       offsetof(gptps_dead_letter, n_measures) + sizeof(size_t)) ? 1 : -1];
+            typedef char dl_run_last[(offsetof(gptps_dead_letter, attempts_run) + sizeof(uint32_t) <=
+                                      sizeof(gptps_dead_letter)) ? 1 : -1];
+            typedef char so_first[(offsetof(gptps_shutdown_options, struct_size) == 0) ? 1 : -1];
+            typedef char so_order[(offsetof(gptps_shutdown_options, dead_letter) == sizeof(size_t) &&
+                                   offsetof(gptps_shutdown_options, dead_letter_user_data) ==
+                                   sizeof(size_t) + sizeof(void (*)(void))) ? 1 : -1];
+            gptps_status (*fs)(gptps *, const gptps_shutdown_options *) = gptps_shutdown_ex;
+            (void)sizeof(dl_run_after); (void)sizeof(dl_run_last); (void)sizeof(so_first); (void)sizeof(so_order);
+            CHECK(fs != NULL);
+        }
         /* The ABI this file guards. A new minor appends something: add its guards
          * above, then move this. */
-        CHECK(GPTPS_ABI_VERSION_MAJOR == 2u && GPTPS_ABI_VERSION_MINOR == 10u);
+        CHECK(GPTPS_ABI_VERSION_MAJOR == 2u && GPTPS_ABI_VERSION_MINOR == 11u);
     }
 
     /* 7) Every flag family: single, distinct bits, and the whole family listed. */

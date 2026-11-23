@@ -538,7 +538,8 @@ static void test_body_cancels_itself(void)
 }
 
 /* ...and in MANUAL mode, work still queued when the host shuts down without
- * pumping gets FAILED / GPTPS_E_CANCELLED from gptps_shutdown, and stays pending.
+ * pumping ends by its policy - GPTPS_EV_DEAD_LETTERED / GPTPS_E_SHUTDOWN with
+ * GPTPS_EV_FLAG_SHUTDOWN (1.14; FAILED / GPTPS_E_CANCELLED before) - and stays pending.
  * A gptps_dq_cancel made from that event's callback - the engine is tearing down -
  * still retracts its record, but returns GPTPS_E_SHUTDOWN: the engine stopped
  * nothing for it. Everything here runs on the one thread, so it is exact. */
@@ -549,7 +550,8 @@ static int          g_mcalls;
 static void manual_obs(const gptps_event *ev, void *ud)
 {
     (void)ud;
-    if (ev->kind != GPTPS_EV_FAILED || ev->status != GPTPS_E_CANCELLED) return;
+    if (ev->kind != GPTPS_EV_DEAD_LETTERED || ev->status != GPTPS_E_SHUTDOWN ||
+        !(ev->flags & GPTPS_EV_FLAG_SHUTDOWN)) return;
     if (ev->handle == g_mh[0] && g_mdq) { g_mcancel = gptps_dq_cancel(g_mdq, g_mh[1]); ++g_mcalls; }
 }
 static void test_shutdown_manual(void)
