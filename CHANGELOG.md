@@ -36,6 +36,12 @@ night-window report.
   window the scan reads), at most 2x. That measures what the gate is for, whether the scan
   grows with the tail, in any build: about 1.0x in Release, 1.06x at -O0, and a failure for
   a scan of the whole tail.
+- **`tui_unit`'s PANE degrade check is reliable on loaded runners.** It simulated a 30 ms
+  pane pass with a real busy-wait and then checked the pane interval, the pass time x 100,
+  to the millisecond. A macOS runner measured the pass at 70 ms or more and failed the
+  check. The test now sets the pass time exactly, through a new compile-time test hook
+  `TUI_PANE_US` (the identity by default, as `TUI_FRAME_US` is), and it passes with a
+  70 ms real pass.
 
 ## [1.13.0] - 2026-11-22
 

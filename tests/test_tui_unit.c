@@ -194,6 +194,10 @@ static uint64_t tui_ec_running;     /* 48): items the counts say run, on top of 
 static uint64_t tui_fake_ms;
 #define TUI_NOW_MS() (tui_fake_ms ? tui_fake_ms : gptps_now_ms(NULL))
 #define TUI_FRAME_US(us) (tui_fake_ms ? 0u : (us))
+/* 1.13.1: a pane pass's cost, exactly (0: as measured) - a real 30 ms busy wait read 70 ms
+ * and more on a loaded macOS runner, and moved the interval a check holds to the ms */
+static uint64_t tui_pane_fake_us;
+#define TUI_PANE_US(us) (tui_pane_fake_us ? tui_pane_fake_us : (us))
 /* called between tui_adapt's two locked sections, once, when set */
 static void (*tui_adapt_mid_cb)(void *);
 #define TUI_ADAPT_MID(t) do { if (tui_adapt_mid_cb) tui_adapt_mid_cb((void *)(t)); } while (0)
@@ -4019,7 +4023,7 @@ static void test_adapt_acting(void)
         void *act = t->act, *hist = t->hist, *tab = t->tab, *tasks = t->tasks;
         uint64_t every = 0, want;
         t->pane = TUI_PANE_TASKS;
-        tui_read_delay_us = 30000;                                  /* a pass: 30 ms - read every 3 s */
+        tui_pane_fake_us = 30000;                                   /* a pass: 30 ms - read every 3 s */
         t->pc.stale = 1; gptps_tui_render(t, frame, sizeof frame);  /* the first pass */
         for (w = 0; w < 3; ++w) {
             CHECK(t->shed == 0);
@@ -4041,7 +4045,7 @@ static void test_adapt_acting(void)
             ad_window(t, frame, sizeof frame);
             CHECK((health(t).pressure & GPTPS_TUI_P_PANE) == 0 && health(t).pane_every_ms == want);
         }
-        tui_read_delay_us = 0;
+        tui_pane_fake_us = 0;
         t->pane = TUI_PANE_DASH;
         gptps_tui_render(t, frame, sizeof frame);
         CHECK(strstr(frame, "DEGRADED: -pane (pressure: pane) - 'u' restores full") != NULL);

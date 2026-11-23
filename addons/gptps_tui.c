@@ -114,6 +114,11 @@ static uint64_t tui_now_us(void)
 #ifndef TUI_FRAME_US
 #  define TUI_FRAME_US(us) (us)
 #endif
+/* A pane pass's measured cost (us): a hook for that test too, so a preempted runner's
+ * slow pass does not move the interval it checks to the millisecond. */
+#ifndef TUI_PANE_US
+#  define TUI_PANE_US(us) (us)
+#endif
 #ifndef TUI_ADAPT_MID
 #  define TUI_ADAPT_MID(t) ((void)0)
 #endif
@@ -1984,7 +1989,7 @@ static void pc_read(gptps_tui *t, uint64_t now)
     }
     if (c->kw > (p == TUI_PANE_DETAIL ? 40 : 44)) c->kw = p == TUI_PANE_DETAIL ? 40 : 44;
     t1 = tui_now_us();
-    c->cost_us = t1 > t0 ? t1 - t0 : 0;
+    c->cost_us = TUI_PANE_US(t1 > t0 ? t1 - t0 : 0);
     every = (c->cost_us * TUI_DUTY + 999u) / 1000u;           /* ms: at most 1/TUI_DUTY of the time */
     mu_lock(&t->mu);
     {   /* never sooner than pane_refresh_ms - or what GPTPS_TUI_SHED_PANE raised it to */
