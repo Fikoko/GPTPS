@@ -87,20 +87,24 @@ typedef struct {
     /* morning events */
     int morning_finished, morning_failed;
     gptps_status morning_status;
+    /* why a morning attempt failed, for the report: its exit code or start error
+     * (-1: none measured) and the end of its stderr */
+    long long morning_exit, morning_start_err;
+    char morning_tail[160];
 } job;
 
 #define NJOBS 5
 static job jobs[NJOBS] = {
     { "gl_close",  "erp_licence", "gl-close",     GPTPS_SUBMIT_POLICY,
-      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK },
+      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK, -1, -1, "" },
     { "rpt_fin",   "erp_job",     "10 0 rpt_fin", GPTPS_SUBMIT_TIMEOUT_MS,
-      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK },
+      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK, -1, -1, "" },
     { "rpt_sales", "erp_job",     "10 0 rpt_sales", GPTPS_SUBMIT_TIMEOUT_MS | GPTPS_SUBMIT_DEADLINE,
-      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK },
+      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK, -1, -1, "" },
     { "mrp",       "erp_licence", "mrp",          GPTPS_SUBMIT_POLICY | GPTPS_SUBMIT_TIMEOUT_MS,
-      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK },
+      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK, -1, -1, "" },
     { "rpt_inv",   "erp_job",     "10 0 rpt_inv", 0,
-      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK },
+      0, 0, 0, 0, 0, 0, GPTPS_OK, 0, 0, GPTPS_OK, -1, -1, "" },
 };
 #define TIMEOUT_MS 30000u
 #define DUE_MS     3600000u
@@ -130,7 +134,21 @@ static void observe(const gptps_event *ev, void *ud)
         }
     } else {
         if (ev->kind == GPTPS_EV_FINISHED) { j->morning_finished = 1; j->morning_status = ev->status; }
-        else if (ev->kind == GPTPS_EV_FAILED) { ++j->morning_failed; j->morning_status = ev->status; }
+        else if (ev->kind == GPTPS_EV_FAILED) {
+            const gptps_measure *m;
+            size_t n = ev->stderr_tail_len, cap = sizeof j->morning_tail - 1, k;
+            ++j->morning_failed; j->morning_status = ev->status;
+            m = gptps_event_measure(ev, GPTPS_M_EXIT_CODE);
+            j->morning_exit = m ? (long long)m->value : -1;
+            m = gptps_event_measure(ev, GPTPS_M_START_ERROR);
+            j->morning_start_err = m ? (long long)m->value : -1;
+            if (n > cap) n = cap;    /* the END of the tail (not NUL-terminated) */
+            for (k = 0; k < n; ++k) {
+                char c = ev->stderr_tail[ev->stderr_tail_len - n + k];
+                j->morning_tail[k] = (c == '\n' || c == '\r') ? ' ' : c;
+            }
+            j->morning_tail[n] = '\0';
+        }
     }
 }
 
@@ -372,8 +390,13 @@ int main(void)
 
     for (i = 0; i < NJOBS; ++i)
         if (i != 1)
+        {
             printf("morning: %-10s finished=%d failed=%d status=%d\n", jobs[i].name,
                    jobs[i].morning_finished, jobs[i].morning_failed, (int)jobs[i].morning_status);
+            if (jobs[i].morning_failed)
+                printf("  why: exit.code=%lld start.error=%lld stderr ends \"%s\"\n",
+                       jobs[i].morning_exit, jobs[i].morning_start_err, jobs[i].morning_tail);
+        }
     t = 1;
     for (i = 0; i < NJOBS; ++i)
         if (i != 1 && (!jobs[i].morning_finished || jobs[i].morning_failed ||
