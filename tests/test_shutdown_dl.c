@@ -16,8 +16,9 @@
  *     gptps_shutdown_ex are GPTPS_E_BUSY.
  *  4) a struct_size below the 2.11 struct is GPTPS_E_INVAL and frees nothing (the
  *     engine still answers); opt NULL and a NULL callback are plain gptps_shutdown.
- *  5) a THREADED engine whose grace ends with work queued behind a busy slot: that
- *     work reaches the callback, GPTPS_E_SHUTDOWN, payload intact.
+ *  5) a THREADED engine: attempts_run counts the worker's runs (2 of 2), and work
+ *     its grace ends queued behind a busy slot reaches the callback, GPTPS_E_SHUTDOWN,
+ *     payload intact.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L
@@ -48,12 +49,13 @@ static int fails = 0;
 static gptps_status run_fail(gptps_ctx *c, void *u) { (void)c; (void)u; return GPTPS_E_TASK; }
 static gptps_status run_ok(gptps_ctx *c, void *u)   { (void)c; (void)u; return GPTPS_OK; }
 
-/* a long body for 5): polls its cancel flag */
-static volatile int slow_started;
+/* a long body for 5): polls its cancel flag. slow_started crosses threads: atomics,
+ * as tests/test_hang.c does */
+static int slow_started;
 static gptps_status run_slow(gptps_ctx *c, void *u)
 {
     (void)u;
-    slow_started = 1;
+    __atomic_store_n(&slow_started, 1, __ATOMIC_SEQ_CST);
     while (!gptps_is_cancelled(c)) sleep_ms(5);
     return GPTPS_E_CANCELLED;
 }
@@ -244,12 +246,19 @@ static void test_threaded(void)
     const seen_dl *s;
     int k;
     if (!e) return;
-    nseen = 0; slow_started = 0;
+    nseen = 0; __atomic_store_n(&slow_started, 0, __ATOMIC_SEQ_CST);
     reg(e, "slow", run_slow, 0, 0);
     reg(e, "ok", run_ok, 0, 0);
+    reg(e, "twice", run_fail, 1, 0);
+    /* attempts_run on the worker path: run, fail, retried, run, fail */
+    CHECK(gptps_submit(e, "twice", "T2", 2, &h) == GPTPS_OK);
+    for (k = 0; k < 5000 && gptps_dead_letter_count(e) == 0; ++k) sleep_ms(1);
+    CHECK(gptps_dead_letter_drain(e, collect, NULL) == 1);
+    CHECK((s = find("T2")) != NULL && s->attempts == 2 && s->runs == 2 && s->status == GPTPS_E_TASK);
+    nseen = 0;
     CHECK(gptps_submit(e, "slow", "S", 1, &h) == GPTPS_OK);
-    for (k = 0; k < 2000 && !slow_started; ++k) sleep_ms(1);
-    CHECK(slow_started);
+    for (k = 0; k < 2000 && !__atomic_load_n(&slow_started, __ATOMIC_SEQ_CST); ++k) sleep_ms(1);
+    CHECK(__atomic_load_n(&slow_started, __ATOMIC_SEQ_CST));
     CHECK(gptps_submit(e, "ok", "B1", 2, &h) == GPTPS_OK);   /* behind the one slot */
     CHECK(gptps_submit(e, "ok", "B2", 2, &h) == GPTPS_OK);
     memset(&so, 0, sizeof so); so.struct_size = sizeof so; so.dead_letter = collect;

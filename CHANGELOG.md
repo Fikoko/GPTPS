@@ -5,6 +5,49 @@ All notable changes to GPTPS are recorded here. Format follows
 semantic versioning; the ABI version (`GPTPS_ABI_VERSION_*`) moves independently of
 the release version and is documented in `include/gptps.h`.
 
+## [Unreleased]
+
+The morning re-drive of a night window, from the pilot's report on Fikoko/GPTPS#12: a
+shutdown now hands the host every dead letter it leaves, and a dead letter says how
+many of its attempts actually ran (core ABI 2.11). The pilot's own harnesses join the
+test suite. Every released name, value, field offset, setting, choice and range keeps
+its place.
+
+### Added
+
+- **`gptps_shutdown_ex(e, &gptps_shutdown_options)`** (ABI 2.11). Its `dead_letter`
+  callback is called once for every dead letter the engine still retains, oldest first:
+  the ones never drained, and the ones this shutdown made itself for work it ended
+  (status `GPTPS_E_SHUTDOWN`).
+  - It runs after all work has ended and had its terminal event, before any add-on is
+    torn down and before the engine is freed, on the calling thread.
+  - Each dead letter is the one `gptps_dead_letter_drain` would give: payload, task
+    name, submit options, stderr tail, measurements. Copy what you keep.
+  - Inside the callback a submit is refused with `GPTPS_E_SHUTDOWN` (keep the dead
+    letter for the next engine), and a shutdown with `GPTPS_E_BUSY`.
+  - `gptps_shutdown(e)` is `gptps_shutdown_ex(e, NULL)`. A `struct_size` smaller than
+    the 2.11 struct is `GPTPS_E_INVAL` and frees nothing.
+- **`gptps_dead_letter.attempts_run`** (ABI 2.11): the attempts that ran, counted the
+  same way as `attempts`. A REQUEUE cycle or a service restart starts both again.
+  `attempts - attempts_run` is the attempts scheduled and refused before they ran: a
+  constraint's `E_DENIED` such as `gptps_retry`'s NEVER rule, or a missed deadline.
+
+### Changed
+
+- **MANUAL: work still waiting at shutdown ends by its policy.** A MANUAL host that
+  stops stepping and shuts down with work still queued, waiting to retry, between
+  REQUEUE cycles or DEFERred now sees each item end as `GPTPS_EV_DEAD_LETTERED` (or
+  `GPTPS_EV_DROPPED` under `on_failure = drop`), with status `GPTPS_E_SHUTDOWN` and
+  `GPTPS_EV_FLAG_SHUTDOWN`. That is what a THREADED engine already did when its grace
+  ran out, and what the header already described.
+  - Until 1.14 such work ended `GPTPS_EV_FAILED` / `GPTPS_E_CANCELLED` and was freed,
+    beyond the reach of any drain.
+  - Still one terminal event per item.
+  - **Behaviour change** for an observer that keys on that old event.
+  - The durable queue keeps such work pending as before, because the shutdown flag
+    decides.
+  - Running work cancelled by the grace and stopped services end as before.
+
 ## [1.13.1] - 2026-11-23
 
 Documentation and one test: no library code, ABI or behaviour change. From the pilot's
